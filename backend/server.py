@@ -28,12 +28,23 @@ logging.basicConfig(
 logger = logging.getLogger("SouronControl")
 
 SECRET_TOKEN = os.environ.get("MCP_SECRET_TOKEN")
+TOKEN_FROM_ENV = bool(SECRET_TOKEN)
 if not SECRET_TOKEN:
     SECRET_TOKEN = secrets.token_urlsafe(24)
     logger.warning(f"MCP_SECRET_TOKEN не задан! Сгенерирован временный токен: {SECRET_TOKEN}")
 
-BASE_DOMAIN = os.environ.get("MCP_BASE_DOMAIN", "https://mcp.souron.space")
-RESOURCE_URL = f"{BASE_DOMAIN}/mcp"
+BASE_DOMAIN = os.environ.get("MCP_BASE_DOMAIN", "https://mcp.souron.space").rstrip("/")
+# Ровно та же строка, что и в AuthSettings.resource_server_url: при validate_token_resource=True
+# SDK сравнивает с ней AccessToken.resource, и любое расхождение даст 401.
+RESOURCE_URL = str(AnyHttpUrl(f"{BASE_DOMAIN}/mcp"))
+
+# Слушаем только localhost: cloudflared работает на этой же машине, а 0.0.0.0 открыл бы
+# run_local_command всей локальной сети. MCP_HOST=0.0.0.0 — если нужен доступ из LAN.
+HOST = os.environ.get("MCP_HOST", "127.0.0.1")
+PORT = int(os.environ.get("MCP_PORT", "8000"))  # должен совпадать с server_port в settings.json
+
+# Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
+HEALTH_PATH = "/health"
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -65,6 +76,13 @@ def truncate_output(text: str) -> str:
 class HybridAuthMiddleware(BaseHTTPMiddleware):
     """Перехватывает запросы ДО MCP. Проверяет токен в заголовке или URL."""
     async def dispatch(self, request: Request, call_next):
+        # 0. Health-check: отвечаем сразу, до проверки токена и логирования.
+        # Именно по пути, а НЕ по IP 127.0.0.1: через туннель ВСЕ внешние запросы
+        # тоже приходят с 127.0.0.1 (cloudflared подключается локально).
+        # Эндпоинт ничего не раскрывает, поэтому его доступность снаружи безопасна.
+        if request.url.path == HEALTH_PATH:
+            return JSONResponse({"status": "ok"})
+
         # 1. Проверка заголовка Authorization
         auth_header = request.headers.get("Authorization", "")
         token = None
@@ -87,7 +105,7 @@ class HybridAuthMiddleware(BaseHTTPMiddleware):
         # 4. Если токена нет вообще (например, ChatGPT в режиме No Auth)
         # ВНИМАНИЕ: Здесь мы пропускаем запрос, чтобы ChatGPT мог работать.
         # Если вы хотите запретить анонимный доступ, верните 401 (см. ниже).
-        logger.warning(f"Запрос без токена с IP: {request.client.host}")
+        logger.warning(f"Запрос без токена с IP: {request.client.host} → {request.method} {request.url.path}")
         
         # Раскомментируйте строку ниже, если хотите ЗАБЛОКИРОВАТЬ анонимные запросы
         # return JSONResponse({"error": "Unauthorized: Token required"}, status_code=401)
@@ -98,7 +116,9 @@ class SimpleTokenVerifier(TokenVerifier):
     """Оставлен для клиентов, которые используют OAuth2-интроспекцию."""
     async def verify_token(self, token: str) -> AccessToken | None:
         if hmac.compare_digest(token.encode(), SECRET_TOKEN.encode()):
-            return AccessToken(token=token, client_id="souron-user", scopes=[])
+            # resource обязателен при validate_token_resource=True: без него SDK отклонит
+            # даже верный токен. Наш токен выпускается только для этого сервера.
+            return AccessToken(token=token, client_id="souron-user", scopes=[], resource=RESOURCE_URL)
         return None
 
 # ==========================================
@@ -112,6 +132,7 @@ mcp = MCPServer(
         issuer_url=AnyHttpUrl(BASE_DOMAIN),
         resource_server_url=AnyHttpUrl(RESOURCE_URL),
         required_scopes=[],
+        validate_token_resource=True,
     ),
 )
 
@@ -228,16 +249,23 @@ def write_workspace_file(relative_path: str, content: str) -> str:
 # 6. ЗАПУСК
 # ==========================================
 
-if __name__ == "__main__":
-    logger.info(f"Сервер запущен: {RESOURCE_URL}")
-    logger.info(f"Токен: {SECRET_TOKEN}")
-    
-    # Получаем базовое приложение FastAPI/Starlette из MCP
+def main() -> None:
+    """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
+    logger.info(f"Сервер запущен: {RESOURCE_URL} (слушает {HOST}:{PORT})")
+    if TOKEN_FROM_ENV:
+        # Токен целиком не пишем: лог уходит в souron_audit.log и в окно GUI.
+        logger.info(f"Токен: из MCP_SECRET_TOKEN (…{SECRET_TOKEN[-4:]})")
+
+    # Получаем базовое приложение Starlette из MCP
     app = mcp.streamable_http_app()
     
-    # Оборачиваем его в наш Middleware для проверки токена
+    # Оборачиваем его в наш Middleware для проверки токена (и /health)
     app.add_middleware(HybridAuthMiddleware)
     
     # Запускаем через uvicorn
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=HOST, port=PORT)
+
+
+if __name__ == "__main__":
+    main()

@@ -42,6 +42,9 @@ class Settings:
     minimize_to_tray_on_close: bool = True
     auto_restart: bool = True
 
+    # Интерфейс
+    logs_expanded: bool = True       # панель логов в главном окне развёрнута
+
     @classmethod
     def path(cls) -> Path:
         return user_data_dir() / SETTINGS_FILE

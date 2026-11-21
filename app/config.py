@@ -31,7 +31,7 @@ class Settings:
     cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
     # http2 по умолчанию: провайдер блокирует исходящий UDP, из-за чего QUIC не поднимается.
-    # П��стая строка = не передавать флаг (тогда решает config.yml или cloudflared).
+    # Пустая строка = не передавать флаг (тогда решает config.yml или cloudflared).
     tunnel_protocol: str = "http2"
 
     # Бэкенд

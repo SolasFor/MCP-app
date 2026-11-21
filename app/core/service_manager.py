@@ -29,7 +29,7 @@ APP = "app"  # источник служебных сообщений в лог�
 
 SERVER_READY_TIMEOUT_MS = 20_000
 MAX_RESTARTS = 5
-STABLE_UPTIME_S = 60  # проработал дольше — счётчик перезапусков сбрасывается
+STABLE_UPTIME_S = 60  # проработал здоровым дольше — счётчик перезапусков сбрасывается
 
 
 class Overall(str, Enum):
@@ -62,11 +62,19 @@ class ServiceManager(QObject):
         self.health.server_health.connect(self._on_server_health)
         self.health.tunnel_health.connect(self.tunnel.mark_health)
 
-        self._server_wait = QTimer(self, singleShot=True, timeout=self._on_server_ready_timeout)
-        self._restart_timers = {
-            name: QTimer(self, singleShot=True, timeout=lambda n=name: self._restart(n)) for name in self._procs
-        }
+        self._server_wait = QTimer(self)
+        self._server_wait.setSingleShot(True)
+        self._server_wait.timeout.connect(self._on_server_ready_timeout)
+
+        self._restart_timers: dict[str, QTimer] = {}
+        for name in self._procs:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda n=name: self._restart(n))
+            self._restart_timers[name] = timer
+
         self._restart_attempts = {name: 0 for name in self._procs}
+        self._healthy_at: dict[str, float | None] = {name: None for name in self._procs}
         self._want_running = False
         self._error = False
         self._overall = Overall.STOPPED
@@ -82,7 +90,10 @@ class ServiceManager(QObject):
         return self._want_running
 
     def toggle(self) -> None:
-        self.stop_all() if self._want_running else self.start_all()
+        if self._want_running:
+            self.stop_all()
+        else:
+            self.start_all()
 
     def start_all(self) -> None:
         if self._want_running:
@@ -97,6 +108,7 @@ class ServiceManager(QObject):
             return
         self._want_running = True
         self._restart_attempts = {name: 0 for name in self._procs}
+        self._healthy_at = {name: None for name in self._procs}
         self._log("Запуск сервисов…")
         self.health.start()
         self._start_server()
@@ -129,8 +141,9 @@ class ServiceManager(QObject):
         if not Path(s.cloudflared_config).expanduser().is_file():
             problems.append(f"Не найден конфиг туннеля: {s.cloudflared_config}")
 
-        for port, what in ((s.server_port, "MCP-сервера"), (s.metrics_port, "метрик cloudflared")):
-            owner = _port_owner(s.server_host if port == s.server_port else "127.0.0.1", port)
+        checks = ((s.server_host, s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
+        for host, port, what in checks:
+            owner = _port_owner(host, port)
             if owner:
                 problems.append(f"Порт {port} ({what}) уже занят: {owner}. Закройте старое окно терминала.")
 
@@ -153,7 +166,7 @@ class ServiceManager(QObject):
         s = self.settings
         exe = resolve_cloudflared(s.cloudflared_path)
         if exe is None:
-            self._log("✖ cloudflared.exe пропал")
+            self._log("✖ cloudflared.exe не найден")
             self._fail()
             return
         args = [
@@ -170,12 +183,16 @@ class ServiceManager(QObject):
         if not self._want_running:
             return
         self._log(f"↻ Перезапуск {name} (попытка {self._restart_attempts[name]}/{MAX_RESTARTS})")
-        self._start_server() if name == SERVER else self._start_tunnel()
+        if name == SERVER:
+            self._start_server()
+        else:
+            self._start_tunnel()
+        self._recompute()
 
     # ================================================================== слоты
     def _on_server_health(self, ok: bool) -> None:
         self.server.mark_health(ok)
-        if ok and self._want_running:
+        if ok and self._want_running and self.server.is_alive():
             self._server_wait.stop()
             # Туннель стартует только когда есть куда проксировать — иначе клиенты получат 502.
             if not self.tunnel.is_alive() and not self._restart_timers[TUNNEL].isActive():
@@ -190,16 +207,17 @@ class ServiceManager(QObject):
         if expected or not self._want_running:
             self._recompute()
             return
-        proc = self._procs[name]
         if name == SERVER:
             self._server_wait.stop()
         if not self.settings.auto_restart:
             self._log(f"✖ {name} упал (код {exit_code}); автоперезапуск выключен")
             self._fail()
             return
-        # proc.healthy_since уже сброшен — ориентируемся на нашу отметку времени
-        if time.monotonic() - getattr(proc, "_last_healthy_at", 0) > STABLE_UPTIME_S:
-            self._restart_attempts[name] = 0
+
+        healthy_at = self._healthy_at[name]
+        if healthy_at is not None and time.monotonic() - healthy_at > STABLE_UPTIME_S:
+            self._restart_attempts[name] = 0  # долго работал — это не crash-loop
+        self._healthy_at[name] = None
         self._restart_attempts[name] += 1
         attempt = self._restart_attempts[name]
         if attempt > MAX_RESTARTS:
@@ -212,12 +230,10 @@ class ServiceManager(QObject):
         self._recompute()
 
     def _on_proc_state(self, name: str, state: ProcState) -> None:
-        proc = self._procs[name]
         if state == ProcState.RUNNING:
-            proc._last_healthy_at = time.monotonic()  # noqa: SLF001
+            if self._healthy_at[name] is None:
+                self._healthy_at[name] = time.monotonic()
             self._log("✔ Сервер отвечает" if name == SERVER else "✔ Туннель подключён к Cloudflare")
-        elif proc.healthy_since is None and hasattr(proc, "_last_healthy_at") and state != ProcState.STARTING:
-            pass
         self.service_state_changed.emit(name, state)
         self._recompute()
 
@@ -274,7 +290,7 @@ def _port_owner(host: str, port: int) -> str | None:
 
 
 def _foreign_cloudflared() -> list[int]:
-    """PID'ы cloudflared, запущенных НЕ нами (например, вручную в терминале или как служба)."""
+    """PID'ы cloudflared, запущенных НЕ нами (вручную в терминале или как служба Windows)."""
     pids = []
     for proc in psutil.process_iter(["name"]):
         if (proc.info.get("name") or "").lower() == "cloudflared.exe":

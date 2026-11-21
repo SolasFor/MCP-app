@@ -22,7 +22,6 @@ def main() -> int:
         run_backend()
         return 0
 
-    # GUI добавляется на шаге 3 (app/ui).
     from app.gui import run_gui
 
     return run_gui(sys.argv)

@@ -1,7 +1,7 @@
 """Настройки приложения: %APPDATA%\\SouronMCP\\settings.json.
 
-Секреты (Bearer-токены, SSH-ключи) сюда НЕ кладём — их читает сам
-бэкенд из переменных окружения или .env.
+Без секретов: Bearer-токен живёт в app/core/token_store.py (отдельный файл
+с ограниченным доступом), SSH-ключи — у бэкенда.
 
 Новые поля безопасно добавлять: если в старом settings.json их нет,
 берётся значение по умолчанию.
@@ -11,22 +11,76 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from app.paths import user_data_dir
 
 SETTINGS_FILE = "settings.json"
 
+# Режимы туннеля
+TUNNEL_NAMED = "named"   # свой домен: config.yml + `cloudflared tunnel run`
+TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `--url http://127.0.0.1:8000`
+TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
+
+DEFAULT_MCP_PATH = "/mcp"
+QUICK_TUNNEL_SUFFIX = ".trycloudflare.com"
+
+
+def normalize_mcp_path(value: str) -> str:
+    path = (value or "").strip()
+    if not path:
+        return DEFAULT_MCP_PATH
+    if not path.startswith("/"):
+        path = "/" + path
+    return path.rstrip("/") or DEFAULT_MCP_PATH
+
+
+def normalize_public_url(value: str, mcp_path: str = DEFAULT_MCP_PATH) -> str:
+    """Привести ввод пользователя к каноническому виду; '' — если это не адрес.
+
+        mcp.souron.space          -> https://mcp.souron.space/mcp
+        https://host/mcp/         -> https://host/mcp
+        http://host:8080/custom   -> http://host:8080/custom
+    """
+    raw = (value or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https") or "@" in parts.netloc:
+        return ""
+    try:
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:  # неверный порт
+        return ""
+    if not host or "." not in host and host != "localhost":
+        return ""
+    netloc = f"{host}:{port}" if port else host
+    path = parts.path.rstrip("/") or normalize_mcp_path(mcp_path)
+    return urlunsplit((parts.scheme, netloc, path, "", ""))
+
+
+def origin_of(url: str) -> str:
+    """'https://host/mcp' -> 'https://host' (для issuer_url бэкенда)."""
+    parts = urlsplit(url or "")
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+
 
 @dataclass
 class Settings:
     # Сеть
-    public_url: str = "https://mcp.souron.space/mcp"
+    public_url: str = "https://mcp.souron.space/mcp"  # свой домен (режим named)
+    quick_url: str = ""              # последний выданный временный адрес (режим quick)
+    mcp_path: str = DEFAULT_MCP_PATH  # путь MCP-эндпоинта на сервере
     server_host: str = "127.0.0.1"
     server_port: int = 8000          # должен совпадать с портом в backend/server.py
     server_health_path: str = "/health"  # любой HTTP-ответ (даже 404/401) = сервер жив
     metrics_port: int = 20241        # cloudflared --metrics -> /ready для индикатора
 
     # Cloudflare Tunnel
+    tunnel_mode: str = TUNNEL_NAMED  # named | quick
     cloudflared_path: str = ""       # пусто = автопоиск (bin/, Program Files, PATH)
     cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
@@ -36,6 +90,7 @@ class Settings:
 
     # Бэкенд
     backend_workdir: str = ""        # пусто = paths.default_backend_workdir()
+    allow_query_token: bool = False  # разрешить ?token=… в ссылке вместо заголовка
 
     # Поведение
     start_services_on_launch: bool = False
@@ -45,6 +100,16 @@ class Settings:
     # Интерфейс
     logs_expanded: bool = True       # панель логов в главном окне развёрнута
 
+    # ------------------------------------------------------------------ свойства
+    @property
+    def is_quick_tunnel(self) -> bool:
+        return self.tunnel_mode == TUNNEL_QUICK
+
+    def local_host(self) -> str:
+        """Адрес, по которому стучаться к серверу с этой же машины."""
+        return "127.0.0.1" if self.server_host in ("0.0.0.0", "::", "") else self.server_host
+
+    # ------------------------------------------------------------------ файл
     @classmethod
     def path(cls) -> Path:
         return user_data_dir() / SETTINGS_FILE
@@ -61,7 +126,18 @@ class Settings:
         if not isinstance(data, dict):
             return cls()
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        settings = cls(**{k: v for k, v in data.items() if k in known})
+        settings.sanitize()
+        return settings
+
+    def sanitize(self) -> None:
+        """Подправить значения, которые могли быть отредактированы вручную."""
+        if self.tunnel_mode not in TUNNEL_MODES:
+            self.tunnel_mode = TUNNEL_NAMED
+        self.mcp_path = normalize_mcp_path(self.mcp_path)
+        self.server_health_path = normalize_mcp_path(self.server_health_path)
+        self.public_url = normalize_public_url(self.public_url, self.mcp_path) or Settings.public_url
+        self.quick_url = normalize_public_url(self.quick_url, self.mcp_path)
 
     def save(self) -> None:
         target = self.path()

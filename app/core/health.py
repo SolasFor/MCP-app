@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from PyQt6.QtCore import QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtNetwork import (
-    QAbstractSocket,
     QNetworkAccessManager,
     QNetworkProxy,
     QNetworkReply,
@@ -40,7 +39,7 @@ class HealthMonitor(QObject):
         self._timer.setInterval(interval_ms)
         self._timer.timeout.connect(self.probe_now)
 
-        self._socket: QTcpSocket | None = None
+        self._server_probe_busy = False
         self._reply: QNetworkReply | None = None
         self.check_tunnel = False  # включает ServiceManager, когда туннель запущен
 
@@ -52,8 +51,6 @@ class HealthMonitor(QObject):
     def stop(self) -> None:
         self._timer.stop()
         self.check_tunnel = False
-        if self._socket is not None:
-            self._socket.abort()
         if self._reply is not None:
             self._reply.abort()
 
@@ -64,27 +61,27 @@ class HealthMonitor(QObject):
 
     # ------------------------------------------------------------------ server
     def _probe_server(self) -> None:
-        if self._socket is not None:  # предыдущая проверка ещё идёт
+        if self._server_probe_busy:  # предыдущая проверка ещё идёт
             return
+        self._server_probe_busy = True
         sock = QTcpSocket(self)
         sock.setProxy(QNetworkProxy(QNetworkProxy.ProxyType.NoProxy))
-        self._socket = sock
         done = False
 
         def finish(ok: bool) -> None:
             nonlocal done
-            if done:
+            if done:  # защита от повторного вызова (connected/error/timeout)
                 return
             done = True
-            self._socket = None
+            self._server_probe_busy = False
             sock.abort()
             sock.deleteLater()
             self.server_health.emit(ok)
 
         sock.connected.connect(lambda: finish(True))
         sock.errorOccurred.connect(lambda _err: finish(False))
-        QTimer.singleShot(PROBE_TIMEOUT_MS, lambda: finish(
-            sock.state() == QAbstractSocket.SocketState.ConnectedState))
+        # Если до таймаута не было ни connected, ни error — сервер не отвечает.
+        QTimer.singleShot(PROBE_TIMEOUT_MS, lambda: finish(False))
         sock.connectToHost(self._host, self._port)
 
     # ------------------------------------------------------------------ tunnel

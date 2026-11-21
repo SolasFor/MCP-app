@@ -3,9 +3,9 @@
     GUI ──start_all()/stop_all()──▶ ServiceManager ──▶ ManagedProcess("server")
     GUI ◀─────── сигналы ──────── ServiceManager ──▶ ManagedProcess("tunnel")
                                          │
-                                         └──▶ HealthMonitor (TCP :8000, /ready)
+                                         └──▶ HealthMonitor (GET :8000/health, /ready)
 
-Порядок старта: preflight -> server -> (порт 8000 ответил) -> tunnel -> (/ready = 200).
+Порядок старта: preflight -> server -> (сервер ответил) -> tunnel -> (/ready = 200).
 Порядок остановки: tunnel -> server (сначала закрываем вход извне).
 """
 from __future__ import annotations
@@ -30,6 +30,7 @@ APP = "app"  # источник служебных сообщений в лог�
 SERVER_READY_TIMEOUT_MS = 20_000
 MAX_RESTARTS = 5
 STABLE_UPTIME_S = 60  # проработал здоровым дольше — счётчик перезапусков сбрасывается
+VALID_PROTOCOLS = {"http2", "quic", "auto"}
 
 
 class Overall(str, Enum):
@@ -54,13 +55,22 @@ class ServiceManager(QObject):
         self._procs = {SERVER: self.server, TUNNEL: self.tunnel}
 
         for proc in self._procs.values():
-            proc.log_line.connect(self.log_line)
+            proc.log_line.connect(self._forward_log)
             proc.state_changed.connect(self._on_proc_state)
             proc.exited.connect(self._on_exited)
 
-        self.health = HealthMonitor(settings.server_host, settings.server_port, settings.metrics_port, parent=self)
+        self.health = HealthMonitor(
+            settings.server_host,
+            settings.server_port,
+            settings.metrics_port,
+            health_path=settings.server_health_path,
+            parent=self,
+        )
         self.health.server_health.connect(self._on_server_health)
         self.health.tunnel_health.connect(self.tunnel.mark_health)
+        # Строка access-лога uvicorn от нашей же проверки: ... "GET /health HTTP/1.1" 404 ...
+        self._health_log_marker = f'"GET {self.health.health_path} '
+        self._quic_hint_shown = False
 
         self._server_wait = QTimer(self)
         self._server_wait.setSingleShot(True)
@@ -109,6 +119,7 @@ class ServiceManager(QObject):
         self._want_running = True
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at = {name: None for name in self._procs}
+        self._quic_hint_shown = False
         self._log("Запуск сервисов…")
         self.health.start()
         self._start_server()
@@ -140,6 +151,9 @@ class ServiceManager(QObject):
             problems.append("cloudflared.exe не найден (настройки, bin/, Program Files, PATH).")
         if not Path(s.cloudflared_config).expanduser().is_file():
             problems.append(f"Не найден конфиг туннеля: {s.cloudflared_config}")
+        protocol = s.tunnel_protocol.strip().lower()
+        if protocol and protocol not in VALID_PROTOCOLS:
+            problems.append(f"tunnel_protocol='{s.tunnel_protocol}' — допустимо: http2, quic, auto или пусто.")
 
         checks = ((s.server_host, s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
         for host, port, what in checks:
@@ -162,21 +176,30 @@ class ServiceManager(QObject):
         self.server.start(program, args, workdir=workdir)
         self._server_wait.start(SERVER_READY_TIMEOUT_MS)
 
-    def _start_tunnel(self) -> None:
+    def tunnel_args(self) -> list[str]:
+        """Аргументы cloudflared. Все флаги — уровня `tunnel`, поэтому стоят ДО `run`."""
         s = self.settings
-        exe = resolve_cloudflared(s.cloudflared_path)
-        if exe is None:
-            self._log("✖ cloudflared.exe не найден")
-            self._fail()
-            return
         args = [
             "tunnel",
             "--no-autoupdate",                          # обновления — наша забота, не процесса
             "--config", str(Path(s.cloudflared_config).expanduser()),
             "--metrics", f"127.0.0.1:{s.metrics_port}",  # для /ready
-            "run",                                      # имя/UUID туннеля берётся из config.yml
         ]
-        self.tunnel.start(exe, args)
+        protocol = s.tunnel_protocol.strip().lower()
+        if protocol:
+            # http2 = TCP вместо QUIC/UDP 7844, который режет провайдер.
+            # Флаг командной строки перекрывает `protocol:` из config.yml.
+            args += ["--protocol", protocol]
+        args.append("run")                              # имя/UUID туннеля берётся из config.yml
+        return args
+
+    def _start_tunnel(self) -> None:
+        exe = resolve_cloudflared(self.settings.cloudflared_path)
+        if exe is None:
+            self._log("✖ cloudflared.exe не найден")
+            self._fail()
+            return
+        self.tunnel.start(exe, self.tunnel_args())
         self.health.check_tunnel = True
 
     def _restart(self, name: str) -> None:
@@ -190,6 +213,16 @@ class ServiceManager(QObject):
         self._recompute()
 
     # ================================================================== слоты
+    def _forward_log(self, name: str, line: str) -> None:
+        if name == SERVER and self._health_log_marker in line:
+            return  # свои же проверки раз в 2 с не засоряют лог
+        self.log_line.emit(name, line)
+        if (name == TUNNEL and not self._quic_hint_shown
+                and "quic" in line.lower() and "failed" in line.lower()):
+            self._quic_hint_shown = True
+            self._log("⚠ QUIC (UDP 7844) не проходит. Проверьте tunnel_protocol = \"http2\" в settings.json "
+                      "и что в config.yml нет protocol: quic.")
+
     def _on_server_health(self, ok: bool) -> None:
         self.server.mark_health(ok)
         if ok and self._want_running and self.server.is_alive():
@@ -200,7 +233,7 @@ class ServiceManager(QObject):
 
     def _on_server_ready_timeout(self) -> None:
         if self._want_running and self.server.state != ProcState.RUNNING:
-            self._log(f"✖ Сервер не открыл порт {self.settings.server_port} за {SERVER_READY_TIMEOUT_MS // 1000} с")
+            self._log(f"✖ Сервер не ответил на порту {self.settings.server_port} за {SERVER_READY_TIMEOUT_MS // 1000} с")
             self._fail()
 
     def _on_exited(self, name: str, exit_code: int, expected: bool) -> None:

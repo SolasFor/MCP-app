@@ -2,6 +2,9 @@
 
 Секреты (Bearer-токены, SSH-ключи) сюда НЕ кладём — их читает сам
 бэкенд из переменных окружения или .env.
+
+Новые поля безопасно добавлять: если в старом settings.json их нет,
+берётся значение по умолчанию.
 """
 from __future__ import annotations
 
@@ -20,11 +23,16 @@ class Settings:
     public_url: str = "https://mcp.souron.space/mcp"
     server_host: str = "127.0.0.1"
     server_port: int = 8000          # должен совпадать с портом в backend/server.py
+    server_health_path: str = "/health"  # любой HTTP-ответ (даже 404/401) = сервер жив
     metrics_port: int = 20241        # cloudflared --metrics -> /ready для индикатора
 
     # Cloudflare Tunnel
     cloudflared_path: str = ""       # пусто = автопоиск (bin/, Program Files, PATH)
     cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")
+    # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
+    # http2 по умолчанию: провайдер блокирует исходящий UDP, из-за чего QUIC не поднимается.
+    # П��стая строка = не передавать флаг (тогда решает config.yml или cloudflared).
+    tunnel_protocol: str = "http2"
 
     # Бэкенд
     backend_workdir: str = ""        # пусто = paths.default_backend_workdir()

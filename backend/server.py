@@ -104,7 +104,7 @@ class HybridAuthMiddleware:
     * /health — отвечает сразу, без токена и без записи в лог. По пути, а НЕ по IP:
       через туннель ВСЕ запросы приходят с 127.0.0.1 (cloudflared подключается локально).
     * ?token=… — если разрешено и токен верный, превращается в заголовок
-      Authorization: Bearer. Только так SDK его примет: его RequireAuthMiddleware смотрит
+      Authorization: Bearer. Только так SDK его примет: его проверка смотрит
       исключительно в заголовок. Сам токен вырезается из query string, чтобы не
       попасть в access-лог uvicorn (а значит, в окно GUI).
     * Всё остальное проверяет SDK: без верного токена /mcp ответит 401 с правильным
@@ -188,24 +188,6 @@ def _accepts(func, name: str) -> bool:
         return False
 
 
-def _transport_security():
-    """Защита от DNS rebinding: пускаем только наш публичный хост и localhost.
-
-    cloudflared передаёт исходный Host (mcp.souron.space или xxx.trycloudflare.com),
-    поэтому его нужно явно разрешить — иначе SDK ответит 421 Invalid Host header.
-    """
-    try:
-        from mcp.server.transport_security import TransportSecuritySettings
-    except ImportError:
-        return None
-    local = ["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "[::1]", "[::1]:*"]
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=[PUBLIC_HOST, *local],
-        allowed_origins=[BASE_URL, "http://127.0.0.1:*", "http://localhost:*"],
-    )
-
-
 auth_settings = AuthSettings(
     issuer_url=AnyHttpUrl(BASE_URL),
     resource_server_url=AnyHttpUrl(RESOURCE_URL),
@@ -213,10 +195,11 @@ auth_settings = AuthSettings(
     validate_token_resource=True,  # убирает MCPDeprecationWarning; токены для чужого адреса отклоняются
 )
 
-# Параметры транспорта: в зависимости от версии SDK их принимает либо конструктор,
-# либо streamable_http_app(). Передаём туда, где они есть.
-_transport_options = {"json_response": JSON_RESPONSE, "transport_security": _transport_security()}
-_transport_options = {k: v for k, v in _transport_options.items() if v is not None}
+# Проверку Host/Origin оставляем SDK по умолчанию (с ней всё уже работало): явный
+# белый список Origin мог бы отсечь настоящих клиентов. Защита — Bearer-токен.
+# json_response в зависимости от версии SDK принимает либо конструктор,
+# либо streamable_http_app() — передаём туда, где он есть.
+_transport_options = {"json_response": JSON_RESPONSE}
 _ctor_options = {k: v for k, v in _transport_options.items() if _accepts(MCPServer.__init__, k)}
 
 mcp = MCPServer(
@@ -345,8 +328,7 @@ def build_app():
         k: v for k, v in _transport_options.items()
         if k not in _ctor_options and _accepts(mcp.streamable_http_app, k)
     }
-    missing = set(_transport_options) - set(_ctor_options) - set(app_options)
-    if "json_response" in missing and JSON_RESPONSE:
+    if JSON_RESPONSE and "json_response" not in _ctor_options and "json_response" not in app_options:
         logger.warning("Эта версия MCP SDK не поддерживает json_response — через временный адрес "
                        "потоковые (SSE) ответы могут зависать.")
     app = mcp.streamable_http_app(**app_options)

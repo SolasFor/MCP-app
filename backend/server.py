@@ -22,12 +22,15 @@ from starlette.responses import JSONResponse
 # Все параметры приходят из переменных окружения. Их задаёт GUI (ServiceManager);
 # при ручном запуске `python backend/server.py` работают значения по умолчанию.
 
+SERVER_NAME = "MCP app"
+AUDIT_LOG = "mcp_audit.log"  # в рабочей папке сервера (в .exe — %APPDATA%\MCPApp\server)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("souron_audit.log", encoding="utf-8"), logging.StreamHandler()],
+    handlers=[logging.FileHandler(AUDIT_LOG, encoding="utf-8"), logging.StreamHandler()],
 )
-logger = logging.getLogger("SouronControl")
+logger = logging.getLogger("MCPApp")
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -173,7 +176,7 @@ class SimpleTokenVerifier(TokenVerifier):
         if _token_ok(token):
             # resource обязателен при validate_token_resource=True: без него SDK отклонит
             # даже верный токен. Наш токен выпускается только для этого сервера.
-            return AccessToken(token=token, client_id="souron-user", scopes=[], resource=RESOURCE_URL)
+            return AccessToken(token=token, client_id="mcp-app-user", scopes=[], resource=RESOURCE_URL)
         return None
 
 # ==========================================
@@ -203,7 +206,7 @@ _transport_options = {"json_response": JSON_RESPONSE}
 _ctor_options = {k: v for k, v in _transport_options.items() if _accepts(MCPServer.__init__, k)}
 
 mcp = MCPServer(
-    "SouronControl",
+    SERVER_NAME,
     token_verifier=SimpleTokenVerifier(),
     auth=auth_settings,
     **_ctor_options,
@@ -340,12 +343,12 @@ def build_app():
 
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
-    logger.info(f"Сервер запущен: {RESOURCE_URL} (слушает {HOST}:{PORT})")
+    logger.info(f"{SERVER_NAME}: {RESOURCE_URL} (слушает {HOST}:{PORT})")
     mode = "JSON (временный адрес без SSE)" if JSON_RESPONSE else "SSE"
     query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
-    logger.info(f"Ответы: {mode}; токен в ссылке (?token=): {query}")
+    logger.info(f"Ответы: {mode}; токен в ссылке: {query}")
     if TOKEN_FROM_ENV:
-        # Токен целиком не пишем: лог уходит в souron_audit.log и в окно GUI.
+        # Токен целиком не пишем: лог уходит в mcp_audit.log и в окно GUI.
         logger.info(f"Токен: из MCP_SECRET_TOKEN (…{SECRET_TOKEN[-4:]})")
 
     import uvicorn

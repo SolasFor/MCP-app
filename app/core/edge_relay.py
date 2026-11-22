@@ -3,20 +3,22 @@
     cloudflared ──TCP──▶ 127.0.0.1:<порт> ──SOCKS5/CONNECT──▶ region1.v2.argotunnel.com:7844
     cloudflared ──HTTP─▶ 127.0.0.1:<порт> ──HTTPS через прокси──▶ api.trycloudflare.com/tunnel
 
-Соединение туннеля. cloudflared запускается с --edge 127.0.0.1:<порт> (по одному на каждый
-хост :7844 из списка) и --protocol http2: QUIC — это UDP, а SOCKS5 CONNECT и HTTP CONNECT везут
-только TCP. Статические адреса --edge cloudflared поддерживает полноценно
-(supervisor.NewSupervisor → edgediscovery.StaticEdge, prechecks тоже идут по ним). Сертификат
-сервера cloudflared проверяет по служебному имени протокола (TLSSettings().ServerName), а не
-по адресу из --edge, поэтому через мост TLS сходится без подмен.
+Соединение туннеля. cloudflared запускается с --edge 127.0.0.1:<порт> (по LISTENERS_PER_TARGET
+на каждый хост :7844 из списка) и --protocol http2: QUIC — это UDP, а SOCKS5 CONNECT и
+HTTP CONNECT везут только TCP. Протокол выставляет ServiceManager (флаг не должен
+повторяться). Статические адреса --edge cloudflared поддерживает полноценно
+(supervisor → edgediscovery.StaticEdge). Сертификат сервера cloudflared проверяет по
+служебному имени, а не по адресу из --edge, поэтому через мост TLS сходится без подмен.
+Одно соединение туннеля занимает один адрес, поэтому мостов несколько: cloudflared держит
+до 4 соединений.
 
 Временный адрес. cloudflared делает POST <quick-service>/tunnel своим http.Transport без
 прокси. С --quick-service http://127.0.0.1:<порт> запрос приходит сюда, и мост пересылает
 его в https://api.trycloudflare.com через прокси, ответ отдаёт как есть.
 
 Мост работает в фоновых потоках (не в цикле Qt) и слушает только 127.0.0.1.
-Жизненный цикл: ServiceManager вызывает start() перед запуском туннеля, добавляет
-cloudflared_args() к команде и вызывает stop() после остановки туннеля.
+Жизненный цикл: ServiceManager вызывает start() перед каждым запуском туннеля, добавляет
+cloudflared_args() к команде и stop() при остановке туннеля.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ from typing import Callable
 from app.core import proxy as px
 
 QUICK_SERVICE_HOST = "api.trycloudflare.com"
+LISTENERS_PER_TARGET = 2
 LogFn = Callable[[str], None]
 
 
@@ -140,6 +143,11 @@ class ProxyBridge:
     def active(self) -> bool:
         return bool(self._listeners or self._http)
 
+    @property
+    def edge_active(self) -> bool:
+        """Соединение туннеля идёт через прокси — значит, только HTTP/2 (TCP)."""
+        return bool(self._listeners)
+
     def start(self) -> None:
         """Поднять мосты. ValueError — неверные настройки (текст понятен пользователю)."""
         self.stop()
@@ -150,7 +158,8 @@ class ProxyBridge:
             raise ValueError("; ".join(errors))
         try:
             for target in self.settings.edge_targets():
-                self._listeners.append(_EdgeListener(self.settings, target, self.log))
+                for _ in range(LISTENERS_PER_TARGET):
+                    self._listeners.append(_EdgeListener(self.settings, target, self.log))
             if self.settings.covers(QUICK_SERVICE_HOST, 443):
                 server = ThreadingHTTPServer(("127.0.0.1", 0), _QuickServiceHandler)
                 server.daemon_threads = True
@@ -168,25 +177,27 @@ class ProxyBridge:
         for listener in self._listeners:
             listener.close()
         self._listeners = []
-        if self._http is not None:
-            self._http.shutdown()
-            self._http.server_close()
-            self._http = None
+        server, self._http = self._http, None
+        if server is not None:
+            # shutdown() ждёт цикл serve_forever (до 0,5 с) — не держим поток GUI.
+            def close() -> None:
+                server.shutdown()
+                server.server_close()
+
+            threading.Thread(target=close, name="quick-service-relay-stop", daemon=True).start()
 
     def cloudflared_args(self, quick: bool) -> list[str]:
-        """Флаги команды `cloudflared tunnel`: вставлять сразу после «tunnel» (см. with_tunnel_args)."""
+        """Флаги уровня `tunnel` (ставить до `run`). --protocol сюда не входит: его задаёт вызывающий."""
         args: list[str] = []
         for listener in self._listeners:
             args += ["--edge", f"127.0.0.1:{listener.port}"]
-        if self._listeners:
-            args += ["--protocol", "http2"]
         if quick and self._http is not None:
             args += ["--quick-service", f"http://127.0.0.1:{self._http.server_address[1]}"]
         return args
 
 
 def with_tunnel_args(argv: list[str], extra: list[str]) -> list[str]:
-    """Вставить флаги после «tunnel»: `tunnel --edge … run --token …` / `tunnel --edge … --url …`."""
+    """Вставить флаги после «tunnel»: `tunnel --edge … run` / `tunnel --edge … --url …`."""
     if not extra:
         return list(argv)
     try:

@@ -7,13 +7,16 @@
 
 Два режима туннеля:
 
+* quick (временный *.trycloudflare.com, по умолчанию): preflight -> tunnel -> (cloudflared
+  напечатал адрес) -> server. Серверу нужен свой публичный адрес
+  (resource_server_url для OAuth-метаданных и проверки токена), а он появляется
+  только после старта туннеля. Если cloudflared перезапустится и выдаст новый
+  адрес — сервер перезапускается с ним.
+  Если cloudflared не смог запросить адрес («failed to request quick Tunnel»), вместо
+  слепых перезапусков запускается диагностика сети (app/core/netcheck.py): где
+  обрывается связь с Cloudflare. Нет связи — останавливаемся сразу с подсказкой.
 * named (свой домен): preflight -> server -> (сервер ответил) -> tunnel -> (/ready = 200).
-  Адрес постоянный и известен заранее.
-* quick (временный *.trycloudflare.com): preflight -> tunnel -> (cloudflared напечатал
-  адрес) -> server. Серверу нужен свой публичный адрес (resource_server_url для
-  OAuth-метаданных и проверки токена), а он появляется только после старта
-  туннеля. Если cloudflared перезапустится и выдаст новый адрес — сервер
-  перезапускается с ним.
+  Адрес постоянный, задаёт его пользователь.
 
 Остановка всегда: tunnel -> server (сначала закрываем вход извне).
 
@@ -26,6 +29,7 @@ import fnmatch
 import os
 import re
 import socket
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -37,6 +41,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from app.config import TUNNEL_MODES, Settings, normalize_public_url
 from app.core import token_store
 from app.core.health import HealthMonitor
+from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
 from app.core.process import ManagedProcess, ProcState
 from app.paths import (
     backend_command,
@@ -56,10 +61,18 @@ QUICK_URL_TIMEOUT_MS = 60_000  # столько ждём, пока trycloudflare
 MAX_RESTARTS = 5
 STABLE_UPTIME_S = 60  # проработал здоровым дольше — счётчик перезапусков сбрасывается
 VALID_PROTOCOLS = {"http2", "quic", "auto"}
+DOMAIN_GUIDE_HINT = "Пошагово: «Подключение» → «Как подключить свой домен»."
 
 # Адрес, который cloudflared печатает в рамке для quick tunnel. api.trycloudflare.com —
 # это служебный адрес из сообщений об ошибках, а не наш.
 QUICK_URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
+# Так cloudflared сообщает, что не получил временный адрес (cmd/cloudflared/tunnel/quick_tunnel.go).
+QUICK_PROVISION_ERRORS = (
+    "failed to request quick tunnel",
+    "quick tunnel provisioning failed",
+    "failed to unmarshal quick tunnel",
+    "failed to read quick-tunnel response",
+)
 QUICK_CONFIG_FILE = "quick-tunnel.yml"
 # Непустой конфиг: на пустой cloudflared пишет «ERR Configuration file … was empty».
 QUICK_CONFIG_TEXT = (
@@ -86,6 +99,8 @@ class ServiceManager(QObject):
     public_url_changed = pyqtSignal(str)             # текущий публичный адрес ('' = ещё нет)
     token_changed = pyqtSignal()
     settings_changed = pyqtSignal()                  # режим туннеля / параметры доступа
+    # Результат диагностики из фонового потока (доставляется в поток GUI очередью Qt).
+    _diagnosis_ready = pyqtSignal(int, object)       # (номер запуска, Diagnosis)
 
     def __init__(self, settings: Settings, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -138,6 +153,13 @@ class ServiceManager(QObject):
         self._server_restart_pending = False  # сервер останавливается, чтобы стартовать с новым адресом
         self._restart_all_pending = False     # после остановки всё запустить снова (новые настройки)
 
+        # Диагностика сети при сбое выдачи временного адреса — один раз за запуск.
+        self._run_id = 0                   # номер запуска: старые результаты игнорируются
+        self._provision_failed = False     # cloudflared написал «failed to request quick Tunnel»
+        self._diagnosing = False
+        self._diagnosis: Diagnosis | None = None
+        self._diagnosis_ready.connect(self._on_diagnosis)
+
         self._token = self._load_or_create_token()
 
     # ================================================================== состояние
@@ -153,6 +175,10 @@ class ServiceManager(QObject):
     @property
     def is_quick(self) -> bool:
         return self.settings.is_quick_tunnel
+
+    @property
+    def is_diagnosing(self) -> bool:
+        return self._diagnosing
 
     @property
     def public_url(self) -> str:
@@ -195,23 +221,29 @@ class ServiceManager(QObject):
         return self.set_token(token_store.generate())
 
     def set_public_url(self, value: str) -> str | None:
-        """Сменить свой домен (режим named). Вернёт текст ошибки или None."""
-        url = normalize_public_url(value, self.settings.mcp_path)
-        if not url:
-            return "Не похоже на адрес. Пример: mcp.example.com или https://mcp.example.com/mcp"
-        host = urlsplit(url).hostname or ""
-        if host.endswith(".trycloudflare.com"):
-            return "Адреса *.trycloudflare.com временные — выберите режим «Временный адрес»."
+        """Сменить свой домен (режим named). Пустая строка — убрать. Вернёт текст ошибки или None."""
+        if not value.strip():
+            url = ""
+        else:
+            url = normalize_public_url(value, self.settings.mcp_path)
+            if not url:
+                return "Не похоже на адрес. Пример: mcp.example.com или https://mcp.example.com/mcp"
+            host = urlsplit(url).hostname or ""
+            if host.endswith(".trycloudflare.com"):
+                return "Адреса *.trycloudflare.com временные — выберите режим «Временный адрес»."
         if url == self.settings.public_url:
             return None
         self.settings.public_url = url
         if not self._save_settings():
             return "Не удалось сохранить настройки (см. журнал)."
-        self._log(f"✔ Публичный адрес: {url}")
+        self._log(f"✔ Публичный адрес: {url}" if url else "Адрес своего домена убран")
         self._warn_if_not_in_config()
         if not self.is_quick:
             self.public_url_changed.emit(self.public_url)
-            self._restart_if_running("новый адрес")
+            if url:
+                self._restart_if_running("новый адрес")
+            elif self._want_running:
+                self.stop_all()  # без адреса именованный туннель работать не должен
         return None
 
     def set_tunnel_mode(self, mode: str) -> None:
@@ -253,6 +285,9 @@ class ServiceManager(QObject):
             self._recompute()
             return
         self._want_running = True
+        self._run_id += 1
+        self._diagnosis = None
+        self._diagnosing = False
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at = {name: None for name in self._procs}
         self._quic_hint_shown = False
@@ -297,8 +332,13 @@ class ServiceManager(QObject):
         if not self.is_quick:
             if not s.has_named_tunnel_config():
                 problems.append(
-                    f"Не найден конфиг туннеля: {s.cloudflared_config}. "
-                    "Нет своего домена — выберите в «Подключении» режим «Временный адрес»."
+                    f"Свой домен ещё не настроен: нет конфига туннеля {s.cloudflared_config}. "
+                    f"{DOMAIN_GUIDE_HINT} Без домена выберите режим «Временный адрес»."
+                )
+            elif not s.has_public_url:
+                problems.append(
+                    "Не указан адрес своего домена. Введите его в «Подключение» → «Публичный адрес» "
+                    "(тот же hostname, что в config.yml)."
                 )
             else:
                 self._warn_if_not_in_config()
@@ -368,6 +408,7 @@ class ServiceManager(QObject):
             self._log("✖ cloudflared.exe не найден")
             self._fail()
             return
+        self._provision_failed = False
         self.tunnel.start(exe, self.tunnel_args())
         self.health.check_tunnel = True
         if self.is_quick and not self._quick_url:
@@ -391,6 +432,44 @@ class ServiceManager(QObject):
         self._restart_all_pending = True
         self.stop_all()
 
+    # ================================================================== диагностика сети
+    def _begin_diagnosis(self) -> None:
+        """cloudflared не получил временный адрес: выяснить, где обрывается связь.
+
+        Пока идёт проверка (до ~40 с, в фоновом потоке), перезапуски на паузе.
+        Нет связи — остановка с объяснением; связь есть — обычные перезапуски.
+        """
+        self._diagnosing = True
+        self._quick_wait.stop()
+        self._log("⚠ Cloudflare не выдал временный адрес (нет ответа от api.trycloudflare.com). "
+                  "Проверяю связь с Cloudflare…")
+        run_id = self._run_id
+
+        def work() -> None:
+            try:
+                result = diagnose_quick_tunnel()
+            except Exception as exc:  # noqa: BLE001 — диагностика не должна ронять приложение
+                result = Diagnosis(True, f"Проверка связи не удалась: {exc}")
+            self._diagnosis_ready.emit(run_id, result)
+
+        threading.Thread(target=work, name="netcheck", daemon=True).start()
+        self._recompute()
+
+    def _on_diagnosis(self, run_id: int, diagnosis: Diagnosis) -> None:
+        if run_id != self._run_id or not self._want_running or not self._diagnosing:
+            return  # пользователь уже остановил или перезапустил
+        self._diagnosing = False
+        self._diagnosis = diagnosis
+        self._log(("⚠ " if diagnosis.reachable else "✖ ") + diagnosis.summary)
+        for tip in diagnosis.advice:
+            self._log(f"   • {tip}")
+        if not diagnosis.reachable:
+            self._log("✖ Временный адрес с этой сетью не получить — останавливаю. "
+                      "Исправьте связь и нажмите «Запустить» снова.")
+            self._fail()
+            return
+        self._schedule_restart(TUNNEL, 1)
+
     # ================================================================== слоты
     def _forward_log(self, name: str, line: str) -> None:
         if name == SERVER and self._health_log_marker in line:
@@ -398,15 +477,18 @@ class ServiceManager(QObject):
         self.log_line.emit(name, line)
         if name != TUNNEL:
             return
+        low = line.lower()
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)
             if match:
                 self._on_quick_url(match.group(0).lower())
+            elif any(marker in low for marker in QUICK_PROVISION_ERRORS):
+                self._provision_failed = True
         # Подсказка про QUIC нужна, только если мы сами его используем. При http2
         # cloudflared всё равно проверяет UDP и пишет «QUIC connection failed» — это норма.
         protocol = self.settings.tunnel_protocol.strip().lower()
         if (protocol != "http2" and not self._quic_hint_shown
-                and "quic" in line.lower() and "failed" in line.lower()):
+                and "quic" in low and "failed" in low):
             self._quic_hint_shown = True
             self._log("⚠ QUIC (UDP 7844) не проходит. Укажите \"tunnel_protocol\": \"http2\" в settings.json "
                       "и уберите protocol: quic из config.yml.")
@@ -430,9 +512,10 @@ class ServiceManager(QObject):
         self._recompute()
 
     def _on_quick_url_timeout(self) -> None:
-        if self._want_running and self.is_quick and not self._quick_url:
+        if self._want_running and self.is_quick and not self._quick_url and not self._diagnosing:
             self._log(f"✖ Cloudflare не выдал временный адрес за {QUICK_URL_TIMEOUT_MS // 1000} с. "
-                      "Проверьте интернет; trycloudflare.com иногда ограничивает выдачу — попробуйте позже.")
+                      "trycloudflare.com иногда ограничивает выдачу — попробуйте позже "
+                      f"или подключите свой домен. {DOMAIN_GUIDE_HINT}")
             self._fail()
 
     def _on_server_health(self, ok: bool) -> None:
@@ -464,6 +547,14 @@ class ServiceManager(QObject):
             return
         if name == SERVER:
             self._server_wait.stop()
+        if (name == TUNNEL and self.is_quick and self._provision_failed
+                and self._diagnosis is None and not self._diagnosing):
+            # Первый сбой выдачи адреса за запуск: сначала проверить сеть, потом решать.
+            self._begin_diagnosis()
+            return
+        self._schedule_restart(name, exit_code)
+
+    def _schedule_restart(self, name: str, exit_code: int) -> None:
         if not self.settings.auto_restart:
             self._log(f"✖ {name} упал (код {exit_code}); автоперезапуск выключен")
             self._fail()
@@ -477,6 +568,9 @@ class ServiceManager(QObject):
         attempt = self._restart_attempts[name]
         if attempt > MAX_RESTARTS:
             self._log(f"✖ {name} падает слишком часто — останавливаю всё")
+            if name == TUNNEL and self.is_quick and not self._quick_url:
+                self._log(f"   • Временный адрес так и не выдан. Попробуйте позже или подключите свой домен. "
+                          f"{DOMAIN_GUIDE_HINT}")
             self._fail()
             return
         delay_s = min(2 ** attempt, 30)  # 2, 4, 8, 16, 30
@@ -539,6 +633,7 @@ class ServiceManager(QObject):
     def _halt(self) -> None:
         self._want_running = False
         self._server_restart_pending = False
+        self._diagnosing = False
         self._server_wait.stop()
         self._quick_wait.stop()
         for timer in self._restart_timers.values():
@@ -555,7 +650,8 @@ class ServiceManager(QObject):
         if self._want_running:
             if states == {ProcState.RUNNING}:
                 overall = Overall.RUNNING
-            elif ProcState.FAILED in states or any(t.isActive() for t in self._restart_timers.values()):
+            elif (ProcState.FAILED in states or self._diagnosing
+                  or any(t.isActive() for t in self._restart_timers.values())):
                 overall = Overall.DEGRADED
             else:
                 overall = Overall.STARTING

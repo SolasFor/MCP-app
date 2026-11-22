@@ -5,6 +5,10 @@
 
 Новые поля безопасно добавлять: если в старом settings.json их нет,
 берётся значение по умолчанию. Неизвестные поля из старых версий игнорируются.
+
+Своего домена по умолчанию нет: режим «Временный адрес», public_url пустой.
+Домен пользователь подключает сам — по инструкции «Подключение» → «Как подключить свой
+домен» (app/ui/domain_guide.py, docs/custom-domain.md).
 """
 from __future__ import annotations
 
@@ -21,10 +25,15 @@ SETTINGS_FILE = "settings.json"
 TUNNEL_NAMED = "named"   # свой домен: config.yml + `cloudflared tunnel run`
 TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `cloudflared tunnel --url …`
 TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
+DEFAULT_TUNNEL_MODE = TUNNEL_QUICK
 
 DEFAULT_MCP_PATH = "/mcp"
-DEFAULT_PUBLIC_URL = "https://mcp.souron.space/mcp"
+DEFAULT_PUBLIC_URL = ""  # своего домена по умолчанию нет
 DEFAULT_CLOUDFLARED_CONFIG = str(Path.home() / ".cloudflared" / "config.yml")
+
+# До 0.4.0 здесь стоял адрес автора, и он попадал в settings.json на любой машине.
+# Убираем его, если на машине нет своего config.yml, — значит, домен не настраивали.
+_LEGACY_DEFAULT_PUBLIC_URLS = ("https://mcp.souron.space/mcp",)
 
 
 def normalize_mcp_path(value: str) -> str:
@@ -68,7 +77,7 @@ def normalize_public_url(value: str, mcp_path: str = DEFAULT_MCP_PATH) -> str:
 @dataclass
 class Settings:
     # Сеть
-    public_url: str = DEFAULT_PUBLIC_URL  # свой домен (режим named)
+    public_url: str = DEFAULT_PUBLIC_URL  # свой домен (режим named); '' = ещё не настроен
     mcp_path: str = DEFAULT_MCP_PATH      # путь MCP-эндпоинта на сервере
     server_host: str = "127.0.0.1"
     server_port: int = 8000
@@ -76,7 +85,7 @@ class Settings:
     metrics_port: int = 20241        # cloudflared --metrics -> /ready для индикатора
 
     # Cloudflare Tunnel
-    tunnel_mode: str = TUNNEL_NAMED  # named | quick
+    tunnel_mode: str = DEFAULT_TUNNEL_MODE  # quick | named
     cloudflared_path: str = ""       # пусто = автопоиск (встроенный в сборку, Program Files, PATH)
     cloudflared_config: str = DEFAULT_CLOUDFLARED_CONFIG  # только для named
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
@@ -99,6 +108,11 @@ class Settings:
     @property
     def is_quick_tunnel(self) -> bool:
         return self.tunnel_mode == TUNNEL_QUICK
+
+    @property
+    def has_public_url(self) -> bool:
+        """Адрес своего домена задан (без него режим named не запустится)."""
+        return bool(self.public_url)
 
     def local_host(self) -> str:
         """Адрес, по которому стучаться к серверу с этой же машины."""
@@ -133,15 +147,13 @@ class Settings:
 
     @classmethod
     def first_run(cls) -> "Settings":
-        """Первый запуск (нет settings.json).
+        """Первый запуск (нет settings.json): всегда «Временный адрес» без домена.
 
-        На чистой машине нет ~/.cloudflared/config.yml — именованный туннель не
-        запустится. Тогда сразу выбираем «Временный адрес»: он работает без домена
-        и без аккаунта Cloudflare, и кнопка «Запустить» срабатывает с первого раза.
+        Он работает без аккаунта Cloudflare. Свой домен пользователь включает сам,
+        когда настроит туннель, — даже если config.yml уже есть, мы не знаем, какой
+        из его адресов отдать клиентам.
         """
         settings = cls()
-        if not settings.has_named_tunnel_config():
-            settings.tunnel_mode = TUNNEL_QUICK
         try:
             settings.save()
         except OSError:
@@ -151,10 +163,18 @@ class Settings:
     def sanitize(self) -> None:
         """Подправить значения, которые могли быть отредактированы вручную."""
         if self.tunnel_mode not in TUNNEL_MODES:
-            self.tunnel_mode = TUNNEL_NAMED
+            self.tunnel_mode = DEFAULT_TUNNEL_MODE
         self.mcp_path = normalize_mcp_path(self.mcp_path)
         self.server_health_path = normalize_mcp_path(self.server_health_path)
-        self.public_url = normalize_public_url(self.public_url, self.mcp_path) or DEFAULT_PUBLIC_URL
+        url = normalize_public_url(self.public_url, self.mcp_path)
+        if (urlsplit(url).hostname or "").endswith(".trycloudflare.com"):
+            url = ""  # временный адрес — не свой домен
+        if url in _LEGACY_DEFAULT_PUBLIC_URLS and not self.has_named_tunnel_config():
+            url = ""
+        self.public_url = url
+        if not self.public_url and self.tunnel_mode == TUNNEL_NAMED and not self.has_named_tunnel_config():
+            # Домен не настроен вообще — «Свой домен» не запустится, остаётся временный.
+            self.tunnel_mode = TUNNEL_QUICK
 
     def save(self) -> None:
         target = self.path()

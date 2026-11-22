@@ -1,21 +1,23 @@
-"""Вкладка «Прокси»: какие хосты Cloudflare и через какой прокси пускать.
+"""Содержимое вкладки «Прокси»: какие хосты Cloudflare и через какой прокси пускать.
 
-    [x] Проксировать хосты Cloudflare
+    [x] Пускать хосты Cloudflare через прокси
     Адрес прокси   [socks5://127.0.0.1:1080        ]
     Хосты          [api.trycloudflare.com:443      ]
                    [region1.v2.argotunnel.com:7844 ] …
     [Сохранить] [Проверить] [Список по умолчанию]
     Хост | Напрямую | Через прокси
 
-Сигнал saved — настройки записаны; главное окно перезапускает туннель, если он
-работает. Проверка идёт в фоновых потоках, результаты приходят сигналом (очередь Qt).
+Заголовок страницы и карточку рисует главное окно (app/ui/main_window.py), здесь — только
+поля. Сигнал saved — настройки записаны в proxy.json; окно передаёт их в
+ServiceManager.apply_proxy_settings (туннель перезапускается, если работает).
+Проверка идёт в фоновых потоках, результаты приходят сигналом (очередь Qt).
 """
 from __future__ import annotations
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -24,28 +26,36 @@ from PyQt6.QtWidgets import (
 from app.core import proxy as px
 
 OK = "✓ доступен"
+HINT = (
+    "Если в вашем регионе часть хостов Cloudflare недоступна, приложение пустит только эти хосты "
+    "через указанный прокси (SOCKS5 или HTTP). Остальной трафик идёт напрямую. Через прокси "
+    "туннель работает по протоколу HTTP/2 (TCP)."
+)
+
+
+def _button(text: str, name: str | None = None) -> QPushButton:
+    button = QPushButton(text)
+    if name:
+        button.setObjectName(name)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    return button
 
 
 class ProxyPage(QWidget):
-    saved = pyqtSignal(object)          # ProxySettings
+    saved = pyqtSignal(object)               # ProxySettings
     _probe_done = pyqtSignal(int, int, str)  # строка, колонка, текст
     _check_finished = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("proxyPage")
         self._checking = False
 
-        title = QLabel("Прокси для Cloudflare")
-        title.setObjectName("pageTitle")
-        hint = QLabel(
-            "Если в вашем регионе часть хостов Cloudflare недоступна, приложение пустит "
-            "только эти хосты через указанный прокси. Остальной трафик идёт напрямую. "
-            "Туннель через прокси работает по протоколу HTTP/2 (TCP).")
+        hint = QLabel(HINT)
+        hint.setObjectName("Hint")
         hint.setWordWrap(True)
-        hint.setObjectName("muted")
 
-        self.enabled = QCheckBox("Проксировать хосты Cloudflare")
+        self.enabled = QCheckBox("Пускать хосты Cloudflare через прокси")
+        self.enabled.setCursor(Qt.CursorShape.PointingHandCursor)
         self.url = QLineEdit()
         self.url.setPlaceholderText("socks5://127.0.0.1:1080  или  http://логин:пароль@host:port")
         self.hosts = QPlainTextEdit()
@@ -53,40 +63,44 @@ class ProxyPage(QWidget):
         self.hosts.setMinimumHeight(110)
 
         form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
         form.addRow("Адрес прокси", self.url)
         form.addRow("Хосты", self.hosts)
 
-        self.save_btn = QPushButton("Сохранить")
-        self.save_btn.setObjectName("primary")
-        self.check_btn = QPushButton("Проверить")
-        self.reset_btn = QPushButton("Список по умолчанию")
+        self.save_btn = _button("Сохранить", "Accent")
+        self.check_btn = _button("Проверить")
+        self.reset_btn = _button("Список по умолчанию", "Ghost")
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         for button in (self.save_btn, self.check_btn, self.reset_btn):
             buttons.addWidget(button)
         buttons.addStretch(1)
 
         self.status = QLabel("")
+        self.status.setObjectName("Hint")
         self.status.setWordWrap(True)
+        self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Хост", "Напрямую", "Через прокси"])
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setMinimumHeight(170)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.table.hide()
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(12)
-        layout.addWidget(title)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
         layout.addWidget(hint)
         layout.addWidget(self.enabled)
         layout.addLayout(form)
         layout.addLayout(buttons)
         layout.addWidget(self.status)
-        layout.addWidget(self.table, 1)
+        layout.addWidget(self.table)
 
         self.save_btn.clicked.connect(self._save)
         self.check_btn.clicked.connect(self._check)
@@ -120,16 +134,21 @@ class ProxyPage(QWidget):
         if errors:
             self._show_status("\n".join(errors), error=True)
             return
-        px.save(settings)
-        self._show_status("Сохранено. Туннель перезапустится с новыми настройками." if settings.enabled
-                          else "Сохранено. Прокси выключен — все хосты идут напрямую.")
+        try:
+            px.save(settings)
+        except OSError as exc:
+            self._show_status(f"Не удалось сохранить: {exc}", error=True)
+            return
+        self._show_status("Сохранено. Если сервисы запущены, туннель перезапустится с новыми настройками."
+                          if settings.enabled else "Сохранено. Прокси выключен — все хосты идут напрямую.")
         self.saved.emit(settings)
 
     def _show_status(self, text: str, error: bool = False) -> None:
         self.status.setText(text)
-        self.status.setObjectName("error" if error else "muted")
-        self.status.style().unpolish(self.status)
-        self.status.style().polish(self.status)
+        self.status.setObjectName("Error" if error else "Hint")
+        style = self.status.style()
+        style.unpolish(self.status)
+        style.polish(self.status)
 
     # ------------------------------------------------------------ проверка
     def _check(self) -> None:
@@ -158,6 +177,7 @@ class ProxyPage(QWidget):
             self.table.setItem(row, 0, QTableWidgetItem(f"{host}:{port}"))
             self.table.setItem(row, 1, QTableWidgetItem("…"))
             self.table.setItem(row, 2, QTableWidgetItem("…" if use_proxy else "—"))
+        self.table.show()
         self._checking = True
         self.check_btn.setEnabled(False)
 
@@ -191,8 +211,11 @@ class ProxyPage(QWidget):
         if proxy_fail:
             self._show_status("Через прокси недоступны: " + ", ".join(proxy_fail)
                               + ". Проверьте адрес прокси и что он запущен.", error=True)
+        elif direct_fail and not self.enabled.isChecked():
+            self._show_status("Напрямую недоступны: " + ", ".join(direct_fail)
+                              + ". Включите прокси и нажмите «Сохранить».")
         elif direct_fail:
             self._show_status("Напрямую недоступны: " + ", ".join(direct_fail)
-                              + ". Включите прокси для этих хостов и нажмите «Сохранить».")
+                              + ", через прокси — всё доступно.")
         else:
             self._show_status("Все хосты доступны.")

@@ -5,7 +5,6 @@
   Не жив = соединение отклонено или нет ответа за PROBE_TIMEOUT_MS.
   Это надёжнее голого TCP-connect: ядро Windows принимает TCP-соединение
   из backlog даже тогда, когда сам сервер висит.
-  Запрос помечен User-Agent: SouronMCP-HealthCheck — middleware может его пропускать.
 * Туннель: cloudflared запускается с --metrics 127.0.0.1:20241, а его эндпоинт /ready
   отвечает 200, только когда есть хотя бы одно активное соединение с сетью Cloudflare.
   Здесь наоборот требуем именно 200 (503 = процесс жив, но не подключён).
@@ -21,7 +20,7 @@ from PyQt6.QtNetwork import (
 )
 
 PROBE_TIMEOUT_MS = 1500
-HEALTH_USER_AGENT = "SouronMCP-HealthCheck"
+HEALTH_USER_AGENT = "MCPApp-HealthCheck"
 
 
 class HealthMonitor(QObject):

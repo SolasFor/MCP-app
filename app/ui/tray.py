@@ -2,6 +2,9 @@
 
     ЛКМ / двойной щелчок  -> открыть окно
     ПКМ                    -> Открыть / статус / Запустить–Остановить / Копировать URL / Выход
+
+Адрес берётся из ServiceManager.public_url: в режиме «Временный адрес» он появляется
+только после старта туннеля и может меняться при перезапуске.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ class TrayIcon(QSystemTrayIcon):
         self.settings = settings
         self._should_notify = should_notify  # уведомляем, только когда окно скрыто
         self._prev = manager.overall
+        self._announced_url = ""
 
         menu = QMenu()
         self._menu = menu  # держим ссылку: у QMenu нет родителя-виджета
@@ -46,7 +50,7 @@ class TrayIcon(QSystemTrayIcon):
         self._act_status.setEnabled(False)
         self._act_toggle = menu.addAction("")
         self._act_toggle.triggered.connect(self._on_toggle)
-        self._act_copy = menu.addAction("Копировать URL")
+        self._act_copy = menu.addAction("Копировать адрес")
         self._act_copy.triggered.connect(self._copy_url)
         menu.addSeparator()
 
@@ -57,6 +61,7 @@ class TrayIcon(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
         self.messageClicked.connect(lambda: self.show_requested.emit())
         manager.overall_state_changed.connect(self._on_overall)
+        manager.public_url_changed.connect(self._on_public_url)
         self._update(manager.overall)
 
     # ------------------------------------------------------------------ slots
@@ -70,8 +75,21 @@ class TrayIcon(QSystemTrayIcon):
         self._update(self.manager.overall)
 
     def _copy_url(self) -> None:
-        QGuiApplication.clipboard().setText(self.settings.public_url)
-        self.showMessage(APP_NAME, f"Скопировано: {self.settings.public_url}", _Info, 2000)
+        url = self.manager.public_url
+        if not url:
+            return
+        QGuiApplication.clipboard().setText(url)
+        self.showMessage(APP_NAME, f"Скопировано: {url}", _Info, 2000)
+
+    def _on_public_url(self, url: str) -> None:
+        self._update(self.manager.overall)
+        # Временный адрес сменился на ходу (cloudflared перезапустился) — клиентам нужен новый.
+        if (url and self.manager.is_quick and self._announced_url and url != self._announced_url
+                and self._should_notify()):
+            self.showMessage(APP_NAME, f"Новый временный адрес: {url}\nОбновите его в клиентах.",
+                             _Warn, 6000)
+        if url:
+            self._announced_url = url
 
     def _on_overall(self, state: Overall) -> None:
         prev, self._prev = self._prev, state
@@ -80,18 +98,21 @@ class TrayIcon(QSystemTrayIcon):
             return
         if state == Overall.ERROR:
             self.showMessage(APP_NAME, "Сервисы остановлены из-за ошибки. "
-                             "Нажмите, чтобы открыть окно с логами.", _Warn, 6000)
+                             "Нажмите, чтобы открыть окно с журналом.", _Warn, 6000)
         elif state == Overall.DEGRADED and prev == Overall.RUNNING:
             self.showMessage(APP_NAME, "Соединение потеряно — перезапускаю…", _Warn, 4000)
         elif state == Overall.RUNNING and prev in (Overall.STARTING, Overall.DEGRADED):
-            self.showMessage(APP_NAME, f"В сети: {self.settings.public_url}", _Info, 3000)
+            url = self.manager.public_url
+            self.showMessage(APP_NAME, f"В сети: {url}" if url else "В сети", _Info, 3000)
 
     # ------------------------------------------------------------------ helpers
     def _update(self, state: Overall) -> None:
         text, color = theme.OVERALL[state.value]
         self.setIcon(icons.status_icon(color))
-        self.setToolTip(f"{APP_NAME} — {text}")
+        url = self.manager.public_url
+        self.setToolTip(f"{APP_NAME} — {text}" + (f"\n{url}" if url and state == Overall.RUNNING else ""))
         self._act_status.setText(f"●  {text}")
         active = self.manager.is_active
         self._act_toggle.setText("Остановить" if active else "Запустить")
         self._act_toggle.setEnabled(active or state != Overall.STOPPING)
+        self._act_copy.setEnabled(bool(url))

@@ -1,10 +1,15 @@
-"""Главное окно SouronMCP.
+"""Главное окно MCP app в стиле Claude Desktop.
 
-    Шапка        логотип, название, общий статус (точка + подпись с бликом во время процесса)
-    Сервисы      «Запустить / Остановить», состояние сервера и туннеля
-    Подключение  режим туннеля, публичный адрес, токен доступа
-    Параметры    автозапуск, старт сервисов, трей
-    Журнал       сворачивается, счётчик непросмотренных ошибок
+    ┌ Сайдбар ─────────┬ Холст ──────────────────────────────────┐
+    │ ◆ MCP app        │      Сервер в сети          (антиква)  │
+    │ Обзор            │      Клиенты подключаются…             │
+    │ Подключение      │  ┌ поднятая карточка ───────────────┐  │
+    │ Журнал        3  │  │ Старт/Стоп · сервер · туннель     │  │
+    │ Параметры        │  └───────────────────────────────────┘  │
+    │                  │  ┌ адрес для клиентов ──────────────┐  │
+    │ ● В сети         │  └───────────────────────────────────┘  │
+    │ v0.4.0           │                                          │
+    └──────────────────┴──────────────────────────────────────────┘
 
 Окно только показывает состояние и передаёт команды. Проверка и применение
 настроек (в том числе перезапуск сервисов) — в ServiceManager.
@@ -15,8 +20,8 @@ import re
 import sys
 from urllib.parse import urlsplit
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QGuiApplication, QKeySequence, QShortcut
+from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -28,33 +33,52 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from app import APP_NAME
+from app import APP_NAME, __version__
 from app.config import TUNNEL_NAMED, TUNNEL_QUICK, Settings
 from app.core import autostart, token_store
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
+from app.paths import user_data_dir
 from app.ui import effects, icons, theme
-from app.ui.widgets import LogView, StatusDot, StatusRow
+from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
-LOG_HEIGHT = 280
 FLASH_MS = 1500
-_QUERY_TOKEN_RE = re.compile(r"(token=)[^&\s\"']+")
+CONTENT_WIDTH = 720  # колонка контента по центру холста, как лента чата в Claude
+SIDEBAR_WIDTH = 216
+# Значение токена в ссылке: только символы токена, минимум 8 — служебный текст
+# вроде «(?token=): разрешён» не задевает.
+_QUERY_TOKEN_RE = re.compile(r"(token=)[A-Za-z0-9\-._~+/=]{8,}")
+
+PAGE_OVERVIEW, PAGE_CONNECTION, PAGE_LOGS, PAGE_SETTINGS = range(4)
+
+OVERVIEW_TEXT = {
+    "stopped": ("Готов к запуску", "Сервер и туннель остановлены. Нажмите «Запустить», чтобы открыть доступ из интернета."),
+    "starting": ("Запускаю…", "Поднимаю MCP-сервер и туннель Cloudflare."),
+    "running": ("Сервер в сети", "Клиенты подключаются по адресу ниже."),
+    "degraded": ("Переподключаюсь…", "Связь потеряна — перезапускаю то, что упало."),
+    "stopping": ("Останавливаю…", "Закрываю туннель, затем сервер."),
+    "error": ("Не удалось запустить", "Причина — в журнале."),
+}
 
 NAMED_HINT = (
-    "Постоянный адрес через ваш туннель из ~/.cloudflared/config.yml. "
-    "Для нового домена добавьте его в ingress config.yml и создайте DNS-запись: "
-    "cloudflared tunnel route dns <туннель> <домен>."
+    "Постоянный адрес через ваш туннель из config.yml. Для нового домена добавьте его "
+    "в ingress config.yml и создайте DNS-запись: cloudflared tunnel route dns <туннель> <домен>."
 )
 QUICK_HINT = (
-    "Не нужны домен и аккаунт Cloudflare. Адрес *.trycloudflare.com выдаётся заново "
-    "при каждом запуске туннеля — обновляйте его в клиентах. Это режим для пробы и тестов: "
-    "Cloudflare не даёт гарантий, ограничивает число одновременных запросов и не передаёт SSE."
+    "Не нужны домен и аккаунт Cloudflare. Адрес *.trycloudflare.com выдаётся заново при каждом "
+    "запуске — обновляйте его в клиентах. Режим для пробы и тестов: без гарантий доступности, "
+    "с лимитом одновременных запросов и без SSE."
 )
 TOKEN_HINT = "Клиенты передают его в заголовке Authorization: Bearer <токен>. Хранится только на этом компьютере."
+CLIENT_HINT = (
+    "В клиенте (Claude, ChatGPT, Notion и др.) добавьте MCP-сервер, он же «коннектор». "
+    "Поле для OpenAI-совместимого API не подойдёт: такие клиенты запрашивают /v1/models и получают 404."
+)
 
 
 # ====================================================================== helpers
@@ -83,11 +107,11 @@ def _button(text: str, name: str | None = None, tooltip: str = "") -> QPushButto
     return button
 
 
-def _card() -> tuple[QFrame, QVBoxLayout]:
+def _card(name: str = "Card", margins: tuple[int, int, int, int] = (20, 18, 20, 20)) -> tuple[QFrame, QVBoxLayout]:
     frame = QFrame()
-    frame.setObjectName("Card")
+    frame.setObjectName(name)
     box = QVBoxLayout(frame)
-    box.setContentsMargins(20, 18, 20, 20)
+    box.setContentsMargins(*margins)
     box.setSpacing(10)
     return frame, box
 
@@ -96,6 +120,38 @@ def _divider() -> QFrame:
     line = QFrame()
     line.setObjectName("Divider")
     return line
+
+
+def _page(title: str, lead: str = "", scroll: bool = True) -> tuple[QWidget, QVBoxLayout, QLabel, QLabel]:
+    """Страница: колонка CONTENT_WIDTH по центру, заголовок антиквой и подзаголовок."""
+    column = QWidget()
+    column.setMaximumWidth(CONTENT_WIDTH)
+    layout = QVBoxLayout(column)
+    layout.setContentsMargins(0, 40, 0, 32)
+    layout.setSpacing(16)
+    title_label = _label(title, "PageTitle", wrap=True)
+    lead_label = _label(lead, "PageLead", wrap=True)
+    layout.addWidget(title_label)
+    layout.addWidget(lead_label)
+    layout.addSpacing(8)
+
+    canvas = QWidget()
+    canvas.setObjectName("Canvas")
+    row = QHBoxLayout(canvas)
+    row.setContentsMargins(40, 0, 40, 0)
+    row.addStretch(1)
+    row.addWidget(column, 100)
+    row.addStretch(1)
+
+    if not scroll:
+        return canvas, layout, title_label, lead_label
+    area = QScrollArea()
+    area.setObjectName("Page")
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(canvas)
+    return area, layout, title_label, lead_label
 
 
 # ====================================================================== окно
@@ -115,32 +171,23 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
-        self.setMinimumSize(620, 560)
-        self.resize(700, 900)
+        self.setMinimumSize(860, 600)
+        self.resize(1040, 760)
 
-        content = QWidget()
-        content.setObjectName("Root")
-        layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 20, 24, 24)
-        layout.setSpacing(16)
-        self._layout = layout
+        root = QWidget()
+        root.setObjectName("Canvas")
+        row = QHBoxLayout(root)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(self._build_sidebar())
 
-        layout.addLayout(self._build_header())
-        layout.addWidget(self._build_control_card())
-        layout.addWidget(self._build_connection_card())
-        layout.addWidget(self._build_options_card())
-        layout.addWidget(self._build_logs())
-        self._logs_index = layout.count() - 1
-        layout.addStretch(0)
-        self._spacer_index = layout.count() - 1
-
-        scroll = QScrollArea()
-        scroll.setObjectName("Scroll")
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
-        self.setCentralWidget(scroll)
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_overview())
+        self._stack.addWidget(self._build_connection())
+        self._stack.addWidget(self._build_logs())
+        self._stack.addWidget(self._build_settings())
+        row.addWidget(self._stack, 1)
+        self.setCentralWidget(root)
 
         manager.overall_state_changed.connect(self._on_overall)
         manager.service_state_changed.connect(lambda *_: self._refresh_services())
@@ -152,77 +199,148 @@ class MainWindow(QMainWindow):
         self._log_view.error_logged.connect(self._on_error_logged)
 
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.quit_requested.emit)
+        for index in range(4):
+            QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, activated=lambda i=index: self.show_page(i))
 
         self._refresh_mode()
         self._load_token_into_field()
         self._on_overall(manager.overall)
-        self._set_logs_expanded(settings.logs_expanded, animate=False)
-        self._apply_dark_titlebar()
+        self.show_page(PAGE_OVERVIEW)
+        self._style_titlebar()
 
-    # ================================================================== построение
-    def _build_header(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(12)
+    # ================================================================== сайдбар
+    def _build_sidebar(self) -> QFrame:
+        bar = QFrame()
+        bar.setObjectName("Sidebar")
+        bar.setFixedWidth(SIDEBAR_WIDTH)
+        column = QVBoxLayout(bar)
+        column.setContentsMargins(12, 18, 12, 14)
+        column.setSpacing(2)
 
+        brand = QHBoxLayout()
+        brand.setContentsMargins(8, 0, 0, 0)
+        brand.setSpacing(10)
         logo = QLabel()
-        logo.setPixmap(icons.app_icon().pixmap(36, 36))
-        row.addWidget(logo)
+        logo.setPixmap(icons.app_icon().pixmap(26, 26))
+        brand.addWidget(logo)
+        brand.addWidget(_label(APP_NAME, "Wordmark"))
+        brand.addStretch(1)
+        column.addLayout(brand)
+        column.addSpacing(22)
 
-        titles = QVBoxLayout()
-        titles.setSpacing(0)
-        titles.addWidget(_label(APP_NAME, "AppTitle"))
-        titles.addWidget(_label("MCP-сервер через Cloudflare Tunnel", "AppSubtitle"))
-        row.addLayout(titles)
-        row.addStretch(1)
+        self._nav: list[NavButton] = []
+        for index, text in enumerate(("Обзор", "Подключение", "Журнал", "Параметры")):
+            button = NavButton(text)
+            button.setToolTip(f"Ctrl+{index + 1}")
+            button.clicked.connect(lambda _c=False, i=index: self.show_page(i))
+            column.addWidget(button)
+            self._nav.append(button)
 
-        pill = QFrame()
-        pill.setObjectName("Pill")
-        pill_row = QHBoxLayout(pill)
-        pill_row.setContentsMargins(6, 4, 14, 4)
-        pill_row.setSpacing(4)
-        self._pill_dot = StatusDot()
-        self._pill_text = effects.ShinyLabel("")
-        self._pill_text.setObjectName("PillText")
-        pill_row.addWidget(self._pill_dot)
-        pill_row.addWidget(self._pill_text)
-        row.addWidget(pill, 0, Qt.AlignmentFlag.AlignVCenter)
-        return row
+        column.addStretch(1)
 
-    def _build_control_card(self) -> QFrame:
-        card = effects.SpotlightFrame()
-        box = QVBoxLayout(card)
-        box.setContentsMargins(20, 18, 20, 18)
+        chip = QFrame()
+        chip.setObjectName("StatusChip")
+        chip_row = QHBoxLayout(chip)
+        chip_row.setContentsMargins(6, 8, 10, 8)
+        chip_row.setSpacing(4)
+        self._chip_dot = StatusDot()
+        chip_row.addWidget(self._chip_dot, 0, Qt.AlignmentFlag.AlignTop)
+        chip_texts = QVBoxLayout()
+        chip_texts.setSpacing(1)
+        self._chip_text = effects.ShinyLabel("")
+        self._chip_text.setObjectName("ChipText")
+        self._chip_detail = _label("", "ChipDetail")
+        chip_texts.addWidget(self._chip_text)
+        chip_texts.addWidget(self._chip_detail)
+        chip_row.addLayout(chip_texts, 1)
+        column.addWidget(chip)
+        column.addSpacing(10)
+        column.addWidget(_label(f"Версия {__version__}", "Version"))
+        return bar
+
+    def show_page(self, index: int) -> None:
+        self._stack.setCurrentIndex(index)
+        self._nav[index].setChecked(True)
+        if index == PAGE_LOGS:
+            self._unseen_errors = 0
+            self._nav[PAGE_LOGS].set_badge(0)
+
+    # ================================================================== Обзор
+    def _build_overview(self) -> QWidget:
+        page, layout, self._ov_title, self._ov_lead = _page("", "")
+
+        hero = effects.SpotlightFrame("Elevated", corner_radius=16)
+        box = QVBoxLayout(hero)
+        box.setContentsMargins(22, 20, 22, 18)
         box.setSpacing(14)
-
         top = QHBoxLayout()
         top.setSpacing(16)
         texts = QVBoxLayout()
         texts.setSpacing(4)
         texts.addWidget(_label("Сервисы", "SectionTitle"))
-        self._control_hint = _label("", "Hint", wrap=True)
-        texts.addWidget(self._control_hint)
+        self._mode_caption = _label("", "Hint", wrap=True)
+        texts.addWidget(self._mode_caption)
         top.addLayout(texts, 1)
-
         self._toggle = effects.SparkButton("Запустить")
         self._toggle.setObjectName("Primary")
         self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle.setMinimumWidth(176)
+        self._toggle.setMinimumWidth(168)
         self._toggle.clicked.connect(self.manager.toggle)
         top.addWidget(self._toggle, 0, Qt.AlignmentFlag.AlignVCenter)
         box.addLayout(top)
-
         box.addWidget(_divider())
         self._server_row = StatusRow("MCP-сервер")
         self._tunnel_row = StatusRow("Cloudflare Tunnel")
         box.addWidget(self._server_row)
         box.addWidget(self._tunnel_row)
-        return card
+        layout.addWidget(hero)
 
-    def _build_connection_card(self) -> QFrame:
+        self._error_box = QWidget()
+        error_row = QHBoxLayout(self._error_box)
+        error_row.setContentsMargins(4, 0, 0, 0)
+        error_row.addWidget(_label("Сервисы остановлены из-за ошибки.", "Error"))
+        open_log = _button("Открыть журнал →", "Link")
+        open_log.clicked.connect(lambda: self.show_page(PAGE_LOGS))
+        error_row.addWidget(open_log)
+        error_row.addStretch(1)
+        self._error_box.hide()
+        layout.addWidget(self._error_box)
+
+        card, cbox = _card()
+        cbox.addWidget(_label("Адрес для клиентов", "FieldLabel"))
+        self._ov_url = _label("", "Mono", wrap=True)
+        self._ov_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cbox.addWidget(self._ov_url)
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self._ov_copy = _button("Копировать адрес")
+        self._ov_copy.clicked.connect(lambda: self._copy(self.manager.public_url, self._ov_copy))
+        self._ov_copy_token = _button("Копировать токен")
+        self._ov_copy_token.clicked.connect(lambda: self._copy(self.manager.token, self._ov_copy_token))
+        self._ov_copy_full = _button("Ссылка с токеном", "Ghost", "Адрес с ?token=… — для клиентов без заголовков")
+        self._ov_copy_full.clicked.connect(lambda: self._copy(self.manager.url_with_token(), self._ov_copy_full))
+        actions.addWidget(self._ov_copy)
+        actions.addWidget(self._ov_copy_token)
+        actions.addWidget(self._ov_copy_full)
+        actions.addStretch(1)
+        edit = _button("Изменить", "Link")
+        edit.clicked.connect(lambda: self.show_page(PAGE_CONNECTION))
+        actions.addWidget(edit)
+        cbox.addLayout(actions)
+        cbox.addSpacing(2)
+        cbox.addWidget(_label(CLIENT_HINT, "Hint", wrap=True))
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
+    # ================================================================== Подключение
+    def _build_connection(self) -> QWidget:
+        page, layout, _t, _l = _page("Подключение", "Как сервер виден из интернета и чем защищён.")
+
+        # --- режим и адрес
         card, box = _card()
-
         head = QHBoxLayout()
-        head.addWidget(_label("Подключение", "SectionTitle"))
+        head.addWidget(_label("Публичный адрес", "SectionTitle"))
         head.addStretch(1)
         segment = QFrame()
         segment.setObjectName("SegmentGroup")
@@ -245,13 +363,10 @@ class MainWindow(QMainWindow):
             seg_row.addWidget(button)
         head.addWidget(segment)
         box.addLayout(head)
-
         self._mode_hint = _label("", "Hint", wrap=True)
         box.addWidget(self._mode_hint)
-        box.addSpacing(6)
+        box.addSpacing(4)
 
-        # --- публичный адрес
-        box.addWidget(_label("Публичный адрес", "FieldLabel"))
         url_row = QHBoxLayout()
         url_row.setSpacing(8)
         self._url_edit = QLineEdit()
@@ -269,10 +384,13 @@ class MainWindow(QMainWindow):
         self._url_error = _label("", "Error", wrap=True)
         self._url_error.hide()
         box.addWidget(self._url_error)
-        box.addSpacing(6)
+        layout.addWidget(card)
 
         # --- токен
-        box.addWidget(_label("Токен доступа", "FieldLabel"))
+        card, box = _card()
+        box.addWidget(_label("Токен доступа", "SectionTitle"))
+        box.addWidget(_label(TOKEN_HINT, "Hint", wrap=True))
+        box.addSpacing(4)
         token_row = QHBoxLayout()
         token_row.setSpacing(8)
         self._token_edit = QLineEdit()
@@ -291,21 +409,17 @@ class MainWindow(QMainWindow):
         self._token_copy.clicked.connect(lambda: self._copy(self.manager.token, self._token_copy))
         self._token_gen = _button("Сгенерировать", tooltip="Новый случайный токен (32 символа)")
         self._token_gen.clicked.connect(self._generate_token)
-        token_row.addWidget(self._token_edit, 1)
-        token_row.addWidget(self._token_eye)
-        token_row.addWidget(self._token_save)
-        token_row.addWidget(self._token_copy)
-        token_row.addWidget(self._token_gen)
+        for widget in (self._token_edit, self._token_eye, self._token_save, self._token_copy, self._token_gen):
+            token_row.addWidget(widget, 1 if widget is self._token_edit else 0)
         box.addLayout(token_row)
         self._token_error = _label("", "Error", wrap=True)
         self._token_error.hide()
         box.addWidget(self._token_error)
-        box.addWidget(_label(TOKEN_HINT, "Hint", wrap=True))
-        box.addSpacing(2)
-
-        # --- токен в ссылке
+        box.addSpacing(4)
+        box.addWidget(_divider())
         query_row = QHBoxLayout()
         self._query_check = QCheckBox("Разрешить токен в ссылке (?token=…)")
+        self._query_check.setCursor(Qt.CursorShape.PointingHandCursor)
         self._query_check.setToolTip(
             "Для клиентов, в которых нельзя задать заголовок Authorization.\n"
             "Ссылка с токеном работает как пароль — не публикуйте её."
@@ -317,118 +431,118 @@ class MainWindow(QMainWindow):
         query_row.addStretch(1)
         query_row.addWidget(self._copy_full)
         box.addLayout(query_row)
-        return card
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
 
-    def _build_options_card(self) -> QFrame:
+    # ================================================================== Журнал
+    def _build_logs(self) -> QWidget:
+        page, layout, _t, _l = _page("Журнал", "Вывод MCP-сервера, cloudflared и самого приложения. Токен вырезается.",
+                                     scroll=False)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        self._logs_copy = _button("Копировать всё", "Ghost")
+        self._logs_clear = _button("Очистить", "Ghost")
+        actions.addWidget(self._logs_copy)
+        actions.addWidget(self._logs_clear)
+        layout.addLayout(actions)
+        self._log_view = LogView()
+        self._logs_copy.clicked.connect(lambda: self._copy(self._log_view.plain_text(), self._logs_copy))
+        self._logs_clear.clicked.connect(self._log_view.clear_log)
+        layout.addWidget(self._log_view, 1)
+        return page
+
+    # ================================================================== Параметры
+    def _build_settings(self) -> QWidget:
+        page, layout, _t, _l = _page("Параметры", "Как приложение ведёт себя в Windows.")
+
         card, box = _card()
-        box.setSpacing(6)
-        box.addWidget(_label("Параметры", "SectionTitle"))
-        box.addSpacing(4)
-
+        box.setSpacing(4)
+        box.addWidget(_label("Запуск", "SectionTitle"))
+        box.addSpacing(6)
         self._autostart = QCheckBox("Запускать вместе с Windows")
         self._autostart.setEnabled(autostart.is_supported())
         self._autostart.setChecked(autostart.is_enabled())
         self._autostart.toggled.connect(self._on_autostart)
-
         self._start_on_launch = QCheckBox("Сразу запускать сервер и туннель при старте приложения")
         self._start_on_launch.setChecked(self.settings.start_services_on_launch)
         self._start_on_launch.toggled.connect(self._on_start_on_launch)
-
         self._minimize = QCheckBox("Сворачивать в трей при закрытии окна")
         self._minimize.setEnabled(self._tray_available)
         self._minimize.setChecked(self._tray_available and self.settings.minimize_to_tray_on_close)
         self._minimize.toggled.connect(self._on_minimize_toggled)
-
-        for check in (self._autostart, self._start_on_launch, self._minimize):
+        self._auto_restart = QCheckBox("Перезапускать упавший сервер или туннель")
+        self._auto_restart.setChecked(self.settings.auto_restart)
+        self._auto_restart.toggled.connect(self._on_auto_restart)
+        for check in (self._autostart, self._start_on_launch, self._minimize, self._auto_restart):
             check.setCursor(Qt.CursorShape.PointingHandCursor)
             box.addWidget(check)
-        return card
+        layout.addWidget(card)
 
-    def _build_logs(self) -> QWidget:
-        section = QWidget()
-        column = QVBoxLayout(section)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(8)
-
-        head = QHBoxLayout()
-        head.setSpacing(8)
-        self._logs_toggle = _button("", "Disclosure")
-        self._logs_toggle.clicked.connect(lambda: self._set_logs_expanded(not self.settings.logs_expanded))
-        self._error_badge = _label("", "Badge")
-        self._error_badge.hide()
-        self._logs_copy = _button("Копировать", "Ghost")
-        self._logs_copy.clicked.connect(lambda: self._copy(self._log_view.plain_text(), self._logs_copy))
-        self._logs_clear = _button("Очистить", "Ghost")
-        head.addWidget(self._logs_toggle)
-        head.addWidget(self._error_badge, 0, Qt.AlignmentFlag.AlignVCenter)
-        head.addStretch(1)
-        head.addWidget(self._logs_copy)
-        head.addWidget(self._logs_clear)
-        column.addLayout(head)
-
-        self._log_view = LogView()
-        self._logs_clear.clicked.connect(self._log_view.clear_log)
-        column.addWidget(self._log_view, 1)
-        return section
+        card, box = _card()
+        box.addWidget(_label("Компоненты", "SectionTitle"))
+        box.addWidget(_label("cloudflared", "FieldLabel"))
+        exe = self.manager.cloudflared_path()
+        cf = _label(exe or "не найден — установите: winget install --id Cloudflare.cloudflared", "ServiceDetail", wrap=True)
+        cf.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.addWidget(cf)
+        box.addSpacing(6)
+        box.addWidget(_label("Данные: настройки, токен, журнал аудита", "FieldLabel"))
+        data_row = QHBoxLayout()
+        data_dir = user_data_dir()
+        data_label = _label(str(data_dir), "ServiceDetail", wrap=True)
+        data_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        data_row.addWidget(data_label, 1)
+        open_dir = _button("Открыть папку")
+        open_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(data_dir))))
+        data_row.addWidget(open_dir)
+        box.addLayout(data_row)
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
 
     # ================================================================== статусы
     def _on_overall(self, state: Overall) -> None:
         text, color = theme.OVERALL[state.value]
         pending = state.value in theme.PENDING
-        self._pill_dot.set_state(color, pending)
-        self._pill_text.setText(text)
-        self._pill_text.setStyleSheet(f"color: {color};")
-        self._pill_text.set_base_color(color)
-        self._pill_text.set_shine(pending)
+        self._chip_dot.set_state(color, pending)
+        self._chip_text.setText(text)
+        self._chip_text.setStyleSheet(f"color: {color};")
+        self._chip_text.set_base_color(color)
+        self._chip_text.set_shine(pending)
+
+        title, lead = OVERVIEW_TEXT[state.value]
+        if state == Overall.STARTING and self.settings.is_quick_tunnel and not self.manager.public_url:
+            lead = "Жду временный адрес от Cloudflare — обычно 5–15 секунд."
+        self._ov_title.setText(title)
+        self._ov_lead.setText(lead)
+        self._error_box.setVisible(state == Overall.ERROR)
 
         active = self.manager.is_active
         self._toggle.setText("Остановить" if active else "Запустить")
         self._toggle.setProperty("running", active)
         _repolish(self._toggle)
         self._toggle.setEnabled(active or state != Overall.STOPPING)
-
-        self._update_control_hint(state)
         self._refresh_services()
-        if state == Overall.ERROR and not self.settings.logs_expanded:
-            self._set_logs_expanded(True)
-
-    def _update_control_hint(self, state: Overall) -> None:
-        quick = self.settings.is_quick_tunnel
-        if state == Overall.RUNNING:
-            hint = "Доступ открыт — клиенты подключаются по адресу ниже."
-        elif state == Overall.STARTING:
-            if quick and not self.manager.public_url:
-                hint = "Жду временный адрес от Cloudflare…"
-            else:
-                hint = "Поднимаю сервер и туннель…"
-        elif state == Overall.DEGRADED:
-            hint = "Связь потеряна — переподключаюсь…"
-        elif state == Overall.STOPPING:
-            hint = "Останавливаю сервисы…"
-        elif state == Overall.ERROR:
-            hint = "Не удалось запустить — причина в журнале ниже."
-        else:
-            hint = "Нажмите «Запустить», чтобы открыть доступ к серверу из интернета."
-        self._control_hint.setText(hint)
 
     def _refresh_services(self) -> None:
         m, s = self.manager, self.settings
         quick = s.is_quick_tunnel
-        self._apply_row(
-            self._server_row, m.server.state,
-            waiting=m.is_active and quick and m.server.state == ProcState.STOPPED,
-            waiting_text="Ждёт адрес…",
-        )
-        self._apply_row(
-            self._tunnel_row, m.tunnel.state,
-            waiting=m.is_active and not quick and m.tunnel.state == ProcState.STOPPED,
-            waiting_text="Ждёт сервер…",
-        )
+        self._apply_row(self._server_row, m.server.state,
+                        waiting=m.is_active and quick and m.server.state == ProcState.STOPPED,
+                        waiting_text="Ждёт адрес…")
+        self._apply_row(self._tunnel_row, m.tunnel.state,
+                        waiting=m.is_active and not quick and m.tunnel.state == ProcState.STOPPED,
+                        waiting_text="Ждёт сервер…")
         self._server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
-        detail = host or ("временный адрес *.trycloudflare.com" if quick else "—")
+        detail = host or ("*.trycloudflare.com" if quick else "—")
         protocol = s.tunnel_protocol.strip()
         self._tunnel_row.set_detail(f"{detail}  ·  {protocol}" if protocol else detail)
+        self._chip_detail.setText(host or ("временный адрес" if quick else "свой домен"))
+        self._mode_caption.setText(
+            "Режим: временный адрес trycloudflare.com" if quick else "Режим: свой домен через config.yml"
+        )
 
     @staticmethod
     def _apply_row(row: StatusRow, state: ProcState, waiting: bool, waiting_text: str) -> None:
@@ -446,7 +560,7 @@ class MainWindow(QMainWindow):
             "Сменить режим туннеля?",
             "Сервисы перезапустятся, а клиентам понадобится новый адрес.",
         ):
-            self._refresh_mode()  # вернуть выделение на текущий режим
+            self._refresh_mode()
             return
         self.manager.set_tunnel_mode(mode)  # settings_changed -> _refresh_mode
 
@@ -464,17 +578,32 @@ class MainWindow(QMainWindow):
         self._query_check.blockSignals(True)
         self._query_check.setChecked(s.allow_query_token)
         self._query_check.blockSignals(False)
-        self._refresh_copy_buttons()
+        self._refresh_address()
         self._refresh_services()
-        self._update_control_hint(self.manager.overall)
 
     def _on_public_url(self, url: str) -> None:
         # Не затираем адрес, который пользователь прямо сейчас редактирует.
         if self.settings.is_quick_tunnel or not self._url_save.isVisible():
             self._url_edit.setText(url)
-        self._refresh_copy_buttons()
+        self._refresh_address()
         self._refresh_services()
-        self._update_control_hint(self.manager.overall)
+        self._on_overall(self.manager.overall)
+
+    def _refresh_address(self) -> None:
+        url = self.manager.public_url
+        if url:
+            self._ov_url.setText(url)
+            self._ov_url.setStyleSheet("")
+        else:
+            waiting = self.settings.is_quick_tunnel
+            self._ov_url.setText("Появится после запуска туннеля" if waiting else "—")
+            self._ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
+        allowed = self.settings.allow_query_token
+        for button in (self._url_copy, self._ov_copy):
+            button.setEnabled(bool(url))
+        for button in (self._copy_full, self._ov_copy_full):
+            button.setVisible(allowed)
+            button.setEnabled(allowed and bool(url) and bool(self.manager.token))
 
     def _on_url_edited(self, text: str) -> None:
         self._url_save.setVisible(text.strip() != self.settings.public_url)
@@ -488,8 +617,7 @@ class MainWindow(QMainWindow):
             self._url_save.hide()
             return
         if self.manager.is_active and not self._confirm(
-            "Применить новый адрес?",
-            "Сервисы перезапустятся с новым адресом.",
+            "Применить новый адрес?", "Сервисы перезапустятся с новым адресом."
         ):
             return
         error = self.manager.set_public_url(text)
@@ -546,18 +674,18 @@ class MainWindow(QMainWindow):
         self._set_token_visible(True)  # сразу показать, чтобы было что скопировать
 
     def _token_warning(self) -> str:
-        text = "Старый токен перестанет работать: обновите его в Notion, ChatGPT и других клиентах."
+        text = "Старый токен перестанет работать: обновите его в Claude, ChatGPT, Notion и других клиентах."
         if self.manager.is_active:
             text += "\n\nСервисы перезапустятся."
         return text
 
     def _on_token_changed(self) -> None:
         self._load_token_into_field()
-        self._refresh_copy_buttons()
+        self._refresh_address()
 
     def _on_query_toggled(self, enabled: bool) -> None:
         self.manager.set_allow_query_token(enabled)
-        self._refresh_copy_buttons()
+        self._refresh_address()
 
     def _redact(self, line: str) -> str:
         """Токен не попадает в журнал ни целиком, ни в составе ссылки."""
@@ -588,44 +716,17 @@ class MainWindow(QMainWindow):
         self.settings.minimize_to_tray_on_close = enabled
         self._save_settings()
 
+    def _on_auto_restart(self, enabled: bool) -> None:
+        self.settings.auto_restart = enabled
+        self._save_settings()
+
     # ================================================================== журнал
-    def _set_logs_expanded(self, expanded: bool, animate: bool = True) -> None:
-        if self.settings.logs_expanded != expanded:
-            self.settings.logs_expanded = expanded
-            self._save_settings()
-        self._logs_toggle.setText(("▾  " if expanded else "▸  ") + "Журнал")
-        self._logs_copy.setVisible(expanded)
-        self._logs_clear.setVisible(expanded)
-        # Развёрнутый журнал забирает свободное место, свёрнутый — отдаёт его распорке.
-        self._layout.setStretch(self._logs_index, 1 if expanded else 0)
-        self._layout.setStretch(self._spacer_index, 0 if expanded else 1)
-        if expanded:
-            self._unseen_errors = 0
-            self._update_badge()
-        if animate:
-            effects.reveal(self._log_view, expanded, LOG_HEIGHT)
-        else:
-            self._log_view.setVisible(expanded)
-
     def _on_error_logged(self) -> None:
-        if not self.settings.logs_expanded:
+        if self._stack.currentIndex() != PAGE_LOGS or not self.isVisible():
             self._unseen_errors += 1
-            self._update_badge()
-
-    def _update_badge(self) -> None:
-        count = self._unseen_errors
-        self._error_badge.setVisible(count > 0)
-        if count:
-            self._error_badge.setText(f"{count if count < 100 else '99+'} ошиб.")
+            self._nav[PAGE_LOGS].set_badge(self._unseen_errors)
 
     # ================================================================== утилиты
-    def _refresh_copy_buttons(self) -> None:
-        url = self.manager.public_url
-        self._url_copy.setEnabled(bool(url))
-        allowed = self.settings.allow_query_token
-        self._copy_full.setVisible(allowed)
-        self._copy_full.setEnabled(allowed and bool(url) and bool(self.manager.token))
-
     def _copy(self, text: str, button: QPushButton) -> None:
         if not text:
             return
@@ -634,7 +735,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _flash(button: QPushButton, text: str) -> None:
-        """Временно сменить подпись кнопки — подтверждение действия без всплывающих окон."""
+        """Временно сменить подпись кнопки — подтверждение без всплывающих окон."""
         original = button.property("flash_original")
         if original is None:
             original = button.text()
@@ -676,21 +777,27 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             self.manager.log_line.emit(APP, f"✖ Не удалось сохранить настройки: {exc}")
 
-    def _apply_dark_titlebar(self) -> None:
-        """Тёмный заголовок окна на Windows 10 (1809+) и 11 — иначе он остаётся белым."""
+    def _style_titlebar(self) -> None:
+        """Тёмный заголовок окна в цвет холста (Windows 10 1809+ / 11). Ошибки игнорируем."""
         if sys.platform != "win32":
             return
         try:
             import ctypes
 
             hwnd = int(self.winId())
-            value = ctypes.c_int(1)
+            dwm = ctypes.windll.dwmapi
+            dark = ctypes.c_int(1)
             for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (новое и старое значение)
-                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
-                )
-                if result == 0:
+                if dwm.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(dark), ctypes.sizeof(dark)) == 0:
                     break
+            # Windows 11: цвет заголовка и рамки (COLORREF = 0x00BBGGRR).
+            def colorref(hex_color: str) -> ctypes.c_uint:
+                r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+                return ctypes.c_uint(b << 16 | g << 8 | r)
+
+            caption, border = colorref(theme.SIDEBAR), colorref(theme.HAIRLINE)
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))  # CAPTION_COLOR
+            dwm.DwmSetWindowAttribute(hwnd, 34, ctypes.byref(border), ctypes.sizeof(border))    # BORDER_COLOR
         except (AttributeError, OSError):
             pass
 

@@ -4,15 +4,19 @@
     │ ◆ MCP app        │      Сервер в сети          (антиква)  │
     │ Обзор            │      Клиенты подключаются…             │
     │ Подключение      │  ┌ поднятая карточка ───────────────┐  │
-    │ Журнал        3  │  │ Старт/Стоп · сервер · туннель     │  │
-    │ Параметры        │  └───────────────────────────────────┘  │
-    │                  │  ┌ адрес для клиентов ──────────────┐  │
+    │ Прокси           │  │ Старт/Стоп · сервер · туннель     │  │
+    │ Журнал        3  │  └───────────────────────────────────┘  │
+    │ Параметры        │  ┌ адрес для клиентов ──────────────┐  │
     │ ● В сети          │  └───────────────────────────────────┘  │
-    │ v0.4.0           │                                          │
+    │ v0.6.0           │                                          │
     └──────────────────┴──────────────────────────────────────────┘
 
 Окно только показывает состояние и передаёт команды. Проверка и применение
 настроек (в том числе перезапуск сервисов) — в ServiceManager.
+
+«Свой домен»: если домен настроен (мастером или вручную) — кнопка просто включает режим;
+если нет — открывается мастер (app/ui/domain_wizard.py). Ручная инструкция
+(app/ui/domain_guide.py) открывается только ссылкой «Как это работает».
 """
 from __future__ import annotations
 
@@ -46,6 +50,8 @@ from app.core.service_manager import APP, Overall, ServiceManager
 from app.paths import user_data_dir
 from app.ui import effects, icons, theme
 from app.ui.domain_guide import DomainGuideDialog
+from app.ui.domain_wizard import DomainWizard
+from app.ui.proxy_page import ProxyPage
 from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
 FLASH_MS = 1500
@@ -55,7 +61,8 @@ SIDEBAR_WIDTH = 216
 # вроде «(?token=): разрешён» не задевает.
 _QUERY_TOKEN_RE = re.compile(r"(token=)[A-Za-z0-9\-._~+/=]{8,}")
 
-PAGE_OVERVIEW, PAGE_CONNECTION, PAGE_LOGS, PAGE_SETTINGS = range(4)
+PAGE_OVERVIEW, PAGE_CONNECTION, PAGE_PROXY, PAGE_LOGS, PAGE_SETTINGS = range(5)
+NAV_TITLES = ("Обзор", "Подключение", "Прокси", "Журнал", "Параметры")
 
 OVERVIEW_TEXT = {
     "stopped": ("Готов к запуску", "Сервер и туннель остановлены. Нажмите «Запустить», чтобы открыть доступ из интернета."),
@@ -70,6 +77,10 @@ NAMED_HINT = (
     "Постоянный адрес на вашем домене через именованный туннель Cloudflare (config.yml). "
     "Адрес ниже должен совпадать с hostname в ingress config.yml."
 )
+NAMED_WIZARD_HINT = (
+    "Постоянный адрес на вашем домене. Туннель и DNS-запись для {host} настроило приложение — "
+    "config.yml не нужен. Сменить домен — «Изменить свой домен…»."
+)
 QUICK_HINT = (
     "Не нужны домен и аккаунт Cloudflare. Адрес *.trycloudflare.com выдаётся заново при каждом "
     "запуске — обновляйте его в клиентах. Режим для пробы и тестов: без гарантий доступности, "
@@ -77,7 +88,7 @@ QUICK_HINT = (
 )
 NO_DOMAIN_HINT = (
     "Свой домен ещё не настроен — сейчас работает временный адрес. Чтобы адрес не менялся, "
-    "подключите свой домен по инструкции."
+    "нажмите «Свой домен»: приложение настроит туннель и DNS по токену API Cloudflare."
 )
 TOKEN_HINT = "Клиенты передают его в заголовке Authorization: Bearer <токен>. Хранится только на этом компьютере."
 CLIENT_HINT = (
@@ -174,6 +185,7 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._unseen_errors = 0
         self._domain_guide: DomainGuideDialog | None = None
+        self._domain_wizard: DomainWizard | None = None
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
@@ -190,6 +202,7 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_overview())
         self._stack.addWidget(self._build_connection())
+        self._stack.addWidget(self._build_proxy())
         self._stack.addWidget(self._build_logs())
         self._stack.addWidget(self._build_settings())
         row.addWidget(self._stack, 1)
@@ -205,7 +218,7 @@ class MainWindow(QMainWindow):
         self._log_view.error_logged.connect(self._on_error_logged)
 
         QShortcut(QKeySequence("Ctrl+Q"), self, activated=self.quit_requested.emit)
-        for index in range(4):
+        for index in range(len(NAV_TITLES)):
             QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, activated=lambda i=index: self.show_page(i))
 
         self._refresh_mode()
@@ -235,7 +248,7 @@ class MainWindow(QMainWindow):
         column.addSpacing(22)
 
         self._nav: list[NavButton] = []
-        for index, text in enumerate(("Обзор", "Подключение", "Журнал", "Параметры")):
+        for index, text in enumerate(NAV_TITLES):
             button = NavButton(text)
             button.setToolTip(f"Ctrl+{index + 1}")
             button.clicked.connect(lambda _c=False, i=index: self.show_page(i))
@@ -308,8 +321,11 @@ class MainWindow(QMainWindow):
         open_log = _button("Открыть журнал →", "Link")
         open_log.clicked.connect(lambda: self.show_page(PAGE_LOGS))
         error_row.addWidget(open_log)
-        self._error_guide = _button("Как подключить свой домен", "Link")
-        self._error_guide.clicked.connect(self.show_domain_guide)
+        open_proxy = _button("Прокси", "Link", "Если хосты Cloudflare недоступны — пустить их через прокси")
+        open_proxy.clicked.connect(lambda: self.show_page(PAGE_PROXY))
+        error_row.addWidget(open_proxy)
+        self._error_guide = _button("Настроить свой домен", "Link")
+        self._error_guide.clicked.connect(self.show_domain_wizard)
         error_row.addWidget(self._error_guide)
         error_row.addStretch(1)
         self._error_box.hide()
@@ -361,7 +377,7 @@ class MainWindow(QMainWindow):
         self._mode_buttons: dict[str, QPushButton] = {}
         modes = (
             (TUNNEL_QUICK, "Временный адрес", "Без домена и аккаунта: случайный адрес *.trycloudflare.com"),
-            (TUNNEL_NAMED, "Свой домен", "Постоянный адрес через именованный туннель (config.yml)"),
+            (TUNNEL_NAMED, "Свой домен", "Постоянный адрес на вашем домене через туннель Cloudflare"),
         )
         for mode, text, tip in modes:
             button = _button(text, "Segment", tip)
@@ -376,8 +392,13 @@ class MainWindow(QMainWindow):
         box.addWidget(self._mode_hint)
         guide_row = QHBoxLayout()
         guide_row.setContentsMargins(0, 0, 0, 0)
-        self._guide_link = _button("Как подключить свой домен →", "Link",
-                                   "Пошаговая инструкция: аккаунт Cloudflare, туннель, DNS и config.yml")
+        guide_row.setSpacing(16)
+        self._wizard_link = _button("Настроить свой домен…", "Link",
+                                    "Туннель, DNS-запись и ключ создаются автоматически по токену API Cloudflare")
+        self._wizard_link.clicked.connect(self.show_domain_wizard)
+        guide_row.addWidget(self._wizard_link)
+        self._guide_link = _button("Как это работает", "Link",
+                                   "Инструкция для ручной настройки: аккаунт Cloudflare, туннель, DNS и config.yml")
         self._guide_link.clicked.connect(self.show_domain_guide)
         guide_row.addWidget(self._guide_link)
         guide_row.addStretch(1)
@@ -451,6 +472,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(card)
         layout.addStretch(1)
         return page
+
+    # ================================================================== Прокси
+    def _build_proxy(self) -> QWidget:
+        page, layout, _t, _l = _page("Прокси", "Обход недоступных хостов Cloudflare: туннель, временный адрес, API.")
+        card, box = _card()
+        self._proxy_page = ProxyPage()
+        self._proxy_page.saved.connect(self._on_proxy_saved)
+        box.addWidget(self._proxy_page)
+        layout.addWidget(card)
+        layout.addStretch(1)
+        return page
+
+    def _on_proxy_saved(self, settings: object) -> None:
+        self.manager.apply_proxy_settings(settings)  # перезапуск туннеля, если работает
+        self._refresh_services()
 
     # ================================================================== Журнал
     def _build_logs(self) -> QWidget:
@@ -536,6 +572,7 @@ class MainWindow(QMainWindow):
         self._ov_title.setText(title)
         self._ov_lead.setText(lead)
         self._error_box.setVisible(state == Overall.ERROR)
+        self._error_guide.setVisible(not self.manager.has_domain())
 
         active = self.manager.is_active
         self._toggle.setText("Остановить" if active else "Запустить")
@@ -556,12 +593,21 @@ class MainWindow(QMainWindow):
         self._server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
         detail = host or ("*.trycloudflare.com" if quick else "—")
-        protocol = s.tunnel_protocol.strip()
-        self._tunnel_row.set_detail(f"{detail}  ·  {protocol}" if protocol else detail)
+        parts = [detail]
+        protocol = m.tunnel_protocol
+        if protocol:
+            parts.append(protocol)
+        if m.proxy_enabled:
+            parts.append("через прокси")
+        self._tunnel_row.set_detail("  ·  ".join(parts))
         self._chip_detail.setText(host or ("временный адрес" if quick else "свой домен"))
-        self._mode_caption.setText(
-            "Режим: временный адрес trycloudflare.com" if quick else "Режим: свой домен через config.yml"
-        )
+        if quick:
+            caption = "Режим: временный адрес trycloudflare.com"
+        elif m.uses_wizard_domain():
+            caption = "Режим: свой домен (настроен приложением)"
+        else:
+            caption = "Режим: свой домен через config.yml"
+        self._mode_caption.setText(caption)
 
     @staticmethod
     def _apply_row(row: StatusRow, state: ProcState, waiting: bool, waiting_text: str) -> None:
@@ -580,17 +626,38 @@ class MainWindow(QMainWindow):
         self._domain_guide.raise_()
         self._domain_guide.activateWindow()
 
+    def show_domain_wizard(self) -> None:
+        """Немодальный мастер: из него можно открыть инструкцию, и она не заблокирована."""
+        if self._domain_wizard is None:
+            self._domain_wizard = DomainWizard(self.settings.server_port, self)
+            self._domain_wizard.guide_requested.connect(self.show_domain_guide)
+            self._domain_wizard.configured.connect(self._on_domain_configured)
+            self._domain_wizard.finished.connect(self._on_domain_wizard_closed)
+        self._domain_wizard.show()
+        self._domain_wizard.raise_()
+        self._domain_wizard.activateWindow()
+
+    def _on_domain_wizard_closed(self, _result: int) -> None:
+        if self._domain_wizard is not None:
+            self._domain_wizard.deleteLater()
+            self._domain_wizard = None
+
+    def _on_domain_configured(self, state: object) -> None:
+        error = self.manager.apply_domain(state)  # режим «Свой домен» + перезапуск, если работает
+        if error:
+            self.manager.log_line.emit(APP, f"✖ {error}")
+        self._refresh_mode()
+        self.show_page(PAGE_CONNECTION)
+
     def _on_mode_clicked(self, mode: str) -> None:
         if mode == self.settings.tunnel_mode:
             return
-        if mode == TUNNEL_NAMED and not self.settings.has_named_tunnel_config():
-            # Своего домена нет: режим не включаем (он всё равно не запустится), а показываем,
-            # как его настроить. После шага 5 инструкции кнопка сработает.
+        if mode == TUNNEL_NAMED and not self.manager.has_domain():
+            # Своего домена нет: режим не включаем (он всё равно не запустится), а открываем
+            # мастер. Когда мастер закончит, режим включится сам (apply_domain).
             self._refresh_mode()
-            self.manager.log_line.emit(
-                APP, f"Свой домен ещё не настроен: нет {self.settings.cloudflared_config}. Открыл инструкцию."
-            )
-            self.show_domain_guide()
+            self.manager.log_line.emit(APP, "Свой домен ещё не настроен — открыл мастер настройки.")
+            self.show_domain_wizard()
             return
         if self.manager.is_active and not self._confirm(
             "Сменить режим туннеля?",
@@ -601,14 +668,18 @@ class MainWindow(QMainWindow):
         self.manager.set_tunnel_mode(mode)  # settings_changed -> _refresh_mode
 
     def _refresh_mode(self) -> None:
-        s = self.settings
+        s, m = self.settings, self.manager
         quick = s.is_quick_tunnel
+        wizard = m.wizard_domain()
         self._mode_buttons[s.tunnel_mode].setChecked(True)
         if quick:
-            hint = QUICK_HINT if s.has_named_tunnel_config() else f"{QUICK_HINT}\n\n{NO_DOMAIN_HINT}"
+            hint = QUICK_HINT if m.has_domain() else f"{QUICK_HINT}\n\n{NO_DOMAIN_HINT}"
+        elif wizard.is_configured:
+            hint = NAMED_WIZARD_HINT.format(host=wizard.hostname)
         else:
             hint = NAMED_HINT
         self._mode_hint.setText(hint)
+        self._wizard_link.setText("Изменить свой домен…" if wizard.is_configured else "Настроить свой домен…")
         self._url_edit.setReadOnly(quick)
         self._url_edit.setPlaceholderText("Появится после запуска туннеля" if quick else "mcp.example.com")
         self._url_edit.setToolTip("" if quick else "Можно ввести только домен — https:// и /mcp добавятся сами")

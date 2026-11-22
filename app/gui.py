@@ -17,27 +17,36 @@ import os
 import re
 import signal
 import sys
+import traceback
+from datetime import datetime
 from typing import Callable
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+from PyQt6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
-from app import APP_NAME, __version__
+from app import APP_ID, APP_NAME, __version__, migrate
 from app.config import Settings
 from app.core import autostart
-from app.core.service_manager import ServiceManager
+from app.core.service_manager import APP, ServiceManager
+from app.paths import user_data_dir
 from app.ui import icons, theme
 from app.ui.main_window import MainWindow
 from app.ui.tray import TrayIcon
 
-APP_USER_MODEL_ID = "Souron.SouronMCP"  # своя иконка в панели задач вместо иконки python.exe
+APP_USER_MODEL_ID = "MCPApp.Desktop"  # своя иконка в панели задач вместо иконки python.exe
+# Именованный мьютекс: по нему установщик (AppMutex в installer.iss) видит, что
+# приложение запущено, и просит закрыть его перед обновлением или удалением.
+INSTALLER_MUTEX = "MCPApp-Running"
+CRASH_LOG = "crash.log"
+
+_mutex_handle = None
 
 
 # ====================================================================== один экземпляр
 def _instance_key() -> str:
     user = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
-    return f"{APP_NAME}-{re.sub(r'[^A-Za-z0-9_.-]', '_', user)}"
+    return f"{APP_ID}-{re.sub(r'[^A-Za-z0-9_.-]', '_', user)}"
 
 
 def _notify_running_instance(key: str, show: bool) -> bool:
@@ -79,6 +88,7 @@ def _listen_for_instances(key: str, on_show: Callable[[], None]) -> QLocalServer
     return server
 
 
+# ====================================================================== Windows
 def _set_app_user_model_id() -> None:
     if sys.platform == "win32":
         try:
@@ -87,19 +97,53 @@ def _set_app_user_model_id() -> None:
             pass
 
 
+def _create_installer_mutex() -> None:
+    global _mutex_handle
+    if sys.platform == "win32":
+        try:
+            _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, False, INSTALLER_MUTEX)
+        except (AttributeError, OSError):
+            pass
+
+
+def _install_crash_handler() -> None:
+    """В оконном .exe нет консоли: необработанное исключение пишем в crash.log и показываем."""
+
+    def hook(exc_type, exc, tb) -> None:  # noqa: ANN001
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        try:
+            with open(user_data_dir() / CRASH_LOG, "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} · {APP_NAME} {__version__} ===\n{text}")
+        except OSError:
+            pass
+        if QApplication.instance() is not None:
+            box = QMessageBox(QMessageBox.Icon.Critical, APP_NAME,
+                              "Внутренняя ошибка. Приложение продолжит работу.")
+            box.setInformativeText(f"Подробности записаны в {user_data_dir() / CRASH_LOG}")
+            box.setDetailedText(text)
+            box.exec()
+
+    sys.excepthook = hook
+
+
 # ====================================================================== точка входа
 def run_gui(argv: list[str]) -> int:
     minimized = "--minimized" in argv[1:]
     _set_app_user_model_id()
+    _install_crash_handler()
 
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)  # закрытое окно ≠ выход: живём в трее
 
     key = _instance_key()
     if _notify_running_instance(key, show=not minimized):
         return 0
+    _create_installer_mutex()
+
+    migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 
     theme.apply(app)
     app.setWindowIcon(icons.app_icon())
@@ -114,6 +158,8 @@ def run_gui(argv: list[str]) -> int:
     tray_available = QSystemTrayIcon.isSystemTrayAvailable()
     window = MainWindow(manager, settings, tray_available=tray_available)
     window.quit_requested.connect(app.quit)
+    for note in migration_notes:
+        manager.log_line.emit(APP, note)
 
     tray: TrayIcon | None = None
     if tray_available:

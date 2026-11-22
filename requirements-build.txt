@@ -1,0 +1,2 @@
+# Только для сборки (packaging/build.ps1), в .exe не попадает.
+pyinstaller>=6.10

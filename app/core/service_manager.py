@@ -3,7 +3,8 @@
     GUI ──start_all()/stop_all()──▶ ServiceManager ──▶ ManagedProcess("server")
     GUI ◀─────── сигналы ──────── ServiceManager ──▶ ManagedProcess("tunnel")
                                          │
-                                         └──▶ HealthMonitor (GET :8000/health, /ready)
+                                         ├──▶ HealthMonitor (GET :8000/health, /ready)
+                                         └──▶ ProxyBridge (мосты cloudflared → прокси, app/core/edge_relay.py)
 
 Два режима туннеля:
 
@@ -15,8 +16,16 @@
   Если cloudflared не смог запросить адрес («failed to request quick Tunnel»), вместо
   слепых перезапусков запускается диагностика сети (app/core/netcheck.py): где
   обрывается связь с Cloudflare. Нет связи — останавливаемся сразу с подсказкой.
+  С включённым прокси диагностика не запускается: прямая проверка сети тут ничего не скажет.
 * named (свой домен): preflight -> server -> (сервер ответил) -> tunnel -> (/ready = 200).
-  Адрес постоянный, задаёт его пользователь.
+  Адрес постоянный. Два источника настройки:
+    - мастер «Свой домен» (domain.json): `cloudflared tunnel run`, ключ туннеля — в TUNNEL_TOKEN;
+    - ручная настройка по инструкции: config.yml + `cloudflared tunnel run`.
+  Мастер в приоритете.
+
+Прокси (вкладка «Прокси», proxy.json): перед каждым запуском туннеля поднимаются локальные
+мосты, cloudflared получает --edge 127.0.0.1:… (и --quick-service для временного адреса),
+протокол принудительно http2 — через SOCKS5/HTTP CONNECT идёт только TCP.
 
 Остановка всегда: tunnel -> server (сначала закрываем вход извне).
 
@@ -38,8 +47,10 @@ from urllib.parse import urlsplit
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from app.config import TUNNEL_MODES, Settings, normalize_public_url
-from app.core import token_store
+from app.config import TUNNEL_MODES, TUNNEL_NAMED, Settings, normalize_public_url
+from app.core import domain_state, token_store
+from app.core import proxy as px
+from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
 from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
 from app.core.process import ManagedProcess, ProcState
@@ -61,7 +72,7 @@ QUICK_URL_TIMEOUT_MS = 60_000  # столько ждём, пока trycloudflare
 MAX_RESTARTS = 5
 STABLE_UPTIME_S = 60  # проработал здоровым дольше — счётчик перезапусков сбрасывается
 VALID_PROTOCOLS = {"http2", "quic", "auto"}
-DOMAIN_GUIDE_HINT = "Пошагово: «Подключение» → «Как подключить свой домен»."
+DOMAIN_GUIDE_HINT = "Настроить: «Подключение» → «Свой домен» (мастер по токену API Cloudflare)."
 
 # Адрес, который cloudflared печатает в рамке для quick tunnel. api.trycloudflare.com —
 # это служебный адрес из сообщений об ошибках, а не наш.
@@ -98,7 +109,7 @@ class ServiceManager(QObject):
     log_line = pyqtSignal(str, str)                  # (SERVER|TUNNEL|APP, строка)
     public_url_changed = pyqtSignal(str)             # текущий публичный адрес ('' = ещё нет)
     token_changed = pyqtSignal()
-    settings_changed = pyqtSignal()                  # режим туннеля / параметры доступа
+    settings_changed = pyqtSignal()                  # режим туннеля / параметры доступа / прокси
     # Результат диагностики из фонового потока (доставляется в поток GUI очередью Qt).
     _diagnosis_ready = pyqtSignal(int, object)       # (номер запуска, Diagnosis)
 
@@ -126,6 +137,11 @@ class ServiceManager(QObject):
         # Строка access-лога uvicorn от нашей же проверки: ... "GET /health HTTP/1.1" 200 ...
         self._health_log_marker = f'"GET {self.health.health_path} '
         self._quic_hint_shown = False
+
+        # Мосты к Cloudflare через прокси. Лог из фоновых потоков мостов: emit сигнала
+        # потокобезопасен, Qt доставит строку в поток GUI очередью.
+        self._bridge = ProxyBridge(px.load(), log=self._log)
+        self._proxy_hint_shown = False
 
         self._server_wait = QTimer(self)
         self._server_wait.setSingleShot(True)
@@ -196,6 +212,40 @@ class ServiceManager(QObject):
     def cloudflared_path(self) -> str | None:
         return resolve_cloudflared(self.settings.cloudflared_path)
 
+    # ------------------------------------------------------------------ свой домен
+    def wizard_domain(self) -> domain_state.DomainState:
+        """Домен из мастера (пустой DomainState, если мастер не запускали)."""
+        return domain_state.load()
+
+    def uses_wizard_domain(self) -> bool:
+        return self.wizard_domain().is_configured
+
+    def has_domain(self) -> bool:
+        """Свой домен настроен — мастером или вручную (config.yml). Тогда режим просто включается."""
+        return self.uses_wizard_domain() or self.settings.has_named_tunnel_config()
+
+    # ------------------------------------------------------------------ прокси
+    @property
+    def proxy_settings(self) -> px.ProxySettings:
+        return self._bridge.settings
+
+    @property
+    def proxy_enabled(self) -> bool:
+        return self._bridge.settings.enabled
+
+    def _proxy_edge_planned(self) -> bool:
+        try:
+            return bool(self._bridge.settings.edge_targets())
+        except ValueError:
+            return False
+
+    @property
+    def tunnel_protocol(self) -> str:
+        """Протокол, с которым реально запускается cloudflared ('' — решает сам cloudflared)."""
+        if self._bridge.edge_active or self._proxy_edge_planned():
+            return "http2"  # через SOCKS5/HTTP CONNECT идёт только TCP
+        return self.settings.tunnel_protocol.strip().lower()
+
     # ================================================================== изменение настроек
     def set_token(self, token: str) -> str | None:
         """Сохранить свой токен. Вернёт текст ошибки или None."""
@@ -231,6 +281,10 @@ class ServiceManager(QObject):
             host = urlsplit(url).hostname or ""
             if host.endswith(".trycloudflare.com"):
                 return "Адреса *.trycloudflare.com временные — выберите режим «Временный адрес»."
+            wizard = self.wizard_domain()
+            if wizard.is_configured and host != wizard.hostname:
+                return (f"Туннель настроен мастером на {wizard.hostname}. Чтобы сменить домен, "
+                        "нажмите «Настроить свой домен…» — мастер перенастроит туннель и DNS.")
         if url == self.settings.public_url:
             return None
         self.settings.public_url = url
@@ -245,6 +299,30 @@ class ServiceManager(QObject):
             elif self._want_running:
                 self.stop_all()  # без адреса именованный туннель работать не должен
         return None
+
+    def apply_domain(self, state: domain_state.DomainState) -> str | None:
+        """Мастер настроил домен: включить режим «Свой домен» с его адресом. Ошибка или None."""
+        url = normalize_public_url(state.hostname, self.settings.mcp_path)
+        if not url or not state.is_configured:
+            return "Мастер не вернул адрес или ключ туннеля."
+        self.settings.public_url = url
+        self.settings.tunnel_mode = TUNNEL_NAMED
+        if not self._save_settings():
+            return "Не удалось сохранить настройки (см. журнал)."
+        self._quick_url = ""
+        self._log(f"✔ Свой домен настроен: {url}")
+        self.settings_changed.emit()
+        self.public_url_changed.emit(self.public_url)
+        self._restart_if_running("свой домен настроен")  # ключ туннеля мог смениться
+        return None
+
+    def apply_proxy_settings(self, settings: px.ProxySettings) -> None:
+        """Вкладка «Прокси» сохранила настройки: применить при следующем запуске туннеля."""
+        self._bridge.settings = settings
+        self._proxy_hint_shown = False
+        self._log("Прокси для хостов Cloudflare " + ("включён" if settings.enabled else "выключен"))
+        self.settings_changed.emit()
+        self._restart_if_running("новые настройки прокси")
 
     def set_tunnel_mode(self, mode: str) -> None:
         if mode not in TUNNEL_MODES or mode == self.settings.tunnel_mode:
@@ -291,6 +369,7 @@ class ServiceManager(QObject):
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at = {name: None for name in self._procs}
         self._quic_hint_shown = False
+        self._proxy_hint_shown = False
         self._set_quick_url("")
         self.health.start()
         if self.is_quick:
@@ -330,10 +409,10 @@ class ServiceManager(QObject):
                 "или укажите путь в настройках."
             )
         if not self.is_quick:
-            if not s.has_named_tunnel_config():
+            if not self.has_domain():
                 problems.append(
-                    f"Свой домен ещё не настроен: нет конфига туннеля {s.cloudflared_config}. "
-                    f"{DOMAIN_GUIDE_HINT} Без домена выберите режим «Временный адрес»."
+                    f"Свой домен ещё не настроен. {DOMAIN_GUIDE_HINT} "
+                    "Без домена выберите режим «Временный адрес»."
                 )
             elif not s.has_public_url:
                 problems.append(
@@ -345,6 +424,11 @@ class ServiceManager(QObject):
         protocol = s.tunnel_protocol.strip().lower()
         if protocol and protocol not in VALID_PROTOCOLS:
             problems.append(f"tunnel_protocol='{s.tunnel_protocol}' — допустимо: http2, quic, auto или пусто.")
+
+        self._bridge.settings = px.load()
+        if self._bridge.settings.enabled:
+            for error in self._bridge.settings.validate():
+                problems.append(f"Прокси: {error}. Исправьте во вкладке «Прокси» или выключите прокси.")
 
         checks = ((s.local_host(), s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
         for host, port, what in checks:
@@ -383,33 +467,64 @@ class ServiceManager(QObject):
         self._server_wait.start(SERVER_READY_TIMEOUT_MS)
 
     def tunnel_args(self) -> list[str]:
-        """Аргументы cloudflared. Все флаги — уровня `tunnel`, поэтому стоят ДО `run`."""
+        """Аргументы cloudflared. Все флаги — уровня `tunnel`, поэтому стоят ДО `run`.
+
+        Мастер: свой config.yml не нужен (ingress хранится в Cloudflare), поэтому, как и для
+        временного адреса, передаём нейтральный конфиг — иначе cloudflared подхватит
+        ~/.cloudflared/config.yml от ручной настройки.
+        """
         s = self.settings
-        config = _quick_tunnel_config() if self.is_quick else Path(s.cloudflared_config).expanduser()
+        wizard = not self.is_quick and self.uses_wizard_domain()
+        if self.is_quick or wizard:
+            config = _quick_tunnel_config()
+        else:
+            config = Path(s.cloudflared_config).expanduser()
         args = [
             "tunnel",
             "--no-autoupdate",                          # обновления — наша забота, не процесса
             "--config", str(config),
             "--metrics", f"127.0.0.1:{s.metrics_port}",  # для /ready
         ]
-        protocol = s.tunnel_protocol.strip().lower()
+        protocol = self.tunnel_protocol
         if protocol:
-            # http2 = TCP вместо QUIC/UDP 7844, который режет провайдер.
+            # http2 = TCP вместо QUIC/UDP 7844, который режет провайдер (и единственный вариант через прокси).
             args += ["--protocol", protocol]
+        args += self._bridge.cloudflared_args(self.is_quick)  # --edge … / --quick-service …
         if self.is_quick:
             args += ["--url", f"http://{s.local_host()}:{s.server_port}"]
         else:
-            args.append("run")                          # имя/UUID туннеля берётся из config.yml
+            args.append("run")  # мастер: туннель по TUNNEL_TOKEN; вручную: имя/UUID из config.yml
         return args
 
+    def _tunnel_env(self) -> dict[str, str]:
+        """Ключ туннеля из мастера — переменной окружения (`--token` читает TUNNEL_TOKEN)."""
+        if self.is_quick:
+            return {}
+        wizard = self.wizard_domain()
+        return {"TUNNEL_TOKEN": wizard.tunnel_token} if wizard.is_configured else {}
+
     def _start_tunnel(self) -> None:
+        if self.tunnel.is_alive():
+            return  # мосты нельзя пересоздавать под живым процессом
         exe = self.cloudflared_path()
         if exe is None:
             self._log("✖ cloudflared.exe не найден")
             self._fail()
             return
+        self._bridge.settings = px.load()
+        try:
+            self._bridge.start()
+        except (ValueError, OSError) as exc:
+            self._log(f"✖ Прокси: {exc}. Исправьте во вкладке «Прокси» или выключите прокси.")
+            self._fail()
+            return
+        configured = self.settings.tunnel_protocol.strip().lower()
+        if self._bridge.edge_active and configured not in ("", "http2") and not self._proxy_hint_shown:
+            self._proxy_hint_shown = True
+            self._log(f"⚠ Через прокси туннель работает только по HTTP/2 — tunnel_protocol={configured} "
+                      "из settings.json сейчас не применяется.")
         self._provision_failed = False
-        self.tunnel.start(exe, self.tunnel_args())
+        self.tunnel.start(exe, self.tunnel_args(), env=self._tunnel_env())
         self.health.check_tunnel = True
         if self.is_quick and not self._quick_url:
             self._quick_wait.start(QUICK_URL_TIMEOUT_MS)
@@ -465,7 +580,7 @@ class ServiceManager(QObject):
             self._log(f"   • {tip}")
         if not diagnosis.reachable:
             self._log("✖ Временный адрес с этой сетью не получить — останавливаю. "
-                      "Исправьте связь и нажмите «Запустить» снова.")
+                      "Исправьте связь или включите прокси во вкладке «Прокси» и нажмите «Запустить» снова.")
             self._fail()
             return
         self._schedule_restart(TUNNEL, 1)
@@ -486,7 +601,7 @@ class ServiceManager(QObject):
                 self._provision_failed = True
         # Подсказка про QUIC нужна, только если мы сами его используем. При http2
         # cloudflared всё равно проверяет UDP и пишет «QUIC connection failed» — это норма.
-        protocol = self.settings.tunnel_protocol.strip().lower()
+        protocol = self.tunnel_protocol
         if (protocol != "http2" and not self._quic_hint_shown
                 and "quic" in low and "failed" in low):
             self._quic_hint_shown = True
@@ -549,9 +664,16 @@ class ServiceManager(QObject):
             self._server_wait.stop()
         if (name == TUNNEL and self.is_quick and self._provision_failed
                 and self._diagnosis is None and not self._diagnosing):
-            # Первый сбой выдачи адреса за запуск: сначала проверить сеть, потом решать.
-            self._begin_diagnosis()
-            return
+            if self._bridge.active:
+                # Связь идёт через прокси: прямая проверка сети ничего не покажет.
+                if not self._proxy_hint_shown:
+                    self._proxy_hint_shown = True
+                    self._log("⚠ Через прокси временный адрес не выдан. Проверьте прокси: "
+                              "«Прокси» → «Проверить».")
+            else:
+                # Первый сбой выдачи адреса за запуск: сначала проверить сеть, потом решать.
+                self._begin_diagnosis()
+                return
         self._schedule_restart(name, exit_code)
 
     def _schedule_restart(self, name: str, exit_code: int) -> None:
@@ -614,6 +736,8 @@ class ServiceManager(QObject):
 
     def _warn_if_not_in_config(self) -> None:
         """Адрес из приложения не меняет DNS: hostname должен быть в ingress config.yml."""
+        if self.uses_wizard_domain():
+            return  # ingress и DNS настроил мастер, config.yml не используется
         host = urlsplit(self.settings.public_url).hostname or ""
         hosts = _config_hostnames(Path(self.settings.cloudflared_config).expanduser())
         if host and hosts and not any(fnmatch.fnmatch(host, pattern) for pattern in hosts):
@@ -639,6 +763,7 @@ class ServiceManager(QObject):
         for timer in self._restart_timers.values():
             timer.stop()
         self.health.stop()
+        self._bridge.stop()
 
     def _fail(self) -> None:
         self._error = True
@@ -672,10 +797,10 @@ class ServiceManager(QObject):
 
 # ====================================================================== утилиты
 def _quick_tunnel_config() -> Path:
-    """Конфиг для quick tunnel (содержимое — QUICK_CONFIG_TEXT).
+    """Нейтральный конфиг (содержимое — QUICK_CONFIG_TEXT): временный адрес и туннель мастера.
 
     Без явного --config cloudflared подхватит ~/.cloudflared/config.yml со своим
-    `tunnel:` и ingress — и временный адрес не получится.
+    `tunnel:` и ingress — и временный адрес не получится, а туннель мастера получит чужой ingress.
     """
     path = user_data_dir() / QUICK_CONFIG_FILE
     try:

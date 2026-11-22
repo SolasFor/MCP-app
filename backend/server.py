@@ -1,24 +1,26 @@
 import asyncio
 import hmac
+import inspect
 import logging
 import os
 import re
 import secrets
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit
+
 import paramiko
 from pydantic import AnyHttpUrl
 from mcp.server import MCPServer
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
-
-# Импорты для перехвата HTTP-запросов
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
+from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
 # ==========================================
+# Все параметры приходят из переменных окружения. Их задаёт GUI (ServiceManager);
+# при ручном запуске `python backend/server.py` работают значения по умолчанию.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,24 +29,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SouronControl")
 
-SECRET_TOKEN = os.environ.get("MCP_SECRET_TOKEN")
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+SECRET_TOKEN = os.environ.get("MCP_SECRET_TOKEN", "").strip()
 TOKEN_FROM_ENV = bool(SECRET_TOKEN)
 if not SECRET_TOKEN:
     SECRET_TOKEN = secrets.token_urlsafe(24)
+    # Только при ручном запуске без GUI: иначе временный токен негде узнать.
     logger.warning(f"MCP_SECRET_TOKEN не задан! Сгенерирован временный токен: {SECRET_TOKEN}")
 
-BASE_DOMAIN = os.environ.get("MCP_BASE_DOMAIN", "https://mcp.souron.space").rstrip("/")
+MCP_PATH = "/mcp"  # путь streamable-http эндпоинта MCP SDK
+_base_domain = os.environ.get("MCP_BASE_DOMAIN", "https://mcp.souron.space").rstrip("/")
+# Полный публичный адрес: свой домен или временный *.trycloudflare.com от GUI.
+PUBLIC_URL = (os.environ.get("MCP_PUBLIC_URL") or f"{_base_domain}{MCP_PATH}").rstrip("/")
+_public = urlsplit(PUBLIC_URL)
+PUBLIC_HOST = (_public.netloc or "").lower()
+BASE_URL = f"{_public.scheme}://{_public.netloc}"
 # Ровно та же строка, что и в AuthSettings.resource_server_url: при validate_token_resource=True
 # SDK сравнивает с ней AccessToken.resource, и любое расхождение даст 401.
-RESOURCE_URL = str(AnyHttpUrl(f"{BASE_DOMAIN}/mcp"))
+RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
 
 # Слушаем только localhost: cloudflared работает на этой же машине, а 0.0.0.0 открыл бы
 # run_local_command всей локальной сети. MCP_HOST=0.0.0.0 — если нужен доступ из LAN.
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
-PORT = int(os.environ.get("MCP_PORT", "8000"))  # должен совпадать с server_port в settings.json
+PORT = int(os.environ.get("MCP_PORT", "8000"))
 
 # Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
-HEALTH_PATH = "/health"
+HEALTH_PATH = os.environ.get("MCP_HEALTH_PATH", "/health")
+# ?token=… в ссылке — для клиентов, в которых нельзя задать заголовок Authorization.
+ALLOW_QUERY_TOKEN = _env_flag("MCP_ALLOW_QUERY_TOKEN", True)
+# Quick Tunnels (trycloudflare.com) не поддерживают SSE — там отвечаем обычным JSON.
+JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudflare.com"))
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
 ALLOWED_HOSTS = {h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()}
@@ -70,52 +91,86 @@ def truncate_output(text: str) -> str:
     return f"{text[:half]}\n\n... [ВЫВОД ОБРЕЗАН: пропущено {len(text) - MAX_OUTPUT_LEN} симв.] ...\n\n{text[-half:]}"
 
 # ==========================================
-# 2. ГИБРИДНАЯ АУТЕНТИФИКАЦИЯ (Middleware + TokenVerifier)
+# 2. АУТЕНТИФИКАЦИЯ (ASGI-middleware + TokenVerifier)
 # ==========================================
 
-class HybridAuthMiddleware(BaseHTTPMiddleware):
-    """Перехватывает запросы ДО MCP. Проверяет токен в заголовке или URL."""
-    async def dispatch(self, request: Request, call_next):
-        # 0. Health-check: отвечаем сразу, до проверки токена и логирования.
-        # Именно по пути, а НЕ по IP 127.0.0.1: через туннель ВСЕ внешние запросы
-        # тоже приходят с 127.0.0.1 (cloudflared подключается локально).
-        # Эндпоинт ничего не раскрывает, поэтому его доступность снаружи безопасна.
-        if request.url.path == HEALTH_PATH:
-            return JSONResponse({"status": "ok"})
+def _token_ok(token: str) -> bool:
+    return hmac.compare_digest(token.encode(), SECRET_TOKEN.encode())
 
-        # 1. Проверка заголовка Authorization
-        auth_header = request.headers.get("Authorization", "")
+
+class HybridAuthMiddleware:
+    """Стоит ПЕРЕД авторизацией MCP SDK.
+
+    * /health — отвечает сразу, без токена и без записи в лог. По пути, а НЕ по IP:
+      через туннель ВСЕ запросы приходят с 127.0.0.1 (cloudflared подключается локально).
+    * ?token=… — если разрешено и токен верный, превращается в заголовок
+      Authorization: Bearer. Только так SDK его примет: его RequireAuthMiddleware смотрит
+      исключительно в заголовок. Сам токен вырезается из query string, чтобы не
+      попасть в access-лог uvicorn (а значит, в окно GUI).
+    * Всё остальное проверяет SDK: без верного токена /mcp ответит 401 с правильным
+      WWW-Authenticate. Мы только пишем в аудит неудачные попытки.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        if path == HEALTH_PATH:
+            await JSONResponse({"status": "ok"})(scope, receive, send)
+            return
+
+        client = scope.get("client") or ("?", 0)
+        headers = Headers(scope=scope)
+        auth_header = headers.get("authorization", "")
+
+        if auth_header.lower().startswith("bearer "):
+            if not _token_ok(auth_header[7:].strip()):
+                logger.warning(f"Неверный токен в заголовке ← {client[0]} {scope.get('method')} {path}")
+        else:
+            query_token = self._pop_query_token(scope)
+            if query_token is not None:
+                if not ALLOW_QUERY_TOKEN:
+                    logger.warning(f"Токен в ссылке отключён в настройках ← {client[0]} {path}")
+                elif _token_ok(query_token):
+                    scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"authorization"]
+                    scope["headers"].append((b"authorization", f"Bearer {query_token}".encode()))
+                else:
+                    logger.warning(f"Неверный токен в ссылке ← {client[0]} {scope.get('method')} {path}")
+            elif path.startswith(MCP_PATH):
+                # Общедоступные /.well-known/… (поиск OAuth-метаданных) не логируем.
+                logger.warning(f"Запрос без токена ← {client[0]} {scope.get('method')} {path} (ответ 401)")
+
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    def _pop_query_token(scope) -> str | None:
+        """Извлечь token из query string и удалить его оттуда (меняем scope на месте:
+        так его не увидит и access-лог uvicorn, который читает тот же словарь)."""
+        raw = scope.get("query_string", b"")
+        if b"token=" not in raw:
+            return None
+        pairs = parse_qsl(raw.decode("latin-1"), keep_blank_values=True)
         token = None
-        
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            
-        # 2. Если в заголовке нет, проверяем query-параметр ?token=
-        if not token:
-            token = request.query_params.get("token")
+        rest = []
+        for key, value in pairs:
+            if key == "token" and token is None:
+                token = value
+            else:
+                rest.append((key, value))
+        if token is None:
+            return None
+        scope["query_string"] = urlencode(rest).encode("latin-1")
+        return token.strip()
 
-        # 3. Валидация
-        if token:
-            if not hmac.compare_digest(token.encode(), SECRET_TOKEN.encode()):
-                logger.warning(f"Неудачная авторизация (неверный токен) с IP: {request.client.host}")
-                return JSONResponse({"error": "Unauthorized: Invalid token"}, status_code=401)
-            # Если токен верный, пропускаем запрос дальше
-            return await call_next(request)
-        
-        # 4. Если токена нет вообще (например, ChatGPT в режиме No Auth)
-        # ВНИМАНИЕ: Здесь мы пропускаем запрос, чтобы ChatGPT мог работать.
-        # Если вы хотите запретить анонимный доступ, верните 401 (см. ниже).
-        logger.warning(f"Запрос без токена с IP: {request.client.host} → {request.method} {request.url.path}")
-        
-        # Раскомментируйте строку ниже, если хотите ЗАБЛОКИРОВАТЬ анонимные запросы
-        # return JSONResponse({"error": "Unauthorized: Token required"}, status_code=401)
-        
-        return await call_next(request)
 
 class SimpleTokenVerifier(TokenVerifier):
-    """Оставлен для клиентов, которые используют OAuth2-интроспекцию."""
     async def verify_token(self, token: str) -> AccessToken | None:
-        if hmac.compare_digest(token.encode(), SECRET_TOKEN.encode()):
+        if _token_ok(token):
             # resource обязателен при validate_token_resource=True: без него SDK отклонит
             # даже верный токен. Наш токен выпускается только для этого сервера.
             return AccessToken(token=token, client_id="souron-user", scopes=[], resource=RESOURCE_URL)
@@ -125,15 +180,50 @@ class SimpleTokenVerifier(TokenVerifier):
 # 3. ИНИЦИАЛИЗАЦИЯ СЕРВЕРА
 # ==========================================
 
+def _accepts(func, name: str) -> bool:
+    """Принимает ли функция SDK такой аргумент (параметры меняются между версиями)."""
+    try:
+        return name in inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _transport_security():
+    """Защита от DNS rebinding: пускаем только наш публичный хост и localhost.
+
+    cloudflared передаёт исходный Host (mcp.souron.space или xxx.trycloudflare.com),
+    поэтому его нужно явно разрешить — иначе SDK ответит 421 Invalid Host header.
+    """
+    try:
+        from mcp.server.transport_security import TransportSecuritySettings
+    except ImportError:
+        return None
+    local = ["127.0.0.1", "127.0.0.1:*", "localhost", "localhost:*", "[::1]", "[::1]:*"]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[PUBLIC_HOST, *local],
+        allowed_origins=[BASE_URL, "http://127.0.0.1:*", "http://localhost:*"],
+    )
+
+
+auth_settings = AuthSettings(
+    issuer_url=AnyHttpUrl(BASE_URL),
+    resource_server_url=AnyHttpUrl(RESOURCE_URL),
+    required_scopes=[],
+    validate_token_resource=True,  # убирает MCPDeprecationWarning; токены для чужого адреса отклоняются
+)
+
+# Параметры транспорта: в зависимости от версии SDK их принимает либо конструктор,
+# либо streamable_http_app(). Передаём туда, где они есть.
+_transport_options = {"json_response": JSON_RESPONSE, "transport_security": _transport_security()}
+_transport_options = {k: v for k, v in _transport_options.items() if v is not None}
+_ctor_options = {k: v for k, v in _transport_options.items() if _accepts(MCPServer.__init__, k)}
+
 mcp = MCPServer(
     "SouronControl",
     token_verifier=SimpleTokenVerifier(),
-    auth=AuthSettings(
-        issuer_url=AnyHttpUrl(BASE_DOMAIN),
-        resource_server_url=AnyHttpUrl(RESOURCE_URL),
-        required_scopes=[],
-        validate_token_resource=True,
-    ),
+    auth=auth_settings,
+    **_ctor_options,
 )
 
 # ==========================================
@@ -249,22 +339,35 @@ def write_workspace_file(relative_path: str, content: str) -> str:
 # 6. ЗАПУСК
 # ==========================================
 
+def build_app():
+    """Starlette-приложение MCP с нашим middleware снаружи."""
+    app_options = {
+        k: v for k, v in _transport_options.items()
+        if k not in _ctor_options and _accepts(mcp.streamable_http_app, k)
+    }
+    missing = set(_transport_options) - set(_ctor_options) - set(app_options)
+    if "json_response" in missing and JSON_RESPONSE:
+        logger.warning("Эта версия MCP SDK не поддерживает json_response — через временный адрес "
+                       "потоковые (SSE) ответы могут зависать.")
+    app = mcp.streamable_http_app(**app_options)
+    # add_middleware ставит наш слой СНАРУЖИ middleware SDK: заголовок из ?token=
+    # появляется до того, как SDK проверит авторизацию.
+    app.add_middleware(HybridAuthMiddleware)
+    return app
+
+
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
     logger.info(f"Сервер запущен: {RESOURCE_URL} (слушает {HOST}:{PORT})")
+    mode = "JSON (временный адрес без SSE)" if JSON_RESPONSE else "SSE"
+    query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
+    logger.info(f"Ответы: {mode}; токен в ссылке (?token=): {query}")
     if TOKEN_FROM_ENV:
         # Токен целиком не пишем: лог уходит в souron_audit.log и в окно GUI.
         logger.info(f"Токен: из MCP_SECRET_TOKEN (…{SECRET_TOKEN[-4:]})")
 
-    # Получаем базовое приложение Starlette из MCP
-    app = mcp.streamable_http_app()
-    
-    # Оборачиваем его в наш Middleware для проверки токена (и /health)
-    app.add_middleware(HybridAuthMiddleware)
-    
-    # Запускаем через uvicorn
     import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(build_app(), host=HOST, port=PORT)
 
 
 if __name__ == "__main__":

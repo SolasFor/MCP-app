@@ -1,11 +1,11 @@
 """Мастер «Свой домен»: токен API + имя хоста → всё остальное делает cf_api.setup_domain.
 
-Открывается только когда домен ещё не настроен (domain_state.domain_ready() == False)
-или по кнопке «Изменить». Ручная инструкция (domain_guide) — по ссылке
-«Настроить вручную»: диалог шлёт guide_requested, инструкцию открывает главное окно.
+Открывается кнопкой «Свой домен», когда домен ещё не настроен, или ссылкой «Настроить свой
+домен…». Ручная инструкция (domain_guide) — только по ссылке «Как это работает»:
+диалог шлёт guide_requested, инструкцию открывает главное окно.
 
-Запросы к API — в фоновом потоке, через прокси из вкладки «Прокси» (если
-в списке есть api.cloudflare.com:443). Токен API не сохраняется.
+Запросы к API — в фоновом потоке, через прокси из вкладки «Прокси» (если в списке
+есть api.cloudflare.com:443). Токен API не сохраняется.
 """
 from __future__ import annotations
 
@@ -24,6 +24,14 @@ TOKEN_PAGE = "https://dash.cloudflare.com/profile/api-tokens"
 PENDING, RUNNING, DONE, FAILED = "○", "…", "✓", "✕"
 
 
+def _button(text: str, name: str | None = None) -> QPushButton:
+    button = QPushButton(text)
+    if name:
+        button.setObjectName(name)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    return button
+
+
 class DomainWizard(QDialog):
     configured = pyqtSignal(object)   # domain_state.DomainState
     guide_requested = pyqtSignal()
@@ -33,13 +41,14 @@ class DomainWizard(QDialog):
     def __init__(self, local_port: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Свой домен")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(540)
         self._port = local_port
         self._current = -1
+        self._busy = False
 
         intro = QLabel(
-            "Адрес вида <b>mcp.example.com</b> вместо временного. Домен должен быть добавлен "
-            "в Cloudflare. Туннель, DNS-запись и ключ приложение создаст само.")
+            "Постоянный адрес вида <b>mcp.example.com</b> вместо временного. Домен должен быть "
+            "добавлен в Cloudflare. Туннель, DNS-запись и ключ приложение создаст само.")
         intro.setWordWrap(True)
 
         token_hint = QLabel(
@@ -47,8 +56,8 @@ class DomainWizard(QDialog):
             + "; ".join(cf_api.TOKEN_PERMISSIONS)
             + ". Токен нужен один раз и не сохраняется.")
         token_hint.setWordWrap(True)
-        token_hint.setObjectName("muted")
-        open_page = QPushButton("Открыть страницу токенов")
+        token_hint.setObjectName("Hint")
+        open_page = _button("Открыть страницу токенов →", "Link")
         open_page.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(TOKEN_PAGE)))
 
         self.hostname = QLineEdit(domain_state.load().hostname)
@@ -62,31 +71,34 @@ class DomainWizard(QDialog):
 
         self._step_labels: list[QLabel] = []
         steps = QVBoxLayout()
+        steps.setSpacing(4)
         for text in cf_api.SETUP_STEPS:
             label = QLabel(f"{PENDING}  {text}")
-            label.setObjectName("muted")
+            label.setObjectName("Hint")
             self._step_labels.append(label)
             steps.addWidget(label)
 
         self.error = QLabel("")
-        self.error.setObjectName("error")
+        self.error.setObjectName("Error")
         self.error.setWordWrap(True)
         self.error.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.error.hide()
 
-        manual = QLabel('<a href="#">Настроить вручную (инструкция)</a>')
-        manual.linkActivated.connect(lambda _href: self.guide_requested.emit())
-        self.run_btn = QPushButton("Настроить")
-        self.run_btn.setObjectName("primary")
+        manual = _button("Как это работает", "Link")
+        manual.setToolTip("Пошаговая инструкция для ручной настройки через config.yml")
+        manual.clicked.connect(self.guide_requested.emit)
+        self.run_btn = _button("Настроить", "Accent")
         self.run_btn.setDefault(True)
-        cancel = QPushButton("Отмена")
-        cancel.clicked.connect(self.reject)
+        self.cancel_btn = _button("Отмена", "Ghost")
+        self.cancel_btn.clicked.connect(self.reject)
         buttons = QHBoxLayout()
         buttons.addWidget(manual)
         buttons.addStretch(1)
-        buttons.addWidget(cancel)
+        buttons.addWidget(self.cancel_btn)
         buttons.addWidget(self.run_btn)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
         layout.setSpacing(12)
         layout.addWidget(intro)
         layout.addWidget(token_hint)
@@ -100,23 +112,33 @@ class DomainWizard(QDialog):
         self._step.connect(self._on_step)
         self._done.connect(self._on_done)
 
-    def _set_inputs_enabled(self, on: bool) -> None:
-        for widget in (self.hostname, self.token, self.run_btn):
-            widget.setEnabled(on)
+    def reject(self) -> None:
+        if self._busy:
+            return  # не закрываем посреди настройки: результат иначе потеряется
+        super().reject()
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        for widget in (self.hostname, self.token, self.run_btn, self.cancel_btn):
+            widget.setEnabled(not busy)
+
+    def _show_error(self, text: str) -> None:
+        self.error.setText(text)
+        self.error.setVisible(bool(text))
 
     def _run(self) -> None:
-        self.error.setText("")
+        self._show_error("")
         try:
             host = cf_api.normalize_hostname(self.hostname.text())
             api = cf_api.CloudflareAPI(self.token.text(), px.load())
         except cf_api.CloudflareError as exc:
-            self.error.setText(str(exc))
+            self._show_error(str(exc))
             return
         self.hostname.setText(host)
         for label, text in zip(self._step_labels, cf_api.SETUP_STEPS):
             label.setText(f"{PENDING}  {text}")
         self._current = -1
-        self._set_inputs_enabled(False)
+        self._set_busy(True)
 
         def work() -> None:
             try:
@@ -125,7 +147,7 @@ class DomainWizard(QDialog):
                 self._done.emit(str(exc))
             except OSError as exc:
                 self._done.emit(f"Нет связи с api.cloudflare.com: {px.describe(exc)}. "
-                                "Если он недоступен напрямую, добавьте его во вкладку «Прокси».")
+                                "Если он недоступен напрямую, включите прокси во вкладке «Прокси».")
             except Exception as exc:  # noqa: BLE001 — любая ошибка должна дойти до окна
                 self._done.emit(f"Непредвиденная ошибка: {exc!r}")
             else:
@@ -143,17 +165,21 @@ class DomainWizard(QDialog):
         self._mark(index, RUNNING)
 
     def _on_done(self, outcome: object) -> None:
-        self._set_inputs_enabled(True)
+        self._set_busy(False)
         if isinstance(outcome, str):
             self._mark(self._current, FAILED)
-            self.error.setText(outcome)
+            self._show_error(outcome)
             return
         self._mark(self._current, DONE)
         result: cf_api.DomainResult = outcome  # type: ignore[assignment]
         state = domain_state.DomainState(
             hostname=result.hostname, tunnel_id=result.tunnel_id,
             tunnel_token=result.tunnel_token, zone_name=result.zone_name)
-        domain_state.save(state)
+        try:
+            domain_state.save(state)
+        except OSError as exc:
+            self._show_error(f"Туннель создан, но ключ не сохранён: {exc}")
+            return
         self.token.clear()
         self.configured.emit(state)
         self.accept()

@@ -4,9 +4,10 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.venv-build/
 .pytest_cache/
 
-# --- PyInstaller (spec-файл лежит в packaging/ и коммитится) ---
+# --- PyInstaller / Inno Setup (spec и installer.iss лежат в packaging/ и коммитятся) ---
 /build/
 /dist/
 
@@ -22,6 +23,7 @@ known_hosts
 credentials*.json
 cert.pem
 .cloudflared/
+token.json
 
 # --- Бинарники и рабочие данные ---
 bin/cloudflared.exe
@@ -29,7 +31,6 @@ workspace/
 
 # --- Логи ---
 *.log
-souron_audit.log
 
 # --- IDE / OS ---
 .idea/

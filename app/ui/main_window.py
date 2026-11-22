@@ -1,13 +1,13 @@
 """Главное окно MCP app в стиле Claude Desktop.
 
-    ┌ Сайдбар ─────────┬ Холст ──────────────────────────────────┐
+    ┌ Сайдбар ─────────┬ Холст ────────────────────────────────────────┐
     │ ◆ MCP app        │      Сервер в сети          (антиква)  │
     │ Обзор            │      Клиенты подключаются…             │
     │ Подключение      │  ┌ поднятая карточка ───────────────┐  │
     │ Журнал        3  │  │ Старт/Стоп · сервер · туннель     │  │
     │ Параметры        │  └───────────────────────────────────┘  │
     │                  │  ┌ адрес для клиентов ──────────────┐  │
-    │ ● В сети         │  └───────────────────────────────────┘  │
+    │ ● В сети          │  └───────────────────────────────────┘  │
     │ v0.4.0           │                                          │
     └──────────────────┴──────────────────────────────────────────┘
 
@@ -45,6 +45,7 @@ from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
 from app.paths import user_data_dir
 from app.ui import effects, icons, theme
+from app.ui.domain_guide import DomainGuideDialog
 from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
 FLASH_MS = 1500
@@ -62,17 +63,21 @@ OVERVIEW_TEXT = {
     "running": ("Сервер в сети", "Клиенты подключаются по адресу ниже."),
     "degraded": ("Переподключаюсь…", "Связь потеряна — перезапускаю то, что упало."),
     "stopping": ("Останавливаю…", "Закрываю туннель, затем сервер."),
-    "error": ("Не удалось запустить", "Причина — в журнале."),
+    "error": ("Не удалось запустить", "Причина и что с ней делать — в журнале."),
 }
 
 NAMED_HINT = (
-    "Постоянный адрес через ваш туннель из config.yml. Для нового домена добавьте его "
-    "в ingress config.yml и создайте DNS-запись: cloudflared tunnel route dns <туннель> <домен>."
+    "Постоянный адрес на вашем домене через именованный туннель Cloudflare (config.yml). "
+    "Адрес ниже должен совпадать с hostname в ingress config.yml."
 )
 QUICK_HINT = (
     "Не нужны домен и аккаунт Cloudflare. Адрес *.trycloudflare.com выдаётся заново при каждом "
     "запуске — обновляйте его в клиентах. Режим для пробы и тестов: без гарантий доступности, "
     "с лимитом одновременных запросов и без SSE."
+)
+NO_DOMAIN_HINT = (
+    "Свой домен ещё не настроен — сейчас работает временный адрес. Чтобы адрес не менялся, "
+    "подключите свой домен по инструкции."
 )
 TOKEN_HINT = "Клиенты передают его в заголовке Authorization: Bearer <токен>. Хранится только на этом компьютере."
 CLIENT_HINT = (
@@ -168,6 +173,7 @@ class MainWindow(QMainWindow):
         self._allow_close = False
         self._tray_hint_shown = False
         self._unseen_errors = 0
+        self._domain_guide: DomainGuideDialog | None = None
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
@@ -302,6 +308,9 @@ class MainWindow(QMainWindow):
         open_log = _button("Открыть журнал →", "Link")
         open_log.clicked.connect(lambda: self.show_page(PAGE_LOGS))
         error_row.addWidget(open_log)
+        self._error_guide = _button("Как подключить свой домен", "Link")
+        self._error_guide.clicked.connect(self.show_domain_guide)
+        error_row.addWidget(self._error_guide)
         error_row.addStretch(1)
         self._error_box.hide()
         layout.addWidget(self._error_box)
@@ -351,8 +360,8 @@ class MainWindow(QMainWindow):
         self._mode_group.setExclusive(True)
         self._mode_buttons: dict[str, QPushButton] = {}
         modes = (
-            (TUNNEL_NAMED, "Свой домен", "Постоянный адрес через именованный туннель (config.yml)"),
             (TUNNEL_QUICK, "Временный адрес", "Без домена и аккаунта: случайный адрес *.trycloudflare.com"),
+            (TUNNEL_NAMED, "Свой домен", "Постоянный адрес через именованный туннель (config.yml)"),
         )
         for mode, text, tip in modes:
             button = _button(text, "Segment", tip)
@@ -365,6 +374,14 @@ class MainWindow(QMainWindow):
         box.addLayout(head)
         self._mode_hint = _label("", "Hint", wrap=True)
         box.addWidget(self._mode_hint)
+        guide_row = QHBoxLayout()
+        guide_row.setContentsMargins(0, 0, 0, 0)
+        self._guide_link = _button("Как подключить свой домен →", "Link",
+                                   "Пошаговая инструкция: аккаунт Cloudflare, туннель, DNS и config.yml")
+        self._guide_link.clicked.connect(self.show_domain_guide)
+        guide_row.addWidget(self._guide_link)
+        guide_row.addStretch(1)
+        box.addLayout(guide_row)
         box.addSpacing(4)
 
         url_row = QHBoxLayout()
@@ -514,6 +531,8 @@ class MainWindow(QMainWindow):
         title, lead = OVERVIEW_TEXT[state.value]
         if state == Overall.STARTING and self.settings.is_quick_tunnel and not self.manager.public_url:
             lead = "Жду временный адрес от Cloudflare — обычно 5–15 секунд."
+        if state == Overall.DEGRADED and self.manager.is_diagnosing:
+            title, lead = "Проверяю связь…", "Cloudflare не выдал адрес — выясняю, где обрывается связь."
         self._ov_title.setText(title)
         self._ov_lead.setText(lead)
         self._error_box.setVisible(state == Overall.ERROR)
@@ -553,8 +572,25 @@ class MainWindow(QMainWindow):
         row.set_state(text, color, pending=state in (ProcState.STARTING, ProcState.STOPPING))
 
     # ================================================================== режим и адрес
+    def show_domain_guide(self) -> None:
+        """Немодальное окно с инструкцией: можно копировать команды и параллельно работать в окне."""
+        if self._domain_guide is None:
+            self._domain_guide = DomainGuideDialog(self.settings, self.manager.cloudflared_path(), self)
+        self._domain_guide.show()
+        self._domain_guide.raise_()
+        self._domain_guide.activateWindow()
+
     def _on_mode_clicked(self, mode: str) -> None:
         if mode == self.settings.tunnel_mode:
+            return
+        if mode == TUNNEL_NAMED and not self.settings.has_named_tunnel_config():
+            # Своего домена нет: режим не включаем (он всё равно не запустится), а показываем,
+            # как его настроить. После шага 5 инструкции кнопка сработает.
+            self._refresh_mode()
+            self.manager.log_line.emit(
+                APP, f"Свой домен ещё не настроен: нет {self.settings.cloudflared_config}. Открыл инструкцию."
+            )
+            self.show_domain_guide()
             return
         if self.manager.is_active and not self._confirm(
             "Сменить режим туннеля?",
@@ -568,7 +604,11 @@ class MainWindow(QMainWindow):
         s = self.settings
         quick = s.is_quick_tunnel
         self._mode_buttons[s.tunnel_mode].setChecked(True)
-        self._mode_hint.setText(QUICK_HINT if quick else NAMED_HINT)
+        if quick:
+            hint = QUICK_HINT if s.has_named_tunnel_config() else f"{QUICK_HINT}\n\n{NO_DOMAIN_HINT}"
+        else:
+            hint = NAMED_HINT
+        self._mode_hint.setText(hint)
         self._url_edit.setReadOnly(quick)
         self._url_edit.setPlaceholderText("Появится после запуска туннеля" if quick else "mcp.example.com")
         self._url_edit.setToolTip("" if quick else "Можно ввести только домен — https:// и /mcp добавятся сами")
@@ -595,8 +635,11 @@ class MainWindow(QMainWindow):
             self._ov_url.setText(url)
             self._ov_url.setStyleSheet("")
         else:
-            waiting = self.settings.is_quick_tunnel
-            self._ov_url.setText("Появится после запуска туннеля" if waiting else "—")
+            if self.settings.is_quick_tunnel:
+                placeholder = "Появится после запуска туннеля"
+            else:
+                placeholder = "Адрес своего домена не указан — «Изменить»"
+            self._ov_url.setText(placeholder)
             self._ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
         allowed = self.settings.allow_query_token
         for button in (self._url_copy, self._ov_copy):
@@ -626,6 +669,7 @@ class MainWindow(QMainWindow):
             return
         self._url_save.hide()
         self._url_edit.setText(self.settings.public_url)  # нормализованный вид
+        self._refresh_address()
         self._flash(self._url_copy, "✓ Сохранено")
 
     # ================================================================== токен

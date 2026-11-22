@@ -1,47 +1,59 @@
-"""Тёмная тема: палитра Fusion + QSS, цвета и подписи статусов.
+"""Тема в стиле Claude Desktop (@ant/cds), тёмный режим.
 
-Принципы (impeccable, режим Operate — интерфейс служит задаче):
-* один акцентный цвет только для главного действия и фокуса;
-* нейтральные цвета слегка подкрашены в синий, а не чисто серые;
-* цвета статусов значат одно и то же везде (окно, трей, журнал);
-* никаких градиентов в тексте, «стекла» и цветных полос сбоку карточек;
-* отступы кратны 4 px, иерархия — размером и насыщенностью шрифта.
+Токены — из SolasFor/Harness-UI, docs/claude-design-system.md:
+* тёплый «обсидиан» вместо холодного серо-синего: холст #191919, сайдбар чуть
+  СВЕТЛЕЕ холста (#1F1F1E), поднятые карточки #30302E со скруглением 16 px;
+* один бренд-акцент Clay #D97757 — точечно: главная кнопка, фокус, индикаторы.
+  Заголовки и жирный текст — молочно-белые, не рыжие;
+* две роли шрифтов: антиква (Georgia) для заголовков страниц, гротеск (Segoe UI)
+  для интерфейса, моноширинный для адресов, токенов и журнала;
+* границы — тонкие 1 px линии без тяжёлых теней.
 
 Цвета — в одном месте: окно, трей, иконки и эффекты берут их отсюда.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from string import Template
 
-from PyQt6.QtGui import QColor, QFont, QPalette
+from PyQt6.QtCore import QRectF, Qt
+from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPalette
 from PyQt6.QtWidgets import QApplication, QStyleFactory
 
 # ---------------------------------------------------------------------- поверхности
-BG = "#0d0f13"            # фон окна и полей ввода
-SURFACE = "#14171d"       # карточки
-SURFACE_2 = "#1b1f27"     # кнопки, плашки
-SURFACE_3 = "#242a34"     # наведение, выбранный сегмент
-BORDER = "#232832"
-BORDER_STRONG = "#323a47"
+BG = "#191919"            # холст (--bg-300)
+SIDEBAR = "#1F1F1E"       # сайдбар (--bg-200), чуть светлее холста
+SURFACE = "#1F1F1E"       # карточки на холсте
+ELEVATED = "#30302E"      # поднятая карточка, как композер Claude (--bg-000)
+CONTROL = "#2C2C2A"       # кнопки (--cds-gray-750)
+CONTROL_HOVER = "#353532"
+ACTIVE = "#383835"        # выбранный пункт меню, сегмент (--cds-gray-700)
+INPUT = "#141413"         # поля ввода и журнал — глубже холста
+HAIRLINE = "#2A2A28"      # ≈ rgba(240,239,236,0.08) на холсте
+BORDER = "#3A3A37"        # ≈ rgba(240,239,236,0.12)
+BORDER_STRONG = "#4A4945"
 
 # ---------------------------------------------------------------------- текст
-TEXT = "#e7eaf0"
-TEXT_MUTED = "#9ba4b4"
-TEXT_FAINT = "#687183"
+TEXT_STRONG = "#F0EFEC"   # заголовки
+TEXT = "#E8E7E2"          # основной
+TEXT_MUTED = "#97958D"    # вторичный
+TEXT_FAINT = "#737373"    # подписи, плейсхолдеры
 
 # ---------------------------------------------------------------------- акцент
-ACCENT = "#5b9cff"
-ACCENT_LIGHT = "#84b5ff"
-ACCENT_DARK = "#3f7fe6"
-ACCENT_TEXT = "#08111f"   # текст на акцентной кнопке (контраст > 7:1)
+ACCENT = "#D97757"        # Clay
+ACCENT_HOVER = "#E88B6D"
+ACCENT_STRONG = "#C6613F" # заливка главной кнопки: белый текст читается (≈4:1)
+ACCENT_PRESSED = "#B5562F"
+ACCENT_TEXT = "#FFFFFF"
+LINK = "#6DA7EC"
 
 # ---------------------------------------------------------------------- статусы
-OK = "#3ccf8e"
-WARN = "#e6b84a"
-ERR = "#f26b6b"
-IDLE = "#5c6474"
-ERR_SOFT_BG = "#2a1a1e"
-ERR_SOFT_BORDER = "#5a2c33"
+OK = "#55BF50"
+WARN = "#D9A440"
+ERR = "#E66767"
+IDLE = "#6B6A65"
+ERR_SOFT_BG = "#2E1F1E"
+ERR_SOFT_BORDER = "#563231"
 
 # Общий статус (Overall.value) -> (подпись, цвет)
 OVERALL = {
@@ -66,124 +78,139 @@ SERVICE = {
 
 # Источник строки журнала -> (метка, цвет метки)
 LOG_SOURCES = {
-    "server": ("server", "#7fb0ff"),
-    "tunnel": ("tunnel", "#efa266"),
-    "app": ("app", "#a6afbd"),
+    "server": ("server", LINK),
+    "tunnel": ("tunnel", ACCENT),
+    "app": ("app", "#A5A49A"),
 }
 
+SERIF_FAMILIES = ["Georgia", "Cambria", "Times New Roman"]
+SANS_FAMILIES = ["Segoe UI Variable Text", "Segoe UI", "Inter"]
+FONT_SERIF = '"Georgia", "Cambria", serif'
 FONT_UI = '"Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif'
-FONT_MONO = '"Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", monospace'
+FONT_MONO = '"Cascadia Mono", "JetBrains Mono", "Consolas", monospace'
 
 _QSS = Template("""
 * { outline: none; }
 QWidget { color: $TEXT; font-family: $FONT_UI; font-size: 13px; }
-QMainWindow, QWidget#Root { background: $BG; }
-QScrollArea#Scroll, QScrollArea#Scroll > QWidget > QWidget { background: $BG; border: none; }
+QMainWindow, QWidget#Canvas { background: $BG; }
+QScrollArea#Page, QScrollArea#Page > QWidget > QWidget { background: $BG; border: none; }
+
+/* ---------- сайдбар ---------- */
+QFrame#Sidebar { background: $SIDEBAR; border: none; border-right: 1px solid $HAIRLINE; }
+QLabel#Wordmark { font-family: $FONT_SERIF; font-size: 19px; color: $TEXT_STRONG; }
+QLabel#SidebarSection { color: $TEXT_FAINT; font-size: 11px; font-weight: 600; padding: 0 10px; }
+QLabel#Version { color: $TEXT_FAINT; font-size: 11px; padding: 0 10px; }
+QPushButton#Nav {
+    background: transparent; border: none; border-radius: 8px;
+    padding: 8px 10px; text-align: left; color: $TEXT_MUTED; font-weight: 500;
+}
+QPushButton#Nav:hover { background: $CONTROL; color: $TEXT; }
+QPushButton#Nav:checked { background: $ACTIVE; color: $TEXT_STRONG; }
+QFrame#StatusChip { background: $BG; border: 1px solid $HAIRLINE; border-radius: 10px; }
+QLabel#ChipText { font-size: 12px; font-weight: 600; }
+QLabel#ChipDetail { color: $TEXT_FAINT; font-size: 11px; }
 
 /* ---------- типографика ---------- */
-QLabel#AppTitle { font-size: 18px; font-weight: 600; }
-QLabel#AppSubtitle { color: $TEXT_FAINT; font-size: 12px; }
-QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
+QLabel#PageTitle { font-family: $FONT_SERIF; font-size: 28px; color: $TEXT_STRONG; }
+QLabel#PageLead { color: $TEXT_MUTED; font-size: 14px; }
+QLabel#SectionTitle { color: $TEXT_STRONG; font-size: 14px; font-weight: 600; }
 QLabel#FieldLabel { color: $TEXT_MUTED; font-size: 12px; font-weight: 600; }
 QLabel#Hint { color: $TEXT_FAINT; font-size: 12px; }
 QLabel#Error { color: $ERR; font-size: 12px; }
-QLabel#ServiceName { font-weight: 600; }
+QLabel#Mono { font-family: $FONT_MONO; font-size: 13px; color: $TEXT_STRONG; }
+QLabel#ServiceName { color: $TEXT; font-weight: 600; }
 QLabel#ServiceDetail { color: $TEXT_FAINT; font-size: 12px; font-family: $FONT_MONO; }
 QLabel#ServiceState { font-size: 12px; font-weight: 600; }
 QLabel#Badge {
     background: $ERR_SOFT_BG; color: $ERR; border: 1px solid $ERR_SOFT_BORDER;
-    border-radius: 9px; padding: 0 7px; font-size: 11px; font-weight: 600;
+    border-radius: 8px; padding: 0 6px; font-size: 11px; font-weight: 600;
 }
 
 /* ---------- карточки ---------- */
-QFrame#Card { background: $SURFACE; border: 1px solid $BORDER; border-radius: 12px; }
-QFrame#Divider { background: $BORDER; border: none; max-height: 1px; min-height: 1px; }
-QFrame#Pill { background: $SURFACE; border: 1px solid $BORDER; border-radius: 14px; }
-QLabel#PillText { font-size: 12px; font-weight: 600; }
+QFrame#Card { background: $SURFACE; border: 1px solid $HAIRLINE; border-radius: 12px; }
+QFrame#Elevated { background: $ELEVATED; border: 1px solid $BORDER; border-radius: 16px; }
+QFrame#Divider { background: $HAIRLINE; border: none; max-height: 1px; min-height: 1px; }
 
 /* ---------- кнопки ---------- */
 QPushButton {
-    background: $SURFACE_2; color: $TEXT; border: 1px solid $BORDER_STRONG;
+    background: $CONTROL; color: $TEXT; border: 1px solid $BORDER;
     border-radius: 8px; padding: 7px 14px; font-weight: 600;
 }
-QPushButton:hover { background: $SURFACE_3; }
-QPushButton:pressed { background: $BORDER; }
-QPushButton:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $BORDER; }
+QPushButton:hover { background: $CONTROL_HOVER; }
+QPushButton:pressed { background: $HAIRLINE; }
+QPushButton:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $HAIRLINE; }
 
 QPushButton#Primary {
-    background: $ACCENT; color: $ACCENT_TEXT; border: none;
-    border-radius: 10px; padding: 11px 24px; font-size: 14px;
+    background: $ACCENT_STRONG; color: $ACCENT_TEXT; border: none;
+    border-radius: 10px; padding: 11px 26px; font-size: 14px;
 }
-QPushButton#Primary:hover { background: $ACCENT_LIGHT; }
-QPushButton#Primary:pressed { background: $ACCENT_DARK; }
-QPushButton#Primary:disabled { background: $SURFACE_2; color: $TEXT_FAINT; }
+QPushButton#Primary:hover { background: $ACCENT; }
+QPushButton#Primary:pressed { background: $ACCENT_PRESSED; }
+QPushButton#Primary:disabled { background: $CONTROL; color: $TEXT_FAINT; }
 QPushButton#Primary[running="true"] {
-    background: $ERR_SOFT_BG; color: $ERR; border: 1px solid $ERR_SOFT_BORDER;
+    background: transparent; color: $TEXT; border: 1px solid $BORDER_STRONG;
 }
-QPushButton#Primary[running="true"]:hover { background: #351f24; }
-QPushButton#Primary[running="true"]:pressed { background: #2a1a1e; }
+QPushButton#Primary[running="true"]:hover { background: $CONTROL; border-color: $ERR_SOFT_BORDER; color: $ERR; }
+QPushButton#Primary[running="true"]:pressed { background: $ERR_SOFT_BG; }
 
-QPushButton#Accent { background: $ACCENT; color: $ACCENT_TEXT; border: none; }
-QPushButton#Accent:hover { background: $ACCENT_LIGHT; }
-QPushButton#Accent:pressed { background: $ACCENT_DARK; }
+QPushButton#Accent { background: $ACCENT_STRONG; color: $ACCENT_TEXT; border: none; }
+QPushButton#Accent:hover { background: $ACCENT; }
+QPushButton#Accent:pressed { background: $ACCENT_PRESSED; }
+QPushButton#Accent:disabled { background: $CONTROL; color: $TEXT_FAINT; }
 
-QPushButton#Ghost {
-    background: transparent; border: none; color: $TEXT_MUTED; padding: 6px 8px;
-}
-QPushButton#Ghost:hover { color: $TEXT; background: $SURFACE_2; }
+QPushButton#Ghost { background: transparent; border: none; color: $TEXT_MUTED; padding: 6px 8px; }
+QPushButton#Ghost:hover { color: $TEXT; background: $CONTROL; }
 QPushButton#Ghost:disabled { color: $TEXT_FAINT; background: transparent; }
 
-QPushButton#Disclosure {
-    background: transparent; border: none; padding: 4px 2px; text-align: left;
-    font-size: 14px; font-weight: 600; color: $TEXT;
-}
-QPushButton#Disclosure:hover { color: $ACCENT_LIGHT; background: transparent; }
+QPushButton#Link { background: transparent; border: none; color: $LINK; padding: 2px 0; font-weight: 500; text-align: left; }
+QPushButton#Link:hover { color: #8BBAF0; }
 
-QFrame#SegmentGroup { background: $BG; border: 1px solid $BORDER; border-radius: 9px; }
+QFrame#SegmentGroup { background: $INPUT; border: 1px solid $HAIRLINE; border-radius: 10px; }
 QPushButton#Segment {
-    background: transparent; border: none; border-radius: 7px;
-    padding: 6px 14px; color: $TEXT_MUTED;
+    background: transparent; border: none; border-radius: 7px; padding: 6px 14px; color: $TEXT_MUTED;
 }
 QPushButton#Segment:hover { color: $TEXT; background: transparent; }
-QPushButton#Segment:checked { background: $SURFACE_3; color: $TEXT; }
+QPushButton#Segment:checked { background: $ACTIVE; color: $TEXT_STRONG; }
 
 /* ---------- поля ---------- */
 QLineEdit {
-    background: $BG; color: $TEXT; border: 1px solid $BORDER_STRONG; border-radius: 8px;
-    padding: 7px 10px; font-family: $FONT_MONO; font-size: 12px;
-    selection-background-color: $ACCENT_DARK; selection-color: #ffffff;
+    background: $INPUT; color: $TEXT_STRONG; border: 1px solid $BORDER; border-radius: 8px;
+    padding: 8px 10px; font-family: $FONT_MONO; font-size: 12px;
+    selection-background-color: $ACCENT_STRONG; selection-color: #ffffff;
 }
-QLineEdit:hover { border-color: #3d4655; }
+QLineEdit:hover { border-color: $BORDER_STRONG; }
 QLineEdit:focus { border-color: $ACCENT; }
-QLineEdit:read-only { color: $TEXT_MUTED; background: $SURFACE; }
+QLineEdit:read-only { color: $TEXT_MUTED; }
 QLineEdit[invalid="true"] { border-color: $ERR; }
 
-QCheckBox { spacing: 10px; padding: 3px 0; }
+/* Переключатели вместо галочек — как в настройках Claude. Картинки рисует _toggle_images(). */
+QCheckBox { spacing: 12px; padding: 5px 0; color: $TEXT; }
 QCheckBox:disabled { color: $TEXT_FAINT; }
+QCheckBox::indicator { width: 32px; height: 18px; image: url("$TOGGLE_OFF"); }
+QCheckBox::indicator:checked { image: url("$TOGGLE_ON"); }
+QCheckBox::indicator:disabled { image: url("$TOGGLE_OFF_DISABLED"); }
+QCheckBox::indicator:checked:disabled { image: url("$TOGGLE_ON_DISABLED"); }
 
 /* ---------- журнал ---------- */
 QPlainTextEdit#Log {
-    background: $BG; color: $TEXT_MUTED; border: 1px solid $BORDER; border-radius: 10px;
-    padding: 8px 6px; font-family: $FONT_MONO; font-size: 12px;
-    selection-background-color: $ACCENT_DARK; selection-color: #ffffff;
+    background: $INPUT; color: $TEXT_MUTED; border: 1px solid $HAIRLINE; border-radius: 12px;
+    padding: 10px 8px; font-family: $FONT_MONO; font-size: 12px;
+    selection-background-color: $ACCENT_STRONG; selection-color: #ffffff;
 }
 
-QScrollBar:vertical { background: transparent; width: 10px; margin: 3px 2px; }
-QScrollBar::handle:vertical { background: $BORDER_STRONG; border-radius: 3px; min-height: 28px; }
-QScrollBar::handle:vertical:hover { background: $TEXT_FAINT; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px 3px; }
-QScrollBar::handle:horizontal { background: $BORDER_STRONG; border-radius: 3px; min-width: 28px; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px; }
+QScrollBar::handle:vertical { background: $BORDER; border-radius: 3px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: $BORDER_STRONG; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px 4px; }
+QScrollBar::handle:horizontal { background: $BORDER; border-radius: 3px; min-width: 28px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 
 /* ---------- всплывающее ---------- */
-QToolTip {
-    background: $SURFACE_3; color: $TEXT; border: 1px solid $BORDER_STRONG;
-    border-radius: 6px; padding: 5px 8px;
-}
-QMenu { background: $SURFACE; border: 1px solid $BORDER_STRONG; border-radius: 8px; padding: 4px; }
-QMenu::item { padding: 6px 20px 6px 14px; border-radius: 5px; }
-QMenu::item:selected { background: $SURFACE_3; }
+QToolTip { background: $ELEVATED; color: $TEXT; border: 1px solid $BORDER; border-radius: 6px; padding: 5px 8px; }
+QMenu { background: $ELEVATED; border: 1px solid $BORDER; border-radius: 10px; padding: 4px; }
+QMenu::item { padding: 6px 22px 6px 14px; border-radius: 6px; }
+QMenu::item:selected { background: $ACTIVE; }
 QMenu::item:disabled { color: $TEXT_MUTED; }
 QMenu::separator { height: 1px; background: $BORDER; margin: 4px 6px; }
 QMessageBox { background: $SURFACE; }
@@ -191,8 +218,48 @@ QMessageBox QLabel { color: $TEXT; }
 """)
 
 
+# ---------------------------------------------------------------------- переключатели
+def _draw_toggle(on: bool, scale: int, disabled: bool) -> QImage:
+    width, height = 32 * scale, 18 * scale
+    image = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    p = QPainter(image)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setOpacity(0.45 if disabled else 1.0)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(ACCENT_STRONG if on else BORDER))
+    radius = height / 2
+    p.drawRoundedRect(QRectF(0, 0, width, height), radius, radius)
+    knob = height - 4 * scale
+    x = width - knob - 2 * scale if on else 2 * scale
+    p.setBrush(QColor("#FFFFFF" if on else TEXT_MUTED))
+    p.drawEllipse(QRectF(x, 2 * scale, knob, knob))
+    p.end()
+    return image
+
+
+def _toggle_images() -> dict[str, str]:
+    """PNG для QCheckBox::indicator (1x и @2x — Qt сам берёт @2x на HiDPI)."""
+    from app.paths import user_data_dir
+
+    folder = user_data_dir() / "ui"
+    folder.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+    for key, on, disabled in (
+        ("TOGGLE_OFF", False, False), ("TOGGLE_ON", True, False),
+        ("TOGGLE_OFF_DISABLED", False, True), ("TOGGLE_ON_DISABLED", True, True),
+    ):
+        base = folder / f"{key.lower()}.png"
+        _draw_toggle(on, 1, disabled).save(str(base))
+        _draw_toggle(on, 2, disabled).save(str(base.with_name(base.stem + "@2x.png")))
+        paths[key] = Path(base).as_posix()
+    return paths
+
+
 def stylesheet() -> str:
-    return _QSS.substitute(globals())
+    values = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, str)}
+    values.update(_toggle_images())
+    return _QSS.substitute(values)
 
 
 def _palette() -> QPalette:
@@ -200,17 +267,17 @@ def _palette() -> QPalette:
     roles = {
         QPalette.ColorRole.Window: BG,
         QPalette.ColorRole.WindowText: TEXT,
-        QPalette.ColorRole.Base: BG,
+        QPalette.ColorRole.Base: INPUT,
         QPalette.ColorRole.AlternateBase: SURFACE,
         QPalette.ColorRole.Text: TEXT,
-        QPalette.ColorRole.Button: SURFACE_2,
+        QPalette.ColorRole.Button: CONTROL,
         QPalette.ColorRole.ButtonText: TEXT,
-        QPalette.ColorRole.Highlight: ACCENT,
+        QPalette.ColorRole.Highlight: ACCENT_STRONG,
         QPalette.ColorRole.HighlightedText: ACCENT_TEXT,
-        QPalette.ColorRole.ToolTipBase: SURFACE_3,
+        QPalette.ColorRole.ToolTipBase: ELEVATED,
         QPalette.ColorRole.ToolTipText: TEXT,
         QPalette.ColorRole.PlaceholderText: TEXT_FAINT,
-        QPalette.ColorRole.Link: ACCENT_LIGHT,
+        QPalette.ColorRole.Link: LINK,
         QPalette.ColorRole.Light: BORDER_STRONG,
         QPalette.ColorRole.Mid: BORDER,
         QPalette.ColorRole.Dark: BG,
@@ -223,14 +290,21 @@ def _palette() -> QPalette:
     return pal
 
 
+def serif_font(pixel_size: int) -> QFont:
+    font = QFont()
+    font.setFamilies(SERIF_FAMILIES)
+    font.setPixelSize(pixel_size)
+    return font
+
+
 def apply(app: QApplication) -> None:
-    """Fusion + тёмная палитра + QSS. Вызывать до создания окон."""
+    """Fusion + тёмная палитра + QSS. Вызывать после QApplication, до создания окон."""
     fusion = QStyleFactory.create("Fusion")
     if fusion is not None:
         app.setStyle(fusion)
     app.setPalette(_palette())
     font = QFont()
-    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter"])
+    font.setFamilies(SANS_FAMILIES)
     font.setPixelSize(13)
     app.setFont(font)
     app.setStyleSheet(stylesheet())

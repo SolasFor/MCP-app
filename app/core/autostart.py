@@ -1,17 +1,19 @@
-"""Автозапуск с Windows: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run.
+"""Автозапуск с Windows: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\MCPApp.
 
 Не требует прав администратора и виден в Диспетчере задач -> Автозагрузка.
 Приложение стартует с --minimized (сразу в трей).
+Деинсталлятор (packaging/installer.iss) удаляет это значение сам.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
-from app import APP_NAME
+from app import APP_ID
 from app.paths import is_frozen, project_root
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+VALUE_NAME = APP_ID
 
 
 def launch_command() -> str:
@@ -32,7 +34,7 @@ def _read() -> str | None:
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-            value, _ = winreg.QueryValueEx(key, APP_NAME)
+            value, _ = winreg.QueryValueEx(key, VALUE_NAME)
             return str(value)
     except FileNotFoundError:
         return None
@@ -49,16 +51,16 @@ def set_enabled(enabled: bool) -> None:
 
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         if enabled:
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, launch_command())
+            winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, launch_command())
         else:
             try:
-                winreg.DeleteValue(key, APP_NAME)
+                winreg.DeleteValue(key, VALUE_NAME)
             except FileNotFoundError:
                 pass
 
 
 def refresh_if_moved() -> None:
-    """Если автозапуск включён, но .exe перенесли — обновить путь в реестре."""
+    """Если автозапуск включён, но .exe перенесли (или переустановили) — обновить путь."""
     current = _read() if is_supported() else None
     if current is not None and current != launch_command():
         set_enabled(True)

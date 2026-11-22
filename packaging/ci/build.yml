@@ -1,26 +1,58 @@
-# Сборка MCP app на чистой Windows (GitHub Actions).
+# Сборка и релиз MCP app на чистой Windows (GitHub Actions).
+# Рабочее место файла: .github/workflows/build.yml
 #
-# Чтобы включить, перенесите файл (токену интеграции GitHub не хватило права `workflow`):
-#     git mv packaging/ci/build.yml .github/workflows/build.yml
-#     git commit -m "ci: enable build workflow" && git push
+# Когда запускается:
+# * push в main, затронувший код или сборку -> если версии v<__version__> ещё нет
+#   среди релизов, собираем, проверяем (--selftest) и публикуем релиз с тегом;
+#   если такой релиз уже есть — только сборка без публикации (проверка, что всё собирается);
+# * вручную: Actions -> Build -> Run workflow.
 #
-# * вручную: Actions -> Build -> Run workflow
-# * на тег v*: собранные файлы прикрепляются к GitHub Release
+# Чтобы выпустить новую версию, достаточно поднять __version__ в app/__init__.py и влить в main.
 name: Build
 
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths:
+      - "app/**"
+      - "backend/**"
+      - "main.py"
+      - "requirements*.txt"
+      - "requirements.lock"
+      - "packaging/**"
+      - ".github/workflows/build.yml"
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          gh release view "v$v" --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release v$v already exists - build only, no publish"
+            "publish=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Release v$v not found - will publish after a successful build"
+            "publish=true" >> $env:GITHUB_OUTPUT
+          }
+          $global:LASTEXITCODE = 0
 
       - uses: actions/setup-python@v5
         with:
@@ -34,17 +66,28 @@ jobs:
         run: ./packaging/build.ps1 -Python python
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: MCPApp
+          name: MCPApp-${{ steps.version.outputs.version }}
           path: |
             dist/*.exe
             dist/*.zip
             build/selftest.txt
+          if-no-files-found: ignore
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.publish == 'true' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: MCP app ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          body: |
+            **Установка:** скачайте `MCPApp-Setup-${{ steps.version.outputs.version }}.exe` и запустите. Права администратора не нужны.
+            **Без установки:** `MCPApp-${{ steps.version.outputs.version }}-portable.zip` — распакуйте и запустите `MCPApp.exe`.
+
+            Сборка не подписана сертификатом: при первом запуске SmartScreen покажет предупреждение — «Подробнее» → «Выполнить в любом случае».
           files: |
             dist/*.exe
             dist/*.zip

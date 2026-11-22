@@ -36,25 +36,28 @@ from PyQt6.QtWidgets import QFrame, QLabel, QPushButton, QWidget
 
 from app.ui import theme
 
-CARD_RADIUS = 12
 QWIDGETSIZE_MAX = 16_777_215  # «без ограничения» для setMaximumHeight
 _RUNNING = QVariantAnimation.State.Running
 
 
 # ====================================================================== SpotlightCard
 class SpotlightFrame(QFrame):
-    """Карточка с мягким светом, следующим за курсором.
+    """Карточка с мягким тёплым светом, следующим за курсором.
 
     Свет появляется и гаснет за 180 мс, рисуется поверх фона из QSS (под дочерними
     виджетами) и обрезается по радиусу карточки. Движения мыши над дочерними
     виджетами ловим фильтром событий — иначе свет «залипал» бы на кнопках.
     """
 
-    def __init__(self, radius: int = 280, parent: QWidget | None = None) -> None:
+    def __init__(self, object_name: str = "Elevated", corner_radius: int = 16,
+                 light_radius: int = 300, strength: float = 0.07,
+                 parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setObjectName("Card")
+        self.setObjectName(object_name)
         self.setMouseTracking(True)
-        self._radius = radius
+        self._corner = corner_radius
+        self._radius = light_radius
+        self._max_alpha = strength
         self._pos = QPointF(-1000.0, -1000.0)
         self._strength = 0.0
         self._filters_installed = False
@@ -111,10 +114,10 @@ class SpotlightFrame(QFrame):
         if self._strength <= 0.01:
             return
         clip = QPainterPath()
-        clip.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), CARD_RADIUS, CARD_RADIUS)
+        clip.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), self._corner, self._corner)
 
         inner = QColor(theme.ACCENT)
-        inner.setAlphaF(0.12 * self._strength)
+        inner.setAlphaF(self._max_alpha * self._strength)
         outer = QColor(theme.ACCENT)
         outer.setAlphaF(0.0)
         gradient = QRadialGradient(self._pos, float(self._radius))
@@ -135,8 +138,7 @@ class ShinyLabel(QLabel):
     """Текст с бегущим бликом — включается только на время процесса.
 
     Пока блик выключен, это обычный QLabel (и таймер не работает).
-    Блик рисуется поверх штатной отрисовки тем же цветом статуса,
-    только светлее, — цвет не меняет смысла.
+    Блик рисуется поверх штатной отрисовки тем же цветом статуса, только светлее.
     """
 
     BAND = 0.34  # ширина светлой полосы в долях ширины надписи
@@ -153,10 +155,9 @@ class ShinyLabel(QLabel):
         self._anim.setLoopCount(-1)
         self._anim.valueChanged.connect(self._on_offset)
 
-    # ------------------------------------------------------------------ API
     def set_base_color(self, color: str) -> None:
         self._base = QColor(color)
-        self._shine = QColor(color).lighter(175)
+        self._shine = QColor(color).lighter(165)
         self.update()
 
     def set_shine(self, active: bool) -> None:
@@ -168,7 +169,6 @@ class ShinyLabel(QLabel):
             self._offset = -self.BAND
             self.update()
 
-    # ------------------------------------------------------------------ внутреннее
     def _on_offset(self, value: object) -> None:
         self._offset = float(value)  # type: ignore[arg-type]
         self.update()
@@ -180,11 +180,9 @@ class ShinyLabel(QLabel):
         rect = QRectF(self.contentsRect())
         if rect.width() <= 0:
             return
-
         gradient = QLinearGradient(rect.left(), 0.0, rect.right(), 0.0)
         for stop, color in self._stops():
             gradient.setColorAt(stop, color)
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setFont(self.font())
@@ -193,7 +191,6 @@ class ShinyLabel(QLabel):
         painter.end()
 
     def _stops(self) -> list[tuple[float, QColor]]:
-        """Точки градиента: базовый цвет и светлая полоса в текущем положении."""
         half = self.BAND / 2
         raw = [
             (0.0, self._base),
@@ -215,11 +212,7 @@ class ShinyLabel(QLabel):
 
 # ====================================================================== ClickSpark
 class SparkButton(QPushButton):
-    """Кнопка, которая на нажатие выбрасывает короткие лучи из точки клика.
-
-    Обратная связь на главном действии: старт сервисов занимает секунды,
-    и пользователь сразу видит, что нажатие засчитано.
-    """
+    """Кнопка, которая на нажатие выбрасывает короткие лучи из точки клика."""
 
     RAYS = 8
     DURATION_MS = 360
@@ -256,7 +249,6 @@ class SparkButton(QPushButton):
         color.setAlphaF(max(0.0, 0.55 * (1.0 - t)))
         pen = QPen(color, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(pen)
@@ -273,11 +265,7 @@ class SparkButton(QPushButton):
 
 # ====================================================================== раскрытие
 def reveal(widget: QWidget, show: bool, height: int, duration: int = 180) -> None:
-    """Плавно раскрыть/свернуть виджет по высоте (для панели журнала).
-
-    Ссылка на анимацию живёт на самом виджете: без неё сборщик мусора
-    удалит объект раньше, чем он доиграет.
-    """
+    """Плавно раскрыть/свернуть виджет по высоте."""
     previous = getattr(widget, "_reveal_anim", None)
     if previous is not None:
         previous.stop()

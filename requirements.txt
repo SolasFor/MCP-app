@@ -1,12 +1,16 @@
+# Зависимости приложения (то, что попадает в MCPApp.exe).
+# Для воспроизводимой сборки зафиксируйте версии из рабочего окружения:
+#     pip freeze > requirements.lock
+# build.ps1 возьмёт requirements.lock, если он есть.
+
 # --- GUI-оболочка ---
 PyQt6>=6.6
-psutil>=5.9                          # кто занял порт 8000
+psutil>=5.9                           # кто занял порт 8000
 pywin32>=306; sys_platform == "win32" # Job Object: убивать всё дерево дочерних процессов
 
-# --- Бэкенд (backend/server.py) ---
-# Добавьте сюда те же версии, что сейчас стоят у вас для server.py:
-mcp
-# paramiko / asyncssh  — в зависимости от того, чем реализован run_ssh_command
-
-# --- Сборка ---
-pyinstaller>=6.0
+# --- MCP-сервер (backend/server.py) ---
+mcp                                   # MCPServer, AuthSettings, streamable HTTP
+uvicorn
+starlette
+pydantic
+paramiko                              # run_ssh_command

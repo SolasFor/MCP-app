@@ -6,7 +6,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from app import APP_NAME
+from app import APP_ID, LEGACY_APP_ID
 
 
 def is_frozen() -> bool:
@@ -20,27 +20,42 @@ def project_root() -> Path:
 
 
 def resource_dir() -> Path:
-    """Папка с read-only ресурсами (assets/, bin/)."""
+    """Папка с read-only ресурсами (assets/, bin/).
+
+    В сборке PyInstaller 6 (onedir) это <папка установки>\\_internal.
+    """
     if is_frozen():
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
     return project_root()
 
 
+def _appdata() -> Path:
+    return Path(os.environ.get("APPDATA") or Path.home())
+
+
+def legacy_user_data_dir() -> Path:
+    """%APPDATA%\\SouronMCP — папка прежней версии (только для переноса данных)."""
+    return _appdata() / LEGACY_APP_ID
+
+
 def user_data_dir() -> Path:
-    """%APPDATA%\\SouronMCP — настройки и логи GUI (всегда доступна на запись)."""
-    base = Path(os.environ.get("APPDATA") or Path.home())
-    path = base / APP_NAME
+    """%APPDATA%\\MCPApp — настройки, токен, служебные файлы (всегда доступна на запись)."""
+    path = _appdata() / APP_ID
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def default_backend_workdir() -> Path:
-    """Рабочая папка бэкенда (туда пишется souron_audit.log, если путь относительный).
+    """Рабочая папка бэкенда: туда пишется mcp_audit.log, и это WORKSPACE_DIR по умолчанию.
 
-    В .exe это %APPDATA%, потому что папка установки может быть только для чтения.
+    В .exe — %APPDATA%\\MCPApp\\server: папка установки может быть только для чтения,
+    а отдельная подпапка не даёт MCP-инструментам read/write_workspace_file
+    дотянуться до token.json и settings.json.
     """
     if is_frozen():
-        return user_data_dir()
+        path = user_data_dir() / "server"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     return project_root() / "backend"
 
 
@@ -63,6 +78,11 @@ def backend_command() -> tuple[str, list[str]]:
     return str(exe), ["-u", str(project_root() / "main.py"), "--backend"]
 
 
+def bundled_cloudflared() -> Path:
+    """cloudflared.exe, который кладёт в сборку packaging/build.ps1."""
+    return resource_dir() / "bin" / "cloudflared.exe"
+
+
 _CLOUDFLARED_DEFAULTS = (
     Path(r"C:\Program Files (x86)\cloudflared\cloudflared.exe"),
     Path(r"C:\Program Files\cloudflared\cloudflared.exe"),
@@ -70,7 +90,7 @@ _CLOUDFLARED_DEFAULTS = (
 
 
 def resolve_cloudflared(configured: str = "") -> str | None:
-    """Найти cloudflared.exe: путь из настроек -> bin/ рядом с приложением -> стандартные папки -> PATH."""
+    """Найти cloudflared.exe: путь из настроек -> встроенный в сборку -> Program Files -> PATH."""
     if configured:
         candidate = Path(configured).expanduser()
         if candidate.is_file():
@@ -79,8 +99,7 @@ def resolve_cloudflared(configured: str = "") -> str | None:
         if found:
             return found
 
-    bundled = resource_dir() / "bin" / "cloudflared.exe"
-    for candidate in (bundled, *_CLOUDFLARED_DEFAULTS):
+    for candidate in (bundled_cloudflared(), *_CLOUDFLARED_DEFAULTS):
         if candidate.is_file():
             return str(candidate)
 

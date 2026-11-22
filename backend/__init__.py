@@ -1,12 +1,6 @@
-"""MCP-бэкенд. Положите сюда ваш server.py и добавьте в него функцию main().
+"""MCP-сервер MCP app (backend/server.py).
 
-Минимальное изменение в server.py:
-
-    def main() -> None:
-        ...  # всё, что сейчас лежит под if __name__ == "__main__":
-
-    if __name__ == "__main__":
-        main()
-
-Токены и SSH-ключи читайте из переменных окружения / .env — репозиторий публичный.
+GUI запускает его дочерним процессом: `python main.py --backend` в исходниках,
+`MCPApp.exe --backend` в сборке. Параметры — через переменные окружения
+(MCP_PUBLIC_URL, MCP_SECRET_TOKEN и др., см. ServiceManager._server_env).
 """

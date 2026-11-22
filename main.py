@@ -1,10 +1,11 @@
-"""Единая точка входа SouronMCP.
+"""Единая точка входа MCP app.
 
-    python main.py              -> GUI (окно + трей)
-    python main.py --minimized  -> GUI сразу в трее (так стартует автозапуск)
-    python main.py --backend    -> MCP-сервер (backend/server.py)
+    python main.py                    -> GUI (окно + трей)
+    python main.py --minimized        -> GUI сразу в трее (так стартует автозапуск)
+    python main.py --backend          -> MCP-сервер (backend/server.py)
+    python main.py --selftest <файл>  -> самопроверка сборки (пишет отчёт в файл)
 
-В собранном .exe то же самое: GUI запускает сам себя с флагом --backend
+В собранном MCPApp.exe то же самое: GUI запускает сам себя с флагом --backend
 как дочерний процесс, поэтому отдельный server.exe не нужен.
 """
 from __future__ import annotations
@@ -15,14 +16,19 @@ import sys
 
 def main() -> int:
     multiprocessing.freeze_support()
+    args = sys.argv[1:]
 
-    if "--backend" in sys.argv[1:]:
+    if "--backend" in args:
         from app.backend_entry import run_backend
 
         run_backend()
         return 0
 
-    # GUI добавляется на шаге 3 (app/ui).
+    if "--selftest" in args:
+        from app.selftest import run
+
+        return run(sys.argv)
+
     from app.gui import run_gui
 
     return run_gui(sys.argv)

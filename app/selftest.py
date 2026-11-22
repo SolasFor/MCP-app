@@ -1,0 +1,103 @@
+"""Самопроверка собранного .exe: MCPApp.exe --selftest <файл-отчёта>.
+
+Запускается из packaging/build.ps1 сразу после сборки. Ловит то, что PyInstaller
+молча пропускает: забытые скрытые импорты (uvicorn, mcp, anyio…), отсутствующий
+cloudflared.exe, сломанный Qt. Окна не открывает, порт не занимает.
+
+Отчёт пишется в файл: у оконного .exe нет консоли. Код выхода 0 = всё в порядке.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+import traceback
+from pathlib import Path
+
+
+def run(argv: list[str]) -> int:
+    report_path = _report_path(argv)
+    lines: list[str] = []
+    ok = True
+
+    def check(title: str, func) -> None:
+        nonlocal ok
+        try:
+            detail = func()
+            lines.append(f"OK    {title}" + (f": {detail}" if detail else ""))
+        except Exception:  # noqa: BLE001 — нужен полный отчёт, а не первое падение
+            ok = False
+            lines.append(f"FAIL  {title}\n{traceback.format_exc()}")
+
+    check("Qt (QtWidgets, QtNetwork)", _check_qt)
+    check("cloudflared", _check_cloudflared)
+    check("MCP-сервер (импорт и сборка приложения)", _check_backend)
+
+    lines.append("RESULT " + ("OK" if ok else "FAIL"))
+    text = "\n".join(lines) + "\n"
+    if report_path:
+        Path(report_path).write_text(text, encoding="utf-8")
+    else:
+        try:
+            print(text)
+        except (OSError, AttributeError):
+            pass
+    return 0 if ok else 1
+
+
+def _report_path(argv: list[str]) -> str:
+    args = argv[1:]
+    if "--selftest" in args:
+        index = args.index("--selftest")
+        if index + 1 < len(args):
+            return args[index + 1]
+    return ""
+
+
+def _check_qt() -> str:
+    from PyQt6 import QtCore, QtNetwork, QtWidgets  # noqa: F401
+
+    return QtCore.PYQT_VERSION_STR
+
+
+def _check_cloudflared() -> str:
+    import subprocess
+
+    from app.paths import is_frozen, resolve_cloudflared
+
+    exe = resolve_cloudflared("")
+    if exe is None:
+        raise RuntimeError("cloudflared.exe не найден (в сборке должен лежать _internal/bin/cloudflared.exe)")
+    if is_frozen() and "_internal" not in exe:
+        raise RuntimeError(f"используется не встроенный cloudflared: {exe}")
+    result = subprocess.run(
+        [exe, "--version"], capture_output=True, text=True, timeout=20,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    version = (result.stdout or result.stderr).strip().splitlines()
+    return f"{exe} ({version[0] if version else 'версия не определена'})"
+
+
+def _check_backend() -> str:
+    # Сервер читает настройки из env при импорте — подставляем безопасные значения,
+    # а лог аудита пишем во временную папку, чтобы не мусорить.
+    os.environ["MCP_SECRET_TOKEN"] = "selftest-token-0123456789abcdef"
+    os.environ["MCP_PUBLIC_URL"] = "https://selftest.example.com/mcp"
+    os.environ["MCP_JSON_RESPONSE"] = "1"
+    previous = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            import uvicorn  # noqa: F401
+            from backend import server
+
+            app = server.build_app()
+            # Обработчик лог-файла держит файл открытым — закрываем, иначе tmp не удалится.
+            import logging
+
+            for handler in list(logging.getLogger().handlers):
+                if isinstance(handler, logging.FileHandler):
+                    handler.close()
+                    logging.getLogger().removeHandler(handler)
+            return type(app).__name__
+        finally:
+            os.chdir(previous)

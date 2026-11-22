@@ -1,171 +1,236 @@
 """Тёмная тема: палитра Fusion + QSS, цвета и подписи статусов.
 
-Цвета — в одном месте: окно, трей и иконки берут их отсюда.
+Принципы (impeccable, режим Operate — интерфейс служит задаче):
+* один акцентный цвет только для главного действия и фокуса;
+* нейтральные цвета слегка подкрашены в синий, а не чисто серые;
+* цвета статусов значат одно и то же везде (окно, трей, журнал);
+* никаких градиентов в тексте, «стекла» и цветных полос сбоку карточек;
+* отступы кратны 4 px, иерархия — размером и насыщенностью шрифта.
+
+Цвета — в одном месте: окно, трей, иконки и эффекты берут их отсюда.
 """
 from __future__ import annotations
 
 from string import Template
 
 from PyQt6.QtGui import QColor, QFont, QPalette
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QStyleFactory
 
-# ---------------------------------------------------------------- палитра
-BG = "#0f1117"
-SURFACE = "#171a23"
-SURFACE_2 = "#1f2330"
-INPUT = "#0b0d12"
-BORDER = "#2a2f3f"
-TEXT = "#e6e8ef"
-TEXT_DIM = "#8b91a5"
+# ---------------------------------------------------------------------- поверхности
+BG = "#0d0f13"            # фон окна и полей ввода
+SURFACE = "#14171d"       # карточки
+SURFACE_2 = "#1b1f27"     # кнопки, плашки
+SURFACE_3 = "#242a34"     # наведение, выбранный сегмент
+BORDER = "#232832"
+BORDER_STRONG = "#323a47"
 
-ACCENT = "#6366f1"
-ACCENT_HOVER = "#7679f6"
-ACCENT_PRESSED = "#5458e8"
-ACCENT_LIGHT = "#818cf8"   # градиент иконки
-ACCENT_DARK = "#4f46e5"
+# ---------------------------------------------------------------------- текст
+TEXT = "#e7eaf0"
+TEXT_MUTED = "#9ba4b4"
+TEXT_FAINT = "#687183"
 
-GREEN = "#22c55e"
-RED = "#ef4444"
-RED_TEXT = "#fca5a5"
-AMBER = "#f59e0b"
-GRAY = "#6b7280"
-BLUE = "#38bdf8"     # источник [server] в логах
-VIOLET = "#a78bfa"   # источник [tunnel] в логах
+# ---------------------------------------------------------------------- акцент
+ACCENT = "#5b9cff"
+ACCENT_LIGHT = "#84b5ff"
+ACCENT_DARK = "#3f7fe6"
+ACCENT_TEXT = "#08111f"   # текст на акцентной кнопке (контраст > 7:1)
 
+# ---------------------------------------------------------------------- статусы
+OK = "#3ccf8e"
+WARN = "#e6b84a"
+ERR = "#f26b6b"
+IDLE = "#5c6474"
+ERR_SOFT_BG = "#2a1a1e"
+ERR_SOFT_BORDER = "#5a2c33"
 
-def rgba(hex_color: str, alpha: float) -> str:
-    """'#rrggbb' + прозрачность 0..1 -> 'rgba(r, g, b, a)' для QSS (a в 0..255)."""
-    c = QColor(hex_color)
-    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {round(alpha * 255)})"
-
-
-# ---------------------------------------------------------------- статусы
-# Ключи — значения enum'ов Overall и ProcState из app.core (это str-enum'ы).
+# Общий статус (Overall.value) -> (подпись, цвет)
 OVERALL = {
-    "stopped": ("Остановлено", GRAY),
-    "starting": ("Запуск…", AMBER),
-    "running": ("Работает", GREEN),
-    "degraded": ("Восстановление…", AMBER),
-    "stopping": ("Остановка…", AMBER),
-    "error": ("Ошибка", RED),
+    "stopped": ("Остановлено", IDLE),
+    "starting": ("Запуск…", WARN),
+    "running": ("В сети", OK),
+    "degraded": ("Переподключение…", WARN),
+    "stopping": ("Остановка…", WARN),
+    "error": ("Ошибка", ERR),
 }
-SERVER_STATES = {
-    "stopped": ("Остановлен", GRAY),
-    "starting": ("Запускается…", AMBER),
-    "running": ("Запущен", GREEN),
-    "stopping": ("Останавливается…", AMBER),
-    "failed": ("Ошибка", RED),
-}
-TUNNEL_STATES = {
-    "stopped": ("Отключён", GRAY),
-    "starting": ("Подключается…", AMBER),
-    "running": ("Активен", GREEN),
-    "stopping": ("Отключается…", AMBER),
-    "failed": ("Ошибка", RED),
+# Состояния «идёт процесс»: только у них анимация (пульс точки, блик на подписи).
+PENDING = {"starting", "degraded", "stopping"}
+
+# Состояние процесса (ProcState.value) -> (подпись, цвет)
+SERVICE = {
+    "stopped": ("Остановлен", IDLE),
+    "starting": ("Подключается…", WARN),
+    "running": ("Работает", OK),
+    "stopping": ("Останавливается…", WARN),
+    "failed": ("Ошибка", ERR),
 }
 
+# Источник строки журнала -> (метка, цвет метки)
+LOG_SOURCES = {
+    "server": ("server", "#7fb0ff"),
+    "tunnel": ("tunnel", "#efa266"),
+    "app": ("app", "#a6afbd"),
+}
 
-# ---------------------------------------------------------------- QSS
-# string.Template ($NAME), а не f-строка: в QSS много фигурных скобок.
+FONT_UI = '"Segoe UI Variable Text", "Segoe UI", "Inter", sans-serif'
+FONT_MONO = '"Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas", monospace'
+
 _QSS = Template("""
+* { outline: none; }
+QWidget { color: $TEXT; font-family: $FONT_UI; font-size: 13px; }
 QMainWindow, QWidget#Root { background: $BG; }
-QLabel { background: transparent; }
-QLabel#Title { font-size: 15pt; font-weight: 600; }
-QLabel#Dim { color: $TEXT_DIM; }
-QLabel#Section { color: $TEXT_DIM; font-size: 8pt; font-weight: 700; }
-QLabel#RowTitle { font-weight: 600; }
+QScrollArea#Scroll, QScrollArea#Scroll > QWidget > QWidget { background: $BG; border: none; }
 
-QFrame#Card { background: $SURFACE; border: 1px solid $BORDER; border-radius: 12px; }
-QFrame#Divider { background: $BORDER; border: none; }
-
-QPushButton {
-    background: $SURFACE_2; color: $TEXT;
-    border: 1px solid $BORDER; border-radius: 8px; padding: 7px 14px;
+/* ---------- типографика ---------- */
+QLabel#AppTitle { font-size: 18px; font-weight: 600; }
+QLabel#AppSubtitle { color: $TEXT_FAINT; font-size: 12px; }
+QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
+QLabel#FieldLabel { color: $TEXT_MUTED; font-size: 12px; font-weight: 600; }
+QLabel#Hint { color: $TEXT_FAINT; font-size: 12px; }
+QLabel#Error { color: $ERR; font-size: 12px; }
+QLabel#ServiceName { font-weight: 600; }
+QLabel#ServiceDetail { color: $TEXT_FAINT; font-size: 12px; font-family: $FONT_MONO; }
+QLabel#ServiceState { font-size: 12px; font-weight: 600; }
+QLabel#Badge {
+    background: $ERR_SOFT_BG; color: $ERR; border: 1px solid $ERR_SOFT_BORDER;
+    border-radius: 9px; padding: 0 7px; font-size: 11px; font-weight: 600;
 }
-QPushButton:hover { border-color: $ACCENT; }
+
+/* ---------- карточки ---------- */
+QFrame#Card { background: $SURFACE; border: 1px solid $BORDER; border-radius: 12px; }
+QFrame#Divider { background: $BORDER; border: none; max-height: 1px; min-height: 1px; }
+QFrame#Pill { background: $SURFACE; border: 1px solid $BORDER; border-radius: 14px; }
+QLabel#PillText { font-size: 12px; font-weight: 600; }
+
+/* ---------- кнопки ---------- */
+QPushButton {
+    background: $SURFACE_2; color: $TEXT; border: 1px solid $BORDER_STRONG;
+    border-radius: 8px; padding: 7px 14px; font-weight: 600;
+}
+QPushButton:hover { background: $SURFACE_3; }
 QPushButton:pressed { background: $BORDER; }
-QPushButton:disabled { color: $TEXT_DIM; border-color: $BORDER; }
-QPushButton#Small { padding: 4px 10px; font-size: 9pt; }
+QPushButton:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $BORDER; }
 
 QPushButton#Primary {
-    background: $ACCENT; color: #ffffff; border: none; border-radius: 10px;
-    font-size: 11pt; font-weight: 600; padding: 12px 18px;
+    background: $ACCENT; color: $ACCENT_TEXT; border: none;
+    border-radius: 10px; padding: 11px 24px; font-size: 14px;
 }
-QPushButton#Primary:hover { background: $ACCENT_HOVER; }
-QPushButton#Primary:pressed { background: $ACCENT_PRESSED; }
-QPushButton#Primary:disabled { background: $BORDER; color: $TEXT_DIM; }
-QPushButton#Primary[running="true"] { background: $RED_SOFT; color: $RED_TEXT; border: 1px solid $RED_BORDER; }
-QPushButton#Primary[running="true"]:hover { background: $RED_SOFT_HOVER; }
+QPushButton#Primary:hover { background: $ACCENT_LIGHT; }
+QPushButton#Primary:pressed { background: $ACCENT_DARK; }
+QPushButton#Primary:disabled { background: $SURFACE_2; color: $TEXT_FAINT; }
+QPushButton#Primary[running="true"] {
+    background: $ERR_SOFT_BG; color: $ERR; border: 1px solid $ERR_SOFT_BORDER;
+}
+QPushButton#Primary[running="true"]:hover { background: #351f24; }
+QPushButton#Primary[running="true"]:pressed { background: #2a1a1e; }
 
+QPushButton#Accent { background: $ACCENT; color: $ACCENT_TEXT; border: none; }
+QPushButton#Accent:hover { background: $ACCENT_LIGHT; }
+QPushButton#Accent:pressed { background: $ACCENT_DARK; }
+
+QPushButton#Ghost {
+    background: transparent; border: none; color: $TEXT_MUTED; padding: 6px 8px;
+}
+QPushButton#Ghost:hover { color: $TEXT; background: $SURFACE_2; }
+QPushButton#Ghost:disabled { color: $TEXT_FAINT; background: transparent; }
+
+QPushButton#Disclosure {
+    background: transparent; border: none; padding: 4px 2px; text-align: left;
+    font-size: 14px; font-weight: 600; color: $TEXT;
+}
+QPushButton#Disclosure:hover { color: $ACCENT_LIGHT; background: transparent; }
+
+QFrame#SegmentGroup { background: $BG; border: 1px solid $BORDER; border-radius: 9px; }
+QPushButton#Segment {
+    background: transparent; border: none; border-radius: 7px;
+    padding: 6px 14px; color: $TEXT_MUTED;
+}
+QPushButton#Segment:hover { color: $TEXT; background: transparent; }
+QPushButton#Segment:checked { background: $SURFACE_3; color: $TEXT; }
+
+/* ---------- поля ---------- */
 QLineEdit {
-    background: $INPUT; color: $TEXT; border: 1px solid $BORDER; border-radius: 8px;
-    padding: 7px 10px; selection-background-color: $ACCENT;
+    background: $BG; color: $TEXT; border: 1px solid $BORDER_STRONG; border-radius: 8px;
+    padding: 7px 10px; font-family: $FONT_MONO; font-size: 12px;
+    selection-background-color: $ACCENT_DARK; selection-color: #ffffff;
 }
+QLineEdit:hover { border-color: #3d4655; }
 QLineEdit:focus { border-color: $ACCENT; }
+QLineEdit:read-only { color: $TEXT_MUTED; background: $SURFACE; }
+QLineEdit[invalid="true"] { border-color: $ERR; }
 
+QCheckBox { spacing: 10px; padding: 3px 0; }
+QCheckBox:disabled { color: $TEXT_FAINT; }
+
+/* ---------- журнал ---------- */
 QPlainTextEdit#Log {
-    background: $INPUT; color: $TEXT; border: 1px solid $BORDER; border-radius: 10px;
-    padding: 6px; selection-background-color: $ACCENT;
+    background: $BG; color: $TEXT_MUTED; border: 1px solid $BORDER; border-radius: 10px;
+    padding: 8px 6px; font-family: $FONT_MONO; font-size: 12px;
+    selection-background-color: $ACCENT_DARK; selection-color: #ffffff;
 }
 
-QToolButton#Disclosure { background: transparent; border: none; color: $TEXT; font-weight: 600; padding: 2px 0; }
-QToolButton#Disclosure:hover { color: $ACCENT_HOVER; }
-
-QCheckBox { background: transparent; spacing: 8px; }
-
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: $BORDER; border-radius: 3px; min-height: 28px; }
-QScrollBar::handle:vertical:hover { background: $TEXT_DIM; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-QScrollBar::handle:horizontal { background: $BORDER; border-radius: 3px; min-width: 28px; }
-QScrollBar::handle:horizontal:hover { background: $TEXT_DIM; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 3px 2px; }
+QScrollBar::handle:vertical { background: $BORDER_STRONG; border-radius: 3px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: $TEXT_FAINT; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: $BORDER_STRONG; border-radius: 3px; min-width: 28px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 
-QMenu { background: $SURFACE; color: $TEXT; border: 1px solid $BORDER; padding: 4px; }
-QMenu::item { padding: 6px 22px 6px 14px; border-radius: 4px; }
-QMenu::item:selected { background: $ACCENT; color: #ffffff; }
-QMenu::item:disabled { color: $TEXT_DIM; }
+/* ---------- всплывающее ---------- */
+QToolTip {
+    background: $SURFACE_3; color: $TEXT; border: 1px solid $BORDER_STRONG;
+    border-radius: 6px; padding: 5px 8px;
+}
+QMenu { background: $SURFACE; border: 1px solid $BORDER_STRONG; border-radius: 8px; padding: 4px; }
+QMenu::item { padding: 6px 20px 6px 14px; border-radius: 5px; }
+QMenu::item:selected { background: $SURFACE_3; }
+QMenu::item:disabled { color: $TEXT_MUTED; }
 QMenu::separator { height: 1px; background: $BORDER; margin: 4px 6px; }
-
-QToolTip { background: $SURFACE_2; color: $TEXT; border: 1px solid $BORDER; padding: 4px; }
+QMessageBox { background: $SURFACE; }
+QMessageBox QLabel { color: $TEXT; }
 """)
 
-STYLESHEET = _QSS.substitute(
-    BG=BG, SURFACE=SURFACE, SURFACE_2=SURFACE_2, INPUT=INPUT, BORDER=BORDER,
-    TEXT=TEXT, TEXT_DIM=TEXT_DIM,
-    ACCENT=ACCENT, ACCENT_HOVER=ACCENT_HOVER, ACCENT_PRESSED=ACCENT_PRESSED,
-    RED_TEXT=RED_TEXT, RED_SOFT=rgba(RED, 0.12), RED_SOFT_HOVER=rgba(RED, 0.2),
-    RED_BORDER=rgba(RED, 0.55),
-)
+
+def stylesheet() -> str:
+    return _QSS.substitute(globals())
+
+
+def _palette() -> QPalette:
+    pal = QPalette()
+    roles = {
+        QPalette.ColorRole.Window: BG,
+        QPalette.ColorRole.WindowText: TEXT,
+        QPalette.ColorRole.Base: BG,
+        QPalette.ColorRole.AlternateBase: SURFACE,
+        QPalette.ColorRole.Text: TEXT,
+        QPalette.ColorRole.Button: SURFACE_2,
+        QPalette.ColorRole.ButtonText: TEXT,
+        QPalette.ColorRole.Highlight: ACCENT,
+        QPalette.ColorRole.HighlightedText: ACCENT_TEXT,
+        QPalette.ColorRole.ToolTipBase: SURFACE_3,
+        QPalette.ColorRole.ToolTipText: TEXT,
+        QPalette.ColorRole.PlaceholderText: TEXT_FAINT,
+        QPalette.ColorRole.Link: ACCENT_LIGHT,
+        QPalette.ColorRole.Light: BORDER_STRONG,
+        QPalette.ColorRole.Mid: BORDER,
+        QPalette.ColorRole.Dark: BG,
+    }
+    for role, color in roles.items():
+        pal.setColor(role, QColor(color))
+    disabled = QPalette.ColorGroup.Disabled
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        pal.setColor(disabled, role, QColor(TEXT_FAINT))
+    return pal
 
 
 def apply(app: QApplication) -> None:
-    """Fusion + тёмная палитра (диалоги, чекбоксы, меню) + QSS (карточки, кнопки)."""
-    app.setStyle("Fusion")
-
-    font = QFont("Segoe UI")
-    font.setPointSizeF(10)
-    app.setFont(font)  # шрифт задаём кодом, не в QSS: QSS перебил бы моноширинный шрифт логов
-
-    role = QPalette.ColorRole
-    pal = QPalette()
-    pal.setColor(role.Window, QColor(BG))
-    pal.setColor(role.WindowText, QColor(TEXT))
-    pal.setColor(role.Base, QColor(INPUT))
-    pal.setColor(role.AlternateBase, QColor(SURFACE))
-    pal.setColor(role.Text, QColor(TEXT))
-    pal.setColor(role.PlaceholderText, QColor(TEXT_DIM))
-    pal.setColor(role.Button, QColor(SURFACE_2))
-    pal.setColor(role.ButtonText, QColor(TEXT))
-    pal.setColor(role.Highlight, QColor(ACCENT))
-    pal.setColor(role.HighlightedText, QColor("#ffffff"))
-    pal.setColor(role.ToolTipBase, QColor(SURFACE_2))
-    pal.setColor(role.ToolTipText, QColor(TEXT))
-    pal.setColor(role.Link, QColor(ACCENT_LIGHT))
-    disabled = QPalette.ColorGroup.Disabled
-    for r in (role.WindowText, role.Text, role.ButtonText):
-        pal.setColor(disabled, r, QColor(TEXT_DIM))
-    app.setPalette(pal)
-
-    app.setStyleSheet(STYLESHEET)
+    """Fusion + тёмная палитра + QSS. Вызывать до создания окон."""
+    fusion = QStyleFactory.create("Fusion")
+    if fusion is not None:
+        app.setStyle(fusion)
+    app.setPalette(_palette())
+    font = QFont()
+    font.setFamilies(["Segoe UI Variable Text", "Segoe UI", "Inter"])
+    font.setPixelSize(13)
+    app.setFont(font)
+    app.setStyleSheet(stylesheet())

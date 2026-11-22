@@ -34,7 +34,7 @@ from urllib.parse import urlsplit
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from app.config import TUNNEL_MODES, TUNNEL_QUICK, Settings, normalize_public_url
+from app.config import TUNNEL_MODES, Settings, normalize_public_url
 from app.core import token_store
 from app.core.health import HealthMonitor
 from app.core.process import ManagedProcess, ProcState
@@ -52,6 +52,7 @@ TUNNEL = "tunnel"
 APP = "app"  # источник служебных сообщений в логе
 
 SERVER_READY_TIMEOUT_MS = 20_000
+QUICK_URL_TIMEOUT_MS = 60_000  # столько ждём, пока trycloudflare.com выдаст адрес
 MAX_RESTARTS = 5
 STABLE_UPTIME_S = 60  # проработал здоровым дольше — счётчик перезапусков сбрасывается
 VALID_PROTOCOLS = {"http2", "quic", "auto"}
@@ -60,6 +61,12 @@ VALID_PROTOCOLS = {"http2", "quic", "auto"}
 # это служебный адрес из сообщений об ошибках, а не наш.
 QUICK_URL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com", re.IGNORECASE)
 QUICK_CONFIG_FILE = "quick-tunnel.yml"
+# Непустой конфиг: на пустой cloudflared пишет «ERR Configuration file … was empty».
+QUICK_CONFIG_TEXT = (
+    "# MCP app: конфиг для временного адреса (quick tunnel).\n"
+    "# Нужен, чтобы cloudflared НЕ читал ~/.cloudflared/config.yml вашего именованного туннеля.\n"
+    "no-autoupdate: true\n"
+)
 _HOSTNAME_RE = re.compile(r"^\s*-?\s*hostname:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 
 
@@ -109,6 +116,10 @@ class ServiceManager(QObject):
         self._server_wait.setSingleShot(True)
         self._server_wait.timeout.connect(self._on_server_ready_timeout)
 
+        self._quick_wait = QTimer(self)
+        self._quick_wait.setSingleShot(True)
+        self._quick_wait.timeout.connect(self._on_quick_url_timeout)
+
         self._restart_timers: dict[str, QTimer] = {}
         for name in self._procs:
             timer = QTimer(self)
@@ -156,6 +167,9 @@ class ServiceManager(QObject):
         url = self.public_url
         return f"{url}?token={self._token}" if url and self._token else url
 
+    def cloudflared_path(self) -> str | None:
+        return resolve_cloudflared(self.settings.cloudflared_path)
+
     # ================================================================== изменение настроек
     def set_token(self, token: str) -> str | None:
         """Сохранить свой токен. Вернёт текст ошибки или None."""
@@ -185,13 +199,14 @@ class ServiceManager(QObject):
         url = normalize_public_url(value, self.settings.mcp_path)
         if not url:
             return "Не похоже на адрес. Пример: mcp.example.com или https://mcp.example.com/mcp"
-        if urlsplit(url).hostname and urlsplit(url).hostname.endswith(".trycloudflare.com"):
+        host = urlsplit(url).hostname or ""
+        if host.endswith(".trycloudflare.com"):
             return "Адреса *.trycloudflare.com временные — выберите режим «Временный адрес»."
         if url == self.settings.public_url:
             return None
         self.settings.public_url = url
         if not self._save_settings():
-            return "Не удалось сохранить настройки (см. лог)."
+            return "Не удалось сохранить настройки (см. журнал)."
         self._log(f"✔ Публичный адрес: {url}")
         self._warn_if_not_in_config()
         if not self.is_quick:
@@ -272,15 +287,18 @@ class ServiceManager(QObject):
         problems: list[str] = []
 
         if not is_frozen() and not (project_root() / "backend" / "server.py").is_file():
-            problems.append("Не найден backend/server.py — скопируйте туда ваш server.py.")
+            problems.append("Не найден backend/server.py.")
 
-        if resolve_cloudflared(s.cloudflared_path) is None:
-            problems.append("cloudflared.exe не найден (настройки, bin/, Program Files, PATH).")
+        if self.cloudflared_path() is None:
+            problems.append(
+                "cloudflared.exe не найден. Установите его (winget install --id Cloudflare.cloudflared) "
+                "или укажите путь в настройках."
+            )
         if not self.is_quick:
-            if not Path(s.cloudflared_config).expanduser().is_file():
+            if not s.has_named_tunnel_config():
                 problems.append(
                     f"Не найден конфиг туннеля: {s.cloudflared_config}. "
-                    "Нет своего домена — выберите режим «Временный адрес»."
+                    "Нет своего домена — выберите в «Подключении» режим «Временный адрес»."
                 )
             else:
                 self._warn_if_not_in_config()
@@ -345,13 +363,15 @@ class ServiceManager(QObject):
         return args
 
     def _start_tunnel(self) -> None:
-        exe = resolve_cloudflared(self.settings.cloudflared_path)
+        exe = self.cloudflared_path()
         if exe is None:
             self._log("✖ cloudflared.exe не найден")
             self._fail()
             return
         self.tunnel.start(exe, self.tunnel_args())
         self.health.check_tunnel = True
+        if self.is_quick and not self._quick_url:
+            self._quick_wait.start(QUICK_URL_TIMEOUT_MS)
 
     def _restart(self, name: str) -> None:
         if not self._want_running:
@@ -382,15 +402,20 @@ class ServiceManager(QObject):
             match = QUICK_URL_RE.search(line)
             if match:
                 self._on_quick_url(match.group(0).lower())
-        if not self._quic_hint_shown and "quic" in line.lower() and "failed" in line.lower():
+        # Подсказка про QUIC нужна, только если мы сами его используем. При http2
+        # cloudflared всё равно проверяет UDP и пишет «QUIC connection failed» — это норма.
+        protocol = self.settings.tunnel_protocol.strip().lower()
+        if (protocol != "http2" and not self._quic_hint_shown
+                and "quic" in line.lower() and "failed" in line.lower()):
             self._quic_hint_shown = True
-            self._log("⚠ QUIC (UDP 7844) не проходит. Проверьте tunnel_protocol = \"http2\" в settings.json "
-                      "и что в config.yml нет protocol: quic.")
+            self._log("⚠ QUIC (UDP 7844) не проходит. Укажите \"tunnel_protocol\": \"http2\" в settings.json "
+                      "и уберите protocol: quic из config.yml.")
 
     def _on_quick_url(self, origin: str) -> None:
         url = origin + self.settings.mcp_path
         if url == self._quick_url:
             return
+        self._quick_wait.stop()
         self._set_quick_url(url)
         self._log(f"✔ Временный адрес: {url}")
         if not self.server.is_alive():
@@ -403,6 +428,12 @@ class ServiceManager(QObject):
             self._server_wait.stop()
             self.server.stop()
         self._recompute()
+
+    def _on_quick_url_timeout(self) -> None:
+        if self._want_running and self.is_quick and not self._quick_url:
+            self._log(f"✖ Cloudflare не выдал временный адрес за {QUICK_URL_TIMEOUT_MS // 1000} с. "
+                      "Проверьте интернет; trycloudflare.com иногда ограничивает выдачу — попробуйте позже.")
+            self._fail()
 
     def _on_server_health(self, ok: bool) -> None:
         self.server.mark_health(ok)
@@ -509,6 +540,7 @@ class ServiceManager(QObject):
         self._want_running = False
         self._server_restart_pending = False
         self._server_wait.stop()
+        self._quick_wait.stop()
         for timer in self._restart_timers.values():
             timer.stop()
         self.health.stop()
@@ -544,15 +576,18 @@ class ServiceManager(QObject):
 
 # ====================================================================== утилиты
 def _quick_tunnel_config() -> Path:
-    """Пустой конфиг для quick tunnel.
+    """Конфиг для quick tunnel (содержимое — QUICK_CONFIG_TEXT).
 
     Без явного --config cloudflared подхватит ~/.cloudflared/config.yml со своим
     `tunnel:` и ingress — и временный адрес не получится.
     """
     path = user_data_dir() / QUICK_CONFIG_FILE
-    if not path.is_file():
-        path.write_text("# Пусто намеренно: quick tunnel не должен читать ~/.cloudflared/config.yml\n",
-                        encoding="utf-8")
+    try:
+        current = path.read_text(encoding="utf-8")
+    except OSError:
+        current = ""
+    if current != QUICK_CONFIG_TEXT:
+        path.write_text(QUICK_CONFIG_TEXT, encoding="utf-8")
     return path
 
 

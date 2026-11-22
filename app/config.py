@@ -19,11 +19,11 @@ SETTINGS_FILE = "settings.json"
 
 # Режимы туннеля
 TUNNEL_NAMED = "named"   # свой домен: config.yml + `cloudflared tunnel run`
-TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `--url http://127.0.0.1:8000`
+TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `cloudflared tunnel --url …`
 TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
 
 DEFAULT_MCP_PATH = "/mcp"
-QUICK_TUNNEL_SUFFIX = ".trycloudflare.com"
+DEFAULT_PUBLIC_URL = "https://mcp.souron.space/mcp"
 
 
 def normalize_mcp_path(value: str) -> str:
@@ -38,9 +38,12 @@ def normalize_mcp_path(value: str) -> str:
 def normalize_public_url(value: str, mcp_path: str = DEFAULT_MCP_PATH) -> str:
     """Привести ввод пользователя к каноническому виду; '' — если это не адрес.
 
-        mcp.souron.space          -> https://mcp.souron.space/mcp
-        https://host/mcp/         -> https://host/mcp
-        http://host:8080/custom   -> http://host:8080/custom
+        mcp.example.com            -> https://mcp.example.com/mcp
+        https://MCP.example.com/   -> https://mcp.example.com/mcp
+        https://host/что-угодно  -> https://host/mcp
+
+    Путь всегда равен mcp_path: сервер отвечает только там, и любой другой путь
+    в ссылке дал бы клиентам 404.
     """
     raw = (value or "").strip()
     if not raw or any(ch.isspace() for ch in raw):
@@ -55,34 +58,26 @@ def normalize_public_url(value: str, mcp_path: str = DEFAULT_MCP_PATH) -> str:
         port = parts.port
     except ValueError:  # неверный порт
         return ""
-    if not host or "." not in host and host != "localhost":
+    if not host or ("." not in host and host != "localhost"):
         return ""
     netloc = f"{host}:{port}" if port else host
-    path = parts.path.rstrip("/") or normalize_mcp_path(mcp_path)
-    return urlunsplit((parts.scheme, netloc, path, "", ""))
-
-
-def origin_of(url: str) -> str:
-    """'https://host/mcp' -> 'https://host' (для issuer_url бэкенда)."""
-    parts = urlsplit(url or "")
-    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else ""
+    return urlunsplit((parts.scheme, netloc, normalize_mcp_path(mcp_path), "", ""))
 
 
 @dataclass
 class Settings:
     # Сеть
-    public_url: str = "https://mcp.souron.space/mcp"  # свой домен (режим named)
-    quick_url: str = ""              # последний выданный временный адрес (режим quick)
-    mcp_path: str = DEFAULT_MCP_PATH  # путь MCP-эндпоинта на сервере
+    public_url: str = DEFAULT_PUBLIC_URL  # свой домен (режим named)
+    mcp_path: str = DEFAULT_MCP_PATH      # путь MCP-эндпоинта на сервере
     server_host: str = "127.0.0.1"
-    server_port: int = 8000          # должен совпадать с портом в backend/server.py
-    server_health_path: str = "/health"  # любой HTTP-ответ (даже 404/401) = сервер жив
+    server_port: int = 8000
+    server_health_path: str = "/health"  # server.py отвечает тут без токена и без записи в лог
     metrics_port: int = 20241        # cloudflared --metrics -> /ready для индикатора
 
     # Cloudflare Tunnel
     tunnel_mode: str = TUNNEL_NAMED  # named | quick
     cloudflared_path: str = ""       # пусто = автопоиск (bin/, Program Files, PATH)
-    cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")
+    cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")  # только для named
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
     # http2 по умолчанию: провайдер блокирует исходящий UDP, из-за чего QUIC не поднимается.
     # Пустая строка = не передавать флаг (тогда решает config.yml или cloudflared).
@@ -90,7 +85,9 @@ class Settings:
 
     # Бэкенд
     backend_workdir: str = ""        # пусто = paths.default_backend_workdir()
-    allow_query_token: bool = False  # разрешить ?token=… в ссылке вместо заголовка
+    # ?token=… в ссылке вместо заголовка Authorization (для клиентов, где заголовок
+    # не задать). Включено, как и в исходном server.py; токен вырезается из логов.
+    allow_query_token: bool = True
 
     # Поведение
     start_services_on_launch: bool = False
@@ -126,7 +123,10 @@ class Settings:
         if not isinstance(data, dict):
             return cls()
         known = {f.name for f in fields(cls)}
-        settings = cls(**{k: v for k, v in data.items() if k in known})
+        try:
+            settings = cls(**{k: v for k, v in data.items() if k in known})
+        except TypeError:
+            return cls()
         settings.sanitize()
         return settings
 
@@ -136,8 +136,7 @@ class Settings:
             self.tunnel_mode = TUNNEL_NAMED
         self.mcp_path = normalize_mcp_path(self.mcp_path)
         self.server_health_path = normalize_mcp_path(self.server_health_path)
-        self.public_url = normalize_public_url(self.public_url, self.mcp_path) or Settings.public_url
-        self.quick_url = normalize_public_url(self.quick_url, self.mcp_path)
+        self.public_url = normalize_public_url(self.public_url, self.mcp_path) or DEFAULT_PUBLIC_URL
 
     def save(self) -> None:
         target = self.path()

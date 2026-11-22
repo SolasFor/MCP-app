@@ -1,10 +1,10 @@
-"""Настройки приложения: %APPDATA%\\SouronMCP\\settings.json.
+"""Настройки приложения: %APPDATA%\\MCPApp\\settings.json.
 
 Без секретов: Bearer-токен живёт в app/core/token_store.py (отдельный файл
 с ограниченным доступом), SSH-ключи — у бэкенда.
 
 Новые поля безопасно добавлять: если в старом settings.json их нет,
-берётся значение по умолчанию.
+берётся значение по умолчанию. Неизвестные поля из старых версий игнорируются.
 """
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
 
 DEFAULT_MCP_PATH = "/mcp"
 DEFAULT_PUBLIC_URL = "https://mcp.souron.space/mcp"
+DEFAULT_CLOUDFLARED_CONFIG = str(Path.home() / ".cloudflared" / "config.yml")
 
 
 def normalize_mcp_path(value: str) -> str:
@@ -40,7 +41,7 @@ def normalize_public_url(value: str, mcp_path: str = DEFAULT_MCP_PATH) -> str:
 
         mcp.example.com            -> https://mcp.example.com/mcp
         https://MCP.example.com/   -> https://mcp.example.com/mcp
-        https://host/что-угодно  -> https://host/mcp
+        https://host/что-угодно    -> https://host/mcp
 
     Путь всегда равен mcp_path: сервер отвечает только там, и любой другой путь
     в ссылке дал бы клиентам 404.
@@ -76,26 +77,23 @@ class Settings:
 
     # Cloudflare Tunnel
     tunnel_mode: str = TUNNEL_NAMED  # named | quick
-    cloudflared_path: str = ""       # пусто = автопоиск (bin/, Program Files, PATH)
-    cloudflared_config: str = str(Path.home() / ".cloudflared" / "config.yml")  # только для named
+    cloudflared_path: str = ""       # пусто = автопоиск (встроенный в сборку, Program Files, PATH)
+    cloudflared_config: str = DEFAULT_CLOUDFLARED_CONFIG  # только для named
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
-    # http2 по умолчанию: провайдер блокирует исходящий UDP, из-за чего QUIC не поднимается.
+    # http2 по умолчанию: провайдеры часто блокируют исходящий UDP, и QUIC не поднимается.
     # Пустая строка = не передавать флаг (тогда решает config.yml или cloudflared).
     tunnel_protocol: str = "http2"
 
     # Бэкенд
     backend_workdir: str = ""        # пусто = paths.default_backend_workdir()
     # ?token=… в ссылке вместо заголовка Authorization (для клиентов, где заголовок
-    # не задать). Включено, как и в исходном server.py; токен вырезается из логов.
+    # не задать). Токен вырезается из логов.
     allow_query_token: bool = True
 
     # Поведение
     start_services_on_launch: bool = False
     minimize_to_tray_on_close: bool = True
     auto_restart: bool = True
-
-    # Интерфейс
-    logs_expanded: bool = True       # панель логов в главном окне развёрнута
 
     # ------------------------------------------------------------------ свойства
     @property
@@ -105,6 +103,9 @@ class Settings:
     def local_host(self) -> str:
         """Адрес, по которому стучаться к серверу с этой же машины."""
         return "127.0.0.1" if self.server_host in ("0.0.0.0", "::", "") else self.server_host
+
+    def has_named_tunnel_config(self) -> bool:
+        return Path(self.cloudflared_config).expanduser().is_file()
 
     # ------------------------------------------------------------------ файл
     @classmethod
@@ -116,7 +117,7 @@ class Settings:
         try:
             data = json.loads(cls.path().read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return cls()
+            return cls.first_run()
         except (OSError, ValueError):
             # Битый файл не должен мешать старту — работаем на дефолтах.
             return cls()
@@ -128,6 +129,23 @@ class Settings:
         except TypeError:
             return cls()
         settings.sanitize()
+        return settings
+
+    @classmethod
+    def first_run(cls) -> "Settings":
+        """Первый запуск (нет settings.json).
+
+        На чистой машине нет ~/.cloudflared/config.yml — именованный туннель не
+        запустится. Тогда сразу выбираем «Временный адрес»: он работает без домена
+        и без аккаунта Cloudflare, и кнопка «Запустить» срабатывает с первого раза.
+        """
+        settings = cls()
+        if not settings.has_named_tunnel_config():
+            settings.tunnel_mode = TUNNEL_QUICK
+        try:
+            settings.save()
+        except OSError:
+            pass
         return settings
 
     def sanitize(self) -> None:

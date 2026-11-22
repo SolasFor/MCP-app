@@ -1,6 +1,6 @@
 """Bearer-токен MCP-сервера: хранение, генерация, проверка.
 
-Токен лежит ОТДЕЛЬНО от settings.json — в %APPDATA%\\SouronMCP\\token.json.
+Токен лежит ОТДЕЛЬНО от settings.json — в %APPDATA%\\MCPApp\\token.json.
 Так settings.json можно показать или скопировать без риска, а файл с токеном
 на Windows получает ACL только для текущего пользователя.
 
@@ -29,7 +29,7 @@ def path() -> Path:
 
 
 def generate(nbytes: int = 24) -> str:
-    """Случайный токен (~32 символа, 192 бита энтропии)."""
+    """Случайный токен (32 символа, 192 бита энтропии)."""
     return secrets.token_urlsafe(nbytes)
 
 
@@ -47,20 +47,13 @@ def save(token: str) -> None:
     tmp = target.with_suffix(".tmp")
     tmp.write_text(json.dumps({"token": token}, indent=2), encoding="utf-8")
     tmp.replace(target)  # атомарная замена: недописанный файл не затрёт рабочий
-    _restrict(target)
-
-
-def clear() -> None:
-    try:
-        path().unlink()
-    except FileNotFoundError:
-        pass
+    restrict(target)
 
 
 def problem(token: str) -> str | None:
     """Почему такой токен нельзя сохранить, или None. Пустой допустим."""
     if not token:
-        return None  # пусто = сервер сгенерирует себе временный сам
+        return None
     if any(ch.isspace() for ch in token):
         return "В токене не должно быть пробелов и переводов строки."
     if len(token) < MIN_LENGTH:
@@ -79,7 +72,7 @@ def mask(token: str) -> str:
     return f"{token[:4]}…{token[-4:]} ({len(token)} симв.)"
 
 
-def _restrict(target: Path) -> None:
+def restrict(target: Path) -> None:
     """Доступ только текущему пользователю. Не критично, ошибки глотаем."""
     try:
         os.chmod(target, 0o600)

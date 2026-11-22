@@ -1,4 +1,4 @@
-"""Виджеты главного окна: точка статуса, строка сервиса, журнал."""
+"""Виджеты окна: точка статуса, строка сервиса, кнопка навигации, журнал."""
 from __future__ import annotations
 
 import re
@@ -8,7 +8,7 @@ from typing import Callable
 
 from PyQt6.QtCore import QPointF, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QTextOption
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
 
 from app.ui import theme
 
@@ -17,10 +17,7 @@ _RUNNING = QVariantAnimation.State.Running
 
 # ====================================================================== точка статуса
 class StatusDot(QWidget):
-    """Цветная точка. В «промежуточных» состояниях вокруг неё расходится кольцо.
-
-    У стабильных состояний (работает / остановлен / ошибка) ничего не движется.
-    """
+    """Цветная точка. В промежуточных состояниях вокруг неё расходится кольцо."""
 
     def __init__(self, diameter: int = 8, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -75,14 +72,14 @@ class StatusRow(QWidget):
     def __init__(self, name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 2, 0, 2)
+        row.setContentsMargins(0, 4, 0, 4)
         row.setSpacing(8)
 
         self._dot = StatusDot()
         row.addWidget(self._dot, 0, Qt.AlignmentFlag.AlignTop)
 
         texts = QVBoxLayout()
-        texts.setSpacing(1)
+        texts.setSpacing(2)
         title = QLabel(name)
         title.setObjectName("ServiceName")
         self._detail = QLabel("")
@@ -106,8 +103,41 @@ class StatusRow(QWidget):
         self._detail.setVisible(bool(text))
 
 
+# ====================================================================== навигация
+class NavButton(QPushButton):
+    """Пункт сайдбара: текст слева, счётчик справа (например, ошибки в журнале)."""
+
+    def __init__(self, text: str, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setObjectName("Nav")
+        self.setCheckable(True)
+        self.setAutoExclusive(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(34)
+        self._badge = QLabel(self)
+        self._badge.setObjectName("Badge")
+        self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._badge.hide()
+
+    def set_badge(self, count: int) -> None:
+        self._badge.setVisible(count > 0)
+        if count:
+            self._badge.setText(str(count) if count < 100 else "99+")
+            self._badge.adjustSize()
+            self._place_badge()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001
+        super().resizeEvent(event)
+        self._place_badge()
+
+    def _place_badge(self) -> None:
+        hint = self._badge.sizeHint()
+        self._badge.setGeometry(self.width() - hint.width() - 10, (self.height() - hint.height()) // 2,
+                                hint.width(), hint.height())
+
+
 # ====================================================================== журнал
-_ERR_RE = re.compile(r"✖|\bERR\b|\bERROR\b|Traceback|\bCRITICAL\b|\bfailed\b", re.IGNORECASE)
+_ERR_RE = re.compile(r"✖|\bERR\b|\bERROR\b|Traceback|\bCRITICAL\b", re.IGNORECASE)
 _WARN_RE = re.compile(r"⚠|\bWRN\b|\bWARN(?:ING)?\b", re.IGNORECASE)
 
 
@@ -116,7 +146,7 @@ class LogView(QPlainTextEdit):
 
     * строки копятся и добавляются раз в 80 мс;
     * хранится не больше MAX_LINES последних строк;
-    * автопрокрутка только если пользователь и так внизу (иначе не мешаем читать);
+    * автопрокрутка только если пользователь и так внизу;
     * перед показом строка проходит через redactor (вырезает токен).
     """
 
@@ -141,7 +171,6 @@ class LogView(QPlainTextEdit):
         self._timer.setInterval(self.FLUSH_MS)
         self._timer.timeout.connect(self._flush)
 
-    # ------------------------------------------------------------------ API
     def set_redactor(self, redact: Callable[[str], str]) -> None:
         self._redact = redact
 
@@ -161,7 +190,6 @@ class LogView(QPlainTextEdit):
         self._pending.clear()
         self.clear()
 
-    # ------------------------------------------------------------------ внутреннее
     def _flush(self) -> None:
         batch = self._pending[: self.MAX_BATCH]
         del self._pending[: self.MAX_BATCH]

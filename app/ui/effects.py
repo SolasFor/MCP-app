@@ -14,6 +14,8 @@ import math
 
 from PyQt6.QtCore import (
     QEasingCurve,
+    QEvent,
+    QObject,
     QPointF,
     QPropertyAnimation,
     QRectF,
@@ -28,6 +30,7 @@ from PyQt6.QtGui import (
     QPainterPath,
     QPen,
     QRadialGradient,
+    QTextOption,
 )
 from PyQt6.QtWidgets import QFrame, QLabel, QPushButton, QWidget
 
@@ -42,8 +45,9 @@ _RUNNING = QVariantAnimation.State.Running
 class SpotlightFrame(QFrame):
     """Карточка с мягким светом, следующим за курсором.
 
-    Свет появляется и гаснет за 180 мс, рисуется поверх фона из QSS
-    и обрезается по тому же радиусу скругления.
+    Свет появляется и гаснет за 180 мс, рисуется поверх фона из QSS (под дочерними
+    виджетами) и обрезается по радиусу карточки. Движения мыши над дочерними
+    виджетами ловим фильтром событий — иначе свет «залипал» бы на кнопках.
     """
 
     def __init__(self, radius: int = 280, parent: QWidget | None = None) -> None:
@@ -53,6 +57,7 @@ class SpotlightFrame(QFrame):
         self._radius = radius
         self._pos = QPointF(-1000.0, -1000.0)
         self._strength = 0.0
+        self._filters_installed = False
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(180)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -70,7 +75,22 @@ class SpotlightFrame(QFrame):
         self._anim.start()
 
     # ------------------------------------------------------------------ мышь
-    def enterEvent(self, event) -> None:  # noqa: ANN001 - QEnterEvent
+    def showEvent(self, event) -> None:  # noqa: ANN001
+        super().showEvent(event)
+        if not self._filters_installed:
+            self._filters_installed = True
+            for child in self.findChildren(QWidget):
+                child.setMouseTracking(True)
+                child.installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.MouseMove and isinstance(obj, QWidget):
+            self._pos = QPointF(obj.mapTo(self, event.position().toPoint()))
+            if self._strength > 0.0:
+                self.update()
+        return False
+
+    def enterEvent(self, event) -> None:  # noqa: ANN001
         self._pos = QPointF(event.position())
         self._animate_to(1.0)
         super().enterEvent(event)
@@ -94,7 +114,7 @@ class SpotlightFrame(QFrame):
         clip.addRoundedRect(QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5), CARD_RADIUS, CARD_RADIUS)
 
         inner = QColor(theme.ACCENT)
-        inner.setAlphaF(0.13 * self._strength)
+        inner.setAlphaF(0.12 * self._strength)
         outer = QColor(theme.ACCENT)
         outer.setAlphaF(0.0)
         gradient = QRadialGradient(self._pos, float(self._radius))
@@ -115,8 +135,8 @@ class ShinyLabel(QLabel):
     """Текст с бегущим бликом — включается только на время процесса.
 
     Пока блик выключен, это обычный QLabel (и таймер не работает).
-    Блик рисуется поверх штатной отрисовки, поэтому фон и отступы
-    из QSS остаются на месте.
+    Блик рисуется поверх штатной отрисовки тем же цветом статуса,
+    только светлее, — цвет не меняет смысла.
     """
 
     BAND = 0.34  # ширина светлой полосы в долях ширины надписи
@@ -157,11 +177,11 @@ class ShinyLabel(QLabel):
         super().paintEvent(event)
         if self._anim.state() != _RUNNING or not self.text():
             return
-        rect = self.contentsRect()
+        rect = QRectF(self.contentsRect())
         if rect.width() <= 0:
             return
 
-        gradient = QLinearGradient(float(rect.left()), 0.0, float(rect.right()), 0.0)
+        gradient = QLinearGradient(rect.left(), 0.0, rect.right(), 0.0)
         for stop, color in self._stops():
             gradient.setColorAt(stop, color)
 
@@ -169,7 +189,7 @@ class ShinyLabel(QLabel):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         painter.setFont(self.font())
         painter.setPen(QPen(QBrush(gradient), 1.0))
-        painter.drawText(rect, int(self.alignment()), self.text())
+        painter.drawText(rect, self.text(), QTextOption(self.alignment()))
         painter.end()
 
     def _stops(self) -> list[tuple[float, QColor]]:
@@ -221,9 +241,10 @@ class SparkButton(QPushButton):
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: ANN001
-        self._center = QPointF(event.position())
-        self._anim.stop()
-        self._anim.start()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._center = QPointF(event.position())
+            self._anim.stop()
+            self._anim.start()
         super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: ANN001
@@ -232,7 +253,7 @@ class SparkButton(QPushButton):
             return
         t = self._t
         color = QColor("#ffffff")
-        color.setAlphaF(max(0.0, 0.5 * (1.0 - t)))
+        color.setAlphaF(max(0.0, 0.55 * (1.0 - t)))
         pen = QPen(color, 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
 
@@ -252,7 +273,7 @@ class SparkButton(QPushButton):
 
 # ====================================================================== раскрытие
 def reveal(widget: QWidget, show: bool, height: int, duration: int = 180) -> None:
-    """Плавно раскрыть/свернуть виджет по высоте (для панели логов).
+    """Плавно раскрыть/свернуть виджет по высоте (для панели журнала).
 
     Ссылка на анимацию живёт на самом виджете: без неё сборщик мусора
     удалит объект раньше, чем он доиграет.

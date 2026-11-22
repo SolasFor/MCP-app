@@ -39,19 +39,23 @@ def legacy_user_data_dir() -> Path:
 
 
 def user_data_dir() -> Path:
-    """%APPDATA%\\MCPApp — настройки, токен, логи (всегда доступна на запись)."""
+    """%APPDATA%\\MCPApp — настройки, токен, служебные файлы (всегда доступна на запись)."""
     path = _appdata() / APP_ID
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def default_backend_workdir() -> Path:
-    """Рабочая папка бэкенда (туда пишется mcp_audit.log).
+    """Рабочая папка бэкенда: туда пишется mcp_audit.log, и это WORKSPACE_DIR по умолчанию.
 
-    В .exe это %APPDATA%\\MCPApp: папка установки может быть только для чтения.
+    В .exe — %APPDATA%\\MCPApp\\server: папка установки может быть только для чтения,
+    а отдельная подпапка не даёт MCP-инструментам read/write_workspace_file
+    дотянуться до token.json и settings.json.
     """
     if is_frozen():
-        return user_data_dir()
+        path = user_data_dir() / "server"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     return project_root() / "backend"
 
 

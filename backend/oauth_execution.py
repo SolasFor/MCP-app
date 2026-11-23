@@ -26,7 +26,9 @@ PROFILE_FULL = "full"
 PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
 MAX_RULES = 24
 MAX_RULE_SIZE = 512
-DEFAULT_WINDOWS_ALLOWLIST = ("whoami", "ipconfig", "systeminfo", "pwd", "ls", "dir", "echo")
+# Standard Windows read-only helpers. These are preloaded as a policy,
+# but the OAuth execution profile itself always defaults to "safe".
+DEFAULT_WINDOWS_ALLOWLIST = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,251}$")
 
 
@@ -82,6 +84,17 @@ class ExecutionApprovals:
                 );
                 DROP TABLE IF EXISTS exec_grants;
             """)
+            # Seed new installations once, so the GUI's allowlist is populated
+            # immediately. Never overwrite an existing owner-edited policy:
+            # users may intentionally have removed or disabled commands.
+            db.execute(
+                "INSERT OR IGNORE INTO exec_policy(issuer, encrypted) VALUES (?,?)",
+                (store.issuer, store._encrypt({
+                    "profile": PROFILE_SAFE,
+                    "windows": list(DEFAULT_WINDOWS_ALLOWLIST),
+                    "hosts": [], "ssh_commands": [],
+                })),
+            )
             # Old short-lived approval tickets cannot authorize anything here.
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
                 db.execute("DELETE FROM exec_requests WHERE issuer=?", (store.issuer,))

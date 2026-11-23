@@ -2,9 +2,9 @@ name: RC Windows installer (no publish)
 
 on:
   push:
-    branches: [release/rc-01-oauth-windows-ssh]
+    branches: [release/rc-01-oauth-windows-ssh, feat/08-three-access-modes-unified-home]
   pull_request:
-    branches: [main]
+    branches: [main, release/rc-01-oauth-windows-ssh]
     paths:
       - "app/**"
       - "backend/**"

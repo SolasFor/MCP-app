@@ -23,7 +23,8 @@ asyncio.run(main())
 """
 
 
-def registry(*, advanced: bool = False, execute: bool = False, hosts: str = "", executables: str = "") -> dict:
+def registry(*, advanced: bool = False, execute: bool = False, oauth: bool = False,
+             hosts: str = "", executables: str = "") -> dict:
     env = os.environ.copy()
     env.update({
         "MCP_PUBLIC_URL": "https://mcp-ci.example.com/mcp",
@@ -32,7 +33,7 @@ def registry(*, advanced: bool = False, execute: bool = False, hosts: str = "", 
         "MCP_JSON_RESPONSE": "1",
         "MCP_ENABLE_ADVANCED": "1" if advanced else "0",
         "MCP_ENABLE_EXECUTION": "1" if execute else "0",
-        "MCP_ENABLE_OAUTH": "0",
+        "MCP_ENABLE_OAUTH": "1" if oauth else "0",
         "MCP_ALLOWED_HOSTS": hosts,
         "MCP_ALLOWED_EXECUTABLES": executables,
     })
@@ -51,6 +52,12 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["resources"], [])
         self.assertNotIn("test-only-not-a-real-token", result["info"])
         self.assertIn("MCP app ready", result["call"])
+
+    def test_oauth_forces_read_only_even_when_advanced_enabled(self) -> None:
+        result = registry(advanced=True, execute=True, oauth=True,
+                          hosts="prod.example", executables=Path(sys.executable).name)
+        self.assertEqual(result["tools"], ["server_info"])
+        self.assertEqual(result["resources"], [])
 
     def test_execution_flag_cannot_bypass_advanced_flag(self) -> None:
         result = registry(execute=True, hosts="example.com", executables="python")

@@ -220,11 +220,14 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, body.decode(errors="replace"))
         rotated = json.loads(body)
         self.assertNotEqual(rotated["access_token"], tokens["access_token"])
-        status, _, _ = req(self.url + "/revoke", "POST", data={
-            "client_id": client_id, "token": rotated["access_token"],
+        # SDK 2.3 RevocationRequest includes a required nullable
+        # client_secret field even for a registered public client.
+        status, _, revoke_body = req(self.url + "/revoke", "POST", data={
+            "client_id": client_id, "client_secret": "",
+            "token": rotated["access_token"],
             "token_type_hint": "access_token",
         })
-        self.assertEqual(status, 200)
+        self.assertEqual(status, 200, revoke_body.decode(errors="replace"))
         status, _, _ = req(self.url + "/mcp", "POST", data=init,
             content_type="application/json", headers={
                 "Authorization": "Bearer " + rotated["access_token"],

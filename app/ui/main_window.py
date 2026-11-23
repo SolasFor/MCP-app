@@ -51,6 +51,7 @@ from app.paths import user_data_dir
 from app.ui import effects, icons, theme
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
+from app.ui.oauth_clients_dialog import OAuthClientsDialog
 from app.ui.proxy_page import ProxyPage
 from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
@@ -470,8 +471,36 @@ class MainWindow(QMainWindow):
         query_row.addWidget(self._copy_full)
         box.addLayout(query_row)
         layout.addWidget(card)
+
+        card, box = _card()
+        box.addWidget(_label("OAuth-подключения", "SectionTitle"))
+        box.addWidget(_label(
+            "Список зарегистрированных клиентов и разрешений для текущего адреса. "
+            "Можно отозвать доступ сразу, не останавливая MCP-сервер.",
+            "Hint", wrap=True,
+        ))
+        manage_clients = _button("Управление OAuth-клиентами…", "Accent")
+        manage_clients.clicked.connect(self._open_oauth_clients)
+        box.addWidget(manage_clients)
+        layout.addWidget(card)
         layout.addStretch(1)
         return page
+
+    def _open_oauth_clients(self) -> None:
+        if not self.manager.public_url:
+            QMessageBox.information(
+                self, "OAuth-подключения",
+                "Сначала запустите сервер: нужен его текущий публичный адрес.",
+            )
+            return
+        try:
+            dialog = OAuthClientsDialog(self.manager.public_url, parent=self)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "OAuth-подключения",
+                f"Не удалось открыть список OAuth-клиентов: {type(exc).__name__}",
+            )
 
     # ================================================================== Прокси
     def _build_proxy(self) -> QWidget:

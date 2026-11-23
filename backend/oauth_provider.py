@@ -318,7 +318,10 @@ class LocalConsentOAuthProvider(
             raise TokenError("invalid_grant", "Refresh token expired or already used")
         if not set(scopes).issubset(set(original.scopes)):
             raise TokenError("invalid_scope", "Cannot elevate token permissions")
-        family = self.store.family(refresh_token.token) if self.store else self._families.get(key, "")
+        family = (
+            self.store.consume_refresh(refresh_token.token, client.client_id)
+            if self.store else self._families.get(key, "")
+        )
         if not family:
             raise TokenError("invalid_grant", "Token family not found")
         self._remove_family(family)

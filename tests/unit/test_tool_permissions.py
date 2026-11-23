@@ -102,6 +102,15 @@ class ToolPermissionsTests(unittest.TestCase):
                 ["server_info", NOTE_LIST, NOTE_READ],
             )
 
+    def test_middleware_filters_mapping_result(self):
+        middleware = make_tool_middleware(self.store)
+        async def next_list(ctx):
+            return {"tools": [{"name": "server_info"}, {"name": NOTE_READ}]}
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("client-a")):
+            ctx = SimpleNamespace(method="tools/list", params={})
+            result = asyncio.run(middleware(ctx, next_list))
+            self.assertEqual(result["tools"], [{"name": "server_info"}])
+
     def test_middleware_refuses_ungranted_call_before_dispatch(self):
         middleware = make_tool_middleware(self.store)
         calls = []

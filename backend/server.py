@@ -313,60 +313,115 @@ def get_environment_info() -> str:
 # 5. ИНСТРУМЕНТЫ (Tools)
 # ==========================================
 
-@_conditional_tool(OAUTH_ENABLED)
-async def oauth_windows_command(command: str, approval_id: str = "") -> str:
-    """Execute an exact allowlisted command, only after one-time local GUI approval.
+def _restricted_windows_argv(command: str) -> list[str]:
+    """Translate safe Windows built-ins without executing a command shell."""
+    from pathlib import Path
 
-    First call creates a pending request and returns a ticket. The client repeats
-    exactly the same command with approval_id after the owner approves locally.
+    # Allowed command lines have already passed the current SQLite allowlist.
+    program = command.strip().split(" ", 1)[0].lower()
+    builtin = {"dir", "ls", "pwd", "echo"}
+    if program in builtin:
+        return []
+    import shlex
+    program_name = shlex.split(command, posix=os.name != "nt")[0].strip('"')
+    argv = parse_allowed_command(command, frozenset({program_name.casefold()}))
+    # Built-in OS utilities are resolved from System32 explicitly to avoid
+    # running a malicious executable from the app's working directory.
+    stem = Path(argv[0]).stem.lower()
+    if os.name == "nt" and stem in {"whoami", "ipconfig", "systeminfo", "hostname"}:
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        executable = system_root / "System32" / (stem + ".exe")
+        if not executable.is_file():
+            raise ValueError("Windows system executable is missing")
+        argv[0] = str(executable)
+    return argv
+
+
+async def _oauth_windows_run(command: str, *, full: bool) -> str:
+    """Bounded execution, with shell semantics only in explicit full mode."""
+    program = command.strip().split(" ", 1)[0].lower()
+    if not full:
+        if program == "pwd" and command.strip().lower() == "pwd":
+            return str(WORKSPACE_DIR)
+        if program in ("ls", "dir") and command.strip().lower() == program:
+            return truncate_output("\n".join(sorted(
+                path.name for path in WORKSPACE_DIR.iterdir()
+            )))
+        if program == "echo":
+            return truncate_output(
+                command.strip()[5:] if command.strip().lower().startswith("echo ") else ""
+            )
+        try:
+            argv = _restricted_windows_argv(command)
+        except (OSError, ValueError, IndexError) as exc:
+            return f"❌ Недопустимая команда белого списка: {type(exc).__name__}"
+        if not argv:
+            return "❌ Недопустимые аргументы встроенной команды."
+    else:
+        # Full mode deliberately permits Windows command interpreter syntax:
+        # pipes, built-ins, redirection, chained commands. This is an
+        # explicit high-risk owner choice, not the default or allowlist path.
+        if os.name == "nt":
+            system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+            executable = str(system_root / "System32" / "cmd.exe")
+            argv = [executable, "/d", "/s", "/c", command]
+        else:
+            import shlex
+            argv = shlex.split(command)
+        if not argv:
+            return "❌ Пустая команда."
+    logger.warning(
+        "[OAUTH EXEC] Windows-command profile=%s argv0=%s (arguments hidden)",
+        "full" if full else "allowlist", Path(argv[0]).name,
+    )
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(WORKSPACE_DIR), stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            return "❌ Команда превысила лимит 15 секунд."
+        return (
+            f"Exit code: {process.returncode}\n"
+            f"STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}\n"
+            f"STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
+        )
+    except (OSError, ValueError) as exc:
+        return f"❌ Не удалось выполнить Windows-команду: {type(exc).__name__}"
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def oauth_windows_command(command: str) -> str:
+    """Run a Windows command immediately in allowlist/full access mode.
+
+    In safe mode this tool is hidden and blocked. Allowlist matches exact
+    owner entries with no command shell; full mode allows arbitrary commands.
+    There is NO extra per-command confirmation or approval ticket.
     """
     client_id = require_execution_permission(
         EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
     if not oauth_execution.can_request(client_id, "windows", command=command):
-        return "❌ Windows command is not on the owner's exact allowlist."
-    if not approval_id:
-        ticket = oauth_execution.request(client_id, "windows", command=command)
-        return (
-            "Approval required. In MCP app open OAuth clients → Pending commands. "
-            f"After approval repeat the same call with approval_id={ticket}. "
-            "Expires in 3 minutes, single use."
-        )
-    if not oauth_execution.consume(approval_id, client_id, "windows", command=command):
-        return "❌ Approval missing, denied, expired, used, or does not match."
-    try:
-        import shlex
-        program = shlex.split(command, posix=os.name != "nt")[0].strip('"')
-        argv = parse_allowed_command(command, frozenset({program.casefold()}))
-        logger.info("[OAUTH WINDOWS] owner-approved command (%s); args redacted", Path(argv[0]).name)
-        proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(WORKSPACE_DIR),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return "❌ Windows command timed out (15 seconds)."
-        return (
-            f"Exit code: {proc.returncode}\n"
-            f"STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}\n"
-            f"STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
-        )
-    except (OSError, ValueError, IndexError) as exc:
-        logger.warning("[OAUTH WINDOWS] failed: %s", type(exc).__name__)
-        return "❌ Approved executable could not be started."
+        return "❌ Эта Windows-команда недоступна в выбранном режиме."
+    return await _oauth_windows_run(command, full=oauth_execution.profile() == "full")
 
 
 @_conditional_tool(OAUTH_ENABLED)
 async def oauth_ssh_command(
-    host: str, command: str, user: str = "", port: int = 22, approval_id: str = "",
+    host: str, command: str, user: str = "", port: int = 22,
 ) -> str:
-    """Execute an exact allowlisted host/command after one-time local GUI approval."""
+    """Run SSH command immediately when the access scenario permits it.
+
+    The default safe mode blocks SSH. Allowlist requires exact host+command.
+    Full access allows arbitrary hosts/commands, but still rejects unknown
+    SSH host keys (Paramiko RejectPolicy).
+    """
     client_id = require_execution_permission(
         EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
     )
@@ -374,26 +429,16 @@ async def oauth_ssh_command(
     if not oauth_execution.can_request(
         client_id, "ssh", command=command, host=host, user=user, port=port
     ):
-        return "❌ SSH host/command is not on the owner's exact allowlist."
-    if not approval_id:
-        ticket = oauth_execution.request(
-            client_id, "ssh", command=command, host=host, user=user, port=port
-        )
-        return (
-            "Approval required. In MCP app open OAuth clients → Pending commands. "
-            f"After approval repeat with approval_id={ticket}. "
-            "Expires in 3 minutes, single use."
-        )
-    if not oauth_execution.consume(
-        approval_id, client_id, "ssh", command=command, host=host, user=user, port=port
-    ):
-        return "❌ Approval missing, denied, expired, used, or mismatched."
-    logger.info("[OAUTH SSH] owner-approved action host=%s port=%s; command redacted", host, port)
+        return "❌ SSH-хост или команда недоступны в выбранном режиме."
+    logger.warning(
+        "[OAUTH EXEC] SSH profile=%s host=%s port=%s (command hidden)",
+        oauth_execution.profile(), host, port,
+    )
     try:
         return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
     except Exception as exc:
         logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
-        return "❌ SSH command failed; details in local server audit log."
+        return "❌ SSH-команда не выполнена; подробности в локальном журнале."
 
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))

@@ -94,7 +94,7 @@ class OAuthGuiTests(unittest.TestCase):
         self.assertEqual(dialog.windows.toPlainText(), "")
         dialog.reset_windows.click()
         self.assertEqual(
-            dialog.windows.toPlainText(), "\\n".join(DEFAULT_WINDOWS_ALLOWLIST)
+            dialog.windows.toPlainText(), "\n".join(DEFAULT_WINDOWS_ALLOWLIST)
         )
         # The reset is a proposed UI change until the user saves.
         self.assertEqual(settings.policy()["windows"], ())

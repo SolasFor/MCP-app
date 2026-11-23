@@ -115,4 +115,9 @@ def _check_backend() -> str:
                     logging.getLogger().removeHandler(handler)
             return type(app).__name__
         finally:
+            # On Windows a RotatingFileHandler keeps its file locked until
+            # explicitly closed; this separate OAuth execution audit handler
+            # must be released before TemporaryDirectory cleanup.
+            if "server" in locals():
+                server.EXEC_AUDIT.close()
             os.chdir(previous)

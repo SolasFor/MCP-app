@@ -86,6 +86,10 @@ class OAuthProviderTests(unittest.TestCase):
         self.assertNotIn(OWNER_SECRET, response.body.decode())
         self.assertIn("A Test Client", response.body.decode())
         self.assertIn("no-store", response.headers["cache-control"])
+        # A browser's same-origin HTML form POST can get Origin: null when the
+        # consent GET specifies no-referrer. Keep referrer information locally
+        # while preventing a cross-origin OAuth callback from seeing it.
+        self.assertEqual(response.headers["referrer-policy"], "same-origin")
 
     def test_cross_origin_and_wrong_secret_rejected(self):
         ticket = self._ticket()
@@ -94,6 +98,11 @@ class OAuthProviderTests(unittest.TestCase):
             form={"request_id": ticket, "owner_token": OWNER_SECRET, "decision": "allow"},
         )))
         self.assertEqual(denial.status_code, 403)
+        opaque = invoke(self.provider.consent(request(
+            "POST", origin="null",
+            form={"request_id": ticket, "owner_token": OWNER_SECRET, "decision": "allow"},
+        )))
+        self.assertEqual(opaque.status_code, 403)
         wrong = invoke(self.provider.consent(request(
             "POST", origin=ISSUER,
             form={"request_id": ticket, "owner_token": "wrong", "decision": "allow"},

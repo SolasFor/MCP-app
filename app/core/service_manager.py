@@ -137,6 +137,7 @@ class ServiceManager(QObject):
         # Строка access-лога uvicorn от нашей же проверки: ... "GET /health HTTP/1.1" 200 ...
         self._health_log_marker = f'"GET {self.health.health_path} '
         self._quic_hint_shown = False
+        self._cancel_hint_shown = False
 
         # Мосты к Cloudflare через прокси. Лог из фоновых потоков мостов: emit сигнала
         # потокобезопасен, Qt доставит строку в поток GUI очередью.
@@ -369,6 +370,7 @@ class ServiceManager(QObject):
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at = {name: None for name in self._procs}
         self._quic_hint_shown = False
+        self._cancel_hint_shown = False
         self._proxy_hint_shown = False
         self._set_quick_url("")
         self.health.start()
@@ -599,6 +601,16 @@ class ServiceManager(QObject):
         if name != TUNNEL:
             return
         low = line.lower()
+        # A canceled proxy request is not proof that the tunnel is offline.
+        # Keep original cloudflared logs, and provide one actionable hint.
+        if "context canceled" in low and not self._cancel_hint_shown:
+            self._cancel_hint_shown = True
+            self._log(
+                "ℹ cloudflared: HTTP-запрос отменён (context canceled). "
+                "Это не обязательно сбой туннеля. Сравните локальный "
+                "http://127.0.0.1:8000/health и публичный HTTPS /health. "
+                "Если оба отвечают 200, вероятна отмена со стороны клиента."
+            )
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)
             if match:

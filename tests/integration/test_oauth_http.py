@@ -139,14 +139,22 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 302)
         consent_url = headers["Location"]
         self.assertEqual(urllib.parse.urlsplit(consent_url).path, "/oauth/consent")
-        status, _, page = req(consent_url)
+        status, consent_headers, page = req(consent_url)
         self.assertEqual(status, 200)
+        # A normal same-origin HTML form POST must send its real Origin, not
+        # Origin: null (which no-referrer could cause in supported browsers).
+        self.assertEqual(consent_headers["Referrer-Policy"], "same-origin")
         self.assertIn(b"MCP integration test", page)
         self.assertNotIn(OWNER.encode(), page)
         ticket = urllib.parse.parse_qs(urllib.parse.urlsplit(consent_url).query)["request_id"][0]
         status, _, _ = req(self.url + "/oauth/consent", "POST",
             data={"request_id": ticket, "owner_token": OWNER, "decision": "allow"},
             headers={"Origin": "https://evil.example.com"})
+        self.assertEqual(status, 403)
+        # Explicit Origin: null or a foreign origin must still be refused.
+        status, _, _ = req(self.url + "/oauth/consent", "POST",
+            data={"request_id": ticket, "owner_token": OWNER, "decision": "allow"},
+            headers={"Origin": "null"})
         self.assertEqual(status, 403)
         status, headers, _ = req(self.url + "/oauth/consent", "POST",
             data={"request_id": ticket, "owner_token": OWNER, "decision": "allow"},

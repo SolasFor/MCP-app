@@ -1,8 +1,8 @@
 """Fixed OAuth tool capability: Windows commands and SSH only.
 
-Every owner-consented client shares the owner-selected global scenario.
-The safe profile exposes no command/SSH tools; whitelist/full expose both.
-No client-specific permission toggles or note/file tools exist.
+Each OAuth client can have an owner-selected profile overriding the global
+default. Safe hides command/SSH tools; whitelist/full expose both.
+There are no note/file tools and no network-accessible permission controls.
 The exact command/host allowlists and one-use local action approval are
 separate mandatory execution safety checks, never permissions to bypass.
 """
@@ -45,7 +45,7 @@ def allowed_tools(
         return BASIC_TOOLS
     # Live read from SQLite on every tools/list and tools/call. Upgrading to
     # full mode never makes stale, unapproved bearer tokens privileged.
-    return OAUTH_TOOLS if execution.profile() != "safe" else BASIC_TOOLS
+    return OAUTH_TOOLS if execution.profile_for(client_id) != "safe" else BASIC_TOOLS
 
 
 def require_execution_permission(

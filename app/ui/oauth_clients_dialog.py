@@ -1,7 +1,7 @@
-"""Local OAuth client management for one global owner-chosen access mode.
+"""Local OAuth client management with an individual access mode per client.
 
-Clients cannot choose or change this global mode. Each is separately OAuth
-authorized and can be revoked. No public administrative HTTP endpoint exists.
+Owner-only GUI controls change encrypted permissions in SQLite. Changes are
+checked on each MCP call; OAuth clients have no network admin route.
 """
 from __future__ import annotations
 
@@ -10,13 +10,12 @@ from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QHBoxLayout, QLabel, QMessageBox,
+    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from backend.oauth_store import OAuthStore, default_store_path
 from backend.oauth_execution import ExecutionApprovals
-from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
 
 
 class OAuthClientsDialog(QDialog):
@@ -40,10 +39,11 @@ class OAuthClientsDialog(QDialog):
         root.addWidget(title)
 
         explanation = QLabel(
-            "Все подтверждённые OAuth-клиенты используют режим доступа, "
-            "выбранный владельцем на главной странице. Нет отдельных прав "
-            "для каждого клиента. В режимах «Белый список» и «Полный доступ» "
-            "команды выполняются сразу, без подтверждения каждого вызова."
+            "Выберите сценарий доступа отдельно для каждого подтверждённого "
+            "OAuth-клиента в колонке «Права». Изменения вступают в силу сразу. "
+            "По умолчанию используется режим с главной страницы, пока для "
+            "клиента не выбран свой. Команды из белого списка и полного "
+            "доступа выполняются без отдельного подтверждения."
         )
         explanation.setWordWrap(True)
         root.addWidget(explanation)
@@ -64,15 +64,13 @@ class OAuthClientsDialog(QDialog):
         footer = QHBoxLayout()
         self.refresh_button = QPushButton("Обновить")
         self.refresh_button.clicked.connect(self.reload)
-        self.policy_button = QPushButton("Разрешённые команды и хосты…")
-        self.policy_button.clicked.connect(self._open_execution_policy)
         self.revoke_button = QPushButton("Отозвать OAuth-доступ")
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
         close_button = QPushButton("Закрыть")
         close_button.clicked.connect(self.accept)
         for btn in (
-            self.refresh_button, self.policy_button, self.revoke_button,
+            self.refresh_button, self.revoke_button,
         ):
             footer.addWidget(btn)
         footer.addStretch(1)
@@ -89,11 +87,6 @@ class OAuthClientsDialog(QDialog):
             )
             return
         self.table.setRowCount(len(clients))
-        mode_name = {
-            "safe": "Безопасный (только server_info)",
-            "allowlist": "Windows + SSH (белый список)",
-            "full": "Полный Windows + SSH",
-        }.get(self.execution.profile(), "Безопасный")
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
             when = (
@@ -101,26 +94,74 @@ class OAuthClientsDialog(QDialog):
                 if approved else "—"
             )
             name = QTableWidgetItem(entry["client_name"])
-            name.setData(Qt.ItemDataRole.UserRole, entry["client_id"])
-            name.setToolTip("ID: " + entry["client_id"])
-            items = (
-                name,
-                QTableWidgetItem("Разрешён" if approved else "Зарегистрирован"),
-                QTableWidgetItem(mode_name if approved else "Нет"),
-                QTableWidgetItem(when),
+            client_id = entry["client_id"]
+            name.setData(Qt.ItemDataRole.UserRole, client_id)
+            name.setToolTip("ID: " + client_id)
+            self.table.setItem(idx, 0, name)
+            self.table.setItem(
+                idx, 1, QTableWidgetItem("Разрешён" if approved else "Зарегистрирован")
             )
-            for col, item in enumerate(items):
-                self.table.setItem(idx, col, item)
+            if approved:
+                selector = QComboBox(self.table)
+                selector.setMinimumWidth(225)
+                selector.addItem("Безопасный", "safe")
+                selector.addItem("Белый список", "allowlist")
+                selector.addItem("Полный доступ", "full")
+                selector.setToolTip(
+                    "Индивидуальные права OAuth-клиента. "
+                    "Белый список настраивается на главной странице."
+                )
+                mode = self.execution.profile_for(client_id)
+                selector.setCurrentIndex(max(selector.findData(mode), 0))
+                selector.currentIndexChanged.connect(
+                    lambda _index, cid=client_id, combo=selector:
+                        self._change_client_profile(cid, combo)
+                )
+                self.table.setCellWidget(idx, 2, selector)
+            else:
+                self.table.setItem(idx, 2, QTableWidgetItem("Нет доступа"))
+            self.table.setItem(idx, 3, QTableWidgetItem(when))
         self.table.resizeColumnsToContents()
+        self.table.setColumnWidth(2, max(245, self.table.columnWidth(2)))
         self._selection_changed()
+
+    def _change_client_profile(self, client_id: str, combo: QComboBox) -> None:
+        try:
+            previous = self.execution.profile_for(client_id)
+            selected = combo.currentData()
+            if selected == previous:
+                return
+            if selected == "full":
+                answer = QMessageBox.warning(
+                    self,
+                    "Полный доступ для OAuth-клиента",
+                    "Вы даёте выбранному клиенту возможность сразу выполнять "
+                    "произвольные Windows-команды и SSH-команды без "
+                    "подтверждения каждого запуска. Это высокий риск: "
+                    "действия выполняются с правами пользователя Windows "
+                    "или SSH-учётной записи.\\n\\nПродолжить?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    combo.blockSignals(True)
+                    combo.setCurrentIndex(combo.findData(previous))
+                    combo.blockSignals(False)
+                    return
+            self.execution.set_client_profile(client_id, selected)
+        except (ValueError, OSError, RuntimeError) as exc:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(max(combo.findData(self.execution.profile_for(client_id)), 0))
+            combo.blockSignals(False)
+            QMessageBox.warning(
+                self, "Права OAuth-клиента",
+                f"Не удалось сохранить сценарий доступа: {type(exc).__name__}"
+            )
 
     def _selection_changed(self) -> None:
         self.revoke_button.setEnabled(
             self.table.currentRow() >= 0 and self.table.item(self.table.currentRow(), 0) is not None
         )
-
-    def _open_execution_policy(self) -> None:
-        ExecutionPolicyDialog(self.execution, self).exec()
 
     def revoke_selected(self) -> None:
         row = self.table.currentRow()

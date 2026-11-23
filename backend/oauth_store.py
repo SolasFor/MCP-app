@@ -100,9 +100,10 @@ def _digest(raw: str) -> str:
 
 
 class OAuthStore:
-    def __init__(self, path: str | Path, issuer: str) -> None:
+    def __init__(self, path: str | Path, issuer: str, resource_url: str) -> None:
         self.path = Path(path).expanduser().resolve()
         self.issuer = issuer.rstrip("/")
+        self.resource_url = resource_url.rstrip("/")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _user_private(self.path.parent, directory=True)
         self._cipher = Fernet(_load_or_create_key(self.path))
@@ -228,9 +229,7 @@ class OAuthStore:
     def save_token(self, token: AccessToken | RefreshToken, kind: str, family: str) -> None:
         if kind not in ("access", "refresh"):
             raise ValueError("Invalid token type")
-        if token.resource.rstrip("/") != self.issuer + "/mcp" and (
-            not token.resource.rstrip("/").startswith(self.issuer + "/")
-        ):
+        if token.resource.rstrip("/") != self.resource_url:
             raise ValueError("OAuth resource mismatch")
         payload = token.model_dump(mode="json", exclude={"token"})
         with self._db() as db:
@@ -263,6 +262,8 @@ class OAuthStore:
                 return None
         payload = self._decrypt(enc)
         payload["token"] = raw
+        if payload.get("resource", "").rstrip("/") != self.resource_url:
+            return None
         cls = AccessToken if kind == "access" else RefreshToken
         return cls.model_validate(payload)
 

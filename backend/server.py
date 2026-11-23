@@ -131,12 +131,11 @@ class HybridAuthMiddleware:
 
     * /health — отвечает сразу, без токена и без записи в лог. По пути, а НЕ по IP:
       через туннель ВСЕ запросы приходят с 127.0.0.1 (cloudflared подключается локально).
-    * ?token=… — если разрешено и токен верный, превращается в заголовок
-      Authorization: Bearer. Только так SDK его примет: его проверка смотрит
-      исключительно в заголовок. Сам токен вырезается из query string, чтобы не
-      попасть в access-лог uvicorn (а значит, в окно GUI).
-    * Всё остальное проверяет SDK: без верного токена /mcp ответит 401 с правильным
-      WWW-Authenticate. Мы только пишем в аудит неудачные попытки.
+    * ?token=… запрещён и удаляется из query string до передачи в SDK
+      и access-логи Uvicorn; OAuth и Bearer работают через заголовок.
+    * Проверку OAuth Bearer выполняет SDK. Нельзя объявлять токен
+      "неверным" только потому, что он отличается от токена владельца.
+      Пишем предупреждение лишь после фактического HTTP 401/403.
     """
 
     def __init__(self, app):
@@ -165,24 +164,34 @@ class HybridAuthMiddleware:
         headers = Headers(scope=scope)
         auth_header = headers.get("authorization", "")
 
-        if auth_header.lower().startswith("bearer "):
-            if not _token_ok(auth_header[7:].strip()):
-                logger.warning(f"Неверный токен в заголовке ← {client[0]} {scope.get('method')} {path}")
-        else:
+        is_bearer = auth_header.lower().startswith("bearer ")
+        # A standard OAuth access token necessarily differs from the local
+        # owner's token. Only the installed SDK can validate its signature,
+        # expiry, resource and client consent. Watch the final HTTP response.
+        # Query-string credentials stay forbidden, even on old installs.
+        if not is_bearer:
             query_token = self._pop_query_token(scope)
             if query_token is not None:
-                if not ALLOW_QUERY_TOKEN:
-                    logger.warning(f"Токен в ссылке отключён в настройках ← {client[0]} {path}")
-                elif _token_ok(query_token):
-                    scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"authorization"]
-                    scope["headers"].append((b"authorization", f"Bearer {query_token}".encode()))
-                else:
-                    logger.warning(f"Неверный токен в ссылке ← {client[0]} {scope.get('method')} {path}")
-            elif path.startswith(MCP_PATH):
-                # Общедоступные /.well-known/… (поиск OAuth-метаданных) не логируем.
-                logger.warning(f"Запрос без токена ← {client[0]} {scope.get('method')} {path} (ответ 401)")
+                logger.warning("Токен в ссылке запрещён ← %s %s", client[0], path)
 
-        await self.app(scope, receive, send)
+        async def observe_auth_result(message):
+            if message["type"] == "http.response.start" and path.rstrip("/") == MCP_PATH:
+                status = message["status"]
+                if status in (401, 403):
+                    if is_bearer:
+                        logger.warning(
+                            "MCP авторизация отклонена HTTP %d ← %s %s %s",
+                            status, client[0], scope.get("method"), path,
+                        )
+                    elif scope.get("method") not in ("HEAD", "OPTIONS"):
+                        # Anonymous HEAD is a common OAuth discovery probe.
+                        logger.info(
+                            "MCP запрос без Bearer отклонён HTTP %d ← %s %s",
+                            status, client[0], scope.get("method"),
+                        )
+            await send(message)
+
+        await self.app(scope, receive, observe_auth_result)
 
     @staticmethod
     def _pop_query_token(scope) -> str | None:

@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
 )
 
 from backend.oauth_store import OAuthStore, default_store_path
+from backend.oauth_execution import ExecutionApprovals
+from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog, ExecutionQueueDialog
 from backend.shared_notes import SharedNotes, default_notes_dir
 
 
@@ -30,11 +32,12 @@ class OAuthClientsDialog(QDialog):
             raise ValueError("Server URL is required to manage OAuth connections")
 
         self.store = OAuthStore(default_store_path(), issuer, public_url)
+        self.execution = ExecutionApprovals(self.store)
         self._clients: dict[str, dict] = {}
         self._updating_checks = False
         self.setWindowTitle("OAuth-клиенты MCP app")
-        self.setMinimumSize(670, 410)
-        self.resize(760, 460)
+        self.setMinimumSize(730, 520)
+        self.resize(800, 560)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 20)
@@ -70,6 +73,16 @@ class OAuthClientsDialog(QDialog):
         permissions.addWidget(self.write_notes_check)
         permissions.addStretch(1)
         root.addLayout(permissions)
+
+        execution_row = QHBoxLayout()
+        self.windows_check = QCheckBox("Windows-команды (каждый запуск подтверждается)")
+        self.ssh_check = QCheckBox("SSH-команды (каждый запуск подтверждается)")
+        self.windows_check.toggled.connect(self._save_execution_grants)
+        self.ssh_check.toggled.connect(self._save_execution_grants)
+        execution_row.addWidget(self.windows_check)
+        execution_row.addWidget(self.ssh_check)
+        execution_row.addStretch(1)
+        root.addLayout(execution_row)
         help_text = QLabel(
             "Разрешения действуют отдельно для каждого OAuth-клиента и только "
             "после вашего подтверждения его подключения. По умолчанию оба выключены. "
@@ -83,6 +96,10 @@ class OAuthClientsDialog(QDialog):
         self.refresh_button.clicked.connect(self.reload)
         self.notes_button = QPushButton("Открыть папку заметок")
         self.notes_button.clicked.connect(self._open_notes_folder)
+        self.policy_button = QPushButton("Списки Windows / SSH…")
+        self.policy_button.clicked.connect(self._open_execution_policy)
+        self.pending_button = QPushButton("Ожидают подтверждения…")
+        self.pending_button.clicked.connect(self._open_execution_queue)
         self.revoke_button = QPushButton("Отозвать доступ")
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
@@ -90,6 +107,8 @@ class OAuthClientsDialog(QDialog):
         self.close_button.clicked.connect(self.accept)
         footer.addWidget(self.refresh_button)
         footer.addWidget(self.notes_button)
+        footer.addWidget(self.policy_button)
+        footer.addWidget(self.pending_button)
         footer.addWidget(self.revoke_button)
         footer.addStretch(1)
         footer.addWidget(self.close_button)
@@ -121,6 +140,7 @@ class OAuthClientsDialog(QDialog):
         item = self.table.item(row, 0) if row >= 0 else None
         client = self._clients.get(item.data(Qt.ItemDataRole.UserRole), {}) if item else {}
         enabled = bool(client.get("approved_at"))
+        execution = self.execution.grants(item.data(Qt.ItemDataRole.UserRole)) if item else (False, False)
         self.revoke_button.setEnabled(bool(item))
         self._updating_checks = True
         try:
@@ -128,6 +148,10 @@ class OAuthClientsDialog(QDialog):
             self.write_notes_check.setChecked(bool(client.get("can_write_notes")))
             self.read_notes_check.setEnabled(enabled)
             self.write_notes_check.setEnabled(enabled)
+            self.windows_check.setChecked(execution[0])
+            self.ssh_check.setChecked(execution[1])
+            self.windows_check.setEnabled(enabled)
+            self.ssh_check.setEnabled(enabled)
         finally:
             self._updating_checks = False
 
@@ -152,6 +176,48 @@ class OAuthClientsDialog(QDialog):
                 self, "OAuth", f"Не удалось сохранить разрешения: {type(exc).__name__}"
             )
             self._selection_changed()
+
+    def _save_execution_grants(self, _checked: bool) -> None:
+        if self._updating_checks:
+            return
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        if item is None:
+            return
+        client_id = item.data(Qt.ItemDataRole.UserRole)
+        current_windows, current_ssh = self.execution.grants(client_id)
+        selected_windows = self.windows_check.isChecked()
+        selected_ssh = self.ssh_check.isChecked()
+        if ((selected_windows and not current_windows) or (selected_ssh and not current_ssh)):
+            answer = QMessageBox.warning(
+                self,
+                "Внимание: удалённое выполнение",
+                "Вы открываете OAuth-клиенту возможность запрашивать НАСТОЯЩИЕ "
+                "Windows/SSH-команды. Даже после этого команды ограничены точными "
+                "списками и КАЖДАЯ требует отдельного локального подтверждения. "
+                "Разрешайте только доверенному клиенту. Продолжить?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self._selection_changed()
+                return
+        try:
+            self.execution.set_grants(
+                client_id, windows=selected_windows, ssh=selected_ssh
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(
+                self, "OAuth", f"Не удалось сохранить права выполнения: {type(exc).__name__}"
+            )
+            self._selection_changed()
+
+    def _open_execution_policy(self) -> None:
+        ExecutionPolicyDialog(self.execution, self).exec()
+        self._selection_changed()
+
+    def _open_execution_queue(self) -> None:
+        ExecutionQueueDialog(self.execution, self).exec()
 
     def _open_notes_folder(self) -> None:
         try:

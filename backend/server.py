@@ -63,7 +63,10 @@ logging.basicConfig(
 logger = logging.getLogger("MCPApp")
 # The dedicated audit log stays local to the server's user data directory.
 # It contains no commands/arguments, stdout, OAuth tokens or SSH credentials.
-EXEC_AUDIT = ExecutionAudit(Path(AUDIT_LOG).with_name("mcp_execution_audit.jsonl"))
+EXEC_AUDIT = ExecutionAudit(
+    os.environ.get("MCP_EXEC_AUDIT_PATH")
+    or Path(AUDIT_LOG).with_name("mcp_execution_audit.jsonl")
+)
 
 
 def _env_flag(name: str, default: bool) -> bool:

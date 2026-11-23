@@ -9,8 +9,9 @@ psutil>=5.9                           # кто занял порт 8000
 pywin32>=306; sys_platform == "win32" # Job Object: убивать всё дерево дочерних процессов
 
 # --- MCP-сервер (backend/server.py) ---
-mcp                                   # MCPServer, AuthSettings, streamable HTTP
+mcp>=2.3,<3                           # MCPServer, transport security, streamable HTTP
 uvicorn
 starlette
 pydantic
-paramiko                              # run_ssh_command
+paramiko                              # SSH commands
+cryptography>=43                       # Fernet encryption of OAuth client metadata (DPAPI key on Windows)

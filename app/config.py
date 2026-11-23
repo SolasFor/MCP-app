@@ -97,7 +97,12 @@ class Settings:
     backend_workdir: str = ""        # пусто = paths.default_backend_workdir()
     # ?token=… в ссылке вместо заголовка Authorization (для клиентов, где заголовок
     # не задать). Токен вырезается из логов.
-    allow_query_token: bool = True
+    allow_query_token: bool = False  # на новых установках секрет не помещаем в URL по умолчанию
+    # Все инструменты, кроме server_info, скрыты в стандартном режиме.
+    # Временный ручной opt-in через settings.json; GUI-переключатели — в отдельном PR.
+    enable_advanced_tools: bool = False
+    enable_execution_tools: bool = False
+    enable_oauth: bool = True  # OAuth DCR + browser consent for read-only external MCP clients
 
     # Поведение
     start_services_on_launch: bool = False
@@ -162,6 +167,14 @@ class Settings:
 
     def sanitize(self) -> None:
         """Подправить значения, которые могли быть отредактированы вручную."""
+        for field in ("allow_query_token", "enable_advanced_tools", "enable_execution_tools", "enable_oauth"):
+            if not isinstance(getattr(self, field), bool):
+                setattr(self, field, False)
+        # Query tokens can leak via logs, history and copied URLs. OAuth
+        # replaces the need for them; disable on existing installs too.
+        self.allow_query_token = False
+        if not self.enable_advanced_tools:
+            self.enable_execution_tools = False
         if self.tunnel_mode not in TUNNEL_MODES:
             self.tunnel_mode = DEFAULT_TUNNEL_MODE
         self.mcp_path = normalize_mcp_path(self.mcp_path)

@@ -1,8 +1,8 @@
 """Асинхронные health-check'и — ни одна проверка не блокирует GUI-поток.
 
-* Сервер: GET http://127.0.0.1:8000/health. Жив = пришёл ЛЮБОЙ HTTP-ответ
-  (200, 404, 401, 405…): значит uvicorn разобрал запрос и event loop не завис.
-  Не жив = соединение отклонено или нет ответа за PROBE_TIMEOUT_MS.
+* Сервер: GET http://127.0.0.1:8000/health. Жив = только HTTP 200.
+  401/404/500 означают ошибку конфигурации или обработчика.
+  Не жив = ошибка статуса или отсутствие ответа за PROBE_TIMEOUT_MS.
   Это надёжнее голого TCP-connect: ядро Windows принимает TCP-соединение
   из backlog даже тогда, когда сам сервер висит.
 * Туннель: cloudflared запускается с --metrics 127.0.0.1:20241, а его эндпоинт /ready
@@ -84,9 +84,8 @@ class HealthMonitor(QObject):
             self._server_reply = None
             reply.deleteLater()
             if self._active:
-                # Статус есть (любой, включая 404) -> сервер ответил.
-                # None -> отказ в соединении / таймаут / обрыв.
-                self.server_health.emit(status is not None)
+                # A response code other than 200 is not a healthy backend.
+                self.server_health.emit(status == 200)
 
         reply.finished.connect(on_finished)
 

@@ -29,6 +29,7 @@ from PyQt6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QKeySequ
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -51,6 +52,11 @@ from app.paths import user_data_dir
 from app.ui import effects, icons, theme
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
+from app.ui.oauth_clients_dialog import OAuthClientsDialog
+from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
+from backend.oauth_store import OAuthStore, default_store_path
+from backend.oauth_execution import ExecutionApprovals
+from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog
 from app.ui.proxy_page import ProxyPage
 from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
@@ -61,8 +67,9 @@ SIDEBAR_WIDTH = 216
 # вроде «(?token=): разрешён» не задевает.
 _QUERY_TOKEN_RE = re.compile(r"(token=)[A-Za-z0-9\-._~+/=]{8,}")
 
-PAGE_OVERVIEW, PAGE_CONNECTION, PAGE_PROXY, PAGE_LOGS, PAGE_SETTINGS = range(5)
-NAV_TITLES = ("Обзор", "Подключение", "Прокси", "Журнал", "Параметры")
+PAGE_OVERVIEW, PAGE_PROXY, PAGE_LOGS, PAGE_SETTINGS = range(4)
+PAGE_CONNECTION = PAGE_OVERVIEW  # old actions now navigate to the unified page
+NAV_TITLES = ("Главная", "Прокси", "Журнал", "Параметры")
 
 OVERVIEW_TEXT = {
     "stopped": ("Готов к запуску", "Сервер и туннель остановлены. Нажмите «Запустить», чтобы открыть доступ из интернета."),
@@ -90,7 +97,11 @@ NO_DOMAIN_HINT = (
     "Свой домен ещё не настроен — сейчас работает временный адрес. Чтобы адрес не менялся, "
     "нажмите «Свой домен»: приложение настроит туннель и DNS по токену API Cloudflare."
 )
-TOKEN_HINT = "Клиенты передают его в заголовке Authorization: Bearer <токен>. Хранится только на этом компьютере."
+TOKEN_HINT = (
+    "OAuth-клиенты подключаются без ручного токена: достаточно MCP-адреса. "
+    "Этот токен владельца нужен только для страницы согласия OAuth или "
+    "ручного заголовка Authorization: Bearer. Не добавляйте его к ссылке."
+)
 CLIENT_HINT = (
     "В клиенте (Claude, ChatGPT, Notion и др.) добавьте MCP-сервер, он же «коннектор». "
     "Поле для OpenAI-совместимого API не подойдёт: такие клиенты запрашивают /v1/models и получают 404."
@@ -201,7 +212,6 @@ class MainWindow(QMainWindow):
 
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_overview())
-        self._stack.addWidget(self._build_connection())
         self._stack.addWidget(self._build_proxy())
         self._stack.addWidget(self._build_logs())
         self._stack.addWidget(self._build_settings())
@@ -342,25 +352,19 @@ class MainWindow(QMainWindow):
         self._ov_copy.clicked.connect(lambda: self._copy(self.manager.public_url, self._ov_copy))
         self._ov_copy_token = _button("Копировать токен")
         self._ov_copy_token.clicked.connect(lambda: self._copy(self.manager.token, self._ov_copy_token))
-        self._ov_copy_full = _button("Ссылка с токеном", "Ghost", "Адрес с ?token=… — для клиентов без заголовков")
-        self._ov_copy_full.clicked.connect(lambda: self._copy(self.manager.url_with_token(), self._ov_copy_full))
         actions.addWidget(self._ov_copy)
         actions.addWidget(self._ov_copy_token)
-        actions.addWidget(self._ov_copy_full)
         actions.addStretch(1)
-        edit = _button("Изменить", "Link")
-        edit.clicked.connect(lambda: self.show_page(PAGE_CONNECTION))
-        actions.addWidget(edit)
         cbox.addLayout(actions)
         cbox.addSpacing(2)
         cbox.addWidget(_label(CLIENT_HINT, "Hint", wrap=True))
         layout.addWidget(card)
+        self._add_connection_cards(layout)
         layout.addStretch(1)
         return page
 
-    # ================================================================== Подключение
-    def _build_connection(self) -> QWidget:
-        page, layout, _t, _l = _page("Подключение", "Как сервер виден из интернета и чем защищён.")
+    # ================================================================== параметры подключения на главной странице
+    def _add_connection_cards(self, layout: QVBoxLayout) -> None:
 
         # --- режим и адрес
         card, box = _card()
@@ -455,23 +459,147 @@ class MainWindow(QMainWindow):
         box.addWidget(self._token_error)
         box.addSpacing(4)
         box.addWidget(_divider())
-        query_row = QHBoxLayout()
-        self._query_check = QCheckBox("Разрешить токен в ссылке (?token=…)")
-        self._query_check.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._query_check.setToolTip(
-            "Для клиентов, в которых нельзя задать заголовок Authorization.\n"
-            "Ссылка с токеном работает как пароль — не публикуйте её."
-        )
-        self._query_check.toggled.connect(self._on_query_toggled)
-        self._copy_full = _button("Копировать ссылку с токеном", "Ghost")
-        self._copy_full.clicked.connect(lambda: self._copy(self.manager.url_with_token(), self._copy_full))
-        query_row.addWidget(self._query_check)
-        query_row.addStretch(1)
-        query_row.addWidget(self._copy_full)
-        box.addLayout(query_row)
+        box.addWidget(_label(
+            "Ссылка с ?token= отключена. Используйте OAuth; для ручных клиентов — "
+            "заголовок Authorization: Bearer.",
+            "Hint", wrap=True,
+        ))
         layout.addWidget(card)
-        layout.addStretch(1)
-        return page
+
+        card, box = _card()
+        box.addWidget(_label("OAuth-подключения", "SectionTitle"))
+        box.addWidget(_label(
+            "Здесь задаётся режим по умолчанию. Для отдельного OAuth-клиента "
+            "можно выбрать другой режим в «Управление OAuth-клиентами…» → «Права». "
+            "Команды в белом списке и полном режиме выполняются сразу.",
+            "Hint", wrap=True,
+        ))
+        box.addWidget(_label("Сценарий доступа по умолчанию", "FieldLabel"))
+        self._access_profile = QComboBox()
+        self._access_profile.addItem("Безопасный — только диагностика", "safe")
+        self._access_profile.addItem("Белый список — только разрешённые команды", "allowlist")
+        self._access_profile.addItem("Полный доступ — любые Windows и SSH-команды", "full")
+        self._access_profile.setEnabled(False)
+        self._access_profile.currentIndexChanged.connect(self._on_access_profile_changed)
+        box.addWidget(self._access_profile)
+        self._access_profile_hint = _label("Запустите MCP-сервер для настройки доступа.", "Hint", wrap=True)
+        box.addWidget(self._access_profile_hint)
+        allowlist_button = _button("Настроить белый список Windows / SSH…")
+        allowlist_button.clicked.connect(self._open_allowlist)
+        box.addWidget(allowlist_button)
+        manage_clients = _button("Управление OAuth-клиентами…", "Accent")
+        manage_clients.clicked.connect(self._open_oauth_clients)
+        box.addWidget(manage_clients)
+        diagnostics = _button("Проверить MCP, OAuth и Cloudflare…")
+        diagnostics.clicked.connect(self._open_connection_diagnostics)
+        box.addWidget(diagnostics)
+        layout.addWidget(card)
+
+    def _execution_store(self) -> ExecutionApprovals | None:
+        url = self.manager.public_url
+        if not url:
+            return None
+        parts = urlsplit(url)
+        if parts.scheme not in ("https", "http") or not parts.netloc:
+            return None
+        issuer = f"{parts.scheme}://{parts.netloc}"
+        return ExecutionApprovals(OAuthStore(default_store_path(), issuer, url))
+
+    def _refresh_access_profile(self) -> None:
+        try:
+            execution = self._execution_store()
+            mode = execution.profile() if execution else "safe"
+            self._access_profile.setEnabled(execution is not None)
+            index = self._access_profile.findData(mode)
+            self._access_profile.blockSignals(True)
+            self._access_profile.setCurrentIndex(max(index, 0))
+            self._access_profile.blockSignals(False)
+            hints = {
+                "safe": "По умолчанию: только server_info. Клиенты с индивидуальными настройками сохраняют свои права.",
+                "allowlist": "Без подтверждения: только точные команды Windows и SSH-хосты/команды из белого списка.",
+                "full": "ВНИМАНИЕ: клиенты без индивидуальных ограничений могут выполнять любые Windows/SSH-команды.",
+            }
+            self._access_profile_hint.setText(hints[mode] if execution else
+                "Сначала запустите сервер и дождитесь публичного MCP-адреса.")
+        except Exception as exc:
+            self._access_profile.setEnabled(False)
+            self._access_profile_hint.setText(
+                f"Ошибка загрузки профиля: {type(exc).__name__}"
+            )
+
+    def _on_access_profile_changed(self, _index: int) -> None:
+        mode = self._access_profile.currentData()
+        try:
+            execution = self._execution_store()
+            if not execution or mode == execution.profile():
+                return
+            if mode == "full":
+                answer = QMessageBox.warning(
+                    self,
+                    "Полный доступ без подтверждений",
+                    "OAuth-клиенты без индивидуального режима смогут сразу выполнять "
+                    "произвольные Windows-команды на этом компьютере и SSH-команды "
+                    "на доверенных хостах без подтверждения каждого действия. "
+                    "Команды работают с правами текущего пользователя. "
+                    "Это высокий риск при доступе через интернет.\n\n"
+                    "Включить полный доступ?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self._refresh_access_profile()
+                    return
+            execution.set_profile(mode)
+            self._refresh_access_profile()
+        except (ValueError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Режим доступа",
+                                f"Не удалось сохранить режим: {type(exc).__name__}")
+            self._refresh_access_profile()
+
+    def _open_allowlist(self) -> None:
+        try:
+            execution = self._execution_store()
+            if execution is None:
+                QMessageBox.information(self, "Белый список",
+                    "Сначала запустите MCP-сервер и дождитесь публичного адреса.")
+                return
+            ExecutionPolicyDialog(execution, self).exec()
+        except (ValueError, OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Белый список",
+                                f"Не удалось открыть: {type(exc).__name__}")
+
+    def _open_oauth_clients(self) -> None:
+        if not self.manager.public_url:
+            QMessageBox.information(
+                self, "OAuth-подключения",
+                "Сначала запустите сервер: нужен его текущий публичный адрес.",
+            )
+            return
+        try:
+            dialog = OAuthClientsDialog(self.manager.public_url, parent=self)
+            dialog.exec()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "OAuth-подключения",
+                f"Не удалось открыть список OAuth-клиентов: {type(exc).__name__}",
+            )
+
+    def _open_connection_diagnostics(self) -> None:
+        public_url = self.manager.public_url
+        if not public_url:
+            QMessageBox.information(
+                self, "Диагностика",
+                "Сначала запустите сервер и дождитесь получения публичного адреса.",
+            )
+            return
+        dialog = ConnectionDiagnosticsDialog(
+            public_url,
+            self.settings.server_port,
+            self.settings.server_health_path,
+            self.manager.token,
+            self,
+        )
+        dialog.exec()
 
     # ================================================================== Прокси
     def _build_proxy(self) -> QWidget:
@@ -686,10 +814,8 @@ class MainWindow(QMainWindow):
         self._url_edit.setText(self.manager.public_url)
         self._url_save.hide()
         self._set_field_error(self._url_edit, self._url_error, None)
-        self._query_check.blockSignals(True)
-        self._query_check.setChecked(s.allow_query_token)
-        self._query_check.blockSignals(False)
         self._refresh_address()
+        self._refresh_access_profile()
         self._refresh_services()
 
     def _on_public_url(self, url: str) -> None:
@@ -697,6 +823,7 @@ class MainWindow(QMainWindow):
         if self.settings.is_quick_tunnel or not self._url_save.isVisible():
             self._url_edit.setText(url)
         self._refresh_address()
+        self._refresh_access_profile()
         self._refresh_services()
         self._on_overall(self.manager.overall)
 
@@ -712,12 +839,8 @@ class MainWindow(QMainWindow):
                 placeholder = "Адрес своего домена не указан — «Изменить»"
             self._ov_url.setText(placeholder)
             self._ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
-        allowed = self.settings.allow_query_token
         for button in (self._url_copy, self._ov_copy):
             button.setEnabled(bool(url))
-        for button in (self._copy_full, self._ov_copy_full):
-            button.setVisible(allowed)
-            button.setEnabled(allowed and bool(url) and bool(self.manager.token))
 
     def _on_url_edited(self, text: str) -> None:
         self._url_save.setVisible(text.strip() != self.settings.public_url)
@@ -796,10 +919,6 @@ class MainWindow(QMainWindow):
 
     def _on_token_changed(self) -> None:
         self._load_token_into_field()
-        self._refresh_address()
-
-    def _on_query_toggled(self, enabled: bool) -> None:
-        self.manager.set_allow_query_token(enabled)
         self._refresh_address()
 
     def _redact(self, line: str) -> str:

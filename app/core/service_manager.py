@@ -137,6 +137,7 @@ class ServiceManager(QObject):
         # Строка access-лога uvicorn от нашей же проверки: ... "GET /health HTTP/1.1" 200 ...
         self._health_log_marker = f'"GET {self.health.health_path} '
         self._quic_hint_shown = False
+        self._cancel_hint_shown = False
 
         # Мосты к Cloudflare через прокси. Лог из фоновых потоков мостов: emit сигнала
         # потокобезопасен, Qt доставит строку в поток GUI очередью.
@@ -206,8 +207,8 @@ class ServiceManager(QObject):
         return self._token
 
     def url_with_token(self) -> str:
-        url = self.public_url
-        return f"{url}?token={self._token}" if url and self._token else url
+        """Deprecated compatibility helper: never expose owner Bearer in a URL."""
+        return self.public_url
 
     def cloudflared_path(self) -> str | None:
         return resolve_cloudflared(self.settings.cloudflared_path)
@@ -369,6 +370,7 @@ class ServiceManager(QObject):
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at = {name: None for name in self._procs}
         self._quic_hint_shown = False
+        self._cancel_hint_shown = False
         self._proxy_hint_shown = False
         self._set_quick_url("")
         self.health.start()
@@ -449,10 +451,15 @@ class ServiceManager(QObject):
         return {
             "MCP_SECRET_TOKEN": self._token,
             "MCP_PUBLIC_URL": self.public_url,
+            "MCP_PATH": s.mcp_path,
             "MCP_HOST": s.server_host,
             "MCP_PORT": str(s.server_port),
             "MCP_HEALTH_PATH": s.server_health_path,
-            "MCP_ALLOW_QUERY_TOKEN": "1" if s.allow_query_token else "0",
+            "MCP_ALLOW_QUERY_TOKEN": "0",
+            "MCP_ENABLE_ADVANCED": "1" if s.enable_advanced_tools else "0",
+            "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
+            "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
+            "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
             "MCP_JSON_RESPONSE": "1" if self.is_quick else "0",
         }
@@ -593,6 +600,16 @@ class ServiceManager(QObject):
         if name != TUNNEL:
             return
         low = line.lower()
+        # A canceled proxy request is not proof that the tunnel is offline.
+        # Keep original cloudflared logs, and provide one actionable hint.
+        if "context canceled" in low and not self._cancel_hint_shown:
+            self._cancel_hint_shown = True
+            self._log(
+                "ℹ cloudflared: HTTP-запрос отменён (context canceled). "
+                "Это не обязательно сбой туннеля. Сравните локальный "
+                "http://127.0.0.1:8000/health и публичный HTTPS /health. "
+                "Если оба отвечают 200, вероятна отмена со стороны клиента."
+            )
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)
             if match:

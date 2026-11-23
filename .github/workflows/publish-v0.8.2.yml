@@ -1,0 +1,107 @@
+name: Publish official MCP app v0.8.2
+
+# The explicitly marked release merge commit is the only automatic trigger.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-v0.8.2
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    if: contains(github.event.head_commit.message, '[publish-release]')
+    name: Verify MCP/OAuth (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Linux Qt libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q backend app tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests/unit -p "test_*.py" -v
+      - name: MCP HTTP and Qt integration tests
+        run: python -m unittest discover -s tests/integration -p "test_*.py" -v
+
+  publish:
+    name: Build Windows and publish v0.8.2
+    needs: tests
+    runs-on: windows-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check release version and prevent overwrites
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $value = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($value -ne "0.8.2") { throw "Unexpected app version: $value" }
+          gh release view "v0.8.2" --repo $env:GITHUB_REPOSITORY --json name 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "v0.8.2 already exists, refusing to overwrite release" }
+          Write-Host "Publishing new release from $env:GITHUB_SHA"
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+      - name: Build exe, bundle verified cloudflared, and self-test
+        shell: pwsh
+        run: |
+          ./packaging/build.ps1 -Python python
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+      - name: Validate outputs and create SHA-256 checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = @("dist/MCPApp-Setup-0.8.2.exe", "dist/MCPApp-0.8.2-portable.zip")
+          foreach ($file in $files) { if (-not (Test-Path $file)) { throw "Missing release file $file" } }
+          $report = Get-Content "build/selftest.txt" -Raw -Encoding UTF8
+          if ($report -notmatch 'RESULT OK') { throw "Built EXE self-test was not successful" }
+          $hashes = @()
+          foreach ($file in $files) {
+            $sha = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $name = Split-Path $file -Leaf
+            $hashes += "$sha  $name"
+            Write-Host "$name SHA256=$sha"
+          }
+          $hashes | Set-Content "dist/SHA256SUMS.txt" -Encoding ASCII
+      - name: Preserve build artifacts in Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCPApp-v0.8.2-Windows
+          path: |
+            dist/MCPApp-Setup-0.8.2.exe
+            dist/MCPApp-0.8.2-portable.zip
+            dist/SHA256SUMS.txt
+            build/selftest.txt
+          if-no-files-found: error
+          retention-days: 60
+      - name: Create official GitHub Release and attach binaries
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.8.2 "dist/MCPApp-Setup-0.8.2.exe" "dist/MCPApp-0.8.2-portable.zip" "dist/SHA256SUMS.txt" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "MCP app v0.8.2" --notes-file "docs/releases/v0.8.2.md" --latest
+          if ($LASTEXITCODE -ne 0) { throw "GitHub Release publication failed" }
+          gh release view v0.8.2 --repo $env:GITHUB_REPOSITORY --json url,assets

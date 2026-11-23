@@ -469,12 +469,12 @@ class MainWindow(QMainWindow):
         card, box = _card()
         box.addWidget(_label("OAuth-подключения", "SectionTitle"))
         box.addWidget(_label(
-            "Один общий режим для всех подтверждённых OAuth-клиентов. "
-            "Выберите уровень доступа; команды в белом списке и полном режиме "
-            "выполняются сразу без дополнительного подтверждения.",
+            "Здесь задаётся режим по умолчанию. Для отдельного OAuth-клиента "
+            "можно выбрать другой режим в «Управление OAuth-клиентами…» → «Права». "
+            "Команды в белом списке и полном режиме выполняются сразу.",
             "Hint", wrap=True,
         ))
-        box.addWidget(_label("Сценарий доступа", "FieldLabel"))
+        box.addWidget(_label("Сценарий доступа по умолчанию", "FieldLabel"))
         self._access_profile = QComboBox()
         self._access_profile.addItem("Безопасный — только диагностика", "safe")
         self._access_profile.addItem("Белый список — только разрешённые команды", "allowlist")
@@ -515,9 +515,9 @@ class MainWindow(QMainWindow):
             self._access_profile.setCurrentIndex(max(index, 0))
             self._access_profile.blockSignals(False)
             hints = {
-                "safe": "По умолчанию: только server_info. Команды Windows и SSH недоступны.",
+                "safe": "По умолчанию: только server_info. Клиенты с индивидуальными настройками сохраняют свои права.",
                 "allowlist": "Без подтверждения: только точные команды Windows и SSH-хосты/команды из белого списка.",
-                "full": "ВНИМАНИЕ: подключённые OAuth-клиенты могут выполнять любые команды с правами пользователя Windows или SSH.",
+                "full": "ВНИМАНИЕ: клиенты без индивидуальных ограничений могут выполнять любые Windows/SSH-команды.",
             }
             self._access_profile_hint.setText(hints[mode] if execution else
                 "Сначала запустите сервер и дождитесь публичного MCP-адреса.")
@@ -537,7 +537,7 @@ class MainWindow(QMainWindow):
                 answer = QMessageBox.warning(
                     self,
                     "Полный доступ без подтверждений",
-                    "Любой авторизованный OAuth-клиент сможет сразу выполнять "
+                    "OAuth-клиенты без индивидуального режима смогут сразу выполнять "
                     "произвольные Windows-команды на этом компьютере и SSH-команды "
                     "на доверенных хостах без подтверждения каждого действия. "
                     "Команды работают с правами текущего пользователя. "

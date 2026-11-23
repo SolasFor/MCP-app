@@ -275,6 +275,30 @@ class OAuthStore:
                              (_digest(raw), self.issuer)).fetchone()
         return row[0] if row else None
 
+    def consume_refresh(self, raw: str, client_id: str) -> str | None:
+        """Single-use refresh token rotation across concurrent backend requests.
+
+        The old token family is removed under BEGIN IMMEDIATE so simultaneous
+        refresh exchanges cannot both succeed for the same token.
+        """
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT family,expires_at FROM tokens
+                   WHERE digest=? AND issuer=? AND kind='refresh' AND client_id=?""",
+                (_digest(raw), self.issuer, client_id),
+            ).fetchone()
+            active = db.execute(
+                "SELECT 1 FROM clients WHERE issuer=? AND client_id=?",
+                (self.issuer, client_id),
+            ).fetchone()
+            if not row or not active or (row[1] and row[1] < time.time()):
+                return None
+            family = row[0]
+            db.execute("DELETE FROM tokens WHERE issuer=? AND family=?",
+                       (self.issuer, family))
+            return family
+
     def revoke_family(self, family: str) -> None:
         with self._db() as db:
             db.execute("DELETE FROM tokens WHERE issuer=? AND family=?",

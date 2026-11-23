@@ -458,6 +458,7 @@ class ServiceManager(QObject):
             "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
             "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
             "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
+            "MCP_SHARED_NOTES_DIR": str(user_data_dir() / "shared_notes"),
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
             "MCP_JSON_RESPONSE": "1" if self.is_quick else "0",
         }

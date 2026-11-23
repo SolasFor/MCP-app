@@ -90,7 +90,10 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(results[3].passed)
 
     def test_rejects_missing_local_token(self):
-        result = d.probe_connection(RESOURCE, 8000, "/health", "")
+        with patch("app.core.diagnostics._request", return_value=(
+            200, "application/json", b'{"status":"ok"}'
+        )):
+            result = d.probe_connection(RESOURCE, 8000, "/health", "")
         self.assertFalse(result[-1].passed)
         self.assertIn("Токен", result[-1].message)
 

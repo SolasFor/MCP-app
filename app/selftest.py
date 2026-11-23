@@ -55,6 +55,11 @@ def _report_path(argv: list[str]) -> str:
 
 def _check_qt() -> str:
     from PyQt6 import QtCore, QtNetwork, QtWidgets  # noqa: F401
+    # Ensure that the newly added OAuth and connection diagnostic dialogs
+    # were actually included by PyInstaller, without opening any window.
+    from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
+    from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog, ExecutionQueueDialog  # noqa: F401
+    from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR
 
@@ -83,14 +88,24 @@ def _check_backend() -> str:
     os.environ["MCP_SECRET_TOKEN"] = "selftest-token-0123456789abcdef"
     os.environ["MCP_PUBLIC_URL"] = "https://selftest.example.com/mcp"
     os.environ["MCP_JSON_RESPONSE"] = "1"
+    os.environ["MCP_ENABLE_OAUTH"] = "1"
     previous = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
+        # Never touch a real user's encrypted OAuth state during selftest.
+        os.environ["MCP_OAUTH_STORE_PATH"] = str(Path(tmp) / "oauth" / "selftest.sqlite3")
         os.chdir(tmp)
         try:
             import uvicorn  # noqa: F401
             from backend import server
 
             app = server.build_app()
+            if server.oauth_execution is None:
+                raise RuntimeError("OAuth execution approvals are missing")
+            import asyncio
+            registered = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+            expected = {"server_info", "oauth_windows_command", "oauth_ssh_command"}
+            if registered != expected:
+                raise RuntimeError(f"OAuth tool registry mismatch: {registered}")
             # Обработчик лог-файла держит файл открытым — закрываем, иначе tmp не удалится.
             import logging
 

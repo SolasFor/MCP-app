@@ -52,6 +52,7 @@ from app.ui import effects, icons, theme
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
 from app.ui.oauth_clients_dialog import OAuthClientsDialog
+from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog
 from app.ui.proxy_page import ProxyPage
 from app.ui.widgets import LogView, NavButton, StatusDot, StatusRow
 
@@ -475,13 +476,17 @@ class MainWindow(QMainWindow):
         card, box = _card()
         box.addWidget(_label("OAuth-подключения", "SectionTitle"))
         box.addWidget(_label(
-            "Список зарегистрированных клиентов и разрешений для текущего адреса. "
-            "Можно отозвать доступ сразу, не останавливая MCP-сервер.",
+            "Один фиксированный профиль OAuth: Windows + SSH. "
+            "Можно просмотреть клиентов, отозвать OAuth-доступ, "
+            "настроить допустимые команды и подтверждать отдельные запуски.",
             "Hint", wrap=True,
         ))
         manage_clients = _button("Управление OAuth-клиентами…", "Accent")
         manage_clients.clicked.connect(self._open_oauth_clients)
         box.addWidget(manage_clients)
+        diagnostics = _button("Проверить MCP, OAuth и Cloudflare…")
+        diagnostics.clicked.connect(self._open_connection_diagnostics)
+        box.addWidget(diagnostics)
         layout.addWidget(card)
         layout.addStretch(1)
         return page
@@ -501,6 +506,23 @@ class MainWindow(QMainWindow):
                 self, "OAuth-подключения",
                 f"Не удалось открыть список OAuth-клиентов: {type(exc).__name__}",
             )
+
+    def _open_connection_diagnostics(self) -> None:
+        public_url = self.manager.public_url
+        if not public_url:
+            QMessageBox.information(
+                self, "Диагностика",
+                "Сначала запустите сервер и дождитесь получения публичного адреса.",
+            )
+            return
+        dialog = ConnectionDiagnosticsDialog(
+            public_url,
+            self.settings.server_port,
+            self.settings.server_health_path,
+            self.manager.token,
+            self,
+        )
+        dialog.exec()
 
     # ================================================================== Прокси
     def _build_proxy(self) -> QWidget:

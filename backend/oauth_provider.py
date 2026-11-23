@@ -43,7 +43,10 @@ MAX_FORM_BYTES = 4096
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Pragma": "no-cache",
-    "Referrer-Policy": "no-referrer",
+    # no-referrer makes Origin: null on same-origin HTML form POST in browsers.
+    # same-origin retains the correct Origin for consent POST, while preventing
+    # Referer disclosure to the OAuth client's cross-origin redirect URI.
+    "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",

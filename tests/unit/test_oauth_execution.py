@@ -1,15 +1,17 @@
-"""Fixed Windows/SSH capability with local one-time approvals."""
+"""Three execution scenarios, migrations, allowlist and OAuth isolation."""
 from __future__ import annotations
 
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from mcp.shared.auth import OAuthClientInformationFull
 
 from backend.oauth_store import OAuthStore
-from backend.oauth_execution import ExecutionApprovals, _parse_rules
+from backend.oauth_execution import (
+    ExecutionApprovals, DEFAULT_WINDOWS_ALLOWLIST, PROFILE_SAFE,
+    PROFILE_ALLOWLIST, PROFILE_FULL, _parse_rules, windows_whitelisted,
+)
 
 BASE = "https://exec.example.com"
 RESOURCE = BASE + "/mcp"
@@ -20,7 +22,7 @@ class OAuthExecutionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "oauth.db"
         self.store = OAuthStore(self.path, BASE, RESOURCE)
-        self.store.bind_owner("owner-token-unique-for-test")
+        self.store.bind_owner("test-owner-token")
         for cid in ("client-a", "client-b"):
             self.store.save_client(OAuthClientInformationFull(
                 client_id=cid, client_name=cid,
@@ -28,139 +30,106 @@ class OAuthExecutionTests(unittest.TestCase):
                 token_endpoint_auth_method="none",
             ))
         self.store.mark_approved("client-a")
-        self.exec = ExecutionApprovals(self.store)
+        self.policy = ExecutionApprovals(self.store)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _configure(self):
-        self.exec.set_policy(
-            windows="hostname.exe\npython.exe -V",
-            hosts="example.internal",
-            ssh_commands="uptime\nhostname",
+    def test_fresh_default_safe_and_allowlist_preset(self):
+        self.assertEqual(self.policy.profile(), PROFILE_SAFE)
+        self.assertEqual(self.policy.policy()["windows"], DEFAULT_WINDOWS_ALLOWLIST)
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
+        self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="machine.local"))
+
+    def test_allowlist_executes_exact_rules_without_tickets(self):
+        self.policy.set_profile(PROFILE_ALLOWLIST)
+        self.assertTrue(self.policy.can_request("client-a", "windows", command="whoami"))
+        self.assertTrue(self.policy.can_request("client-a", "windows", command="echo any literal text"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="python -c 'print(1)'"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami && danger"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami /priv"))
+        self.assertFalse(self.policy.can_request("client-b", "windows", command="whoami"))
+        self.policy.set_policy(
+            windows="whoami\nhostname.exe",
+            hosts="machine.local", ssh_commands="uptime",
         )
+        self.assertTrue(self.policy.can_request("client-a", "ssh", command="uptime", host="machine.local"))
+        self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="other.local"))
+        self.assertFalse(self.policy.can_request("client-a", "ssh", command="sudo reboot", host="machine.local"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="echo hello"))
 
-    def test_access_is_immutable_and_policy_empty_by_default(self):
-        self.assertTrue(self.exec.client_approved("client-a"))
-        self.assertFalse(self.exec.client_approved("client-b"))
-        self.assertFalse(self.exec.client_approved("mcp-app-user"))
-        self.assertFalse(hasattr(self.exec, "set_grants"))
-        self.assertFalse(hasattr(self.exec, "grants"))
-        self.assertFalse(self.exec.can_request("client-a", "windows", command="hostname.exe"))
-        self._configure()
-        self.assertTrue(self.exec.can_request("client-a", "windows", command="hostname.exe"))
-        self.assertTrue(self.exec.can_request("client-a", "ssh", command="uptime", host="example.internal"))
-        self.assertFalse(self.exec.can_request("client-b", "windows", command="hostname.exe"))
-        self.assertFalse(self.exec.can_request("client-a", "windows", command="hostname.exe -V"))
-        self.assertFalse(self.exec.can_request("client-a", "ssh", command="uptime", host="evil.internal"))
-        self.assertFalse(self.exec.can_request("client-a", "ssh", command="rm -rf /", host="example.internal"))
+    def test_full_executes_arbitrary_command_and_ssh_without_allowlist(self):
+        self.policy.set_profile(PROFILE_FULL)
+        self.assertTrue(self.policy.can_request("client-a", "windows", command="python -c 'print(123)'"))
+        self.assertTrue(self.policy.can_request("client-a", "ssh", command="echo unrestricted", host="new.example"))
+        self.assertFalse(self.policy.can_request("client-b", "ssh", command="echo unrestricted", host="new.example"))
+        self.assertFalse(self.policy.can_request("mcp-app-user", "windows", command="whoami"))
+        # Input bounds still apply to prevent resource abuse and host injection.
+        self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="bad/host"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="x" * 513))
 
-    def test_policy_rejects_wildcards_and_invalid_host(self):
-        for value in ("*.example.com", "abc?", "x" * 513):
-            with self.subTest(value=value[:20]), self.assertRaises(ValueError):
-                _parse_rules(value)
-        for value in ("user@host", "host:22", "host/path"):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                _parse_rules(value, host=True)
+    def test_switch_is_live_and_persistent_per_issuer(self):
+        self.policy.set_profile(PROFILE_FULL)
+        restarted = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
+        self.assertEqual(restarted.profile(), PROFILE_FULL)
+        restarted.set_profile(PROFILE_ALLOWLIST)
+        self.assertEqual(self.policy.profile(), PROFILE_ALLOWLIST)
+        restarted.set_profile(PROFILE_SAFE)
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
 
-    def test_upgrades_remove_legacy_editable_grants(self):
+    def test_old_exact_allowlist_without_profile_fails_closed(self):
+        with self.store._db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO exec_policy VALUES (?,?)",
+                (BASE, self.store._encrypt({
+                    "windows": ["hostname.exe"], "hosts": ["prod.local"],
+                    "ssh_commands": ["uptime"],
+                })),
+            )
+        self.assertEqual(ExecutionApprovals(self.store).profile(), PROFILE_SAFE)
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="hostname.exe"))
+
+    def test_old_approval_tickets_are_invalidated_and_no_ticket_api(self):
         with self.store._db() as db:
             db.execute("""
-                CREATE TABLE exec_grants(
-                    issuer TEXT NOT NULL, client_id TEXT NOT NULL,
-                    can_windows INTEGER NOT NULL, can_ssh INTEGER NOT NULL,
-                    PRIMARY KEY(issuer,client_id)
+                CREATE TABLE IF NOT EXISTS exec_requests(
+                    digest TEXT PRIMARY KEY,issuer TEXT,client_id TEXT,
+                    encrypted BLOB,created INTEGER,expires INTEGER,approved INTEGER
                 )
             """)
             db.execute(
-                "INSERT INTO exec_grants VALUES (?,?,?,?)",
-                (BASE, "client-a", 0, 0),
+                "INSERT INTO exec_requests VALUES (?,?,?,?,?,?,?)",
+                ("old", BASE, "client-a", b"data", 1, 99999999, 1),
             )
-        restarted = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
-        self.assertTrue(restarted.client_approved("client-a"))
+        upgraded = ExecutionApprovals(self.store)
         with self.store._db() as db:
-            count = db.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='exec_grants'"
-            ).fetchone()[0]
+            count = db.execute("SELECT count(*) FROM exec_requests WHERE issuer=?", (BASE,)).fetchone()[0]
         self.assertEqual(count, 0)
+        self.assertFalse(hasattr(upgraded, "request"))
+        self.assertFalse(hasattr(upgraded, "decision"))
+        self.assertFalse(hasattr(upgraded, "consume"))
 
-    def test_ticket_requires_local_approval_exact_command_and_one_use(self):
-        self._configure()
-        ticket = self.exec.request("client-a", "windows", command="hostname.exe")
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-        pending = self.exec.pending()
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["command"], "hostname.exe")
-        self.assertTrue(self.exec.decision(pending[0]["ticket_hash"], approve=True))
-        self.assertFalse(self.exec.consume(ticket, "client-b", "windows", command="hostname.exe"))
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="python.exe -V"))
-        self.assertTrue(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
+    def test_invalid_profile_rejected(self):
+        for value in ("dangerous", None, "FULL", True):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.policy.set_profile(value)
 
-    def test_ssh_ticket_binds_host_user_port_and_command(self):
-        self._configure()
-        ticket = self.exec.request(
-            "client-a", "ssh", command="uptime", host="example.internal",
-            user="alice", port=2222,
-        )
-        self.assertTrue(self.exec.decision(self.exec.pending()[0]["ticket_hash"], approve=True))
-        for params in (
-            {"command": "uptime", "host": "example.internal", "user": "bob", "port": 2222},
-            {"command": "uptime", "host": "example.internal", "user": "alice", "port": 22},
-            {"command": "hostname", "host": "example.internal", "user": "alice", "port": 2222},
-            {"command": "uptime", "host": "other.internal", "user": "alice", "port": 2222},
-        ):
-            self.assertFalse(self.exec.consume(ticket, "client-a", "ssh", **params))
-        self.assertTrue(self.exec.consume(
-            ticket, "client-a", "ssh", command="uptime",
-            host="example.internal", user="alice", port=2222,
-        ))
+    def test_allowlist_rejects_wildcards_and_bad_hosts(self):
+        for value in ("*.example.com", "whoami?", "x" * 513):
+            with self.assertRaises(ValueError):
+                _parse_rules(value)
+        for value in ("user@host", "host:22", "host/path"):
+            with self.assertRaises(ValueError):
+                _parse_rules(value, host=True)
+        self.assertTrue(windows_whitelisted("echo plain text", ("echo",)))
+        self.assertFalse(windows_whitelisted("echo plain text", ("whoami",)))
 
-    def test_denial_and_policy_change_cancel_tickets(self):
-        self._configure()
-        ticket = self.exec.request("client-a", "windows", command="hostname.exe")
-        self.assertTrue(self.exec.decision(self.exec.pending()[0]["ticket_hash"], approve=False))
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-        ticket = self.exec.request("client-a", "windows", command="hostname.exe")
-        self.assertTrue(self.exec.decision(self.exec.pending()[0]["ticket_hash"], approve=True))
-        self.exec.set_policy(windows="hostname.exe", hosts="", ssh_commands="")
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-
-    def test_expiration_is_fail_closed(self):
-        self._configure()
-        with patch("backend.oauth_execution.time.time", return_value=1000):
-            ticket = self.exec.request("client-a", "windows", command="hostname.exe")
-        with patch("backend.oauth_execution.time.time", return_value=1200):
-            self.assertEqual(self.exec.pending(), [])
-            self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-
-    def test_client_revocation_and_owner_rotation_cancel_access(self):
-        self._configure()
-        ticket = self.exec.request("client-a", "windows", command="hostname.exe")
+    def test_revocation_does_not_recreate_client(self):
+        self.policy.set_profile(PROFILE_FULL)
         self.store.revoke_client("client-a")
-        self.assertFalse(self.exec.client_approved("client-a"))
-        self.assertFalse(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
-        self.store.mark_approved("client-b")
-        ticket = self.exec.request("client-b", "windows", command="hostname.exe")
-        self.store.bind_owner("rotated-owner-token")
-        self.assertFalse(self.exec.client_approved("client-b"))
-        self.assertFalse(self.exec.consume(ticket, "client-b", "windows", command="hostname.exe"))
-
-    def test_approval_data_is_encrypted_on_disk(self):
-        self._configure()
-        self.exec.request("client-a", "ssh", command="uptime", host="example.internal")
-        db_data = self.path.read_bytes()
-        for secret in (b"example.internal", b"hostname.exe", b"uptime"):
-            self.assertNotIn(secret, db_data)
-
-    def test_approval_across_independent_process_stores(self):
-        self._configure()
-        ticket = self.exec.request("client-a", "windows", command="hostname.exe")
-        gui_store = OAuthStore(self.path, BASE, RESOURCE)
-        owner_gui = ExecutionApprovals(gui_store)
-        self.assertEqual(owner_gui.policy()["windows"], ("hostname.exe", "python.exe -V"))
-        self.assertTrue(owner_gui.decision(owner_gui.pending()[0]["ticket_hash"], approve=True))
-        self.assertTrue(self.exec.consume(ticket, "client-a", "windows", command="hostname.exe"))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
+        self.store.bind_owner("changed-owner")
+        self.assertFalse(self.policy.client_approved("client-b"))
 
 
 if __name__ == "__main__":

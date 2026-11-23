@@ -32,6 +32,7 @@ def registry(*, advanced: bool = False, execute: bool = False, hosts: str = "", 
         "MCP_JSON_RESPONSE": "1",
         "MCP_ENABLE_ADVANCED": "1" if advanced else "0",
         "MCP_ENABLE_EXECUTION": "1" if execute else "0",
+        "MCP_ENABLE_OAUTH": "0",
         "MCP_ALLOWED_HOSTS": hosts,
         "MCP_ALLOWED_EXECUTABLES": executables,
     })

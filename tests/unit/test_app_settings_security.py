@@ -13,6 +13,11 @@ class SettingsSecurityTests(unittest.TestCase):
         self.assertFalse(settings.enable_advanced_tools)
         self.assertFalse(settings.enable_execution_tools)
 
+    def test_old_query_token_setting_is_disabled_on_upgrade(self) -> None:
+        settings = Settings(allow_query_token=True)
+        settings.sanitize()
+        self.assertFalse(settings.allow_query_token)
+
     def test_execution_cannot_be_enabled_without_advanced(self) -> None:
         settings = Settings(enable_advanced_tools=False, enable_execution_tools=True)
         settings.sanitize()

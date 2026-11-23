@@ -74,6 +74,7 @@ class OAuthHttpTests(unittest.TestCase):
             "MCP_ALLOW_QUERY_TOKEN": "0",
             "MCP_JSON_RESPONSE": "1",
             "MCP_OAUTH_STORE_PATH": str(Path(cls._tempdir.name) / "oauth" / "state.sqlite3"),
+            "MCP_SHARED_NOTES_DIR": str(Path(cls._tempdir.name) / "shared_notes"),
         })
         cls._env = env
         cls._command = [
@@ -238,6 +239,65 @@ class OAuthHttpTests(unittest.TestCase):
             content_type="application/json", headers=base_headers)
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertIn("MCP app ready", body.decode())
+
+        # Per-client permissions are local SQLite grants, not OAuth scopes.
+        # They must update tool discovery and dispatch immediately, without
+        # restarting the server or asking the client to obtain a new token.
+        from backend.oauth_store import OAuthStore
+        from backend.shared_notes import SharedNotes
+        test_root = Path(cls._tempdir.name)
+        notes = SharedNotes(test_root / "shared_notes")
+        notes.write("public.md", "Only the approved OAuth client should read me.")
+        store = OAuthStore(
+            test_root / "oauth" / "state.sqlite3", self.url, self.url + "/mcp"
+        )
+        store.set_note_permissions(client_id, read=True, write=False)
+
+        status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertEqual(
+            {t["name"] for t in json.loads(body)["result"]["tools"]},
+            {"server_info", "shared_notes_list", "shared_note_read"},
+        )
+        read_note = {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                     "params": {"name": "shared_note_read", "arguments": {"name": "public.md"}}}
+        status, _, body = req(self.url + "/mcp", "POST", data=read_note,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertIn("Only the approved OAuth client", body.decode())
+
+        write_note = {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                      "params": {"name": "shared_note_write", "arguments": {
+                          "name": "attempt.txt", "content": "should-not-be-written",
+                      }}}
+        status, _, body = req(self.url + "/mcp", "POST", data=write_note,
+            content_type="application/json", headers=base_headers)
+        self.assertNotIn("should-not-be-written", notes.list_names())
+        self.assertFalse((notes.directory / "attempt.txt").exists())
+        self.assertIn("not permitted", body.decode().lower())
+
+        store.set_note_permissions(client_id, read=False, write=True)
+        status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertEqual(
+            {t["name"] for t in json.loads(body)["result"]["tools"]},
+            {"server_info", "shared_note_write"},
+        )
+        status, _, body = req(self.url + "/mcp", "POST", data=write_note,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertEqual(notes.read("attempt.txt"), "should-not-be-written")
+
+        store.set_note_permissions(client_id, read=False, write=False)
+        status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertEqual(
+            [t["name"] for t in json.loads(body)["result"]["tools"]],
+            ["server_info"],
+        )
 
         status, _, body = req(self.url + "/token", "POST", data={
             "grant_type": "refresh_token", "client_id": client_id,

@@ -1,8 +1,8 @@
 """Local-only, single-use approval workflow for remote OAuth execution.
 
 No internet-exposed admin endpoint: only Windows GUI opens and approves pending
-requests in the same user-owned SQLite database. All privileges are deny-by-default.
-Every requested command must match an exact OWNER-configured template and,
+requests in the same user-owned SQLite database. All OAuth-approved clients have the SAME fixed Windows + SSH capabilities.
+Each executable request must match an exact OWNER-configured template and,
 for SSH, an exact host. Each attempt requires an additional short-lived local
 approval of the exact request; the server does NOT wait over Cloudflare.
 """
@@ -62,13 +62,6 @@ class ExecutionApprovals:
                     issuer TEXT PRIMARY KEY,
                     encrypted BLOB NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS exec_grants(
-                    issuer TEXT NOT NULL,
-                    client_id TEXT NOT NULL,
-                    can_windows INTEGER NOT NULL DEFAULT 0 CHECK(can_windows IN (0,1)),
-                    can_ssh INTEGER NOT NULL DEFAULT 0 CHECK(can_ssh IN (0,1)),
-                    PRIMARY KEY(issuer,client_id)
-                );
                 CREATE TABLE IF NOT EXISTS exec_requests(
                     digest TEXT PRIMARY KEY,
                     issuer TEXT NOT NULL,
@@ -81,13 +74,8 @@ class ExecutionApprovals:
                 CREATE INDEX IF NOT EXISTS idx_exec_pending ON
                     exec_requests(issuer,expires,approved);
             """)
-            # Never inherit grants from a revoked registration or a previously
-            # issued OAuth client with the same ID.
-            db.execute("""
-                DELETE FROM exec_grants
-                WHERE issuer=? AND client_id NOT IN (
-                    SELECT client_id FROM clients WHERE issuer=?
-                )""", (store.issuer, store.issuer))
+            # Existing databases may contain the superseded per-client grant
+            # table. Its values are deliberately ignored: access is fixed.
             db.execute("""
                 DELETE FROM exec_requests
                 WHERE issuer=? AND client_id NOT IN (
@@ -118,35 +106,15 @@ class ExecutionApprovals:
                        (self.store.issuer, encrypted))
             db.execute("DELETE FROM exec_requests WHERE issuer=?", (self.store.issuer,))
 
-    def grants(self, client_id: str) -> tuple[bool, bool]:
-        """An unapproved/revoked client always has no execution privileges."""
+    def client_approved(self, client_id: str) -> bool:
+        """Only browser-consented OAuth clients are allowed to request actions."""
+        if not isinstance(client_id, str) or not client_id or client_id == "mcp-app-user":
+            return False
         with self.store._db() as db:
-            row = db.execute("""
-                SELECT g.can_windows,g.can_ssh FROM exec_grants g
-                JOIN clients c ON c.issuer=g.issuer AND c.client_id=g.client_id
-                WHERE g.issuer=? AND g.client_id=? AND c.approved_at IS NOT NULL
-            """, (self.store.issuer, client_id)).fetchone()
-        return (bool(row[0]), bool(row[1])) if row else (False, False)
-
-    def set_grants(self, client_id: str, *, windows: bool, ssh: bool) -> None:
-        if type(windows) is not bool or type(ssh) is not bool:
-            raise ValueError("Grant values must be booleans")
-        with self.store._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            if not db.execute(
+            return bool(db.execute(
                 "SELECT 1 FROM clients WHERE issuer=? AND client_id=? AND approved_at IS NOT NULL",
                 (self.store.issuer, client_id),
-            ).fetchone():
-                raise ValueError("Cannot grant execution to unapproved client")
-            db.execute("""
-                INSERT INTO exec_grants(issuer,client_id,can_windows,can_ssh)
-                VALUES(?,?,?,?) ON CONFLICT(issuer,client_id) DO UPDATE SET
-                can_windows=excluded.can_windows,can_ssh=excluded.can_ssh
-            """, (self.store.issuer, client_id, int(windows), int(ssh)))
-            # Changing *any* execution permission cancels pending/approved
-            # tickets. The client must submit a new exact request.
-            db.execute("DELETE FROM exec_requests WHERE issuer=? AND client_id=?",
-                       (self.store.issuer, client_id))
+            ).fetchone())
 
     def can_request(self, client_id: str, kind: ActionKind, *,
                     command: str, host: str = "", user: str = "", port: int = 22) -> bool:
@@ -158,12 +126,12 @@ class ExecutionApprovals:
             return False
         if len(user) > 64 or any(ch in user for ch in ("/", "\\", " ", "@", "\x00")):
             return False
-        can_windows, can_ssh = self.grants(client_id)
+        if not self.client_approved(client_id):
+            return False
         policy = self.policy()
         if kind == "windows":
-            return can_windows and command in policy["windows"] and not host and not user
-        return (can_ssh and host in policy["hosts"]
-                and command in policy["ssh_commands"])
+            return command in policy["windows"] and not host and not user
+        return host in policy["hosts"] and command in policy["ssh_commands"]
 
     @staticmethod
     def _action(kind: ActionKind, command: str, host: str, user: str, port: int) -> dict:
@@ -233,9 +201,8 @@ class ExecutionApprovals:
             if not self.can_request(row[0], payload["kind"],
                                     command=payload["command"], host=payload["host"],
                                     user=payload["user"], port=payload["port"]):
-                # Existing transaction holds SQLite reserved lock. can_request
-                # uses its own read connection; no concurrent writer can change
-                # client grants or policy until the transaction commits.
+                # The writer lock prevents another process from changing
+                # client approval or policy while this decision commits.
                 return False
             db.execute("UPDATE exec_requests SET approved=1 WHERE digest=?",
                        (ticket_hash,))

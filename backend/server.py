@@ -18,8 +18,16 @@ from starlette.responses import JSONResponse, Response
 
 if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
+    from .security_policy import (
+        MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
+        parse_allowed_command, workspace_path,
+    )
 else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
+    from security_policy import (
+        MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
+        parse_allowed_command, workspace_path,
+    )
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
@@ -50,7 +58,7 @@ TOKEN_FROM_ENV = bool(SECRET_TOKEN)
 if not SECRET_TOKEN:
     SECRET_TOKEN = secrets.token_urlsafe(24)
     # Только при ручном запуске без GUI: иначе временный токен негде узнать.
-    logger.warning(f"MCP_SECRET_TOKEN не задан! Сгенерирован временный токен: {SECRET_TOKEN}")
+    logger.warning("MCP_SECRET_TOKEN not set: temporary token generated (never logged). Set a token before remote use.")
 
 # The GUI passes the active Quick Tunnel URL and MCP path for each server start.
 MCP_PATH = validate_mcp_path(os.environ.get("MCP_PATH", "/mcp"))
@@ -71,26 +79,18 @@ RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
 # Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
 HEALTH_PATH = os.environ.get("MCP_HEALTH_PATH", "/health")
 # ?token=… в ссылке — для клиентов, в которых нельзя задать заголовок Authorization.
-ALLOW_QUERY_TOKEN = _env_flag("MCP_ALLOW_QUERY_TOKEN", True)
+ALLOW_QUERY_TOKEN = _env_flag("MCP_ALLOW_QUERY_TOKEN", False)
 # Quick Tunnels (trycloudflare.com) не поддерживают SSE — там отвечаем обычным JSON.
 JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudflare.com"))
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
-ALLOWED_HOSTS = {h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()}
-
+# All remote tools use one server-wide Bearer token at present. Keep privileged
+# tools unregistered unless an administrator explicitly opts in.
+ADVANCED_TOOLS = enabled(os.environ.get("MCP_ENABLE_ADVANCED"))
+EXECUTION_TOOLS = ADVANCED_TOOLS and enabled(os.environ.get("MCP_ENABLE_EXECUTION"))
+ALLOWED_HOSTS = exact_allowlist(os.environ.get("MCP_ALLOWED_HOSTS"))
+ALLOWED_EXECUTABLES = exact_allowlist(os.environ.get("MCP_ALLOWED_EXECUTABLES"))
 MAX_OUTPUT_LEN = 8000
-DANGEROUS_PATTERNS = [
-    r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+(/|\*|~)",
-    r"\bmkfs\b",
-    r"\bdd\s+if=",
-    r":\(\)\{\s*:\|:&\s*\};:",
-]
-
-def check_command_safety(command: str) -> str | None:
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, command):
-            return "❌ Заблокировано политикой безопасности (совпадение с запрещенным паттерном)."
-    return None
 
 def truncate_output(text: str) -> str:
     if len(text) <= MAX_OUTPUT_LEN:
@@ -226,7 +226,27 @@ mcp = MCPServer(
 # 4. MCP-РЕСУРСЫ (Контекст)
 # ==========================================
 
-@mcp.resource("system://environment")
+def _advanced_resource(uri: str):
+    def decorator(func):
+        return mcp.resource(uri)(func) if ADVANCED_TOOLS else func
+    return decorator
+
+
+def _conditional_tool(should_register: bool):
+    def decorator(func):
+        return mcp.tool()(func) if should_register else func
+    return decorator
+
+
+@mcp.tool()
+def server_info() -> str:
+    """Safe read-only connectivity check; returns no machine paths or secrets."""
+    return "MCP app ready; transport=streamable-http; profile=standard" if not ADVANCED_TOOLS else (
+        "MCP app ready; transport=streamable-http; profile=advanced"
+    )
+
+
+@_advanced_resource("system://environment")
 def get_environment_info() -> str:
     ssh_config_hosts = []
     ssh_cfg_path = Path.home() / ".ssh" / "config"
@@ -246,35 +266,49 @@ def get_environment_info() -> str:
 # 5. ИНСТРУМЕНТЫ (Tools)
 # ==========================================
 
-@mcp.tool()
+@_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
 async def run_local_command(command: str, timeout: int = 30, cwd: str | None = None) -> str:
-    if err := check_command_safety(command):
-        return err
-    timeout = min(max(timeout, 1), 120)
-    work_dir = Path(cwd).resolve() if cwd else WORKSPACE_DIR
-    logger.info(f"[LOCAL] cwd={work_dir} | cmd={command}")
+    """Execute one explicitly allowlisted executable, without a command shell.
 
+    This is an administrator-only capability. The allowlist must not contain
+    interpreters or programs that can run arbitrary scripts.
+    """
+    try:
+        argv = parse_allowed_command(command, ALLOWED_EXECUTABLES)
+        work_dir = workspace_path(WORKSPACE_DIR, cwd) if cwd else WORKSPACE_DIR
+        if not work_dir.is_dir():
+            return "❌ Рабочая директория не существует."
+    except ValueError as exc:
+        return f"❌ Команда запрещена: {exc}"
+    timeout = min(max(timeout, 1), 120)
+    logger.info("[LOCAL] executable=%s (arguments redacted)", Path(argv[0]).name)
     proc = None
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command, cwd=str(work_dir), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(work_dir), stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        out_str = truncate_output(stdout.decode(errors="replace"))
-        err_str = truncate_output(stderr.decode(errors="replace"))
-        return f"Exit code: {proc.returncode}\n✅ STDOUT:\n{out_str}\n❌ STDERR:\n{err_str}"
+        return (
+            f"Exit code: {proc.returncode}\n✅ STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}"
+            f"\n❌ STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
+        )
     except asyncio.TimeoutError:
-        if proc: proc.kill(); await proc.wait()
+        if proc:
+            proc.kill()
+            await proc.wait()
         return f"❌ Таймаут: команда превысила лимит {timeout} сек."
-    except Exception as e:
-        return f"❌ Ошибка выполнения: {e}"
+    except OSError as exc:
+        return f"❌ Не удалось запустить разрешённую программу: {type(exc).__name__}"
 
 def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) -> str:
     client = paramiko.SSHClient()
     known_hosts = Path.home() / ".ssh" / "known_hosts"
+    client.load_system_host_keys()
     if known_hosts.exists():
         client.load_host_keys(str(known_hosts))
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    # Never trust unknown SSH hosts silently, even in Advanced mode.
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     actual_host, actual_user, actual_port, key_filename = host, user or None, port, None
     ssh_cfg_path = Path.home() / ".ssh" / "config"
@@ -296,40 +330,47 @@ def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) 
     finally:
         client.close()
 
-@mcp.tool()
+@_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_HOSTS))
 async def run_ssh_command(host: str, command: str, user: str = "", port: int = 22, timeout: int = 30) -> str:
-    if ALLOWED_HOSTS and host not in ALLOWED_HOSTS:
-        return f"❌ Отказано: хост '{host}' отсутствует в белом списке."
-    if len(command) > 2000:
-        return "❌ Отказано: команда слишком длинная."
-    if err := check_command_safety(command):
-        return err
-
+    if not allowed_ssh_host(host, ALLOWED_HOSTS):
+        return "❌ Отказано: SSH-хост отсутствует в разрешённом списке."
+    if not (1 <= port <= 65535) or len(command) > 2000 or not command.strip():
+        return "❌ Отказано: недопустимый порт или команда."
     timeout = min(max(timeout, 1), 120)
-    logger.info(f"[SSH] {user or '<from-ssh-config>'}@{host}:{port} | cmd={command}")
+    logger.info("[SSH] host=%s port=%s (command redacted)", host, port)
     try:
         return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, timeout)
-    except Exception as e:
-        return f"❌ SSH Ошибка: {e}"
+    except Exception as exc:
+        logger.warning("SSH call failed: %s", type(exc).__name__)
+        return "❌ SSH операция не выполнена; подробности в журнале администратора."
 
-@mcp.tool()
+@_conditional_tool(ADVANCED_TOOLS)
 def read_workspace_file(relative_path: str) -> str:
-    target = (WORKSPACE_DIR / relative_path).resolve()
-    if not target.is_relative_to(WORKSPACE_DIR):
-        return "❌ Доступ запрещен: выход за пределы WORKSPACE_DIR."
-    if not target.is_file():
-        return f"❌ Файл не найден: {relative_path}"
-    return truncate_output(target.read_text(encoding="utf-8", errors="replace"))
+    try:
+        target = workspace_path(WORKSPACE_DIR, relative_path)
+        if not target.is_file():
+            return "❌ Файл не найден."
+        if target.stat().st_size > 1024 * 1024:
+            return "❌ Файл превышает допустимый размер."
+        return truncate_output(target.read_text(encoding="utf-8", errors="replace"))
+    except (ValueError, OSError) as exc:
+        return f"❌ Доступ к файлу запрещён: {type(exc).__name__}"
 
-@mcp.tool()
+
+@_conditional_tool(ADVANCED_TOOLS)
 def write_workspace_file(relative_path: str, content: str) -> str:
-    target = (WORKSPACE_DIR / relative_path).resolve()
-    if not target.is_relative_to(WORKSPACE_DIR):
-        return "❌ Доступ запрещен: выход за пределы WORKSPACE_DIR."
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    logger.info(f"[FILE WRITE] {target} ({len(content)} bytes)")
-    return f"✅ Файл сохранен: {relative_path} ({len(content)} байт)"
+    if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
+        return "❌ Файл превышает допустимый размер."
+    try:
+        target = workspace_path(WORKSPACE_DIR, relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Resolve again after mkdir to reject paths moved outside the workspace.
+        target = workspace_path(WORKSPACE_DIR, relative_path)
+        target.write_text(content, encoding="utf-8")
+    except (ValueError, OSError) as exc:
+        return f"❌ Запись файла запрещена: {type(exc).__name__}"
+    logger.info("[FILE WRITE] bytes=%d (path redacted)", len(content.encode("utf-8")))
+    return "✅ Файл сохранён в разрешённой рабочей папке."
 
 # ==========================================
 # 6. ЗАПУСК
@@ -351,6 +392,11 @@ def build_app():
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
     logger.info(f"{SERVER_NAME}: {RESOURCE_URL} (слушает {HOST}:{PORT})")
+    logger.info("Tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
+                "advanced" if ADVANCED_TOOLS else "standard",
+                "enabled" if EXECUTION_TOOLS else "disabled",
+                len(ALLOWED_HOSTS) if EXECUTION_TOOLS else 0,
+                len(ALLOWED_EXECUTABLES) if EXECUTION_TOOLS else 0)
     mode = "JSON (временный адрес без SSE)" if JSON_RESPONSE else "SSE"
     query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
     logger.info(f"Ответы: {mode}; токен в ссылке: {query}")

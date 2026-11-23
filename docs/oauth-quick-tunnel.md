@@ -53,11 +53,16 @@ are limited to five per request. Form responses forbid caching and framing.
 - Resource (audience) is the current `MCP_PUBLIC_URL`.
 - An old Quick Tunnel URL's tokens are rejected by the new process.
 
-**Limitations of this PR**: registrations and tokens are intentionally
-process-local. All OAuth clients must re-register and reauthorize after an
-app restart, including named-domain mode. This is not yet a durable production
-authorization server. A later PR must add secure persistent client/token
-storage, revocation management in GUI, and per-client consent/scopes.
+**Storage since PR-05**: OAuth registrations and tokens now survive backend
+restarts with the **same public URL**, using encrypted SQLite and the Windows
+user's DPAPI-protected data key. The GUI can list registered/approved clients
+and revoke access immediately. Quick Tunnel URL rotation still invalidates
+the previous URL's grants. In-progress approval tickets and authorization
+codes remain short-lived and process-local.
+
+Per-client privileged scopes, individual tool-level approvals and a strong
+Windows execution sandbox are **not** implemented. See
+[OAuth persistence and client management](oauth-persistence.md).
 
 ## Security boundary: Standard vs Advanced
 

@@ -52,6 +52,7 @@ class ExecutionAudit:
         self, *, client_id: str, kind: str, profile: str,
         event: str, command: str, host: str = "", port: int | None = None,
         exit_code: int | None = None, duration_ms: int | None = None,
+        action_id: str | None = None,
     ) -> None:
         if kind not in _ALLOWED_KINDS or event not in _ALLOWED_EVENTS:
             raise ValueError("Unsupported execution audit event")
@@ -66,6 +67,10 @@ class ExecutionAudit:
             "event": event,
             "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
         }
+        if action_id is not None:
+            if not re.fullmatch(r"[0-9a-f]{16}", action_id):
+                raise ValueError("Invalid execution action id")
+            payload["action_id"] = action_id
         if host:
             payload["host_sha256"] = hashlib.sha256(host.encode("utf-8")).hexdigest()
         if port is not None:

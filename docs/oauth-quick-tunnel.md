@@ -1,7 +1,8 @@
 # OAuth 2.1 for MCP-app (PR-04 / initial integration)
 
-This implements the first **read-only** OAuth flow through the official
-Python MCP SDK. It is intended for interoperability testing with Gemini
+This uses the official MCP Python SDK OAuth flow. Every owner-approved
+OAuth client receives one non-editable Windows+SSH capability profile.
+Execution is gated separately by exact allowlists and one-use local approval. It is intended for interoperability testing with Gemini
 Developer Mode, Notion, and other OAuth-capable MCP clients. **A successful
 browser authorization does not guarantee a service's own plan/region or SSE
 requirements are met.**
@@ -15,12 +16,14 @@ requirements are met.**
    metadata, then registers itself dynamically using `/register`.
 4. Its authorization browser opens `/authorize`, which redirects to a local
    MCP-app **owner consent page** on the same HTTPS origin.
-5. Check the client name, callback URL, and requested read-only permission.
+5. Check the client name, callback URL, and the requested Windows+SSH capability.
    Enter the **existing owner token displayed in the Windows MCP app** on
    that consent page and click **Allow**. Do not send the token to the client.
 6. The official MCP SDK verifies PKCE S256 during `/token` exchange.
-7. The client receives a short-lived access token with the single scope
-   `mcp:read` and may invoke the safe `server_info` tool.
+7. The client receives a short-lived access token with the compatibility
+   scope `mcp:read` and sees `server_info`, `oauth_windows_command`,
+   and `oauth_ssh_command`. Command execution is NOT automatically allowed:
+   exact allowlists and fresh local GUI approval are mandatory.
 
 The owner token itself remains usable via manual
 `Authorization: Bearer ...` authentication. It is **never placed in an OAuth
@@ -60,16 +63,18 @@ and revoke access immediately. Quick Tunnel URL rotation still invalidates
 the previous URL's grants. In-progress approval tickets and authorization
 codes remain short-lived and process-local.
 
-Per-client privileged scopes, individual tool-level approvals and a strong
-Windows execution sandbox are **not** implemented. See
-[OAuth persistence and client management](oauth-persistence.md).
+Individual execution requests now need local one-time approval (3-minute
+ticket), but Windows execution is **not** isolated in an OS sandbox. See
+[Windows/SSH execution flow](oauth-fixed-windows-ssh.md) and
+[OAuth persistence](oauth-persistence.md).
 
 ## Security boundary: Standard vs Advanced
 
-With OAuth enabled, the server **forces the Standard tool profile** even if
-`enable_advanced_tools=true` is saved in settings. OAuth tokens never grant
-filesystem/command/SSH tools. The log shows a warning when an Advanced
-setting is overridden.
+With OAuth enabled, the server ignores legacy Advanced/Execution toggles
+and exposes one fixed capability set: Windows and SSH **request tools**.
+There are no per-client rights toggles and no arbitrary workspace/note tools.
+Each executable action still requires exact configured allowlist entries and
+fresh local approval. The log warns when a legacy Advanced setting is overridden.
 
 Administrators using Advanced tools with manual Bearer tokens can set
 `enable_oauth=false` and explicitly enable Advanced/Execution flags.
@@ -80,16 +85,17 @@ The OAuth approval secret currently is the existing owner Bearer token.
 password**. Never share it with an app, put it in a URL, or type it on a page
 whose origin is not the current MCP-app HTTPS hostname.
 
-We do not currently isolate privileged work in a Windows sandbox, and this
-OAuth implementation must not be treated as approval for privileged access.
+Actual execution occurs with the Windows user's existing privileges.
+The current design is not an OS sandbox; only authorize trusted OAuth
+clients and inspect each exact command before approving it.
 
 ## Testing
 
 - CI tests the provider's consent requirement, code replay prevention,
   token rotation and revocation, allowed resource, origin checks, and an
   in-memory reset on a new Quick URL.
-- CI checks OAuth routes and the default safe tool registry via the actual
-  installed SDK.
+- CI checks OAuth routes, the fixed Windows+SSH registry, command approval,
+  and one-use ticket behavior via the actual installed SDK.
 - Actual Windows + cloudflared and Gemini / Notion sign-in must still be
   tested manually and documented; plans and regional availability can block
   those integrations independent of server quality.

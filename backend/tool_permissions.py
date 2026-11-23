@@ -1,11 +1,9 @@
-"""Per-client MCP tool visibility and authorization.
+"""Fixed OAuth tool capability: Windows commands and SSH only.
 
-The SDK's middleware hides unauthorized tools during tools/list and denies
-tools/call before dispatch. Every note tool ALSO calls require_note_permission:
-this second check is the security boundary if middleware behavior changes in
-an SDK minor version or a tool is called directly in-process.
-
-The owner's shared Bearer token is never a client permission grant.
+All clients who completed browser-owner consent get the same immutable tool
+visibility. No client-level permission settings or note/file tools exist.
+The exact command/host allowlists and one-use local action approval are
+separate mandatory execution safety checks, never permissions to bypass.
 """
 from __future__ import annotations
 
@@ -22,14 +20,11 @@ except ImportError:
     from oauth_store import OAuthStore
     from oauth_execution import ExecutionApprovals
 
-NOTE_LIST = "shared_notes_list"
-NOTE_READ = "shared_note_read"
-NOTE_WRITE = "shared_note_write"
-NOTES = frozenset({NOTE_LIST, NOTE_READ, NOTE_WRITE})
 EXEC_WINDOWS = "oauth_windows_command"
 EXEC_SSH = "oauth_ssh_command"
 EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH})
-ALWAYS_VISIBLE = frozenset({"server_info"})
+BASIC_TOOLS = frozenset({"server_info"})
+OAUTH_TOOLS = BASIC_TOOLS | EXEC_TOOLS
 FORBIDDEN_TOOL = -32602
 
 
@@ -38,37 +33,16 @@ def allowed_tools(
     principal: Any,
     execution: ExecutionApprovals | None = None,
 ) -> frozenset[str]:
-    """Re-evaluate live SQLite grants on every request, never cache sessions."""
-    basic = ALWAYS_VISIBLE
-    if store is None or principal is None:
-        return basic
-    client_id = getattr(principal, "client_id", "")
-    # The owner token is also accepted as a Bearer token for compatibility.
-    # It must never get per-client grants or turn into a privileged OAuth client.
-    if not isinstance(client_id, str) or client_id == "mcp-app-user" or not client_id:
-        return basic
-    if "mcp:read" not in (getattr(principal, "scopes", None) or []):
-        return basic
-    can_read, can_write = store.get_note_permissions(client_id)
-    allowed = set(basic)
-    if can_read:
-        allowed.update({NOTE_LIST, NOTE_READ})
-    if can_write:
-        allowed.add(NOTE_WRITE)
-    if execution is not None:
-        can_windows, can_ssh = execution.grants(client_id)
-        policy = execution.policy()
-        if can_windows and policy["windows"]:
-            allowed.add(EXEC_WINDOWS)
-        if can_ssh and policy["hosts"] and policy["ssh_commands"]:
-            allowed.add(EXEC_SSH)
-    return frozenset(allowed)
-
-
-def require_note_permission(name: str, store: OAuthStore | None) -> None:
-    """Fail closed on missing identity, client approval, or stale permissions."""
-    if name not in NOTES or name not in allowed_tools(store, get_access_token()):
-        raise PermissionError("OAuth client does not have permission for this note tool")
+    """An approved OAuth principal gets both capabilities; never cache approval."""
+    if store is None or execution is None or principal is None:
+        return BASIC_TOOLS
+    client_id = getattr(principal, "client_id", None)
+    scopes = getattr(principal, "scopes", None) or []
+    if not isinstance(client_id, str) or "mcp:read" not in scopes:
+        return BASIC_TOOLS
+    if not execution.client_approved(client_id):
+        return BASIC_TOOLS
+    return OAUTH_TOOLS
 
 
 def require_execution_permission(
@@ -77,7 +51,7 @@ def require_execution_permission(
 ) -> str:
     principal = get_access_token()
     if tool not in EXEC_TOOLS or tool not in allowed_tools(store, principal, execution):
-        raise PermissionError("OAuth client is not permitted to request remote execution")
+        raise PermissionError("OAuth client is not authorized to request execution")
     return principal.client_id
 
 
@@ -85,28 +59,26 @@ def make_tool_middleware(
     store: OAuthStore | None, execution: ExecutionApprovals | None = None,
 ):
     async def restrict_tools(ctx, call_next):
-        method = ctx.method
-        if method not in ("tools/list", "tools/call"):
+        if ctx.method not in ("tools/list", "tools/call"):
             return await call_next(ctx)
         allowed = allowed_tools(store, get_access_token(), execution)
-        if method == "tools/call":
+        if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
-            if name in NOTES | EXEC_TOOLS and name not in allowed:
-                raise MCPError(code=FORBIDDEN_TOOL, message="This tool is not permitted for this client")
+            if name in EXEC_TOOLS and name not in allowed:
+                raise MCPError(code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client")
             return await call_next(ctx)
         result = await call_next(ctx)
         if isinstance(result, ListToolsResult):
-            # Do not mutate cached SDK response instances in place.
-            return result.model_copy(update={"tools": [t for t in result.tools if t.name in allowed]})
+            return result.model_copy(update={
+                "tools": [tool for tool in result.tools if tool.name in allowed],
+            })
         if isinstance(result, dict) and isinstance(result.get("tools"), list):
-            # SDK 2.x may return a raw mapping from a handler.
             return {**result, "tools": [
                 tool for tool in result["tools"]
                 if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)) in allowed
             ]}
-        # Refuse to send an unfiltered catalog when the SDK changes its result
-        # shape. Handler-level permission checks remain the independent gate.
+        # Avoid leaking unexpected SDK registry types.
         raise MCPError(code=-32603, message="Unrecognized tools/list response type")
 
     return restrict_tools

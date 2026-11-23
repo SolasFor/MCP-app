@@ -207,8 +207,8 @@ class ServiceManager(QObject):
         return self._token
 
     def url_with_token(self) -> str:
-        url = self.public_url
-        return f"{url}?token={self._token}" if url and self._token else url
+        """Deprecated compatibility helper: never expose owner Bearer in a URL."""
+        return self.public_url
 
     def cloudflared_path(self) -> str | None:
         return resolve_cloudflared(self.settings.cloudflared_path)
@@ -455,7 +455,7 @@ class ServiceManager(QObject):
             "MCP_HOST": s.server_host,
             "MCP_PORT": str(s.server_port),
             "MCP_HEALTH_PATH": s.server_health_path,
-            "MCP_ALLOW_QUERY_TOKEN": "1" if s.allow_query_token else "0",
+            "MCP_ALLOW_QUERY_TOKEN": "0",
             "MCP_ENABLE_ADVANCED": "1" if s.enable_advanced_tools else "0",
             "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
             "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",

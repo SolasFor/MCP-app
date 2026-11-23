@@ -16,6 +16,12 @@ import html
 import secrets
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from .oauth_store import OAuthStore
+except ImportError:
+    from oauth_store import OAuthStore
 from urllib.parse import urlencode
 
 from mcp.server.auth.provider import (
@@ -74,7 +80,10 @@ class LocalConsentOAuthProvider(
     administrative tools cannot be enabled together in the same server.
     """
 
-    def __init__(self, issuer: str, resource_url: str, owner_secret: str) -> None:
+    def __init__(
+        self, issuer: str, resource_url: str, owner_secret: str,
+        store_path: str | Path | None = None,
+    ) -> None:
         self.issuer = issuer.rstrip("/")
         self.resource_url = resource_url.rstrip("/")
         self._owner_secret = owner_secret
@@ -84,6 +93,11 @@ class LocalConsentOAuthProvider(
         self.access: dict[str, AccessToken] = {}
         self.refresh: dict[str, RefreshToken] = {}
         self._families: dict[str, str] = {}
+        self.store = OAuthStore(store_path, self.issuer, self.resource_url) if store_path else None
+        if self.store:
+            self.store.remove_old_quick_tunnels()
+            self.store.bind_owner(owner_secret)
+            self.store.prune_expired()
 
     def _cleanup(self) -> None:
         now = time.time()
@@ -100,17 +114,24 @@ class LocalConsentOAuthProvider(
                     self._families.pop(key, None)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self.clients.get(client_id)
+        # Re-read SQLite on every access: GUI revocation must take effect without
+        # an application/server restart, even for already authenticated clients.
+        return self.store.get_client(client_id) if self.store else self.clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        if len(self.clients) >= MAX_CLIENTS:
+        if (self.store.count_clients() if self.store else len(self.clients)) >= MAX_CLIENTS:
             raise RegistrationError("invalid_client_metadata", "Registration capacity reached")
         if not client_info.client_id or client_info.client_id in self.clients:
             raise RegistrationError("invalid_client_metadata", "Invalid client identifier")
-        self.clients[client_info.client_id] = client_info
+        if self.store:
+            self.store.save_client(client_info)
+        else:
+            self.clients[client_info.client_id] = client_info
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
         self._cleanup()
+        if self.store and not self.store.get_client(client.client_id or ""):
+            raise AuthorizeError("unauthorized_client", "Client registration revoked")
         if params.resource is not None and params.resource.rstrip("/") != self.resource_url:
             raise AuthorizeError("invalid_target", "The requested resource is not this MCP server")
         if params.scopes and set(params.scopes) != {READ_SCOPE}:
@@ -202,6 +223,9 @@ class LocalConsentOAuthProvider(
             )
         if decision != "allow":
             return Response(status_code=400, headers=SECURITY_HEADERS)
+        if self.store and not self.store.get_client(pending.client.client_id or ""):
+            del self.pending[digest]
+            return Response("Client access revoked.", status_code=403, headers=SECURITY_HEADERS)
         candidate = (fields.get("owner_token") or [""])[0]
         if not hmac.compare_digest(candidate.encode(), self._owner_secret.encode()):
             pending.attempts += 1
@@ -238,6 +262,11 @@ class LocalConsentOAuthProvider(
         )
         self._families[akey] = family
         self._families[rkey] = family
+        if self.store:
+            # Persist tokens before responding to the client.
+            self.store.save_token(self.access[akey], "access", family)
+            self.store.save_token(self.refresh[rkey], "refresh", family)
+            self.store.mark_approved(client_id)
         return OAuthToken(
             access_token=raw_access, refresh_token=raw_refresh,
             expires_in=ACCESS_SECONDS, token_type="Bearer", scope=" ".join(scopes),
@@ -253,6 +282,8 @@ class LocalConsentOAuthProvider(
             or original.expires_at < time.time() or original != authorization_code
         ):
             raise TokenError("invalid_grant", "Invalid or already used authorization code")
+        if self.store and not self.store.get_client(client.client_id):
+            raise TokenError("invalid_grant", "Client registration revoked")
         return self._issue_tokens(client.client_id, original.scopes, secrets.token_urlsafe(16))
 
     async def load_access_token(self, token: str) -> AccessToken | None:
@@ -263,18 +294,23 @@ class LocalConsentOAuthProvider(
                 resource=self.resource_url, subject="local-owner",
             )
         self._cleanup()
+        if self.store:
+            return self.store.get_token(token, "access")
         return self.access.get(token_digest(token))
 
     async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
         self._cleanup()
-        value = self.refresh.get(token_digest(refresh_token))
+        value = (
+            self.store.get_token(refresh_token, "refresh")
+            if self.store else self.refresh.get(token_digest(refresh_token))
+        )
         return value if value and value.client_id == client.client_id else None
 
     async def exchange_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
     ) -> OAuthToken:
         key = token_digest(refresh_token.token)
-        original = self.refresh.get(key)
+        original = self.store.get_token(refresh_token.token, "refresh") if self.store else self.refresh.get(key)
         if (
             not original or original != refresh_token or original.client_id != client.client_id
             or original.expires_at is not None and original.expires_at < time.time()
@@ -282,13 +318,17 @@ class LocalConsentOAuthProvider(
             raise TokenError("invalid_grant", "Refresh token expired or already used")
         if not set(scopes).issubset(set(original.scopes)):
             raise TokenError("invalid_scope", "Cannot elevate token permissions")
-        family = self._families.get(key, "")
+        family = self.store.family(refresh_token.token) if self.store else self._families.get(key, "")
         if not family:
             raise TokenError("invalid_grant", "Token family not found")
         self._remove_family(family)
+        if self.store and not self.store.get_client(client.client_id):
+            raise TokenError("invalid_grant", "Client registration revoked")
         return self._issue_tokens(client.client_id, scopes, family)
 
     def _remove_family(self, family: str) -> None:
+        if self.store:
+            self.store.revoke_family(family)
         for key, value in list(self._families.items()):
             if value == family:
                 self.access.pop(key, None)
@@ -296,6 +336,6 @@ class LocalConsentOAuthProvider(
                 del self._families[key]
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        family = self._families.get(token_digest(token.token))
+        family = self.store.family(token.token) if self.store else self._families.get(token_digest(token.token))
         if family:
             self._remove_family(family)

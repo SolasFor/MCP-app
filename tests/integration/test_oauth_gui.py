@@ -50,20 +50,39 @@ class OAuthGuiTests(unittest.TestCase):
         self.assertEqual(dialog.table.item(0, 1).text(), "Разрешён")
         dialog.close()
 
-    def test_global_profile_is_reflected_without_client_toggles(self):
+    def test_rights_column_has_per_client_scenario_dropdown(self):
         from backend.oauth_execution import ExecutionApprovals
         dialog = OAuthClientsDialog(RESOURCE)
-        self.assertEqual(dialog.table.item(0, 2).text(), "Безопасный (только server_info)")
-        self.assertFalse(hasattr(dialog, "windows_check"))
-        self.assertFalse(hasattr(dialog, "ssh_check"))
-        self.assertFalse(hasattr(dialog, "pending_button"))
-        self.assertTrue(dialog.policy_button.isEnabled())
-        ExecutionApprovals(self.store).set_profile("allowlist")
+        select = dialog.table.cellWidget(0, 2)
+        self.assertIsNotNone(select)
+        self.assertFalse(hasattr(dialog, "policy_button"))
+        self.assertEqual(
+            [select.itemData(i) for i in range(select.count())],
+            ["safe", "allowlist", "full"],
+        )
+        self.assertEqual(select.currentData(), "safe")
+        select.setCurrentIndex(select.findData("allowlist"))
+        state = ExecutionApprovals(self.store)
+        self.assertEqual(state.profile_for("gui-client-1"), "allowlist")
+        self.assertEqual(state.profile(), "safe")
         dialog.reload()
-        self.assertEqual(dialog.table.item(0, 2).text(), "Windows + SSH (белый список)")
-        ExecutionApprovals(self.store).set_profile("full")
-        dialog.reload()
-        self.assertEqual(dialog.table.item(0, 2).text(), "Полный Windows + SSH")
+        self.assertEqual(dialog.table.cellWidget(0, 2).currentData(), "allowlist")
+        dialog.close()
+
+    def test_full_access_requires_explicit_confirmation_and_can_be_revoked(self):
+        from backend.oauth_execution import ExecutionApprovals
+        dialog = OAuthClientsDialog(RESOURCE)
+        combo = dialog.table.cellWidget(0, 2)
+        full = combo.findData("full")
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.No):
+            combo.setCurrentIndex(full)
+        self.assertEqual(combo.currentData(), "safe")
+        self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "safe")
+        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes):
+            combo.setCurrentIndex(full)
+        self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "full")
+        combo.setCurrentIndex(combo.findData("safe"))
+        self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "safe")
         dialog.close()
 
     def test_revoke_button_revokes_in_live_backend_store(self):

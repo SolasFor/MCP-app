@@ -231,13 +231,10 @@ class OAuthHttpTests(unittest.TestCase):
         status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
             content_type="application/json", headers=base_headers)
         self.assertEqual(status, 200, body.decode(errors="replace"))
+        # New/updated installations must fail closed: only server_info
+        # appears until the owner deliberately selects a stronger profile.
         tools = json.loads(body)["result"]["tools"]
-        # The fixed OAuth profile contains *only* diagnostic + Windows + SSH
-        # tools. They are visible without a separate client rights toggle.
-        self.assertEqual(
-            {t["name"] for t in tools},
-            {"server_info", "oauth_windows_command", "oauth_ssh_command"},
-        )
+        self.assertEqual({tool["name"] for tool in tools}, {"server_info"})
         call_request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                         "params": {"name": "server_info", "arguments": {}}}
         status, _, body = req(self.url + "/mcp", "POST", data=call_request,
@@ -245,71 +242,61 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertIn("MCP app ready", body.decode())
 
-        # The capability is permanently visible but actual execution is
-        # impossible without an exact allowlist + a one-use local approval.
         from backend.oauth_store import OAuthStore
         from backend.oauth_execution import ExecutionApprovals
-        import re
         test_root = Path(cls._tempdir.name)
         store = OAuthStore(test_root / "oauth" / "state.sqlite3",
                            self.url, self.url + "/mcp")
-        approvals = ExecutionApprovals(store)
+        profiles = ExecutionApprovals(store)
         executable = "hostname.exe" if os.name == "nt" else "hostname"
         exec_request = {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                         "params": {"name": "oauth_windows_command",
                                    "arguments": {"command": executable}}}
+
+        # Direct calls to a hidden tool must be blocked before dispatch.
         status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
             content_type="application/json", headers=base_headers)
-        self.assertEqual(status, 200, body.decode(errors="replace"))
-        self.assertIn("not on the owner's exact allowlist", body.decode())
-        self.assertEqual(approvals.pending(), [])
+        self.assertIn("not available", body.decode(errors="replace"))
 
-        approvals.set_policy(
-            windows=executable, hosts="test.example.invalid", ssh_commands="uptime"
-        )
-        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
-            content_type="application/json", headers=base_headers)
-        self.assertEqual(status, 200, body.decode(errors="replace"))
-        match = re.search(r"approval_id=([A-Za-z0-9_-]+)", body.decode())
-        self.assertIsNotNone(match, body.decode(errors="replace"))
-        ticket = match.group(1)
-        self.assertEqual(len(approvals.pending()), 1)
-
-        exec_request["params"]["arguments"]["approval_id"] = ticket
-        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
-            content_type="application/json", headers=base_headers)
-        self.assertIn("Approval missing", body.decode())
-        self.assertTrue(approvals.decision(approvals.pending()[0]["ticket_hash"], approve=True))
-        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
-            content_type="application/json", headers=base_headers)
-        self.assertEqual(status, 200, body.decode(errors="replace"))
-        self.assertIn("Exit code: 0", body.decode())
-
-        # Same ticket cannot be used again, even with identical arguments.
-        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
-            content_type="application/json", headers=base_headers)
-        self.assertIn("Approval missing", body.decode())
-
-        ssh_request = {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
-                       "params": {"name": "oauth_ssh_command", "arguments": {
-                           "host": "test.example.invalid", "command": "uptime",
-                       }}}
-        status, _, body = req(self.url + "/mcp", "POST", data=ssh_request,
-            content_type="application/json", headers=base_headers)
-        self.assertEqual(status, 200, body.decode(errors="replace"))
-        self.assertIn("Approval required", body.decode())
-        pending = approvals.pending()
-        self.assertEqual(len(pending), 1)
-        approvals.decision(pending[0]["ticket_hash"], approve=False)
-
-        # Changing the safety allowlist never changes which OAuth tools exist.
-        approvals.set_policy(windows="", hosts="", ssh_commands="")
+        profiles.set_policy(windows=executable, hosts="test.example.invalid", ssh_commands="uptime")
+        profiles.set_profile("allowlist")
         status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
             content_type="application/json", headers=base_headers)
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertEqual(
             {t["name"] for t in json.loads(body)["result"]["tools"]},
             {"server_info", "oauth_windows_command", "oauth_ssh_command"},
+        )
+
+        # In allowlist mode the command runs IMMEDIATELY: no approval_id.
+        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertIn("Exit code: 0", body.decode(errors="replace"))
+        self.assertNotIn("Approval required", body.decode(errors="replace"))
+
+        exec_request["params"]["arguments"]["command"] = "echo not-on-list"
+        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
+            content_type="application/json", headers=base_headers)
+        self.assertIn("недоступна", body.decode(errors="replace"))
+
+        # Full mode skips command/SSH allowlists but requires the same OAuth
+        # client credentials and retains host-key verification for SSH.
+        profiles.set_profile("full")
+        exec_request["params"]["arguments"]["command"] = "echo full-mode-check"
+        status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertIn("full-mode-check", body.decode(errors="replace"))
+        self.assertIn("Exit code: 0", body.decode(errors="replace"))
+
+        profiles.set_profile("safe")
+        status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
+            content_type="application/json", headers=base_headers)
+        self.assertEqual(status, 200, body.decode(errors="replace"))
+        self.assertEqual(
+            [t["name"] for t in json.loads(body)["result"]["tools"]],
+            ["server_info"],
         )
 
         status, _, body = req(self.url + "/token", "POST", data={

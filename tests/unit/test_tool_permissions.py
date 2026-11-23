@@ -59,6 +59,21 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.exec.set_profile("safe")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
 
+    def test_each_client_has_independent_tool_visibility(self):
+        self.store.mark_approved("beta")
+        self.exec.set_profile("allowlist")
+        self.exec.set_client_profile("alpha", "full")
+        self.exec.set_client_profile("beta", "safe")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("beta"), self.exec), BASIC_TOOLS)
+        self.exec.set_client_profile("alpha", "safe")
+        self.exec.set_client_profile("beta", "allowlist")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("beta"), self.exec), OAUTH_TOOLS)
+        self.exec.set_profile("full")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("beta"), self.exec), OAUTH_TOOLS)
+
     def test_unknown_unapproved_owner_and_missing_scope_deny(self):
         for identity in (
             None, principal("beta"), principal("missing"),

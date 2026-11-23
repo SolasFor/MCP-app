@@ -1,4 +1,12 @@
-# Public MCP tool safety (PR-03)
+# Legacy administrator profiles (OAuth disabled)
+
+> **Актуальный OAuth-режим:** все подтверждённые OAuth-клиенты имеют один
+> неизменяемый профиль **Windows + SSH**, без дополнительных переключателей.
+> Реальное выполнение ограничено точными списками команд и одобрением каждого
+> действия в локальном GUI. Подробнее:
+> [docs/oauth-fixed-windows-ssh.md](oauth-fixed-windows-ssh.md).
+> Дальнейшая информация на этой странице описывает **старый режим
+> `enable_oauth=false`**, а не поведение OAuth-клиентов.
 
 The default public profile intentionally exposes **only** `server_info`.
 It is safe to use it to verify `tools/list` and `tools/call` through

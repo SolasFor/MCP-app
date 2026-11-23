@@ -22,11 +22,9 @@ if __package__:
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .oauth_store import default_store_path
     from .oauth_execution import ExecutionApprovals
-    from .shared_notes import SharedNotes, default_notes_dir
     from .tool_permissions import (
-        NOTE_LIST, NOTE_READ, NOTE_WRITE,
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
-        require_note_permission, require_execution_permission,
+        require_execution_permission,
     )
     from .security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
@@ -37,11 +35,9 @@ else:
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from oauth_store import default_store_path
     from oauth_execution import ExecutionApprovals
-    from shared_notes import SharedNotes, default_notes_dir
     from tool_permissions import (
-        NOTE_LIST, NOTE_READ, NOTE_WRITE,
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
-        require_note_permission, require_execution_permission,
+        require_execution_permission,
     )
     from security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
@@ -242,11 +238,6 @@ oauth_provider = (
     )
     if OAUTH_ENABLED else None
 )
-# A separate private folder for manually shared notes: not the backend's
-# arbitrary WORKSPACE_DIR, not user profile files or administrator tools.
-shared_notes = SharedNotes(
-    os.environ.get("MCP_SHARED_NOTES_DIR") or default_notes_dir()
-) if OAUTH_ENABLED else None
 oauth_execution = ExecutionApprovals(oauth_provider.store) if oauth_provider is not None else None
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
@@ -321,39 +312,6 @@ def get_environment_info() -> str:
 # ==========================================
 # 5. ИНСТРУМЕНТЫ (Tools)
 # ==========================================
-
-@_conditional_tool(OAUTH_ENABLED)
-async def shared_notes_list() -> str:
-    """List names of text/Markdown notes explicitly shared with this OAuth client."""
-    require_note_permission(NOTE_LIST, oauth_provider.store if oauth_provider else None)
-    assert shared_notes is not None
-    names = shared_notes.list_names()
-    return "\n".join(names) if names else "(нет доступных заметок)"
-
-
-@_conditional_tool(OAUTH_ENABLED)
-async def shared_note_read(name: str) -> str:
-    """Read one .txt/.md file from the separate shared_notes folder (max 32 KB)."""
-    require_note_permission(NOTE_READ, oauth_provider.store if oauth_provider else None)
-    assert shared_notes is not None
-    try:
-        return shared_notes.read(name)
-    except (OSError, UnicodeError, ValueError) as exc:
-        return f"❌ Не удалось прочитать заметку: {type(exc).__name__}"
-
-
-@_conditional_tool(OAUTH_ENABLED)
-async def shared_note_write(name: str, content: str) -> str:
-    """Create/update one small note in shared_notes; requires separate write grant."""
-    require_note_permission(NOTE_WRITE, oauth_provider.store if oauth_provider else None)
-    assert shared_notes is not None
-    try:
-        shared_notes.write(name, content)
-    except (OSError, UnicodeError, ValueError) as exc:
-        return f"❌ Не удалось сохранить заметку: {type(exc).__name__}"
-    logger.info("[OAUTH SHARED NOTE WRITE] name redacted (client-specific permission)")
-    return "✅ Заметка сохранена в общей папке."
-
 
 @_conditional_tool(OAUTH_ENABLED)
 async def oauth_windows_command(command: str, approval_id: str = "") -> str:

@@ -11,19 +11,21 @@ import paramiko
 from pydantic import AnyHttpUrl
 from mcp.server import MCPServer
 from mcp.server.auth.provider import AccessToken, TokenVerifier
-from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
 if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
+    from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
     )
 else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
+    from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
@@ -86,8 +88,13 @@ JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudfl
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
-ADVANCED_TOOLS = enabled(os.environ.get("MCP_ENABLE_ADVANCED"))
+OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
+# The existing Bearer token is shared across clients. Advanced tools cannot be
+# co-hosted with this first-stage read-only OAuth authorization server.
+ADVANCED_TOOLS = enabled(os.environ.get("MCP_ENABLE_ADVANCED")) and not OAUTH_ENABLED
 EXECUTION_TOOLS = ADVANCED_TOOLS and enabled(os.environ.get("MCP_ENABLE_EXECUTION"))
+if OAUTH_ENABLED and enabled(os.environ.get("MCP_ENABLE_ADVANCED")):
+    logger.warning("OAuth read-only mode overrides Advanced tools. Disable OAuth to use Advanced locally.")
 ALLOWED_HOSTS = exact_allowlist(os.environ.get("MCP_ALLOWED_HOSTS"))
 ALLOWED_EXECUTABLES = exact_allowlist(os.environ.get("MCP_ALLOWED_EXECUTABLES"))
 MAX_OUTPUT_LEN = 8000
@@ -200,9 +207,15 @@ class SimpleTokenVerifier(TokenVerifier):
 auth_settings = AuthSettings(
     issuer_url=AnyHttpUrl(BASE_URL),
     resource_server_url=AnyHttpUrl(RESOURCE_URL),
-    required_scopes=[],
-    validate_token_resource=True,  # убирает MCPDeprecationWarning; токены для чужого адреса отклоняются
+    required_scopes=[READ_SCOPE] if OAUTH_ENABLED else [],
+    client_registration_options=(
+        ClientRegistrationOptions(enabled=True, valid_scopes=[READ_SCOPE], default_scopes=[READ_SCOPE])
+        if OAUTH_ENABLED else None
+    ),
+    revocation_options=RevocationOptions(enabled=True) if OAUTH_ENABLED else None,
+    validate_token_resource=True,
 )
+oauth_provider = LocalConsentOAuthProvider(BASE_URL, RESOURCE_URL, SECRET_TOKEN) if OAUTH_ENABLED else None
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
@@ -216,11 +229,17 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
     allowed_origins=_allowed_origins,
 )
 
-mcp = MCPServer(
-    SERVER_NAME,
-    token_verifier=SimpleTokenVerifier(),
-    auth=auth_settings,
+# The SDK derives ProviderTokenVerifier automatically from auth_server_provider.
+# Do NOT also pass token_verifier: the two arguments are mutually exclusive.
+mcp = (
+    MCPServer(SERVER_NAME, auth=auth_settings, auth_server_provider=oauth_provider)
+    if oauth_provider is not None
+    else MCPServer(SERVER_NAME, auth=auth_settings, token_verifier=SimpleTokenVerifier())
 )
+if oauth_provider is not None:
+    @mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
+    async def oauth_consent(request):
+        return await oauth_provider.consent(request)
 
 # ==========================================
 # 4. MCP-РЕСУРСЫ (Контекст)
@@ -392,6 +411,8 @@ def build_app():
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
     logger.info(f"{SERVER_NAME}: {RESOURCE_URL} (слушает {HOST}:{PORT})")
+    logger.info("OAuth authorization server: %s (read-only; local consent required)",
+                "enabled" if OAUTH_ENABLED else "disabled")
     logger.info("Tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
                 "advanced" if ADVANCED_TOOLS else "standard",
                 "enabled" if EXECUTION_TOOLS else "disabled",

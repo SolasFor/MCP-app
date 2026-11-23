@@ -50,20 +50,15 @@ class OAuthGuiTests(unittest.TestCase):
         self.assertEqual(dialog.table.item(0, 1).text(), "Разрешён")
         dialog.close()
 
-    def test_per_client_checkboxes_immediately_update_sqlite(self):
+    def test_permissions_are_fixed_and_non_editable(self):
         dialog = OAuthClientsDialog(RESOURCE)
-        dialog.table.selectRow(0)
-        self.assertFalse(dialog.read_notes_check.isChecked())
-        self.assertFalse(dialog.write_notes_check.isChecked())
-        self.assertTrue(dialog.read_notes_check.isEnabled())
-        self.assertTrue(dialog.write_notes_check.isEnabled())
-
-        dialog.read_notes_check.setChecked(True)
-        self.assertEqual(self.store.get_note_permissions("gui-client-1"), (True, False))
-        dialog.write_notes_check.setChecked(True)
-        self.assertEqual(self.store.get_note_permissions("gui-client-1"), (True, True))
-        dialog.read_notes_check.setChecked(False)
-        self.assertEqual(self.store.get_note_permissions("gui-client-1"), (False, True))
+        self.assertEqual(dialog.table.item(0, 2).text(), "Windows + SSH (фиксировано)")
+        self.assertFalse(hasattr(dialog, "windows_check"))
+        self.assertFalse(hasattr(dialog, "ssh_check"))
+        self.assertFalse(hasattr(dialog, "read_notes_check"))
+        self.assertFalse(hasattr(dialog, "write_notes_check"))
+        self.assertTrue(dialog.policy_button.isEnabled())
+        self.assertTrue(dialog.pending_button.isEnabled())
         dialog.close()
 
     def test_revoke_button_revokes_in_live_backend_store(self):

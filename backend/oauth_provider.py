@@ -175,20 +175,37 @@ class LocalConsentOAuthProvider(
             display_name = html.escape(pending.client.client_name or pending.client.client_id or "Unknown client")
             display_uri = html.escape(str(pending.params.redirect_uri))
             safe_ticket = html.escape(ticket, quote=True)
+            # OAuth scope mcp:read is retained for compatibility, but local
+            # scenario may allow command execution. Show the actual policy.
+            mode = "safe"
+            if self.store:
+                try:
+                    from .oauth_execution import ExecutionApprovals
+                except ImportError:
+                    from oauth_execution import ExecutionApprovals
+                mode = ExecutionApprovals(self.store).profile()
+            descriptions = {
+                "safe": "Safe: only server_info; no command execution.",
+                "allowlist": "Allowlist: Windows and SSH commands matching the owner's "
+                             "exact allowlists run immediately without confirmation.",
+                "full": "FULL ACCESS: arbitrary Windows and SSH commands can run "
+                        "immediately with the user's privileges. HIGH RISK.",
+            }
+            mode_description = html.escape(descriptions.get(mode, descriptions["safe"]))
             page = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Authorize MCP app</title></head>
 <body><main><h1>Authorize MCP app access</h1>
 <p>Client: <strong>{display_name}</strong></p>
 <p>Return address: <code>{display_uri}</code></p>
-<p>OAuth scope: <strong>mcp:read</strong>. Once you authorize this client,
-it can request Windows and SSH commands. Every request is limited by the owner's
-exact command/host allowlist and must be approved locally, separately, before
-execution. No filesystem tools are available.</p>
+<p>OAuth compatibility scope: <strong>mcp:read</strong>.</p>
+<p>Current access scenario: <strong>{mode_description}</strong></p>
+<p>The owner can change this server-wide scenario later. Only authorize
+clients you trust; never share the owner token with them.</p>
 <p>Type the owner token shown in your MCP app. Never share this token with the requesting client.</p>
 <form method="post" action="/oauth/consent">
 <input type="hidden" name="request_id" value="{safe_ticket}">
 <label>Owner token <input type="password" name="owner_token" autocomplete="off" required></label>
-<button type="submit" name="decision" value="allow">Allow read-only access</button>
+<button type="submit" name="decision" value="allow">Allow access</button>
 <button type="submit" name="decision" value="deny">Deny</button>
 </form></main></body></html>"""
             return HTMLResponse(page, headers=SECURITY_HEADERS)

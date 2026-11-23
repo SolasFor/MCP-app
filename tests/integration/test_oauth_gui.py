@@ -50,15 +50,20 @@ class OAuthGuiTests(unittest.TestCase):
         self.assertEqual(dialog.table.item(0, 1).text(), "Разрешён")
         dialog.close()
 
-    def test_permissions_are_fixed_and_non_editable(self):
+    def test_global_profile_is_reflected_without_client_toggles(self):
+        from backend.oauth_execution import ExecutionApprovals
         dialog = OAuthClientsDialog(RESOURCE)
-        self.assertEqual(dialog.table.item(0, 2).text(), "Windows + SSH (фиксировано)")
+        self.assertEqual(dialog.table.item(0, 2).text(), "Безопасный (только server_info)")
         self.assertFalse(hasattr(dialog, "windows_check"))
         self.assertFalse(hasattr(dialog, "ssh_check"))
-        self.assertFalse(hasattr(dialog, "read_notes_check"))
-        self.assertFalse(hasattr(dialog, "write_notes_check"))
+        self.assertFalse(hasattr(dialog, "pending_button"))
         self.assertTrue(dialog.policy_button.isEnabled())
-        self.assertTrue(dialog.pending_button.isEnabled())
+        ExecutionApprovals(self.store).set_profile("allowlist")
+        dialog.reload()
+        self.assertEqual(dialog.table.item(0, 2).text(), "Windows + SSH (белый список)")
+        ExecutionApprovals(self.store).set_profile("full")
+        dialog.reload()
+        self.assertEqual(dialog.table.item(0, 2).text(), "Полный Windows + SSH")
         dialog.close()
 
     def test_revoke_button_revokes_in_live_backend_store(self):

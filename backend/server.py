@@ -420,9 +420,41 @@ async def oauth_windows_command(command: str) -> str:
         EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
+    profile = oauth_execution.profile_for(client_id)
     if not oauth_execution.can_request(client_id, "windows", command=command):
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile,
+            event="denied", command=command,
+        )
         return "❌ Эта Windows-команда недоступна в выбранном режиме."
-    return await _oauth_windows_run(command, full=oauth_execution.profile_for(client_id) == "full")
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile,
+        event="started", command=command, action_id=action_id,
+    )
+    try:
+        output = await _oauth_windows_run(command, full=profile == "full")
+    except BaseException:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile,
+            event="failed", command=command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        raise
+    outcome, exit_code = classify_command_output(output)
+    # Shell-free builtins return their output without an exit-code prefix.
+    if profile == "allowlist" and command.strip().split(" ", 1)[0].lower() in (
+        "pwd", "ls", "dir", "echo",
+    ) and not output.startswith("❌"):
+        outcome = "completed"
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile,
+        event=outcome, command=command, action_id=action_id,
+        exit_code=exit_code,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return output
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -439,19 +471,43 @@ async def oauth_ssh_command(
         EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
+    profile = oauth_execution.profile_for(client_id)
     if not oauth_execution.can_request(
         client_id, "ssh", command=command, host=host, user=user, port=port
     ):
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile,
+            event="denied", command=command, host=host, port=port,
+        )
         return "❌ SSH-хост или команда недоступны в выбранном режиме."
-    logger.warning(
-        "[OAUTH EXEC] SSH profile=%s host=%s port=%s (command hidden)",
-        oauth_execution.profile_for(client_id), host, port,
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="ssh", profile=profile,
+        event="started", command=command, host=host, port=port,
+        action_id=action_id,
     )
     try:
-        return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
-    except Exception as exc:
-        logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
-        return "❌ SSH-команда не выполнена; подробности в локальном журнале."
+        output = await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
+    except BaseException as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile,
+            event="failed", command=command, host=host, port=port,
+            action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        if isinstance(exc, Exception):
+            logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
+            return "❌ SSH-команда не выполнена; подробности в локальном журнале."
+        raise
+    outcome, exit_code = classify_command_output(output)
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="ssh", profile=profile,
+        event=outcome, command=command, host=host, port=port,
+        action_id=action_id, exit_code=exit_code,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return output
 
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))

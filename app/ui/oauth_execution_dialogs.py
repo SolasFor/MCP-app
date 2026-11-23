@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from backend.oauth_execution import ExecutionApprovals
+from backend.oauth_execution import ExecutionApprovals, DEFAULT_WINDOWS_ALLOWLIST
 
 
 class ExecutionPolicyDialog(QDialog):
@@ -34,13 +34,26 @@ class ExecutionPolicyDialog(QDialog):
         root.addWidget(warning)
         policy = approvals.policy()
         self.windows = QPlainTextEdit("\n".join(policy["windows"]))
-        self.windows.setPlaceholderText("Например:\nwhoami\nipconfig\nsysteminfo\ndir\nls\npwd\necho")
+        self.windows.setPlaceholderText("\n".join(DEFAULT_WINDOWS_ALLOWLIST))
         self.hosts = QPlainTextEdit("\n".join(policy["hosts"]))
         self.hosts.setPlaceholderText("SSH-хосты или алиасы, по одному в строке")
         self.ssh_commands = QPlainTextEdit("\n".join(policy["ssh_commands"]))
         self.ssh_commands.setPlaceholderText("Точные удалённые команды:\nuptime\nhostname")
+        root.addWidget(QLabel("Windows: точные команды, по одной в строке"))
+        root.addWidget(self.windows)
+        reset_row = QHBoxLayout()
+        self.reset_windows = QPushButton("Восстановить базовые команды")
+        self.reset_windows.setToolTip(
+            "ls, pwd, dir, echo, whoami, ipconfig, systeminfo. "
+            "Изменение сохранится только после нажатия «Сохранить»."
+        )
+        self.reset_windows.clicked.connect(
+            lambda: self.windows.setPlainText("\n".join(DEFAULT_WINDOWS_ALLOWLIST))
+        )
+        reset_row.addWidget(self.reset_windows)
+        reset_row.addStretch(1)
+        root.addLayout(reset_row)
         for label, widget in (
-            ("Windows: точные команды, по одной в строке", self.windows),
             ("SSH: точные разрешённые имена хостов/алиасы", self.hosts),
             ("SSH: точные команды (по строкам)", self.ssh_commands),
         ):

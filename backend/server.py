@@ -1,6 +1,5 @@
 import asyncio
 import hmac
-import inspect
 import logging
 import os
 import re
@@ -13,8 +12,14 @@ from pydantic import AnyHttpUrl
 from mcp.server import MCPServer
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
+
+if __package__:
+    from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
+else:
+    from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
@@ -47,21 +52,21 @@ if not SECRET_TOKEN:
     # Только при ручном запуске без GUI: иначе временный токен негде узнать.
     logger.warning(f"MCP_SECRET_TOKEN не задан! Сгенерирован временный токен: {SECRET_TOKEN}")
 
-MCP_PATH = "/mcp"  # путь streamable-http эндпоинта MCP SDK
-_base_domain = os.environ.get("MCP_BASE_DOMAIN", "https://mcp.souron.space").rstrip("/")
-# Полный публичный адрес: свой домен или временный *.trycloudflare.com от GUI.
-PUBLIC_URL = (os.environ.get("MCP_PUBLIC_URL") or f"{_base_domain}{MCP_PATH}").rstrip("/")
-_public = urlsplit(PUBLIC_URL)
-PUBLIC_HOST = (_public.netloc or "").lower()
-BASE_URL = f"{_public.scheme}://{_public.netloc}"
-# Ровно та же строка, что и в AuthSettings.resource_server_url: при validate_token_resource=True
-# SDK сравнивает с ней AccessToken.resource, и любое расхождение даст 401.
-RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
-
-# Слушаем только localhost: cloudflared работает на этой же машине, а 0.0.0.0 открыл бы
-# run_local_command всей локальной сети. MCP_HOST=0.0.0.0 — если нужен доступ из LAN.
+# The GUI passes the active Quick Tunnel URL and MCP path for each server start.
+MCP_PATH = validate_mcp_path(os.environ.get("MCP_PATH", "/mcp"))
+# Local loopback only by default; cloudflared exposes the public HTTPS endpoint.
 HOST = os.environ.get("MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MCP_PORT", "8000"))
+_base_domain = os.environ.get("MCP_BASE_DOMAIN", "").rstrip("/")
+PUBLIC_URL = validate_public_url(
+    os.environ.get("MCP_PUBLIC_URL")
+    or (f"{_base_domain}{MCP_PATH}" if _base_domain else f"http://127.0.0.1:{PORT}{MCP_PATH}"),
+    MCP_PATH,
+)
+_public = urlsplit(PUBLIC_URL)
+PUBLIC_HOST = (_public.hostname or "").lower()
+BASE_URL = f"{_public.scheme}://{_public.netloc}"
+RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
 
 # Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
 HEALTH_PATH = os.environ.get("MCP_HEALTH_PATH", "/health")
@@ -126,6 +131,15 @@ class HybridAuthMiddleware:
         if path == HEALTH_PATH:
             await JSONResponse({"status": "ok"})(scope, receive, send)
             return
+        # GET streams are optional in Streamable HTTP. Cloudflare Quick Tunnel
+        # does not support SSE; avoid hanging clients in JSON-only mode.
+        if JSON_RESPONSE and path.rstrip("/") == MCP_PATH and scope.get("method") == "GET":
+            await Response(
+                "SSE unavailable on JSON-only transport",
+                status_code=405,
+                headers={"Allow": "POST, DELETE"},
+            )(scope, receive, send)
+            return
 
         client = scope.get("client") or ("?", 0)
         headers = Headers(scope=scope)
@@ -183,14 +197,6 @@ class SimpleTokenVerifier(TokenVerifier):
 # 3. ИНИЦИАЛИЗАЦИЯ СЕРВЕРА
 # ==========================================
 
-def _accepts(func, name: str) -> bool:
-    """Принимает ли функция SDK такой аргумент (параметры меняются между версиями)."""
-    try:
-        return name in inspect.signature(func).parameters
-    except (TypeError, ValueError):
-        return False
-
-
 auth_settings = AuthSettings(
     issuer_url=AnyHttpUrl(BASE_URL),
     resource_server_url=AnyHttpUrl(RESOURCE_URL),
@@ -198,18 +204,22 @@ auth_settings = AuthSettings(
     validate_token_resource=True,  # убирает MCPDeprecationWarning; токены для чужого адреса отклоняются
 )
 
-# Проверку Host/Origin оставляем SDK по умолчанию (с ней всё уже работало): явный
-# белый список Origin мог бы отсечь настоящих клиентов. Защита — Bearer-токен.
-# json_response в зависимости от версии SDK принимает либо конструктор,
-# либо streamable_http_app() — передаём туда, где он есть.
-_transport_options = {"json_response": JSON_RESPONSE}
-_ctor_options = {k: v for k, v in _transport_options.items() if _accepts(MCPServer.__init__, k)}
+# The SDK's localhost-only defaults reject public Cloudflare Host headers
+# with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
+# tunnel hostname (never a wildcard for trycloudflare.com).
+_allowed_hosts, _allowed_origins = transport_allowlists(
+    PUBLIC_URL, PORT, os.environ.get("MCP_ALLOWED_ORIGINS", "")
+)
+TRANSPORT_SECURITY = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=_allowed_hosts,
+    allowed_origins=_allowed_origins,
+)
 
 mcp = MCPServer(
     SERVER_NAME,
     token_verifier=SimpleTokenVerifier(),
     auth=auth_settings,
-    **_ctor_options,
 )
 
 # ==========================================
@@ -327,14 +337,11 @@ def write_workspace_file(relative_path: str, content: str) -> str:
 
 def build_app():
     """Starlette-приложение MCP с нашим middleware снаружи."""
-    app_options = {
-        k: v for k, v in _transport_options.items()
-        if k not in _ctor_options and _accepts(mcp.streamable_http_app, k)
-    }
-    if JSON_RESPONSE and "json_response" not in _ctor_options and "json_response" not in app_options:
-        logger.warning("Эта версия MCP SDK не поддерживает json_response — через временный адрес "
-                       "потоковые (SSE) ответы могут зависать.")
-    app = mcp.streamable_http_app(**app_options)
+    app = mcp.streamable_http_app(
+        json_response=JSON_RESPONSE,
+        streamable_http_path=MCP_PATH,
+        transport_security=TRANSPORT_SECURITY,
+    )
     # add_middleware ставит наш слой СНАРУЖИ middleware SDK: заголовок из ?token=
     # появляется до того, как SDK проверит авторизацию.
     app.add_middleware(HybridAuthMiddleware)

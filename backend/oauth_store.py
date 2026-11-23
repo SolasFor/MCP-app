@@ -150,7 +150,7 @@ class OAuthStore:
 
     def bind_owner(self, secret: str) -> None:
         """Changing the owner token invalidates all OAuth grants for this issuer."""
-        fingerprint = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.issuer)
+        fingerprint = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.resource_url)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT owner_fingerprint FROM meta WHERE issuer=?", (self.issuer,)).fetchone()
@@ -165,7 +165,9 @@ class OAuthStore:
             return
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            old = [row[0] for row in db.execute("SELECT DISTINCT issuer FROM clients UNION SELECT issuer FROM tokens")]
+            old = [row[0] for row in db.execute(
+                "SELECT issuer FROM clients UNION SELECT issuer FROM tokens UNION SELECT issuer FROM meta"
+            )]
             for origin in old:
                 host = (urlsplit(origin).hostname or "").lower()
                 if origin != self.issuer and host.endswith(".trycloudflare.com"):

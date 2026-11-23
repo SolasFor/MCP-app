@@ -58,7 +58,7 @@ def _check_qt() -> str:
     # Ensure that the newly added OAuth and connection diagnostic dialogs
     # were actually included by PyInstaller, without opening any window.
     from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
-    from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog, ExecutionQueueDialog  # noqa: F401
+    from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog  # noqa: F401
     from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR

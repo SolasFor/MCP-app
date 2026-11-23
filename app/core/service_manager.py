@@ -456,6 +456,7 @@ class ServiceManager(QObject):
             "MCP_ALLOW_QUERY_TOKEN": "1" if s.allow_query_token else "0",
             "MCP_ENABLE_ADVANCED": "1" if s.enable_advanced_tools else "0",
             "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
+            "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
             "MCP_JSON_RESPONSE": "1" if self.is_quick else "0",
         }

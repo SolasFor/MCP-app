@@ -63,6 +63,27 @@ class OAuthExecutionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 _parse_rules(value, host=True)
 
+    def test_upgrades_remove_legacy_editable_grants(self):
+        with self.store._db() as db:
+            db.execute("""
+                CREATE TABLE exec_grants(
+                    issuer TEXT NOT NULL, client_id TEXT NOT NULL,
+                    can_windows INTEGER NOT NULL, can_ssh INTEGER NOT NULL,
+                    PRIMARY KEY(issuer,client_id)
+                )
+            """)
+            db.execute(
+                "INSERT INTO exec_grants VALUES (?,?,?,?)",
+                (BASE, "client-a", 0, 0),
+            )
+        restarted = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
+        self.assertTrue(restarted.client_approved("client-a"))
+        with self.store._db() as db:
+            count = db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='exec_grants'"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_ticket_requires_local_approval_exact_command_and_one_use(self):
         self._configure()
         ticket = self.exec.request("client-a", "windows", command="hostname.exe")

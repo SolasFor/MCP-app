@@ -22,6 +22,7 @@ if __package__:
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .oauth_store import default_store_path
     from .oauth_execution import ExecutionApprovals
+    from .execution_audit import ExecutionAudit, classify_command_output
     from .tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
         require_execution_permission,
@@ -35,6 +36,7 @@ else:
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from oauth_store import default_store_path
     from oauth_execution import ExecutionApprovals
+    from execution_audit import ExecutionAudit, classify_command_output
     from tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
         require_execution_permission,
@@ -59,6 +61,9 @@ logging.basicConfig(
     handlers=[logging.FileHandler(AUDIT_LOG, encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger("MCPApp")
+# The dedicated audit log stays local to the server's user data directory.
+# It contains no commands/arguments, stdout, OAuth tokens or SSH credentials.
+EXEC_AUDIT = ExecutionAudit(Path(AUDIT_LOG).with_name("mcp_execution_audit.jsonl"))
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -107,7 +112,10 @@ OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
 ADVANCED_TOOLS = enabled(os.environ.get("MCP_ENABLE_ADVANCED")) and not OAUTH_ENABLED
 EXECUTION_TOOLS = ADVANCED_TOOLS and enabled(os.environ.get("MCP_ENABLE_EXECUTION"))
 if OAUTH_ENABLED and enabled(os.environ.get("MCP_ENABLE_ADVANCED")):
-    logger.warning("OAuth read-only mode overrides Advanced tools. Disable OAuth to use Advanced locally.")
+    logger.warning(
+        "OAuth mode overrides legacy Advanced tools; Windows/SSH commands "
+        "are controlled separately by each OAuth client's access profile."
+    )
 ALLOWED_HOSTS = exact_allowlist(os.environ.get("MCP_ALLOWED_HOSTS"))
 ALLOWED_EXECUTABLES = exact_allowlist(os.environ.get("MCP_ALLOWED_EXECUTABLES"))
 MAX_OUTPUT_LEN = 8000
@@ -379,10 +387,6 @@ async def _oauth_windows_run(command: str, *, full: bool) -> str:
             argv = shlex.split(command)
         if not argv:
             return "❌ Пустая команда."
-    logger.warning(
-        "[OAUTH EXEC] Windows-command profile=%s argv0=%s (arguments hidden)",
-        "full" if full else "allowlist", Path(argv[0]).name,
-    )
     process = None
     try:
         process = await asyncio.create_subprocess_exec(
@@ -584,13 +588,30 @@ def build_app():
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
     logger.info(f"{SERVER_NAME}: {RESOURCE_URL} (слушает {HOST}:{PORT})")
-    logger.info("OAuth authorization server: %s (read-only; local consent required)",
-                "enabled" if OAUTH_ENABLED else "disabled")
-    logger.info("Tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
-                "advanced" if ADVANCED_TOOLS else "standard",
-                "enabled" if EXECUTION_TOOLS else "disabled",
-                len(ALLOWED_HOSTS) if EXECUTION_TOOLS else 0,
-                len(ALLOWED_EXECUTABLES) if EXECUTION_TOOLS else 0)
+    if OAUTH_ENABLED:
+        logger.info(
+            "OAuth authorization server: enabled (local owner consent required; "
+            "client-specific Windows/SSH access profiles)"
+        )
+        logger.info(
+            "OAuth command policies: global_default=%s; registered_clients=%d; "
+            "Windows allowlist=%d; SSH hosts=%d; SSH commands=%d; "
+            "commands are not enabled for Safe clients",
+            oauth_execution.profile(), len(oauth_provider.store.list_clients()),
+            len(oauth_execution.policy()["windows"]),
+            len(oauth_execution.policy()["hosts"]),
+            len(oauth_execution.policy()["ssh_commands"]),
+        )
+        logger.info("OAuth execution audit: %s (no plaintext commands or tokens)", EXEC_AUDIT.path)
+    else:
+        logger.info("OAuth authorization server: disabled")
+        logger.info(
+            "Legacy tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
+            "advanced" if ADVANCED_TOOLS else "standard",
+            "enabled" if EXECUTION_TOOLS else "disabled",
+            len(ALLOWED_HOSTS) if EXECUTION_TOOLS else 0,
+            len(ALLOWED_EXECUTABLES) if EXECUTION_TOOLS else 0,
+        )
     mode = "JSON (временный адрес без SSE)" if JSON_RESPONSE else "SSE"
     query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
     logger.info(f"Ответы: {mode}; токен в ссылке: {query}")

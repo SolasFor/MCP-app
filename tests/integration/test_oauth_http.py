@@ -13,6 +13,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -61,6 +62,7 @@ class OAuthHttpTests(unittest.TestCase):
         cls.port = sock.getsockname()[1]
         sock.close()
         cls.url = f"http://127.0.0.1:{cls.port}"
+        cls._tempdir = tempfile.TemporaryDirectory()
         env = os.environ.copy()
         env.update({
             "MCP_PUBLIC_URL": cls.url + "/mcp",
@@ -71,11 +73,20 @@ class OAuthHttpTests(unittest.TestCase):
             "MCP_ENABLE_EXECUTION": "1",
             "MCP_ALLOW_QUERY_TOKEN": "0",
             "MCP_JSON_RESPONSE": "1",
+            "MCP_OAUTH_STORE_PATH": str(Path(cls._tempdir.name) / "oauth" / "state.sqlite3"),
         })
+        cls._env = env
+        cls._command = [
+            sys.executable, "-m", "uvicorn", "backend.server:build_app", "--factory",
+            "--host", "127.0.0.1", "--port", str(cls.port), "--log-level", "warning",
+        ]
+        cls._start_child()
+
+    @classmethod
+    def _start_child(cls):
         cls.proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "backend.server:build_app", "--factory",
-             "--host", "127.0.0.1", "--port", str(cls.port), "--log-level", "warning"],
-            cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cls._command, cwd=ROOT, env=cls._env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         for _ in range(100):
             if cls.proc.poll() is not None:
@@ -99,6 +110,8 @@ class OAuthHttpTests(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 cls.proc.kill()
                 cls.proc.wait(timeout=5)
+        if getattr(cls, "_tempdir", None) is not None:
+            cls._tempdir.cleanup()
 
     def test_oauth_endpoints_and_browser_consent(self):
         status, _, body = req(self.url + "/.well-known/oauth-authorization-server")
@@ -181,6 +194,12 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertTrue(tokens["access_token"])
         self.assertTrue(tokens["refresh_token"])
         self.assertEqual(tokens["scope"], "mcp:read")
+        # Real backend restart with the same issuer: registration and access
+        # token must remain valid with no new browser consent.
+        cls = type(self)
+        cls.proc.terminate()
+        cls.proc.wait(timeout=5)
+        cls._start_child()
         status, _, _ = req(self.url + "/token", "POST", data=grant)
         self.assertEqual(status, 400)
 

@@ -102,6 +102,7 @@ class Settings:
     # Временный ручной opt-in через settings.json; GUI-переключатели — в отдельном PR.
     enable_advanced_tools: bool = False
     enable_execution_tools: bool = False
+    enable_oauth: bool = True  # OAuth DCR + browser consent for read-only external MCP clients
 
     # Поведение
     start_services_on_launch: bool = False
@@ -166,7 +167,7 @@ class Settings:
 
     def sanitize(self) -> None:
         """Подправить значения, которые могли быть отредактированы вручную."""
-        for field in ("allow_query_token", "enable_advanced_tools", "enable_execution_tools"):
+        for field in ("allow_query_token", "enable_advanced_tools", "enable_execution_tools", "enable_oauth"):
             if not isinstance(getattr(self, field), bool):
                 setattr(self, field, False)
         if not self.enable_advanced_tools:

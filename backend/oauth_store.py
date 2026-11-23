@@ -124,6 +124,12 @@ class OAuthStore:
                     encrypted BLOB NOT NULL, expires_at INTEGER NOT NULL,
                     family TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS client_permissions(
+                    issuer TEXT NOT NULL, client_id TEXT NOT NULL,
+                    can_read_notes INTEGER NOT NULL DEFAULT 0 CHECK(can_read_notes IN (0,1)),
+                    can_write_notes INTEGER NOT NULL DEFAULT 0 CHECK(can_write_notes IN (0,1)),
+                    PRIMARY KEY(issuer, client_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_token_family ON tokens(issuer, family);
                 CREATE INDEX IF NOT EXISTS idx_client_tokens ON tokens(issuer, client_id);
             """)
@@ -157,6 +163,7 @@ class OAuthStore:
             if existing and existing[0] != fingerprint:
                 db.execute("DELETE FROM tokens WHERE issuer=?", (self.issuer,))
                 db.execute("DELETE FROM clients WHERE issuer=?", (self.issuer,))
+                db.execute("DELETE FROM client_permissions WHERE issuer=?", (self.issuer,))
             db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (self.issuer, fingerprint))
 
     def remove_old_quick_tunnels(self) -> None:
@@ -174,6 +181,7 @@ class OAuthStore:
                     db.execute("DELETE FROM clients WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM tokens WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM meta WHERE issuer=?", (origin,))
+                    db.execute("DELETE FROM client_permissions WHERE issuer=?", (origin,))
 
     def count_clients(self) -> int:
         with self._db() as db:
@@ -207,8 +215,11 @@ class OAuthStore:
     def list_clients(self) -> list[dict]:
         with self._db() as db:
             records = db.execute(
-                """SELECT client_id,encrypted,registered_at,approved_at
-                   FROM clients WHERE issuer=? ORDER BY approved_at DESC, registered_at DESC""",
+                """SELECT c.client_id,c.encrypted,c.registered_at,c.approved_at,
+                          COALESCE(p.can_read_notes,0),COALESCE(p.can_write_notes,0)
+                   FROM clients c LEFT JOIN client_permissions p
+                   ON p.issuer=c.issuer AND p.client_id=c.client_id
+                   WHERE c.issuer=? ORDER BY c.approved_at DESC,c.registered_at DESC""",
                 (self.issuer,),
             ).fetchall()
         return [{
@@ -216,7 +227,40 @@ class OAuthStore:
             "client_name": self._decrypt(enc).get("client_name") or "Без названия",
             "registered_at": registered,
             "approved_at": approved,
-        } for ident, enc, registered, approved in records]
+            "can_read_notes": bool(read) if approved else False,
+            "can_write_notes": bool(write) if approved else False,
+        } for ident, enc, registered, approved, read, write in records]
+
+    def get_note_permissions(self, client_id: str) -> tuple[bool, bool]:
+        """Live per-client capability lookup. Unknown/unapproved clients deny."""
+        with self._db() as db:
+            row = db.execute(
+                """SELECT p.can_read_notes,p.can_write_notes FROM client_permissions p
+                   JOIN clients c ON c.issuer=p.issuer AND c.client_id=p.client_id
+                   WHERE p.issuer=? AND p.client_id=? AND c.approved_at IS NOT NULL""",
+                (self.issuer, client_id),
+            ).fetchone()
+        return (bool(row[0]), bool(row[1])) if row else (False, False)
+
+    def set_note_permissions(self, client_id: str, *, read: bool, write: bool) -> None:
+        """Only the local GUI may call this; never exposed through HTTP."""
+        if type(read) is not bool or type(write) is not bool:
+            raise ValueError("Permissions must be booleans")
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            approved = db.execute(
+                "SELECT approved_at FROM clients WHERE issuer=? AND client_id=?",
+                (self.issuer, client_id),
+            ).fetchone()
+            if not approved or approved[0] is None:
+                raise ValueError("Client must be approved before granting permissions")
+            db.execute(
+                """INSERT INTO client_permissions(issuer,client_id,can_read_notes,can_write_notes)
+                   VALUES(?,?,?,?) ON CONFLICT(issuer,client_id)
+                   DO UPDATE SET can_read_notes=excluded.can_read_notes,
+                                 can_write_notes=excluded.can_write_notes""",
+                (self.issuer, client_id, int(read), int(write)),
+            )
 
     def revoke_client(self, client_id: str) -> bool:
         """Transactionally invalidate all client tokens and its registration."""
@@ -225,6 +269,8 @@ class OAuthStore:
             cursor = db.execute("DELETE FROM clients WHERE issuer=? AND client_id=?",
                                 (self.issuer, client_id))
             db.execute("DELETE FROM tokens WHERE issuer=? AND client_id=?",
+                       (self.issuer, client_id))
+            db.execute("DELETE FROM client_permissions WHERE issuer=? AND client_id=?",
                        (self.issuer, client_id))
             return cursor.rowcount > 0
 

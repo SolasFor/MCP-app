@@ -41,6 +41,25 @@ class OAuthExecutionTests(unittest.TestCase):
         self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
         self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="machine.local"))
 
+    def test_default_commands_are_seeded_and_survive_restart(self):
+        expected = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
+        self.assertEqual(self.policy.policy()["windows"], expected)
+        self.assertEqual(self.policy.profile(), PROFILE_SAFE)
+        with self.store._db() as db:
+            self.assertIsNotNone(db.execute(
+                "SELECT encrypted FROM exec_policy WHERE issuer=?", (BASE,)
+            ).fetchone())
+        reloaded = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
+        self.assertEqual(reloaded.policy()["windows"], expected)
+        self.assertEqual(reloaded.profile(), PROFILE_SAFE)
+
+    def test_explicit_empty_allowlist_remains_empty_on_upgrade(self):
+        self.policy.set_policy(windows="", hosts="", ssh_commands="")
+        self.assertEqual(self.policy.policy()["windows"], ())
+        reloaded = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
+        self.assertEqual(reloaded.policy()["windows"], ())
+        self.assertFalse(reloaded.can_request("client-a", "windows", command="whoami"))
+
     def test_allowlist_executes_exact_rules_without_tickets(self):
         self.policy.set_profile(PROFILE_ALLOWLIST)
         self.assertTrue(self.policy.can_request("client-a", "windows", command="whoami"))

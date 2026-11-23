@@ -138,6 +138,52 @@ class PersistentOAuthStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_token("expired-token", "access"))
         self.store.prune_expired()
 
+    def test_permissions_are_default_deny_even_after_approval(self):
+        self.store.save_client(client())
+        self.assertEqual(self.store.get_note_permissions("client-1"), (False, False))
+        self.assertEqual(self.store.get_note_permissions("unknown"), (False, False))
+        with self.assertRaises(ValueError):
+            self.store.set_note_permissions("client-1", read=True, write=False)
+        self.store.mark_approved("client-1")
+        self.assertEqual(self.store.get_note_permissions("client-1"), (False, False))
+
+    def test_independent_read_write_permissions_persist(self):
+        self.store.save_client(client())
+        self.store.save_client(client("client-2"))
+        self.store.mark_approved("client-1")
+        self.store.mark_approved("client-2")
+        self.store.set_note_permissions("client-1", read=True, write=False)
+        self.store.set_note_permissions("client-2", read=False, write=True)
+        another = OAuthStore(self.path, URL, RESOURCE)
+        self.assertEqual(another.get_note_permissions("client-1"), (True, False))
+        self.assertEqual(another.get_note_permissions("client-2"), (False, True))
+        listing = {entry["client_id"]: entry for entry in another.list_clients()}
+        self.assertTrue(listing["client-1"]["can_read_notes"])
+        self.assertFalse(listing["client-1"]["can_write_notes"])
+        self.assertFalse(listing["client-2"]["can_read_notes"])
+        self.assertTrue(listing["client-2"]["can_write_notes"])
+
+    def test_revocation_and_owner_change_reset_permissions(self):
+        self.store.save_client(client())
+        self.store.mark_approved("client-1")
+        self.store.set_note_permissions("client-1", read=True, write=True)
+        self.assertTrue(self.store.revoke_client("client-1"))
+        self.assertEqual(self.store.get_note_permissions("client-1"), (False, False))
+        self.store.save_client(client())
+        self.store.mark_approved("client-1")
+        self.assertEqual(self.store.get_note_permissions("client-1"), (False, False))
+        self.store.set_note_permissions("client-1", read=True, write=True)
+        self.store.bind_owner("different owner")
+        self.assertEqual(self.store.get_note_permissions("client-1"), (False, False))
+
+    def test_permissions_are_strict_booleans(self):
+        self.store.save_client(client())
+        self.store.mark_approved("client-1")
+        with self.assertRaises(ValueError):
+            self.store.set_note_permissions("client-1", read="true", write=False)
+        with self.assertRaises(ValueError):
+            self.store.set_note_permissions("client-1", read=True, write=1)
+
     def test_existing_db_with_missing_key_fails_closed(self):
         self._seed_tokens()
         self.path.with_suffix(".key").unlink()

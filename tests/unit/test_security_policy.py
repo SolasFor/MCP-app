@@ -39,7 +39,7 @@ class SecurityPolicyTests(unittest.TestCase):
     def test_workspace_file_and_subdirectory(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            self.assertEqual(workspace_path(root, "nested/file.txt"), root / "nested" / "file.txt")
+            self.assertEqual(workspace_path(root, "nested/file.txt"), root.resolve() / "nested" / "file.txt")
 
     def test_workspace_blocks_absolute_and_traversal(self) -> None:
         with tempfile.TemporaryDirectory() as d:

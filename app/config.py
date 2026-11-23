@@ -170,6 +170,9 @@ class Settings:
         for field in ("allow_query_token", "enable_advanced_tools", "enable_execution_tools", "enable_oauth"):
             if not isinstance(getattr(self, field), bool):
                 setattr(self, field, False)
+        # Query tokens can leak via logs, history and copied URLs. OAuth
+        # replaces the need for them; disable on existing installs too.
+        self.allow_query_token = False
         if not self.enable_advanced_tools:
             self.enable_execution_tools = False
         if self.tunnel_mode not in TUNNEL_MODES:

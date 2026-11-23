@@ -1,0 +1,73 @@
+name: Complete official v0.8.3 assets and checksums
+
+# Build.yml is the single binary publisher. This workflow only adds the
+# checksum file and complete release notes to already uploaded artifacts.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: finish-v0.8.3
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: contains(github.event.head_commit.message, '[complete-v0.8.3-assets]')
+    name: Verify and finish GitHub Release v0.8.3
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the exact already-published binaries
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path "release-assets" -Force | Out-Null
+          gh release download "v0.8.3" --repo $env:GITHUB_REPOSITORY --dir "release-assets" --pattern "MCPApp-Setup-0.8.3.exe" --pattern "MCPApp-0.8.3-portable.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch released v0.8.3 assets" }
+          foreach ($name in @("MCPApp-Setup-0.8.3.exe", "MCPApp-0.8.3-portable.zip")) {
+            $file = Join-Path "release-assets" $name
+            if (-not (Test-Path $file)) { throw "Missing released asset $name" }
+            if ((Get-Item $file).Length -lt 1000000) { throw "Released asset is unexpectedly small: $name" }
+          }
+      - name: Compute SHA-256 from published assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $lines = @()
+          foreach ($name in @("MCPApp-Setup-0.8.3.exe", "MCPApp-0.8.3-portable.zip")) {
+            $sha = (Get-FileHash -Path (Join-Path "release-assets" $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$name SHA256 $sha"
+            $lines += "$sha  $name"
+          }
+          $lines | Set-Content "release-assets/SHA256SUMS.txt" -Encoding Ascii
+          if ((Get-Content "release-assets/SHA256SUMS.txt").Count -ne 2) { throw "Incorrect checksum file" }
+      - name: Attach checksum and publish full release notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh release upload "v0.8.3" "release-assets/SHA256SUMS.txt" --repo $env:GITHUB_REPOSITORY --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to upload release checksums" }
+          gh release edit "v0.8.3" --repo $env:GITHUB_REPOSITORY --title "MCP app v0.8.3" --notes-file "docs/releases/v0.8.3.md" --latest
+          if ($LASTEXITCODE -ne 0) { throw "Failed to update GitHub Release notes" }
+          $release = gh release view "v0.8.3" --repo $env:GITHUB_REPOSITORY --json assets,tagName,url | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Failed to verify the official release" }
+          $names = @($release.assets | ForEach-Object { $_.name })
+          foreach ($required in @("MCPApp-Setup-0.8.3.exe", "MCPApp-0.8.3-portable.zip", "SHA256SUMS.txt")) {
+            if ($required -notin $names) { throw "Release is missing $required" }
+          }
+          Write-Host "Verified official release: $($release.url)"
+      - name: Retain checksum for independent CI verification
+        uses: actions/upload-artifact@v4
+        with:
+          name: MCPApp-v0.8.3-checksums
+          path: release-assets/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 60

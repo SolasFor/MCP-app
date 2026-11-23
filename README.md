@@ -63,7 +63,8 @@ Python и cloudflared ставить не нужно: оба внутри сбо
 
 Подробнее: [сценарии Windows/SSH](docs/oauth-fixed-windows-ssh.md),
 [OAuth через Cloudflare](docs/oauth-quick-tunnel.md),
-[защищённое хранение клиентов](docs/oauth-persistence.md).
+[защищённое хранение клиентов](docs/oauth-persistence.md),
+[журнал выполнения Windows/SSH и диагностика Cloudflare](docs/oauth-execution-audit.md).
 
 ## Данные
 
@@ -71,7 +72,8 @@ Python и cloudflared ставить не нужно: оба внутри сбо
 |---|---|
 | Настройки | `%APPDATA%\MCPApp\settings.json` |
 | Токен (доступ только у вашего пользователя) | `%APPDATA%\MCPApp\token.json` |
-| Рабочая папка и журнал аудита сервера | `%APPDATA%\MCPApp\server\mcp_audit.log` |
+| Рабочая папка и журнал сервера | `%APPDATA%\MCPApp\server\mcp_audit.log` |
+| Журнал выполнений OAuth Windows/SSH (JSONL, с ротацией, без открытого текста команд) | `%APPDATA%\MCPApp\server\mcp_execution_audit.jsonl` |
 | Отчёт о сбое | `%APPDATA%\MCPApp\crash.log` |
 
 При удалении эти данные остаются. Данные прежней версии (`%APPDATA%\SouronMCP`) копируются при первом запуске, поэтому токен и клиенты сохраняются.

@@ -53,6 +53,7 @@ from app.core import proxy as px
 from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
 from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
+from app.core.tunnel_log import classify_tunnel_error
 from app.core.process import ManagedProcess, ProcState
 from app.paths import (
     backend_command,
@@ -138,6 +139,7 @@ class ServiceManager(QObject):
         self._health_log_marker = f'"GET {self.health.health_path} '
         self._quic_hint_shown = False
         self._cancel_hint_shown = False
+        self._origin_hint_shown = False
 
         # Мосты к Cloudflare через прокси. Лог из фоновых потоков мостов: emit сигнала
         # потокобезопасен, Qt доставит строку в поток GUI очередью.
@@ -371,6 +373,7 @@ class ServiceManager(QObject):
         self._healthy_at = {name: None for name in self._procs}
         self._quic_hint_shown = False
         self._cancel_hint_shown = False
+        self._origin_hint_shown = False
         self._proxy_hint_shown = False
         self._set_quick_url("")
         self.health.start()
@@ -600,15 +603,28 @@ class ServiceManager(QObject):
         if name != TUNNEL:
             return
         low = line.lower()
-        # A canceled proxy request is not proof that the tunnel is offline.
-        # Keep original cloudflared logs, and provide one actionable hint.
-        if "context canceled" in low and not self._cancel_hint_shown:
+        # Preserve raw cloudflared error lines. Provide one contextual hint
+        # per kind; canceled requests and actual origin failures are different.
+        issue = classify_tunnel_error(line)
+        if issue == "request_canceled" and not self._cancel_hint_shown:
             self._cancel_hint_shown = True
+            if self.server.is_alive() and self.tunnel.is_alive() and self._want_running:
+                self._log(
+                    "ℹ cloudflared: отменён отдельный HTTP/SSE-запрос. "
+                    "Сервер и туннель продолжают работать; отмена не равна сбою. "
+                    "Если клиент не подключается, проверьте локальный и публичный /health."
+                )
+            else:
+                self._log(
+                    "⚠ cloudflared: запрос отменён, при этом сервер или туннель "
+                    "не работает. Проверьте состояние сервисов и /health."
+                )
+        elif issue == "origin_unreachable" and not self._origin_hint_shown:
+            self._origin_hint_shown = True
             self._log(
-                "ℹ cloudflared: HTTP-запрос отменён (context canceled). "
-                "Это не обязательно сбой туннеля. Сравните локальный "
-                "http://127.0.0.1:8000/health и публичный HTTPS /health. "
-                "Если оба отвечают 200, вероятна отмена со стороны клиента."
+                "✖ cloudflared не может подключиться к локальному MCP-серверу. "
+                f"Проверьте http://127.0.0.1:{self.settings.server_port}"
+                f"{self.settings.server_health_path}, порт и журнал сервера."
             )
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)

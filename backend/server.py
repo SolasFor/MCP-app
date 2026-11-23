@@ -22,6 +22,7 @@ if __package__:
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .oauth_store import default_store_path
     from .oauth_execution import ExecutionApprovals
+    from .execution_audit import ExecutionAudit, classify_command_output
     from .tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
         require_execution_permission,
@@ -35,6 +36,7 @@ else:
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from oauth_store import default_store_path
     from oauth_execution import ExecutionApprovals
+    from execution_audit import ExecutionAudit, classify_command_output
     from tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
         require_execution_permission,
@@ -59,6 +61,12 @@ logging.basicConfig(
     handlers=[logging.FileHandler(AUDIT_LOG, encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger("MCPApp")
+# The dedicated audit log stays local to the server's user data directory.
+# It contains no commands/arguments, stdout, OAuth tokens or SSH credentials.
+EXEC_AUDIT = ExecutionAudit(
+    os.environ.get("MCP_EXEC_AUDIT_PATH")
+    or Path(AUDIT_LOG).with_name("mcp_execution_audit.jsonl")
+)
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -107,7 +115,10 @@ OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
 ADVANCED_TOOLS = enabled(os.environ.get("MCP_ENABLE_ADVANCED")) and not OAUTH_ENABLED
 EXECUTION_TOOLS = ADVANCED_TOOLS and enabled(os.environ.get("MCP_ENABLE_EXECUTION"))
 if OAUTH_ENABLED and enabled(os.environ.get("MCP_ENABLE_ADVANCED")):
-    logger.warning("OAuth read-only mode overrides Advanced tools. Disable OAuth to use Advanced locally.")
+    logger.warning(
+        "OAuth mode overrides legacy Advanced tools; Windows/SSH commands "
+        "are controlled separately by each OAuth client's access profile."
+    )
 ALLOWED_HOSTS = exact_allowlist(os.environ.get("MCP_ALLOWED_HOSTS"))
 ALLOWED_EXECUTABLES = exact_allowlist(os.environ.get("MCP_ALLOWED_EXECUTABLES"))
 MAX_OUTPUT_LEN = 8000
@@ -131,12 +142,11 @@ class HybridAuthMiddleware:
 
     * /health — отвечает сразу, без токена и без записи в лог. По пути, а НЕ по IP:
       через туннель ВСЕ запросы приходят с 127.0.0.1 (cloudflared подключается локально).
-    * ?token=… — если разрешено и токен верный, превращается в заголовок
-      Authorization: Bearer. Только так SDK его примет: его проверка смотрит
-      исключительно в заголовок. Сам токен вырезается из query string, чтобы не
-      попасть в access-лог uvicorn (а значит, в окно GUI).
-    * Всё остальное проверяет SDK: без верного токена /mcp ответит 401 с правильным
-      WWW-Authenticate. Мы только пишем в аудит неудачные попытки.
+    * ?token=… запрещён и удаляется из query string до передачи в SDK
+      и access-логи Uvicorn; OAuth и Bearer работают через заголовок.
+    * Проверку OAuth Bearer выполняет SDK. Нельзя объявлять токен
+      "неверным" только потому, что он отличается от токена владельца.
+      Пишем предупреждение лишь после фактического HTTP 401/403.
     """
 
     def __init__(self, app):
@@ -165,24 +175,34 @@ class HybridAuthMiddleware:
         headers = Headers(scope=scope)
         auth_header = headers.get("authorization", "")
 
-        if auth_header.lower().startswith("bearer "):
-            if not _token_ok(auth_header[7:].strip()):
-                logger.warning(f"Неверный токен в заголовке ← {client[0]} {scope.get('method')} {path}")
-        else:
+        is_bearer = auth_header.lower().startswith("bearer ")
+        # A standard OAuth access token necessarily differs from the local
+        # owner's token. Only the installed SDK can validate its signature,
+        # expiry, resource and client consent. Watch the final HTTP response.
+        # Query-string credentials stay forbidden, even on old installs.
+        if not is_bearer:
             query_token = self._pop_query_token(scope)
             if query_token is not None:
-                if not ALLOW_QUERY_TOKEN:
-                    logger.warning(f"Токен в ссылке отключён в настройках ← {client[0]} {path}")
-                elif _token_ok(query_token):
-                    scope["headers"] = [(k, v) for k, v in scope["headers"] if k.lower() != b"authorization"]
-                    scope["headers"].append((b"authorization", f"Bearer {query_token}".encode()))
-                else:
-                    logger.warning(f"Неверный токен в ссылке ← {client[0]} {scope.get('method')} {path}")
-            elif path.startswith(MCP_PATH):
-                # Общедоступные /.well-known/… (поиск OAuth-метаданных) не логируем.
-                logger.warning(f"Запрос без токена ← {client[0]} {scope.get('method')} {path} (ответ 401)")
+                logger.warning("Токен в ссылке запрещён ← %s %s", client[0], path)
 
-        await self.app(scope, receive, send)
+        async def observe_auth_result(message):
+            if message["type"] == "http.response.start" and path.rstrip("/") == MCP_PATH:
+                status = message["status"]
+                if status in (401, 403):
+                    if is_bearer:
+                        logger.warning(
+                            "MCP авторизация отклонена HTTP %d ← %s %s %s",
+                            status, client[0], scope.get("method"), path,
+                        )
+                    elif scope.get("method") not in ("HEAD", "OPTIONS"):
+                        # Anonymous HEAD is a common OAuth discovery probe.
+                        logger.info(
+                            "MCP запрос без Bearer отклонён HTTP %d ← %s %s",
+                            status, client[0], scope.get("method"),
+                        )
+            await send(message)
+
+        await self.app(scope, receive, observe_auth_result)
 
     @staticmethod
     def _pop_query_token(scope) -> str | None:
@@ -370,10 +390,6 @@ async def _oauth_windows_run(command: str, *, full: bool) -> str:
             argv = shlex.split(command)
         if not argv:
             return "❌ Пустая команда."
-    logger.warning(
-        "[OAUTH EXEC] Windows-command profile=%s argv0=%s (arguments hidden)",
-        "full" if full else "allowlist", Path(argv[0]).name,
-    )
     process = None
     try:
         process = await asyncio.create_subprocess_exec(
@@ -407,9 +423,41 @@ async def oauth_windows_command(command: str) -> str:
         EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
+    profile = oauth_execution.profile_for(client_id)
     if not oauth_execution.can_request(client_id, "windows", command=command):
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile,
+            event="denied", command=command,
+        )
         return "❌ Эта Windows-команда недоступна в выбранном режиме."
-    return await _oauth_windows_run(command, full=oauth_execution.profile_for(client_id) == "full")
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile,
+        event="started", command=command, action_id=action_id,
+    )
+    try:
+        output = await _oauth_windows_run(command, full=profile == "full")
+    except BaseException:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile,
+            event="failed", command=command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        raise
+    outcome, exit_code = classify_command_output(output)
+    # Shell-free builtins return their output without an exit-code prefix.
+    if profile == "allowlist" and command.strip().split(" ", 1)[0].lower() in (
+        "pwd", "ls", "dir", "echo",
+    ) and not output.startswith("❌"):
+        outcome = "completed"
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile,
+        event=outcome, command=command, action_id=action_id,
+        exit_code=exit_code,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return output
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -426,19 +474,43 @@ async def oauth_ssh_command(
         EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
+    profile = oauth_execution.profile_for(client_id)
     if not oauth_execution.can_request(
         client_id, "ssh", command=command, host=host, user=user, port=port
     ):
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile,
+            event="denied", command=command, host=host, port=port,
+        )
         return "❌ SSH-хост или команда недоступны в выбранном режиме."
-    logger.warning(
-        "[OAUTH EXEC] SSH profile=%s host=%s port=%s (command hidden)",
-        oauth_execution.profile_for(client_id), host, port,
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="ssh", profile=profile,
+        event="started", command=command, host=host, port=port,
+        action_id=action_id,
     )
     try:
-        return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
-    except Exception as exc:
-        logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
-        return "❌ SSH-команда не выполнена; подробности в локальном журнале."
+        output = await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
+    except BaseException as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile,
+            event="failed", command=command, host=host, port=port,
+            action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        if isinstance(exc, Exception):
+            logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
+            return "❌ SSH-команда не выполнена; подробности в локальном журнале."
+        raise
+    outcome, exit_code = classify_command_output(output)
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="ssh", profile=profile,
+        event=outcome, command=command, host=host, port=port,
+        action_id=action_id, exit_code=exit_code,
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
+    return output
 
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
@@ -575,13 +647,30 @@ def build_app():
 def main() -> None:
     """Точка входа: и для `python backend/server.py`, и для GUI (`main.py --backend`)."""
     logger.info(f"{SERVER_NAME}: {RESOURCE_URL} (слушает {HOST}:{PORT})")
-    logger.info("OAuth authorization server: %s (read-only; local consent required)",
-                "enabled" if OAUTH_ENABLED else "disabled")
-    logger.info("Tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
-                "advanced" if ADVANCED_TOOLS else "standard",
-                "enabled" if EXECUTION_TOOLS else "disabled",
-                len(ALLOWED_HOSTS) if EXECUTION_TOOLS else 0,
-                len(ALLOWED_EXECUTABLES) if EXECUTION_TOOLS else 0)
+    if OAUTH_ENABLED:
+        logger.info(
+            "OAuth authorization server: enabled (local owner consent required; "
+            "client-specific Windows/SSH access profiles)"
+        )
+        logger.info(
+            "OAuth command policies: global_default=%s; registered_clients=%d; "
+            "Windows allowlist=%d; SSH hosts=%d; SSH commands=%d; "
+            "commands are not enabled for Safe clients",
+            oauth_execution.profile(), len(oauth_provider.store.list_clients()),
+            len(oauth_execution.policy()["windows"]),
+            len(oauth_execution.policy()["hosts"]),
+            len(oauth_execution.policy()["ssh_commands"]),
+        )
+        logger.info("OAuth execution audit: %s (no plaintext commands or tokens)", EXEC_AUDIT.path)
+    else:
+        logger.info("OAuth authorization server: disabled")
+        logger.info(
+            "Legacy tool profile: %s; execution tools: %s; SSH targets: %d; executables: %d",
+            "advanced" if ADVANCED_TOOLS else "standard",
+            "enabled" if EXECUTION_TOOLS else "disabled",
+            len(ALLOWED_HOSTS) if EXECUTION_TOOLS else 0,
+            len(ALLOWED_EXECUTABLES) if EXECUTION_TOOLS else 0,
+        )
     mode = "JSON (временный адрес без SSE)" if JSON_RESPONSE else "SSE"
     query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
     logger.info(f"Ответы: {mode}; токен в ссылке: {query}")

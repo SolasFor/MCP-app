@@ -74,6 +74,7 @@ class OAuthHttpTests(unittest.TestCase):
             "MCP_ALLOW_QUERY_TOKEN": "0",
             "MCP_JSON_RESPONSE": "1",
             "MCP_OAUTH_STORE_PATH": str(Path(cls._tempdir.name) / "oauth" / "state.sqlite3"),
+            "MCP_EXEC_AUDIT_PATH": str(Path(cls._tempdir.name) / "logs" / "mcp_execution_audit.jsonl"),
             "MCP_SHARED_NOTES_DIR": str(Path(cls._tempdir.name) / "shared_notes"),
         })
         cls._env = env
@@ -289,6 +290,27 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertIn("full-mode-check", body.decode(errors="replace"))
         self.assertIn("Exit code: 0", body.decode(errors="replace"))
+
+        # Live end-to-end audit must correlate with authenticated client, not
+        # disclose the command, its output, or OAuth access/refresh tokens.
+        audit_path = Path(cls._tempdir.name) / "logs" / "mcp_execution_audit.jsonl"
+        raw_audit = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn("full-mode-check", raw_audit)
+        self.assertNotIn(tokens["access_token"], raw_audit)
+        self.assertNotIn(tokens["refresh_token"], raw_audit)
+        records = [json.loads(line) for line in raw_audit.splitlines()]
+        self.assertTrue(any(
+            row["event"] == "completed" and row["profile"] == "full"
+            and row["kind"] == "windows" and row["client_id"] == client_id
+            and row["exit_code"] == 0
+            for row in records
+        ))
+        self.assertTrue(any(
+            row["event"] == "denied" and row["kind"] == "windows"
+            and row["client_id"] == client_id
+            for row in records
+        ))
+        self.assertTrue(any(row["event"] == "started" for row in records))
 
         profiles.set_profile("safe")
         status, _, body = req(self.url + "/mcp", "POST", data=tool_request,

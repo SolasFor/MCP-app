@@ -15,7 +15,10 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.shared.exceptions import MCPError
 from mcp.types import ListToolsResult
 
-from .oauth_store import OAuthStore
+try:
+    from .oauth_store import OAuthStore
+except ImportError:
+    from oauth_store import OAuthStore
 
 NOTE_LIST = "shared_notes_list"
 NOTE_READ = "shared_note_read"

@@ -409,7 +409,7 @@ async def oauth_windows_command(command: str) -> str:
     assert oauth_execution is not None
     if not oauth_execution.can_request(client_id, "windows", command=command):
         return "❌ Эта Windows-команда недоступна в выбранном режиме."
-    return await _oauth_windows_run(command, full=oauth_execution.profile() == "full")
+    return await _oauth_windows_run(command, full=oauth_execution.profile_for(client_id) == "full")
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -432,7 +432,7 @@ async def oauth_ssh_command(
         return "❌ SSH-хост или команда недоступны в выбранном режиме."
     logger.warning(
         "[OAUTH EXEC] SSH profile=%s host=%s port=%s (command hidden)",
-        oauth_execution.profile(), host, port,
+        oauth_execution.profile_for(client_id), host, port,
     )
     try:
         return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)

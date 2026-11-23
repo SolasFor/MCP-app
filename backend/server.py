@@ -94,7 +94,7 @@ RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
 # Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
 HEALTH_PATH = os.environ.get("MCP_HEALTH_PATH", "/health")
 # ?token=… в ссылке — для клиентов, в которых нельзя задать заголовок Authorization.
-ALLOW_QUERY_TOKEN = _env_flag("MCP_ALLOW_QUERY_TOKEN", False)
+ALLOW_QUERY_TOKEN = False  # OAuth or Bearer header only; forbid ?token= in public URLs
 # Quick Tunnels (trycloudflare.com) не поддерживают SSE — там отвечаем обычным JSON.
 JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudflare.com"))
 

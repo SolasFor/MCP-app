@@ -1,4 +1,4 @@
-"""Security tests for OAuth per-client tool visibility and dispatch gates."""
+"""Fixed OAuth permission tests: no editable grants, notes, or SSH bypass."""
 from __future__ import annotations
 
 import asyncio
@@ -14,118 +14,123 @@ from mcp.shared.exceptions import MCPError
 from mcp.types import ListToolsResult, Tool
 
 from backend.oauth_store import OAuthStore
+from backend.oauth_execution import ExecutionApprovals
 from backend.tool_permissions import (
-    ALWAYS_VISIBLE, NOTE_LIST, NOTE_READ, NOTE_WRITE,
-    allowed_tools, make_tool_middleware, require_note_permission,
+    BASIC_TOOLS, EXEC_TOOLS, OAUTH_TOOLS, EXEC_WINDOWS, EXEC_SSH,
+    allowed_tools, make_tool_middleware, require_execution_permission,
 )
 
-BASE = "https://notes.example.com"
+BASE = "https://fixed.example.com"
 RESOURCE = BASE + "/mcp"
 
 
-def principal(client_id: str, scopes=None):
+def principal(client_id: str, scopes=None) -> AccessToken:
     return AccessToken(
-        token="dummy-token", client_id=client_id,
+        token="unit-test-token", client_id=client_id,
         scopes=["mcp:read"] if scopes is None else scopes,
         resource=RESOURCE,
     )
 
 
-class ToolPermissionsTests(unittest.TestCase):
+class FixedOAuthToolsTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = OAuthStore(Path(self.temp.name) / "oauth.sqlite3", BASE, RESOURCE)
-        self.store.bind_owner("owner token")
-        for cid in ("client-a", "client-b"):
+        self.store.bind_owner("owner-token")
+        self.exec = ExecutionApprovals(self.store)
+        for cid in ("alpha", "beta"):
             self.store.save_client(OAuthClientInformationFull(
                 client_id=cid, client_name=cid,
-                redirect_uris=["http://127.0.0.1:10001/"],
+                redirect_uris=["http://127.0.0.1:12345/callback"],
                 token_endpoint_auth_method="none",
             ))
-            self.store.mark_approved(cid)
+        self.store.mark_approved("alpha")
 
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_only_connectivity_by_default(self):
-        for p in (None, principal("unknown"), principal("mcp-app-user"), principal("client-a", [])):
-            with self.subTest(p=str(p)):
-                self.assertEqual(allowed_tools(self.store, p), ALWAYS_VISIBLE)
+    def test_fixed_rights_for_approved_client_without_configuration(self):
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.assertEqual(OAUTH_TOOLS, frozenset({
+            "server_info", "oauth_windows_command", "oauth_ssh_command"
+        }))
+        # Policy defaults remain empty; command execution is still forbidden.
+        self.assertFalse(self.exec.can_request("alpha", "windows", command="hostname.exe"))
 
-    def test_grants_do_not_cross_clients(self):
-        self.store.set_note_permissions("client-a", read=True, write=False)
-        self.assertEqual(
-            allowed_tools(self.store, principal("client-a")),
-            frozenset({"server_info", NOTE_LIST, NOTE_READ}),
-        )
-        self.assertEqual(allowed_tools(self.store, principal("client-b")), ALWAYS_VISIBLE)
-        self.store.set_note_permissions("client-a", read=False, write=True)
-        self.assertEqual(
-            allowed_tools(self.store, principal("client-a")),
-            frozenset({"server_info", NOTE_WRITE}),
-        )
+    def test_unknown_unapproved_owner_and_missing_scope_deny(self):
+        for identity in (
+            None, principal("beta"), principal("missing"),
+            principal("mcp-app-user"), principal("alpha", scopes=[]),
+        ):
+            with self.subTest(identity=str(identity)):
+                self.assertEqual(allowed_tools(self.store, identity, self.exec), BASIC_TOOLS)
 
-    def test_fresh_revocation_immediately_hides_tools(self):
-        self.store.set_note_permissions("client-a", read=True, write=True)
-        self.assertIn(NOTE_WRITE, allowed_tools(self.store, principal("client-a")))
-        self.store.set_note_permissions("client-a", read=False, write=False)
-        self.assertEqual(allowed_tools(self.store, principal("client-a")), ALWAYS_VISIBLE)
-        self.store.revoke_client("client-a")
-        self.assertEqual(allowed_tools(self.store, principal("client-a")), ALWAYS_VISIBLE)
+    def test_revocation_removes_fixed_tools(self):
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.store.revoke_client("alpha")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
 
-    def test_handler_rejects_even_without_middleware(self):
-        with patch("backend.tool_permissions.get_access_token", return_value=principal("client-a")):
+    def test_handler_rejects_owner_and_accepts_approved_client(self):
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("mcp-app-user")):
             with self.assertRaises(PermissionError):
-                require_note_permission(NOTE_READ, self.store)
-            self.store.set_note_permissions("client-a", read=True, write=False)
-            require_note_permission(NOTE_READ, self.store)
-            with self.assertRaises(PermissionError):
-                require_note_permission(NOTE_WRITE, self.store)
-
-    def test_middleware_hides_ungranted_tools(self):
-        middleware = make_tool_middleware(self.store)
-        tools = [
-            Tool(name=name, input_schema={"type": "object", "properties": {}})
-            for name in ("server_info", NOTE_LIST, NOTE_READ, NOTE_WRITE)
-        ]
-        async def next_list(ctx):
-            return ListToolsResult(tools=tools)
-
-        with patch("backend.tool_permissions.get_access_token", return_value=principal("client-a")):
-            ctx = SimpleNamespace(method="tools/list", params={})
-            result = asyncio.run(middleware(ctx, next_list))
-            self.assertEqual([t.name for t in result.tools], ["server_info"])
-            self.store.set_note_permissions("client-a", read=True, write=False)
-            result = asyncio.run(middleware(ctx, next_list))
+                require_execution_permission(EXEC_WINDOWS, self.store, self.exec)
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
             self.assertEqual(
-                [t.name for t in result.tools],
-                ["server_info", NOTE_LIST, NOTE_READ],
+                require_execution_permission(EXEC_WINDOWS, self.store, self.exec), "alpha"
+            )
+            self.assertEqual(
+                require_execution_permission(EXEC_SSH, self.store, self.exec), "alpha"
             )
 
-    def test_middleware_filters_mapping_result(self):
-        middleware = make_tool_middleware(self.store)
+    def test_middleware_filters_typed_catalog(self):
+        middleware = make_tool_middleware(self.store, self.exec)
+        all_tools = [
+            Tool(name=name, input_schema={"type": "object", "properties": {}})
+            for name in ("server_info", EXEC_WINDOWS, EXEC_SSH, "shared_note_read")
+        ]
         async def next_list(ctx):
-            return {"tools": [{"name": "server_info"}, {"name": NOTE_READ}]}
-        with patch("backend.tool_permissions.get_access_token", return_value=principal("client-a")):
-            ctx = SimpleNamespace(method="tools/list", params={})
+            return ListToolsResult(tools=all_tools)
+        ctx = SimpleNamespace(method="tools/list", params={})
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
+            result = asyncio.run(middleware(ctx, next_list))
+            self.assertEqual({x.name for x in result.tools}, OAUTH_TOOLS)
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("beta")):
+            result = asyncio.run(middleware(ctx, next_list))
+            self.assertEqual([x.name for x in result.tools], ["server_info"])
+
+    def test_middleware_filters_dict_catalog(self):
+        middleware = make_tool_middleware(self.store, self.exec)
+        async def next_list(ctx):
+            return {"tools": [
+                {"name": "server_info"}, {"name": EXEC_WINDOWS},
+                {"name": EXEC_SSH}, {"name": "shared_notes_list"},
+            ]}
+        ctx = SimpleNamespace(method="tools/list", params={})
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
+            result = asyncio.run(middleware(ctx, next_list))
+            self.assertEqual(
+                {item["name"] for item in result["tools"]}, OAUTH_TOOLS
+            )
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("beta")):
             result = asyncio.run(middleware(ctx, next_list))
             self.assertEqual(result["tools"], [{"name": "server_info"}])
 
-    def test_middleware_refuses_ungranted_call_before_dispatch(self):
-        middleware = make_tool_middleware(self.store)
+    def test_middleware_refuses_unapproved_tools_calls(self):
+        middleware = make_tool_middleware(self.store, self.exec)
         calls = []
         async def next_call(ctx):
             calls.append(ctx.params["name"])
             return "executed"
-        with patch("backend.tool_permissions.get_access_token", return_value=principal("client-a")):
-            ctx = SimpleNamespace(method="tools/call", params={"name": NOTE_WRITE, "arguments": {}})
+        ctx = SimpleNamespace(method="tools/call", params={
+            "name": EXEC_WINDOWS, "arguments": {"command": "hostname.exe"},
+        })
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("beta")):
             with self.assertRaises(MCPError):
                 asyncio.run(middleware(ctx, next_call))
             self.assertEqual(calls, [])
-            self.store.set_note_permissions("client-a", read=False, write=True)
-            result = asyncio.run(middleware(ctx, next_call))
-            self.assertEqual(result, "executed")
-            self.assertEqual(calls, [NOTE_WRITE])
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
+            self.assertEqual(asyncio.run(middleware(ctx, next_call)), "executed")
+            self.assertEqual(calls, [EXEC_WINDOWS])
 
 
 if __name__ == "__main__":

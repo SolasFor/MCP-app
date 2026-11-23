@@ -322,7 +322,7 @@ async def shared_notes_list() -> str:
     require_note_permission(NOTE_LIST, oauth_provider.store if oauth_provider else None)
     assert shared_notes is not None
     names = shared_notes.list_names()
-    return "\\n".join(names) if names else "(нет доступных заметок)"
+    return "\n".join(names) if names else "(нет доступных заметок)"
 
 
 @_conditional_tool(OAUTH_ENABLED)

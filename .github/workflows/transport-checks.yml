@@ -7,6 +7,8 @@ on:
       - "app/**"
       - "tests/**"
       - "requirements.txt"
+      - "README.md"
+      - "docs/security-profiles.md"
       - ".github/workflows/transport-checks.yml"
   push:
     branches: [main]
@@ -15,6 +17,8 @@ on:
       - "app/**"
       - "tests/**"
       - "requirements.txt"
+      - "README.md"
+      - "docs/security-profiles.md"
       - ".github/workflows/transport-checks.yml"
 
 permissions:

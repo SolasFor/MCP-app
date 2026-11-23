@@ -48,6 +48,18 @@ class ExecutionAudit:
             handler.setFormatter(logging.Formatter("%(message)s"))
             self._logger.addHandler(handler)
 
+    def close(self) -> None:
+        """Flush and release Windows file handles (also used by unit tests)."""
+        for handler in list(self._logger.handlers):
+            self._logger.removeHandler(handler)
+            handler.close()
+
+    def __enter__(self) -> "ExecutionAudit":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
     def record(
         self, *, client_id: str, kind: str, profile: str,
         event: str, command: str, host: str = "", port: int | None = None,

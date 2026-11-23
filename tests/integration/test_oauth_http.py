@@ -48,9 +48,9 @@ def req(url, method="GET", data=None, content_type=None, headers=None):
     request = urllib.request.Request(url, data=body, method=method, headers=hdrs)
     try:
         with OPENER.open(request, timeout=5) as r:
-            return r.status, dict(r.headers), r.read()
+            return r.status, {k.title(): v for k, v in r.headers.items()}, r.read()
     except urllib.error.HTTPError as e:
-        return e.code, dict(e.headers), e.read()
+        return e.code, {k.title(): v for k, v in e.headers.items()}, e.read()
 
 
 class OAuthHttpTests(unittest.TestCase):

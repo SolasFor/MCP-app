@@ -85,6 +85,24 @@ class OAuthGuiTests(unittest.TestCase):
         self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "safe")
         dialog.close()
 
+    def test_restore_basic_commands_preserves_ssh_policy(self):
+        from backend.oauth_execution import ExecutionApprovals, DEFAULT_WINDOWS_ALLOWLIST
+        from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
+        settings = ExecutionApprovals(self.store)
+        settings.set_policy(windows="", hosts="trusted.example", ssh_commands="uptime")
+        dialog = ExecutionPolicyDialog(settings)
+        self.assertEqual(dialog.windows.toPlainText(), "")
+        dialog.reset_windows.click()
+        self.assertEqual(
+            dialog.windows.toPlainText(), "\\n".join(DEFAULT_WINDOWS_ALLOWLIST)
+        )
+        # The reset is a proposed UI change until the user saves.
+        self.assertEqual(settings.policy()["windows"], ())
+        dialog.save()
+        self.assertEqual(settings.policy()["windows"], DEFAULT_WINDOWS_ALLOWLIST)
+        self.assertEqual(settings.policy()["hosts"], ("trusted.example",))
+        self.assertEqual(settings.policy()["ssh_commands"], ("uptime",))
+
     def test_revoke_button_revokes_in_live_backend_store(self):
         dialog = OAuthClientsDialog(RESOURCE)
         dialog.table.selectRow(0)

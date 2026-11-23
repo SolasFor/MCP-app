@@ -16,7 +16,9 @@ from backend.server import mcp, server_info
 async def main():
     tools = sorted(t.name for t in await mcp.list_tools())
     resources = sorted(str(r.uri) for r in await mcp.list_resources())
-    print(json.dumps({"tools": tools, "resources": resources, "info": server_info()}))
+    call = await mcp.call_tool("server_info", {})
+    result_text = " ".join(getattr(c, "text", "") for c in call.content)
+    print(json.dumps({"tools": tools, "resources": resources, "info": server_info(), "call": result_text}))
 asyncio.run(main())
 """
 
@@ -47,6 +49,7 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(result["tools"], ["server_info"])
         self.assertEqual(result["resources"], [])
         self.assertNotIn("test-only-not-a-real-token", result["info"])
+        self.assertIn("MCP app ready", result["call"])
 
     def test_execution_flag_cannot_bypass_advanced_flag(self) -> None:
         result = registry(execute=True, hosts="example.com", executables="python")

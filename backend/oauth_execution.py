@@ -73,6 +73,9 @@ class ExecutionApprovals:
                 );
                 CREATE INDEX IF NOT EXISTS idx_exec_pending ON
                     exec_requests(issuer,expires,approved);
+                -- Remove stale, editable grants from previous development
+                -- builds. All approved OAuth clients now share fixed rights.
+                DROP TABLE IF EXISTS exec_grants;
             """)
             # Existing databases may contain the superseded per-client grant
             # table. Its values are deliberately ignored: access is fixed.

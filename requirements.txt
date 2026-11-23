@@ -13,4 +13,5 @@ mcp>=2.3,<3                           # MCPServer, transport security, streamabl
 uvicorn
 starlette
 pydantic
-paramiko                              # run_ssh_command
+paramiko                              # SSH commands
+cryptography>=43                       # Fernet encryption of OAuth client metadata (DPAPI key on Windows)

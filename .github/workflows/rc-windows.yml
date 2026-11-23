@@ -1,0 +1,63 @@
+name: RC Windows installer (no publish)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "backend/**"
+      - "main.py"
+      - "requirements*.txt"
+      - "packaging/**"
+      - "tools/**"
+      - ".github/workflows/rc-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rc-windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-package:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
+      - name: Build PyInstaller, embedded cloudflared, portable ZIP and Setup.exe
+        shell: pwsh
+        run: |
+          ./packaging/build.ps1 -Python python
+          if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
+      - name: Verify actual Windows installer and portable ZIP exist
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $setup = "dist/MCPApp-Setup-$version.exe"
+          $portable = "dist/MCPApp-$version-portable.zip"
+          $selftest = Get-Content "build/selftest.txt" -Raw -Encoding UTF8
+          if (-not (Test-Path $setup)) { throw "Missing $setup" }
+          if (-not (Test-Path $portable)) { throw "Missing $portable" }
+          if ($selftest -notmatch 'RESULT OK') { throw "Built EXE self-test failed" }
+          Write-Host "Installer: $setup"
+          Write-Host "Portable: $portable"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MCPApp-RC-Windows-${{ github.run_number }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            build/selftest.txt
+          retention-days: 14
+          if-no-files-found: warn

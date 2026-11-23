@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse, Response
 if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
+    from .oauth_store import default_store_path
     from .security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
@@ -26,6 +27,7 @@ if __package__:
 else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
+    from oauth_store import default_store_path
     from security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
@@ -218,7 +220,13 @@ auth_settings = AuthSettings(
     revocation_options=RevocationOptions(enabled=True) if OAUTH_ENABLED else None,
     validate_token_resource=True,
 )
-oauth_provider = LocalConsentOAuthProvider(BASE_URL, RESOURCE_URL, SECRET_TOKEN) if OAUTH_ENABLED else None
+oauth_provider = (
+    LocalConsentOAuthProvider(
+        BASE_URL, RESOURCE_URL, SECRET_TOKEN,
+        store_path=os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path(),
+    )
+    if OAUTH_ENABLED else None
+)
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current

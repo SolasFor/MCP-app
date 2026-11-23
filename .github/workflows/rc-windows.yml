@@ -1,6 +1,8 @@
 name: RC Windows installer (no publish)
 
 on:
+  push:
+    branches: [release/rc-01-oauth-windows-ssh]
   pull_request:
     branches: [main]
     paths:

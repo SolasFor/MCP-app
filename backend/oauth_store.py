@@ -156,9 +156,9 @@ class OAuthStore:
         # OAuthStore also works without the optional execution module/tables.
         existing = {row[0] for row in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('exec_grants','exec_requests')"
+            "AND name IN ('exec_grants','exec_requests','exec_client_profiles')"
         )}
-        for table in ("exec_grants", "exec_requests"):
+        for table in ("exec_grants", "exec_requests", "exec_client_profiles"):
             if table not in existing:
                 continue
             sql = f"DELETE FROM {table} WHERE issuer=?"

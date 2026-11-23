@@ -20,10 +20,12 @@ if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .oauth_store import default_store_path
+    from .oauth_execution import ExecutionApprovals
     from .shared_notes import SharedNotes, default_notes_dir
     from .tool_permissions import (
         NOTE_LIST, NOTE_READ, NOTE_WRITE,
-        make_tool_middleware, require_note_permission,
+        EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
+        require_note_permission, require_execution_permission,
     )
     from .security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
@@ -33,10 +35,12 @@ else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from oauth_store import default_store_path
+    from oauth_execution import ExecutionApprovals
     from shared_notes import SharedNotes, default_notes_dir
     from tool_permissions import (
         NOTE_LIST, NOTE_READ, NOTE_WRITE,
-        make_tool_middleware, require_note_permission,
+        EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
+        require_note_permission, require_execution_permission,
     )
     from security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
@@ -242,6 +246,7 @@ oauth_provider = (
 shared_notes = SharedNotes(
     os.environ.get("MCP_SHARED_NOTES_DIR") or default_notes_dir()
 ) if OAUTH_ENABLED else None
+oauth_execution = ExecutionApprovals(oauth_provider.store) if oauth_provider is not None else None
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
@@ -262,7 +267,7 @@ mcp = (
         SERVER_NAME,
         auth=auth_settings,
         auth_server_provider=oauth_provider,
-        middleware=[make_tool_middleware(oauth_provider.store)],
+        middleware=[make_tool_middleware(oauth_provider.store, oauth_execution)],
     )
     if oauth_provider is not None
     else MCPServer(SERVER_NAME, auth=auth_settings, token_verifier=SimpleTokenVerifier())
@@ -347,6 +352,89 @@ async def shared_note_write(name: str, content: str) -> str:
         return f"❌ Не удалось сохранить заметку: {type(exc).__name__}"
     logger.info("[OAUTH SHARED NOTE WRITE] name redacted (client-specific permission)")
     return "✅ Заметка сохранена в общей папке."
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def oauth_windows_command(command: str, approval_id: str = "") -> str:
+    """Execute an exact allowlisted command, only after one-time local GUI approval.
+
+    First call creates a pending request and returns a ticket. The client repeats
+    exactly the same command with approval_id after the owner approves locally.
+    """
+    client_id = require_execution_permission(
+        EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    if not oauth_execution.can_request(client_id, "windows", command=command):
+        return "❌ Windows command is not on the owner's exact allowlist."
+    if not approval_id:
+        ticket = oauth_execution.request(client_id, "windows", command=command)
+        return (
+            "Approval required. In MCP app open OAuth clients → Pending commands. "
+            f"After approval repeat the same call with approval_id={ticket}. "
+            "Expires in 3 minutes, single use."
+        )
+    if not oauth_execution.consume(approval_id, client_id, "windows", command=command):
+        return "❌ Approval missing, denied, expired, used, or does not match."
+    try:
+        import shlex
+        program = shlex.split(command, posix=os.name != "nt")[0].strip('"')
+        argv = parse_allowed_command(command, frozenset({program.casefold()}))
+        logger.info("[OAUTH WINDOWS] owner-approved command (%s); args redacted", Path(argv[0]).name)
+        proc = await asyncio.create_subprocess_exec(
+            *argv, cwd=str(WORKSPACE_DIR),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "❌ Windows command timed out (15 seconds)."
+        return (
+            f"Exit code: {proc.returncode}\n"
+            f"STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}\n"
+            f"STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
+        )
+    except (OSError, ValueError, IndexError) as exc:
+        logger.warning("[OAUTH WINDOWS] failed: %s", type(exc).__name__)
+        return "❌ Approved executable could not be started."
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def oauth_ssh_command(
+    host: str, command: str, user: str = "", port: int = 22, approval_id: str = "",
+) -> str:
+    """Execute an exact allowlisted host/command after one-time local GUI approval."""
+    client_id = require_execution_permission(
+        EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    if not oauth_execution.can_request(
+        client_id, "ssh", command=command, host=host, user=user, port=port
+    ):
+        return "❌ SSH host/command is not on the owner's exact allowlist."
+    if not approval_id:
+        ticket = oauth_execution.request(
+            client_id, "ssh", command=command, host=host, user=user, port=port
+        )
+        return (
+            "Approval required. In MCP app open OAuth clients → Pending commands. "
+            f"After approval repeat with approval_id={ticket}. "
+            "Expires in 3 minutes, single use."
+        )
+    if not oauth_execution.consume(
+        approval_id, client_id, "ssh", command=command, host=host, user=user, port=port
+    ):
+        return "❌ Approval missing, denied, expired, used, or mismatched."
+    logger.info("[OAUTH SSH] owner-approved action host=%s port=%s; command redacted", host, port)
+    try:
+        return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, 12)
+    except Exception as exc:
+        logger.warning("[OAUTH SSH] failed: %s", type(exc).__name__)
+        return "❌ SSH command failed; details in local server audit log."
 
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))

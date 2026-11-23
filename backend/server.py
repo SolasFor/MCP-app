@@ -20,6 +20,11 @@ if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from .oauth_store import default_store_path
+    from .shared_notes import SharedNotes, default_notes_dir
+    from .tool_permissions import (
+        NOTE_LIST, NOTE_READ, NOTE_WRITE,
+        make_tool_middleware, require_note_permission,
+    )
     from .security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
@@ -28,6 +33,11 @@ else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
     from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
     from oauth_store import default_store_path
+    from shared_notes import SharedNotes, default_notes_dir
+    from tool_permissions import (
+        NOTE_LIST, NOTE_READ, NOTE_WRITE,
+        make_tool_middleware, require_note_permission,
+    )
     from security_policy import (
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
@@ -227,6 +237,11 @@ oauth_provider = (
     )
     if OAUTH_ENABLED else None
 )
+# A separate private folder for manually shared notes: not the backend's
+# arbitrary WORKSPACE_DIR, not user profile files or administrator tools.
+shared_notes = SharedNotes(
+    os.environ.get("MCP_SHARED_NOTES_DIR") or default_notes_dir()
+) if OAUTH_ENABLED else None
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
@@ -243,7 +258,12 @@ TRANSPORT_SECURITY = TransportSecuritySettings(
 # The SDK derives ProviderTokenVerifier automatically from auth_server_provider.
 # Do NOT also pass token_verifier: the two arguments are mutually exclusive.
 mcp = (
-    MCPServer(SERVER_NAME, auth=auth_settings, auth_server_provider=oauth_provider)
+    MCPServer(
+        SERVER_NAME,
+        auth=auth_settings,
+        auth_server_provider=oauth_provider,
+        middleware=[make_tool_middleware(oauth_provider.store)],
+    )
     if oauth_provider is not None
     else MCPServer(SERVER_NAME, auth=auth_settings, token_verifier=SimpleTokenVerifier())
 )
@@ -295,6 +315,39 @@ def get_environment_info() -> str:
 # ==========================================
 # 5. ИНСТРУМЕНТЫ (Tools)
 # ==========================================
+
+@_conditional_tool(OAUTH_ENABLED)
+async def shared_notes_list() -> str:
+    """List names of text/Markdown notes explicitly shared with this OAuth client."""
+    require_note_permission(NOTE_LIST, oauth_provider.store if oauth_provider else None)
+    assert shared_notes is not None
+    names = shared_notes.list_names()
+    return "\\n".join(names) if names else "(нет доступных заметок)"
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def shared_note_read(name: str) -> str:
+    """Read one .txt/.md file from the separate shared_notes folder (max 32 KB)."""
+    require_note_permission(NOTE_READ, oauth_provider.store if oauth_provider else None)
+    assert shared_notes is not None
+    try:
+        return shared_notes.read(name)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return f"❌ Не удалось прочитать заметку: {type(exc).__name__}"
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def shared_note_write(name: str, content: str) -> str:
+    """Create/update one small note in shared_notes; requires separate write grant."""
+    require_note_permission(NOTE_WRITE, oauth_provider.store if oauth_provider else None)
+    assert shared_notes is not None
+    try:
+        shared_notes.write(name, content)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return f"❌ Не удалось сохранить заметку: {type(exc).__name__}"
+    logger.info("[OAUTH SHARED NOTE WRITE] name redacted (client-specific permission)")
+    return "✅ Заметка сохранена в общей папке."
+
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
 async def run_local_command(command: str, timeout: int = 30, cwd: str | None = None) -> str:

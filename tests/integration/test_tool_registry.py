@@ -53,19 +53,19 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertNotIn("test-only-not-a-real-token", result["info"])
         self.assertIn("MCP app ready", result["call"])
 
-    def test_oauth_never_registers_privileged_admin_tools(self) -> None:
+    def test_oauth_registers_one_fixed_windows_and_ssh_capability(self) -> None:
         result = registry(advanced=True, execute=True, oauth=True,
                           hosts="prod.example", executables=Path(sys.executable).name)
-        # This is the internal SDK registry (no HTTP identity/middleware).
-        # On the wire tools/list hides note tools until the local owner grants
-        # a specific client permission, as asserted by test_oauth_http.
         self.assertEqual(
             result["tools"],
-            ["server_info", "shared_note_read", "shared_note_write", "shared_notes_list"],
+            ["oauth_ssh_command", "oauth_windows_command", "server_info"],
         )
         self.assertEqual(result["resources"], [])
-        for prohibited in ("run_local_command", "run_ssh_command", "read_workspace_file",
-                           "write_workspace_file"):
+        for prohibited in (
+            "run_local_command", "run_ssh_command",
+            "read_workspace_file", "write_workspace_file",
+            "shared_notes_list", "shared_note_read", "shared_note_write",
+        ):
             self.assertNotIn(prohibited, result["tools"])
 
     def test_execution_flag_cannot_bypass_advanced_flag(self) -> None:

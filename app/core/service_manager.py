@@ -449,6 +449,7 @@ class ServiceManager(QObject):
         return {
             "MCP_SECRET_TOKEN": self._token,
             "MCP_PUBLIC_URL": self.public_url,
+            "MCP_PATH": s.mcp_path,
             "MCP_HOST": s.server_host,
             "MCP_PORT": str(s.server_port),
             "MCP_HEALTH_PATH": s.server_health_path,

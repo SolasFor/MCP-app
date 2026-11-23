@@ -1,16 +1,16 @@
-"""Local-only, single-use approval workflow for remote OAuth execution.
+"""Three owner-selected execution profiles for OAuth MCP clients.
 
-No internet-exposed admin endpoint: only Windows GUI opens and approves pending
-requests in the same user-owned SQLite database. All OAuth-approved clients have the SAME fixed Windows + SSH capabilities.
-Each executable request must match an exact OWNER-configured template and,
-for SSH, an exact host. Each attempt requires an additional short-lived local
-approval of the exact request; the server does NOT wait over Cloudflare.
+safe (default): no command/SSH tools.
+allowlist: Windows command lines and SSH host+commands must match exact owner
+           entries; no per-call confirmation.
+full: approved OAuth clients can run Windows shell/SSH commands immediately.
+
+The profile is encrypted in the per-issuer SQLite policy and reread for every
+tool discovery and every invocation. No remote admin API can change it.
 """
 from __future__ import annotations
 
-import hashlib
-import secrets
-import time
+import re
 from typing import Literal
 
 try:
@@ -19,20 +19,20 @@ except ImportError:
     from oauth_store import OAuthStore
 
 ActionKind = Literal["windows", "ssh"]
-REQUEST_TTL = 180
-MAX_PENDING = 32
+PROFILE_SAFE = "safe"
+PROFILE_ALLOWLIST = "allowlist"
+PROFILE_FULL = "full"
+PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
 MAX_RULES = 24
 MAX_RULE_SIZE = 512
-
-
-def _digest(ticket: str) -> str:
-    return hashlib.sha256(ticket.encode("utf-8")).hexdigest()
+DEFAULT_WINDOWS_ALLOWLIST = ("whoami", "ipconfig", "systeminfo", "pwd", "ls", "dir", "echo")
+_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,251}$")
 
 
 def _parse_rules(text: str, *, host: bool = False) -> tuple[str, ...]:
-    """Exact, per-line whitelist; no wildcards, control chars or shell defaults."""
+    """Exact, per-line entries only. No wildcard host or command grants."""
     if not isinstance(text, str) or len(text) > MAX_RULES * MAX_RULE_SIZE:
-        raise ValueError("Invalid rule list")
+        raise ValueError("Invalid allowlist")
     rules: list[str] = []
     for line in text.splitlines():
         rule = line.strip()
@@ -41,9 +41,9 @@ def _parse_rules(text: str, *, host: bool = False) -> tuple[str, ...]:
         if len(rule) > MAX_RULE_SIZE or any(ch in rule for ch in ("\x00", "\r", "\t")):
             raise ValueError("Invalid allowlist entry")
         if "*" in rule or "?" in rule:
-            raise ValueError("Wildcards are not allowed")
-        if host and any(ch in rule for ch in (" ", "/", "\\", ":", "@")):
-            raise ValueError("SSH hosts must be exact hostnames or SSH aliases")
+            raise ValueError("Wildcards are forbidden in allowlist")
+        if host and not _SSH_HOST_RE.fullmatch(rule):
+            raise ValueError("SSH hosts must be exact hostnames or aliases")
         if rule not in rules:
             rules.append(rule)
         if len(rules) > MAX_RULES:
@@ -51,8 +51,19 @@ def _parse_rules(text: str, *, host: bool = False) -> tuple[str, ...]:
     return tuple(rules)
 
 
+def windows_whitelisted(command: str, entries: tuple[str, ...]) -> bool:
+    """Exact lines, plus pure (non-shell) echo with arbitrary literal text."""
+    normalized = command.strip()
+    if normalized in entries:
+        return True
+    return "echo" in entries and normalized.lower().startswith("echo ") and len(normalized) <= MAX_RULE_SIZE
+
+
 class ExecutionApprovals:
-    """A constrained authorization layer attached to an existing OAuthStore."""
+    """Retained class name for compatibility with existing GUI/backend imports.
+
+    No approvals or tickets are created in any of the three scenarios.
+    """
 
     def __init__(self, store: OAuthStore) -> None:
         self.store = store
@@ -62,55 +73,64 @@ class ExecutionApprovals:
                     issuer TEXT PRIMARY KEY,
                     encrypted BLOB NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS exec_requests(
-                    digest TEXT PRIMARY KEY,
-                    issuer TEXT NOT NULL,
-                    client_id TEXT NOT NULL,
-                    encrypted BLOB NOT NULL,
-                    created INTEGER NOT NULL,
-                    expires INTEGER NOT NULL,
-                    approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1))
-                );
-                CREATE INDEX IF NOT EXISTS idx_exec_pending ON
-                    exec_requests(issuer,expires,approved);
-                -- Remove stale, editable grants from previous development
-                -- builds. All approved OAuth clients now share fixed rights.
                 DROP TABLE IF EXISTS exec_grants;
             """)
-            # Existing databases may contain the superseded per-client grant
-            # table. Its values are deliberately ignored: access is fixed.
-            db.execute("""
-                DELETE FROM exec_requests
-                WHERE issuer=? AND client_id NOT IN (
-                    SELECT client_id FROM clients WHERE issuer=?
-                )""", (store.issuer, store.issuer))
+            # Old short-lived approval tickets cannot authorize anything here.
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
+                db.execute("DELETE FROM exec_requests WHERE issuer=?", (store.issuer,))
 
-    def policy(self) -> dict[str, tuple[str, ...]]:
+    def policy(self) -> dict:
         with self.store._db() as db:
             row = db.execute("SELECT encrypted FROM exec_policy WHERE issuer=?",
                              (self.store.issuer,)).fetchone()
         if not row:
-            return {"windows": (), "hosts": (), "ssh_commands": ()}
+            return {
+                "profile": PROFILE_SAFE, "windows": DEFAULT_WINDOWS_ALLOWLIST,
+                "hosts": (), "ssh_commands": (),
+            }
         payload = self.store._decrypt(row[0])
-        return {key: tuple(payload.get(key, ()))
-                for key in ("windows", "hosts", "ssh_commands")}
-
-    def set_policy(self, *, windows: str, hosts: str, ssh_commands: str) -> None:
-        """GUI-only policy mutation. Invalidate all pending approvals on change."""
-        policy = {
-            "windows": _parse_rules(windows),
-            "hosts": _parse_rules(hosts, host=True),
-            "ssh_commands": _parse_rules(ssh_commands),
+        profile = payload.get("profile", PROFILE_SAFE)
+        if profile not in PROFILES:
+            profile = PROFILE_SAFE
+        # Existing records from earlier builds contain lists but no profile:
+        # never silently convert them to command execution privileges.
+        return {
+            "profile": profile,
+            "windows": tuple(payload.get("windows", DEFAULT_WINDOWS_ALLOWLIST)),
+            "hosts": tuple(payload.get("hosts", ())),
+            "ssh_commands": tuple(payload.get("ssh_commands", ())),
         }
-        encrypted = self.store._encrypt(policy)
+
+    def profile(self) -> str:
+        return self.policy()["profile"]
+
+    def _save(self, policy: dict) -> None:
         with self.store._db() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("INSERT OR REPLACE INTO exec_policy(issuer,encrypted) VALUES (?,?)",
-                       (self.store.issuer, encrypted))
-            db.execute("DELETE FROM exec_requests WHERE issuer=?", (self.store.issuer,))
+                       (self.store.issuer, self.store._encrypt(policy)))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
+                db.execute("DELETE FROM exec_requests WHERE issuer=?", (self.store.issuer,))
+
+    def set_profile(self, profile: str) -> None:
+        """Local GUI only. Full access requires an explicit UI warning."""
+        if profile not in PROFILES:
+            raise ValueError("Unknown access scenario")
+        policy = self.policy()
+        policy["profile"] = profile
+        self._save(policy)
+
+    def set_policy(self, *, windows: str, hosts: str, ssh_commands: str) -> None:
+        """Owner-edited exact allowlists; profile remains unchanged."""
+        policy = self.policy()
+        policy.update({
+            "windows": _parse_rules(windows),
+            "hosts": _parse_rules(hosts, host=True),
+            "ssh_commands": _parse_rules(ssh_commands),
+        })
+        self._save(policy)
 
     def client_approved(self, client_id: str) -> bool:
-        """Only browser-consented OAuth clients are allowed to request actions."""
         if not isinstance(client_id, str) or not client_id or client_id == "mcp-app-user":
             return False
         with self.store._db() as db:
@@ -119,116 +139,27 @@ class ExecutionApprovals:
                 (self.store.issuer, client_id),
             ).fetchone())
 
-    def can_request(self, client_id: str, kind: ActionKind, *,
-                    command: str, host: str = "", user: str = "", port: int = 22) -> bool:
-        if kind not in ("windows", "ssh") or client_id == "mcp-app-user":
+    def can_request(
+        self, client_id: str, kind: ActionKind, *, command: str,
+        host: str = "", user: str = "", port: int = 22,
+    ) -> bool:
+        if kind not in ("windows", "ssh") or not self.client_approved(client_id):
             return False
-        if not isinstance(command, str) or not command or len(command) > MAX_RULE_SIZE:
+        if not isinstance(command, str) or not command.strip() or len(command) > MAX_RULE_SIZE:
             return False
-        if not isinstance(port, int) or not (1 <= port <= 65535) or not isinstance(user, str):
+        if type(port) is not int or not (1 <= port <= 65535) or not isinstance(user, str):
             return False
         if len(user) > 64 or any(ch in user for ch in ("/", "\\", " ", "@", "\x00")):
             return False
-        if not self.client_approved(client_id):
+        if kind == "windows" and (host or user):
+            return False
+        if kind == "ssh" and (not isinstance(host, str) or not _SSH_HOST_RE.fullmatch(host)):
             return False
         policy = self.policy()
-        if kind == "windows":
-            return command in policy["windows"] and not host and not user
-        return host in policy["hosts"] and command in policy["ssh_commands"]
-
-    @staticmethod
-    def _action(kind: ActionKind, command: str, host: str, user: str, port: int) -> dict:
-        return {"kind": kind, "command": command, "host": host,
-                "user": user, "port": port}
-
-    def request(self, client_id: str, kind: ActionKind, *, command: str,
-                host: str = "", user: str = "", port: int = 22) -> str:
-        if not self.can_request(client_id, kind, command=command,
-                                host=host, user=user, port=port):
-            raise PermissionError("Execution is disabled or not on the exact allowlist")
-        ticket = secrets.token_urlsafe(24)
-        now = int(time.time())
-        payload = self._action(kind, command, host, user, port)
-        with self.store._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM exec_requests WHERE expires<?", (now,))
-            count = db.execute(
-                "SELECT count(*) FROM exec_requests WHERE issuer=?",
-                (self.store.issuer,),
-            ).fetchone()[0]
-            if count >= MAX_PENDING:
-                raise RuntimeError("Too many pending approvals")
-            db.execute("""
-                INSERT INTO exec_requests
-                (digest,issuer,client_id,encrypted,created,expires,approved)
-                VALUES (?,?,?,?,?,?,0)
-            """, (_digest(ticket), self.store.issuer, client_id,
-                  self.store._encrypt(payload), now, now + REQUEST_TTL))
-        return ticket
-
-    def pending(self) -> list[dict]:
-        now = int(time.time())
-        with self.store._db() as db:
-            rows = db.execute("""
-                SELECT r.digest,r.client_id,r.encrypted,r.created,r.expires,r.approved
-                FROM exec_requests r JOIN clients c
-                ON c.issuer=r.issuer AND c.client_id=r.client_id
-                WHERE r.issuer=? AND r.expires>? AND c.approved_at IS NOT NULL
-                ORDER BY r.created ASC
-            """, (self.store.issuer, now)).fetchall()
-        return [dict(ticket_hash=digest, client_id=cid,
-                     **self.store._decrypt(enc), created=created,
-                     expires=expires, approved=bool(approved))
-                for digest,cid,enc,created,expires,approved in rows]
-
-    def decision(self, ticket_hash: str, *, approve: bool) -> bool:
-        """Local GUI approval; no route for remote clients to call this."""
-        now = int(time.time())
-        with self.store._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""
-                SELECT r.client_id,r.encrypted,r.approved
-                FROM exec_requests r JOIN clients c
-                ON c.issuer=r.issuer AND c.client_id=r.client_id
-                WHERE r.digest=? AND r.issuer=? AND r.expires>?
-                      AND c.approved_at IS NOT NULL
-            """, (ticket_hash, self.store.issuer, now)).fetchone()
-            if not row:
-                return False
-            if not approve:
-                db.execute("DELETE FROM exec_requests WHERE digest=?", (ticket_hash,))
-                return True
-            if row[2]:
-                return False
-            payload = self.store._decrypt(row[1])
-            if not self.can_request(row[0], payload["kind"],
-                                    command=payload["command"], host=payload["host"],
-                                    user=payload["user"], port=payload["port"]):
-                # The writer lock prevents another process from changing
-                # client approval or policy while this decision commits.
-                return False
-            db.execute("UPDATE exec_requests SET approved=1 WHERE digest=?",
-                       (ticket_hash,))
-            return True
-
-    def consume(self, ticket: str, client_id: str, kind: ActionKind, *,
-                command: str, host: str = "", user: str = "", port: int = 22) -> bool:
-        """One-time consume bound to exact client and every execution argument."""
-        if not ticket or not self.can_request(client_id, kind, command=command,
-                                              host=host, user=user, port=port):
+        if policy["profile"] == PROFILE_SAFE:
             return False
-        now = int(time.time())
-        with self.store._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("""
-                SELECT encrypted,expires,approved FROM exec_requests
-                WHERE digest=? AND issuer=? AND client_id=?
-            """, (_digest(ticket), self.store.issuer, client_id)).fetchone()
-            if not row or row[1] <= now or not row[2]:
-                return False
-            if self.store._decrypt(row[0]) != self._action(kind, command, host, user, port):
-                return False
-            # Consume before executing. Replays cannot run twice.
-            db.execute("DELETE FROM exec_requests WHERE digest=?",
-                       (_digest(ticket),))
+        if policy["profile"] == PROFILE_FULL:
             return True
+        if kind == "windows":
+            return windows_whitelisted(command, policy["windows"])
+        return host in policy["hosts"] and command.strip() in policy["ssh_commands"]

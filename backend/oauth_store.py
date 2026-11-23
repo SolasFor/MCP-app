@@ -154,6 +154,23 @@ class OAuthStore:
     def _decrypt(self, value: bytes) -> dict:
         return json.loads(self._cipher.decrypt(value).decode("utf-8"))
 
+    @staticmethod
+    def _clear_exec_records(db, issuer: str, client_id: str | None = None) -> None:
+        # OAuthStore also works without the optional execution module/tables.
+        existing = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('exec_grants','exec_requests')"
+        )}
+        for table in ("exec_grants", "exec_requests"):
+            if table not in existing:
+                continue
+            sql = f"DELETE FROM {table} WHERE issuer=?"
+            args = (issuer,)
+            if client_id is not None:
+                sql += " AND client_id=?"
+                args = (issuer, client_id)
+            db.execute(sql, args)
+
     def bind_owner(self, secret: str) -> None:
         """Changing the owner token invalidates all OAuth grants for this issuer."""
         fingerprint = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.resource_url)
@@ -164,6 +181,7 @@ class OAuthStore:
                 db.execute("DELETE FROM tokens WHERE issuer=?", (self.issuer,))
                 db.execute("DELETE FROM clients WHERE issuer=?", (self.issuer,))
                 db.execute("DELETE FROM client_permissions WHERE issuer=?", (self.issuer,))
+                self._clear_exec_records(db, self.issuer)
             db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (self.issuer, fingerprint))
 
     def remove_old_quick_tunnels(self) -> None:
@@ -182,6 +200,7 @@ class OAuthStore:
                     db.execute("DELETE FROM tokens WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM meta WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM client_permissions WHERE issuer=?", (origin,))
+                    self._clear_exec_records(db, origin)
 
     def count_clients(self) -> int:
         with self._db() as db:
@@ -272,6 +291,7 @@ class OAuthStore:
                        (self.issuer, client_id))
             db.execute("DELETE FROM client_permissions WHERE issuer=? AND client_id=?",
                        (self.issuer, client_id))
+            self._clear_exec_records(db, self.issuer, client_id)
             return cursor.rowcount > 0
 
     def save_token(self, token: AccessToken | RefreshToken, kind: str, family: str) -> None:

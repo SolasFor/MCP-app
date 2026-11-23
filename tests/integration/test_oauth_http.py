@@ -105,8 +105,14 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, body.decode(errors="replace"))
         metadata = json.loads(body)
         self.assertEqual(metadata["issuer"], self.url)
-        for path in ("authorize", "token", "register", "revoke"):
-            self.assertEqual(metadata[f"{path if path != 'authorize' else 'authorization'}_endpoint"], self.url + f"/{path}")
+        endpoint_names = {
+            "authorize": "authorization_endpoint",
+            "token": "token_endpoint",
+            "register": "registration_endpoint",
+            "revoke": "revocation_endpoint",
+        }
+        for path, field in endpoint_names.items():
+            self.assertEqual(metadata[field], self.url + f"/{path}")
         status, _, body = req(self.url + "/.well-known/oauth-protected-resource/mcp")
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertIn(self.url, json.loads(body)["authorization_servers"])

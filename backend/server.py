@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -494,6 +495,14 @@ def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) 
     try:
         client.connect(hostname=actual_host, port=actual_port, username=actual_user, key_filename=key_filename, timeout=10, banner_timeout=10)
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
+        # Paramiko recv_exit_status() alone can wait forever if the remote
+        # program never exits. Enforce a total deadline before reading output.
+        deadline = time.monotonic() + min(max(timeout, 1), 30)
+        while not stdout.channel.exit_status_ready():
+            if time.monotonic() >= deadline:
+                stdout.channel.close()
+                return "❌ SSH command timed out."
+            time.sleep(0.1)
         exit_status = stdout.channel.recv_exit_status()
         out_str = truncate_output(stdout.read().decode(errors="replace"))
         err_str = truncate_output(stderr.read().decode(errors="replace"))

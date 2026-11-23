@@ -49,13 +49,15 @@ class FixedOAuthToolsTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_fixed_rights_for_approved_client_without_configuration(self):
+    def test_three_profiles_change_tool_visibility_without_restart(self):
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
+        self.assertFalse(self.exec.can_request("alpha", "windows", command="whoami"))
+        self.exec.set_profile("allowlist")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
-        self.assertEqual(OAUTH_TOOLS, frozenset({
-            "server_info", "oauth_windows_command", "oauth_ssh_command"
-        }))
-        # Policy defaults remain empty; command execution is still forbidden.
-        self.assertFalse(self.exec.can_request("alpha", "windows", command="hostname.exe"))
+        self.exec.set_profile("full")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.exec.set_profile("safe")
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
 
     def test_unknown_unapproved_owner_and_missing_scope_deny(self):
         for identity in (
@@ -66,6 +68,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
                 self.assertEqual(allowed_tools(self.store, identity, self.exec), BASIC_TOOLS)
 
     def test_revocation_removes_fixed_tools(self):
+        self.exec.set_profile("full")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
         self.store.revoke_client("alpha")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
@@ -74,6 +77,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         with patch("backend.tool_permissions.get_access_token", return_value=principal("mcp-app-user")):
             with self.assertRaises(PermissionError):
                 require_execution_permission(EXEC_WINDOWS, self.store, self.exec)
+        self.exec.set_profile("allowlist")
         with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
             self.assertEqual(
                 require_execution_permission(EXEC_WINDOWS, self.store, self.exec), "alpha"
@@ -91,6 +95,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         async def next_list(ctx):
             return ListToolsResult(tools=all_tools)
         ctx = SimpleNamespace(method="tools/list", params={})
+        self.exec.set_profile("allowlist")
         with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
             result = asyncio.run(middleware(ctx, next_list))
             self.assertEqual({x.name for x in result.tools}, OAUTH_TOOLS)
@@ -106,6 +111,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
                 {"name": EXEC_SSH}, {"name": "shared_notes_list"},
             ]}
         ctx = SimpleNamespace(method="tools/list", params={})
+        self.exec.set_profile("allowlist")
         with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
             result = asyncio.run(middleware(ctx, next_list))
             self.assertEqual(
@@ -128,6 +134,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
             with self.assertRaises(MCPError):
                 asyncio.run(middleware(ctx, next_call))
             self.assertEqual(calls, [])
+        self.exec.set_profile("allowlist")
         with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
             self.assertEqual(asyncio.run(middleware(ctx, next_call)), "executed")
             self.assertEqual(calls, [EXEC_WINDOWS])

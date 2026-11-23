@@ -183,7 +183,10 @@ class LocalConsentOAuthProvider(
                     from .oauth_execution import ExecutionApprovals
                 except ImportError:
                     from oauth_execution import ExecutionApprovals
-                mode = ExecutionApprovals(self.store).profile()
+                profiles = ExecutionApprovals(self.store)
+                mode = (profiles.profile_for(pending.client.client_id)
+                        if profiles.client_approved(pending.client.client_id)
+                        else profiles.profile())
             descriptions = {
                 "safe": "Safe: only server_info; no command execution.",
                 "allowlist": "Allowlist: Windows and SSH commands matching the owner's "
@@ -199,7 +202,7 @@ class LocalConsentOAuthProvider(
 <p>Return address: <code>{display_uri}</code></p>
 <p>OAuth compatibility scope: <strong>mcp:read</strong>.</p>
 <p>Current access scenario: <strong>{mode_description}</strong></p>
-<p>The owner can change this server-wide scenario later. Only authorize
+<p>The owner can change this scenario for the client in the Windows app later. Only authorize
 clients you trust; never share the owner token with them.</p>
 <p>Type the owner token shown in your MCP app. Never share this token with the requesting client.</p>
 <form method="post" action="/oauth/consent">

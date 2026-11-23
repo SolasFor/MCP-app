@@ -109,6 +109,63 @@ class OAuthExecutionTests(unittest.TestCase):
         self.assertFalse(hasattr(upgraded, "decision"))
         self.assertFalse(hasattr(upgraded, "consume"))
 
+    def test_client_profiles_are_isolated_and_persist_without_restart(self):
+        self.store.mark_approved("client-b")
+        self.policy.set_profile(PROFILE_ALLOWLIST)
+        self.assertEqual(self.policy.profile_for("client-a"), PROFILE_ALLOWLIST)
+        self.assertEqual(self.policy.profile_for("client-b"), PROFILE_ALLOWLIST)
+        self.policy.set_client_profile("client-a", PROFILE_FULL)
+        self.policy.set_client_profile("client-b", PROFILE_SAFE)
+        self.assertEqual(self.policy.profile_for("client-a"), PROFILE_FULL)
+        self.assertEqual(self.policy.profile_for("client-b"), PROFILE_SAFE)
+        self.assertTrue(self.policy.can_request(
+            "client-a", "windows", command="not-on-any-allowlist"
+        ))
+        self.assertFalse(self.policy.can_request(
+            "client-b", "windows", command="whoami"
+        ))
+        other = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
+        self.assertEqual(other.profile_for("client-a"), PROFILE_FULL)
+        self.assertEqual(other.profile_for("client-b"), PROFILE_SAFE)
+        # Global default changes do not override individual selections.
+        self.policy.set_profile(PROFILE_SAFE)
+        self.assertEqual(other.profile_for("client-a"), PROFILE_FULL)
+        self.assertEqual(other.profile_for("client-b"), PROFILE_SAFE)
+        # An absent override always inherits the global default.
+        self.assertEqual(self.policy.profile(), PROFILE_SAFE)
+
+    def test_revoke_and_owner_rotation_delete_client_profiles(self):
+        self.store.mark_approved("client-b")
+        self.policy.set_client_profile("client-a", PROFILE_FULL)
+        self.policy.set_client_profile("client-b", PROFILE_ALLOWLIST)
+        self.store.revoke_client("client-a")
+        self.assertEqual(self.policy.profile_for("client-a"), PROFILE_SAFE)
+        with self.store._db() as db:
+            remaining = db.execute(
+                "SELECT client_id FROM exec_client_profiles WHERE issuer=?",
+                (BASE,),
+            ).fetchall()
+        self.assertEqual(remaining, [("client-b",)])
+        self.store.bind_owner("new-token")
+        with self.store._db() as db:
+            remaining = db.execute(
+                "SELECT COUNT(*) FROM exec_client_profiles WHERE issuer=?",
+                (BASE,),
+            ).fetchone()[0]
+        self.assertEqual(remaining, 0)
+        self.assertEqual(self.policy.profile_for("client-b"), PROFILE_SAFE)
+
+    def test_unapproved_or_unknown_client_cannot_be_granted_access(self):
+        with self.assertRaises(ValueError):
+            self.policy.set_client_profile("client-b", PROFILE_FULL)
+        with self.assertRaises(ValueError):
+            self.policy.set_client_profile("unknown", PROFILE_FULL)
+        with self.assertRaises(ValueError):
+            self.policy.set_client_profile("mcp-app-user", PROFILE_FULL)
+        with self.assertRaises(ValueError):
+            self.policy.set_client_profile("client-a", "invalid")
+        self.assertEqual(self.policy.profile_for("client-b"), PROFILE_SAFE)
+
     def test_invalid_profile_rejected(self):
         for value in ("dangerous", None, "FULL", True):
             with self.subTest(value=value), self.assertRaises(ValueError):

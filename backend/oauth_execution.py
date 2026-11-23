@@ -5,8 +5,9 @@ allowlist: Windows command lines and SSH host+commands must match exact owner
            entries; no per-call confirmation.
 full: approved OAuth clients can run Windows shell/SSH commands immediately.
 
-The profile is encrypted in the per-issuer SQLite policy and reread for every
-tool discovery and every invocation. No remote admin API can change it.
+The global default and per-client profile overrides are stored encrypted in
+SQLite and reread for each tool discovery and invocation. No remote admin
+route can mutate permissions.
 """
 from __future__ import annotations
 
@@ -73,6 +74,12 @@ class ExecutionApprovals:
                     issuer TEXT PRIMARY KEY,
                     encrypted BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS exec_client_profiles(
+                    issuer TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    encrypted BLOB NOT NULL,
+                    PRIMARY KEY(issuer,client_id)
+                );
                 DROP TABLE IF EXISTS exec_grants;
             """)
             # Old short-lived approval tickets cannot authorize anything here.
@@ -103,6 +110,47 @@ class ExecutionApprovals:
 
     def profile(self) -> str:
         return self.policy()["profile"]
+
+    def profile_for(self, client_id: str) -> str:
+        """Return this approved client's explicit profile, else the global default.
+
+        A revoked, unapproved or unknown client can never receive privileges.
+        The encrypted SQLite row is read anew for every list and call, allowing
+        the owner to downgrade access immediately without reconnecting.
+        """
+        if not self.client_approved(client_id):
+            return PROFILE_SAFE
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT encrypted FROM exec_client_profiles "
+                "WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            ).fetchone()
+        if row:
+            stored = self.store._decrypt(row[0]).get("profile")
+            return stored if stored in PROFILES else PROFILE_SAFE
+        return self.profile()
+
+    def set_client_profile(self, client_id: str, profile: str) -> None:
+        """Called exclusively from the local GUI, never an exposed MCP route."""
+        if not isinstance(profile, str) or profile not in PROFILES:
+            raise ValueError("Unknown access scenario")
+        if not isinstance(client_id, str) or not client_id or client_id == "mcp-app-user":
+            raise ValueError("Invalid OAuth client")
+        with self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute(
+                "SELECT 1 FROM clients WHERE issuer=? AND client_id=? "
+                "AND approved_at IS NOT NULL",
+                (self.store.issuer, client_id),
+            ).fetchone():
+                raise ValueError("Cannot assign access to unapproved or revoked client")
+            db.execute(
+                "INSERT OR REPLACE INTO exec_client_profiles "
+                "(issuer,client_id,encrypted) VALUES (?,?,?)",
+                (self.store.issuer, client_id,
+                 self.store._encrypt({"profile": profile})),
+            )
 
     def _save(self, policy: dict) -> None:
         with self.store._db() as db:
@@ -156,9 +204,10 @@ class ExecutionApprovals:
         if kind == "ssh" and (not isinstance(host, str) or not _SSH_HOST_RE.fullmatch(host)):
             return False
         policy = self.policy()
-        if policy["profile"] == PROFILE_SAFE:
+        profile = self.profile_for(client_id)
+        if profile == PROFILE_SAFE:
             return False
-        if policy["profile"] == PROFILE_FULL:
+        if profile == PROFILE_FULL:
             return True
         if kind == "windows":
             return windows_whitelisted(command, policy["windows"])

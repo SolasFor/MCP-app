@@ -71,6 +71,14 @@ def make_tool_middleware(store: OAuthStore | None):
         if isinstance(result, ListToolsResult):
             # Do not mutate cached SDK response instances in place.
             return result.model_copy(update={"tools": [t for t in result.tools if t.name in allowed]})
-        return result
+        if isinstance(result, dict) and isinstance(result.get("tools"), list):
+            # SDK 2.x may return a raw mapping from a handler.
+            return {**result, "tools": [
+                tool for tool in result["tools"]
+                if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)) in allowed
+            ]}
+        # Refuse to send an unfiltered catalog when the SDK changes its result
+        # shape. Handler-level permission checks remain the independent gate.
+        raise MCPError(code=-32603, message="Unrecognized tools/list response type")
 
     return restrict_tools

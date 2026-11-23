@@ -205,8 +205,11 @@ class SimpleTokenVerifier(TokenVerifier):
 # ==========================================
 
 auth_settings = AuthSettings(
-    issuer_url=AnyHttpUrl(BASE_URL),
-    resource_server_url=AnyHttpUrl(RESOURCE_URL),
+    # Pass raw strings: AuthSettings.url_preserve_empty_path keeps the root
+    # issuer EXACTLY equal to BASE_URL. AnyHttpUrl(BASE_URL) adds a slash and
+    # breaks strict RFC 8414 issuer comparison in browser clients.
+    issuer_url=BASE_URL,
+    resource_server_url=RESOURCE_URL,
     required_scopes=[READ_SCOPE] if OAUTH_ENABLED else [],
     client_registration_options=(
         ClientRegistrationOptions(enabled=True, valid_scopes=[READ_SCOPE], default_scopes=[READ_SCOPE])

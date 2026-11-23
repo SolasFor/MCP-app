@@ -1,0 +1,38 @@
+# Базовые проверки без внешних учётных записей и секретов (PR-01).
+#
+# МЕСТО ФАЙЛА: .github/workflows/ci.yml
+# Лежит здесь, потому что токен, которым создавался PR, не имеет права писать в
+# .github/workflows/. Перенесите вручную:  git mv packaging/ci/ci.yml .github/workflows/ci.yml
+#
+# Сборка .exe остаётся в build.yml; здесь — быстрая обратная связь на каждый PR.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test tools
+        run: python -m pip install --upgrade pip pytest
+      - name: Byte-compile tools
+        run: python -m compileall -q tools
+      - name: Probe CLI starts
+        run: python tools/mcp_probe.py --help
+      - name: Unit tests
+        run: python -m pytest tests/unit -q

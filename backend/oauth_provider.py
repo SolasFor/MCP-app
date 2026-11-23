@@ -180,7 +180,9 @@ class LocalConsentOAuthProvider(
 <body><main><h1>Authorize MCP app access</h1>
 <p>Client: <strong>{display_name}</strong></p>
 <p>Return address: <code>{display_uri}</code></p>
-<p>Permission: <strong>mcp:read</strong> — only safe tools in Standard profile.</p>
+<p>OAuth scope: <strong>mcp:read</strong>. Initially only server_info is available.
+Later the local owner may separately grant access to limited shared notes
+(read/write) in the Windows application. No commands or SSH are available.</p>
 <p>Type the owner token shown in your MCP app. Never share this token with the requesting client.</p>
 <form method="post" action="/oauth/consent">
 <input type="hidden" name="request_id" value="{safe_ticket}">

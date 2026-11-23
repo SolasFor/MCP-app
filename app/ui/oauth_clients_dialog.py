@@ -1,8 +1,7 @@
-"""Local OAuth client management with one non-editable Windows+SSH capability.
+"""Local OAuth client management for one global owner-chosen access mode.
 
-Only the owner can configure *which exact actions are safe to run* and approve
-each requested action. OAuth clients cannot change capabilities themselves.
-No public admin HTTP endpoints are created.
+Clients cannot choose or change this global mode. Each is separately OAuth
+authorized and can be revoked. No public administrative HTTP endpoint exists.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from PyQt6.QtWidgets import (
 
 from backend.oauth_store import OAuthStore, default_store_path
 from backend.oauth_execution import ExecutionApprovals
-from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog, ExecutionQueueDialog
+from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
 
 
 class OAuthClientsDialog(QDialog):
@@ -41,10 +40,10 @@ class OAuthClientsDialog(QDialog):
         root.addWidget(title)
 
         explanation = QLabel(
-            "Все подтверждённые OAuth-клиенты имеют ОДИН фиксированный набор "
-            "возможностей: Windows-команды и SSH. Переключателей прав нет. "
-            "Каждая команда должна точно совпадать с разрешённым списком "
-            "и отдельно подтверждаться владельцем на этом компьютере."
+            "Все подтверждённые OAuth-клиенты используют режим доступа, "
+            "выбранный владельцем на главной странице. Нет отдельных прав "
+            "для каждого клиента. В режимах «Белый список» и «Полный доступ» "
+            "команды выполняются сразу, без подтверждения каждого вызова."
         )
         explanation.setWordWrap(True)
         root.addWidget(explanation)
@@ -67,15 +66,13 @@ class OAuthClientsDialog(QDialog):
         self.refresh_button.clicked.connect(self.reload)
         self.policy_button = QPushButton("Разрешённые команды и хосты…")
         self.policy_button.clicked.connect(self._open_execution_policy)
-        self.pending_button = QPushButton("Очередь подтверждений…")
-        self.pending_button.clicked.connect(self._open_execution_queue)
         self.revoke_button = QPushButton("Отозвать OAuth-доступ")
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
         close_button = QPushButton("Закрыть")
         close_button.clicked.connect(self.accept)
         for btn in (
-            self.refresh_button, self.policy_button, self.pending_button, self.revoke_button,
+            self.refresh_button, self.policy_button, self.revoke_button,
         ):
             footer.addWidget(btn)
         footer.addStretch(1)
@@ -92,6 +89,11 @@ class OAuthClientsDialog(QDialog):
             )
             return
         self.table.setRowCount(len(clients))
+        mode_name = {
+            "safe": "Безопасный (только server_info)",
+            "allowlist": "Windows + SSH (белый список)",
+            "full": "Полный Windows + SSH",
+        }.get(self.execution.profile(), "Безопасный")
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
             when = (
@@ -104,7 +106,7 @@ class OAuthClientsDialog(QDialog):
             items = (
                 name,
                 QTableWidgetItem("Разрешён" if approved else "Зарегистрирован"),
-                QTableWidgetItem("Windows + SSH (фиксировано)" if approved else "Нет"),
+                QTableWidgetItem(mode_name if approved else "Нет"),
                 QTableWidgetItem(when),
             )
             for col, item in enumerate(items):
@@ -119,9 +121,6 @@ class OAuthClientsDialog(QDialog):
 
     def _open_execution_policy(self) -> None:
         ExecutionPolicyDialog(self.execution, self).exec()
-
-    def _open_execution_queue(self) -> None:
-        ExecutionQueueDialog(self.execution, self).exec()
 
     def revoke_selected(self) -> None:
         row = self.table.currentRow()

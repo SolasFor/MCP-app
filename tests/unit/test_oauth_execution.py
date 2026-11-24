@@ -77,6 +77,15 @@ class OAuthExecutionTests(unittest.TestCase):
         self.assertFalse(self.policy.can_request("client-a", "ssh", command="sudo reboot", host="machine.local"))
         self.assertFalse(self.policy.can_request("client-a", "windows", command="echo hello"))
 
+    def test_expected_profile_change_fails_closed(self):
+        self.policy.set_client_profile("client-a", "allowlist")
+        self.assertFalse(self.policy.can_request(
+            "client-a", "windows", command="whoami", expected_profile="full"
+        ))
+        self.assertTrue(self.policy.can_request(
+            "client-a", "windows", command="whoami", expected_profile="allowlist"
+        ))
+
     def test_full_executes_arbitrary_command_and_ssh_without_allowlist(self):
         self.policy.set_profile(PROFILE_FULL)
         self.assertTrue(self.policy.can_request("client-a", "windows", command="python -c 'print(123)'"))

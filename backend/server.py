@@ -444,8 +444,17 @@ async def _oauth_windows_run(
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            # A descendant may retain inherited pipe handles. Do not hold
+            # the MCP request indefinitely waiting for those handles to close.
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                pass
             return f"❌ Команда превысила лимит {timeout} секунд."
         return (
             f"Exit code: {process.returncode}\n"
@@ -483,7 +492,7 @@ async def oauth_windows_command(
     )
     assert oauth_execution is not None
     profile = oauth_execution.profile_for(client_id)
-    if (not oauth_execution.can_request(client_id, "windows", command=command)
+    if (not oauth_execution.can_request(client_id, "windows", command=command, expected_profile=profile)
             or not 1 <= timeout <= 600
             or (profile != "full" and (shell != "cmd" or timeout > 15))):
         EXEC_AUDIT.record(
@@ -582,7 +591,8 @@ async def oauth_ssh_command(
     assert oauth_execution is not None
     profile = oauth_execution.profile_for(client_id)
     if (not oauth_execution.can_request(
-        client_id, "ssh", command=command, host=host, user=user, port=port
+        client_id, "ssh", command=command, host=host, user=user, port=port,
+        expected_profile=profile,
     ) or not 1 <= timeout <= (600 if profile == "full" else 12)):
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,

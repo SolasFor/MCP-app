@@ -1,10 +1,9 @@
-"""Fixed OAuth tool capability: Windows commands and SSH only.
+"""OAuth tool capability: Windows, SSH and Full-only managed servers.
 
 Each OAuth client can have an owner-selected profile overriding the global
 default. Safe hides command/SSH tools; whitelist/full expose both.
 There are no note/file tools and no network-accessible permission controls.
-The exact command/host allowlists and one-use local action approval are
-separate mandatory execution safety checks, never permissions to bypass.
+Exact command/host allowlists apply only to allowlist clients.
 """
 from __future__ import annotations
 
@@ -23,9 +22,11 @@ except ImportError:
 
 EXEC_WINDOWS = "oauth_windows_command"
 EXEC_SSH = "oauth_ssh_command"
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH})
+EXEC_MANAGED = "oauth_managed_server"
+EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
 BASIC_TOOLS = frozenset({"server_info"})
-OAUTH_TOOLS = BASIC_TOOLS | EXEC_TOOLS
+OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH}
+FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
 FORBIDDEN_TOOL = -32602
 
 
@@ -45,7 +46,10 @@ def allowed_tools(
         return BASIC_TOOLS
     # Live read from SQLite on every tools/list and tools/call. Upgrading to
     # full mode never makes stale, unapproved bearer tokens privileged.
-    return OAUTH_TOOLS if execution.profile_for(client_id) != "safe" else BASIC_TOOLS
+    profile = execution.profile_for(client_id)
+    if profile == "full":
+        return FULL_TOOLS
+    return OAUTH_TOOLS if profile == "allowlist" else BASIC_TOOLS
 
 
 def require_execution_permission(

@@ -5,7 +5,9 @@ import os
 import re
 import secrets
 import subprocess
+import tempfile
 import time
+from typing import Literal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
@@ -358,8 +360,15 @@ def _restricted_windows_argv(command: str) -> list[str]:
     return argv
 
 
-async def _oauth_windows_run(command: str, *, full: bool) -> str:
+async def _oauth_windows_run(
+    command: str, *, full: bool, shell: str = "cmd", timeout: int = 15,
+) -> str:
     """Bounded execution, with shell semantics only in explicit full mode."""
+    if shell not in ("cmd", "powershell") or not (1 <= timeout <= 600):
+        return "❌ Invalid shell or timeout (1–600 seconds)."
+    if not full and (shell != "cmd" or timeout > 15):
+        return "❌ Shell and extended timeout require Full Access."
+    script_path = None
     program = command.strip().split(" ", 1)[0].lower()
     if not full:
         if program == "pwd" and command.strip().lower() == "pwd":
@@ -384,11 +393,36 @@ async def _oauth_windows_run(command: str, *, full: bool) -> str:
         # explicit high-risk owner choice, not the default or allowlist path.
         if os.name == "nt":
             system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-            executable = str(system_root / "System32" / "cmd.exe")
-            argv = [executable, "/d", "/s", "/c", command]
+            if shell == "powershell":
+                executable = str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+                # A script file avoids the Windows command-line length limit
+                # for multiline scripts. Respect the user's execution policy.
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8-sig", suffix=".ps1",
+                        delete=False,
+                    ) as script:
+                        script_path = Path(script.name)
+                        script.write(command)
+                except OSError:
+                    if script_path:
+                        script_path.unlink(missing_ok=True)
+                    return "❌ Could not prepare PowerShell script."
+                argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                        "-File", str(script_path)]
+            else:
+                if len(command) > 8000:
+                    return "❌ CMD command line too long; use PowerShell."
+                executable = str(system_root / "System32" / "cmd.exe")
+                argv = [executable, "/d", "/s", "/c", command]
         else:
+            if shell != "cmd":
+                return "❌ Windows PowerShell is only available on Windows."
             import shlex
-            argv = shlex.split(command)
+            try:
+                argv = shlex.split(command)
+            except ValueError:
+                return "❌ Invalid command syntax."
         if not argv:
             return "❌ Пустая команда."
     process = None
@@ -399,34 +433,50 @@ async def _oauth_windows_run(command: str, *, full: bool) -> str:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            return "❌ Команда превысила лимит 15 секунд."
+            return f"❌ Команда превысила лимит {timeout} секунд."
         return (
             f"Exit code: {process.returncode}\n"
             f"STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}\n"
             f"STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
         )
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
     except (OSError, ValueError) as exc:
         return f"❌ Не удалось выполнить Windows-команду: {type(exc).__name__}"
+    finally:
+        if script_path:
+            try:
+                script_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Could not remove temporary PowerShell script")
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def oauth_windows_command(command: str) -> str:
+async def oauth_windows_command(
+    command: str, shell: Literal["cmd", "powershell"] = "cmd", timeout: int = 15,
+) -> str:
     """Run a Windows command immediately in allowlist/full access mode.
 
     In safe mode this tool is hidden and blocked. Allowlist matches exact
     owner entries with no command shell; full mode allows arbitrary commands.
-    There is NO extra per-command confirmation or approval ticket.
+    Full mode supports shell='powershell' for scripts and timeout=1–600 seconds.
+    Allowlist mode retains the original direct execution and 15-second limit.
     """
     client_id = require_execution_permission(
         EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
     )
     assert oauth_execution is not None
     profile = oauth_execution.profile_for(client_id)
-    if not oauth_execution.can_request(client_id, "windows", command=command):
+    if (not oauth_execution.can_request(client_id, "windows", command=command)
+            or not 1 <= timeout <= 600
+            or (profile != "full" and (shell != "cmd" or timeout > 15))):
         EXEC_AUDIT.record(
             client_id=client_id, kind="windows", profile=profile,
             event="denied", command=command,
@@ -439,7 +489,7 @@ async def oauth_windows_command(command: str) -> str:
         event="started", command=command, action_id=action_id,
     )
     try:
-        output = await _oauth_windows_run(command, full=profile == "full")
+        output = await _oauth_windows_run(command, full=profile == "full", shell=shell, timeout=timeout)
     except BaseException:
         EXEC_AUDIT.record(
             client_id=client_id, kind="windows", profile=profile,

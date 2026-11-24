@@ -85,7 +85,8 @@ class OAuthExecutionTests(unittest.TestCase):
         self.assertFalse(self.policy.can_request("mcp-app-user", "windows", command="whoami"))
         # Input bounds still apply to prevent resource abuse and host injection.
         self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="bad/host"))
-        self.assertFalse(self.policy.can_request("client-a", "windows", command="x" * 513))
+        self.assertTrue(self.policy.can_request("client-a", "windows", command="x" * 513))
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="x" * 65537))
 
     def test_switch_is_live_and_persistent_per_issuer(self):
         self.policy.set_profile(PROFILE_FULL)

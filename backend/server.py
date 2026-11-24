@@ -26,8 +26,9 @@ if __package__:
     from .oauth_store import default_store_path
     from .oauth_execution import ExecutionApprovals
     from .execution_audit import ExecutionAudit, classify_command_output
+    from .managed_servers import ManagedServers
     from .tool_permissions import (
-        EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
+        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
     )
     from .security_policy import (
@@ -40,8 +41,9 @@ else:
     from oauth_store import default_store_path
     from oauth_execution import ExecutionApprovals
     from execution_audit import ExecutionAudit, classify_command_output
+    from managed_servers import ManagedServers
     from tool_permissions import (
-        EXEC_WINDOWS, EXEC_SSH, make_tool_middleware,
+        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
     )
     from security_policy import (
@@ -110,6 +112,9 @@ ALLOW_QUERY_TOKEN = False  # OAuth or Bearer header only; forbid ?token= in publ
 JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudflare.com"))
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
+MANAGED_SERVERS = ManagedServers(Path(
+    os.environ.get("MCP_MANAGED_SERVERS_PATH") or WORKSPACE_DIR / "managed_servers.json"
+))
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
 OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
@@ -395,21 +400,25 @@ async def _oauth_windows_run(
             system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
             if shell == "powershell":
                 executable = str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
-                # A script file avoids the Windows command-line length limit
-                # for multiline scripts. Respect the user's execution policy.
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", encoding="utf-8-sig", suffix=".ps1",
-                        delete=False,
-                    ) as script:
-                        script_path = Path(script.name)
-                        script.write(command)
-                except OSError:
-                    if script_path:
-                        script_path.unlink(missing_ok=True)
-                    return "❌ Could not prepare PowerShell script."
-                argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                        "-File", str(script_path)]
+                # Short commands run normally. Long scripts use a file and
+                # remain subject to the user's PowerShell execution policy.
+                if len(command) <= 8000:
+                    argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                            "-Command", command]
+                else:
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w", encoding="utf-8-sig", suffix=".ps1",
+                            delete=False,
+                        ) as script:
+                            script_path = Path(script.name)
+                            script.write(command)
+                    except OSError:
+                        if script_path:
+                            script_path.unlink(missing_ok=True)
+                        return "❌ Could not prepare PowerShell script."
+                    argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                            "-File", str(script_path)]
             else:
                 if len(command) > 8000:
                     return "❌ CMD command line too long; use PowerShell."
@@ -510,6 +519,51 @@ async def oauth_windows_command(
         duration_ms=int((time.monotonic() - started) * 1000),
     )
     return output
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def oauth_managed_server(
+    action: Literal["list", "start", "stop"] = "list", name: str = "",
+) -> dict:
+    """List, start or stop locally configured development servers (Full only).
+
+    Only the owner can create named profiles in managed_servers.json.
+    A client may stop only a direct process it started via this tool.
+    No arbitrary executable paths or arguments are accepted here.
+    """
+    client_id = require_execution_permission(
+        EXEC_MANAGED, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    if oauth_execution.profile_for(client_id) != "full":
+        raise PermissionError("Managed servers require Full Access")
+    if action == "list":
+        try:
+            return {"servers": await asyncio.to_thread(MANAGED_SERVERS.list, client_id)}
+        except (OSError, ValueError):
+            return {"error": "Invalid local managed server configuration"}
+    audit_command = f"managed:{action}:{name}"
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
+                      event="started", command=audit_command, action_id=action_id)
+    try:
+        operation = MANAGED_SERVERS.start if action == "start" else MANAGED_SERVERS.stop
+        if action not in ("start", "stop"):
+            raise ValueError("Invalid operation")
+        # Recheck current privileges just before dispatch.
+        if oauth_execution.profile_for(client_id) != "full":
+            raise PermissionError("Access changed")
+        result = await asyncio.to_thread(operation, client_id, name)
+        EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
+                          event="completed", command=audit_command, action_id=action_id,
+                          duration_ms=int((time.monotonic() - started) * 1000))
+        return result
+    except (OSError, ValueError, PermissionError, subprocess.TimeoutExpired) as exc:
+        EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
+                          event="failed", command=audit_command, action_id=action_id,
+                          duration_ms=int((time.monotonic() - started) * 1000))
+        return {"error": f"Managed server operation failed: {type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -732,7 +786,10 @@ def main() -> None:
         logger.info(f"Токен: из MCP_SECRET_TOKEN (…{SECRET_TOKEN[-4:]})")
 
     import uvicorn
-    uvicorn.run(build_app(), host=HOST, port=PORT)
+    try:
+        uvicorn.run(build_app(), host=HOST, port=PORT)
+    finally:
+        MANAGED_SERVERS.close()
 
 
 if __name__ == "__main__":

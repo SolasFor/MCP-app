@@ -47,6 +47,23 @@ class ConsoleWindowTests(unittest.TestCase):
         )
         self.assertIn("legacy stdout", result)
 
+    def test_allowlist_cannot_choose_powershell_or_extended_timeout(self):
+        from backend.server import _oauth_windows_run
+        for kwargs in ({"shell": "powershell"}, {"timeout": 120}):
+            result = asyncio.run(_oauth_windows_run("whoami", full=False, **kwargs))
+            self.assertIn("Full Access", result)
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only PowerShell smoke test")
+    def test_powershell_multiline_and_extended_timeout(self):
+        from backend.server import _oauth_windows_run
+        result = asyncio.run(_oauth_windows_run(
+            "Write-Output 'first'\nWrite-Output 'second'",
+            full=True, shell="powershell", timeout=60,
+        ))
+        self.assertIn("Exit code: 0", result)
+        self.assertIn("first", result)
+        self.assertIn("second", result)
+
     @unittest.skipUnless(os.name == "nt", "Windows-only process smoke test")
     def test_actual_windows_command_in_both_execution_modes(self):
         from backend.server import _oauth_windows_run

@@ -103,7 +103,7 @@ def _check_backend() -> str:
                 raise RuntimeError("OAuth execution approvals are missing")
             import asyncio
             registered = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
-            expected = {"server_info", "oauth_windows_command", "oauth_ssh_command"}
+            expected = {"server_info", "oauth_windows_command", "oauth_ssh_command", "oauth_managed_server"}
             if registered != expected:
                 raise RuntimeError(f"OAuth tool registry mismatch: {registered}")
             # Обработчик лог-файла держит файл открытым — закрываем, иначе tmp не удалится.

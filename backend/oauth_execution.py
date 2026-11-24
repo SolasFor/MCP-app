@@ -26,6 +26,7 @@ PROFILE_FULL = "full"
 PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
 MAX_RULES = 24
 MAX_RULE_SIZE = 512
+MAX_FULL_COMMAND_SIZE = 65536  # transport/resource bound, not a command allowlist
 # Standard Windows read-only helpers. These are preloaded as a policy,
 # but the OAuth execution profile itself always defaults to "safe".
 DEFAULT_WINDOWS_ALLOWLIST = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
@@ -206,7 +207,7 @@ class ExecutionApprovals:
     ) -> bool:
         if kind not in ("windows", "ssh") or not self.client_approved(client_id):
             return False
-        if not isinstance(command, str) or not command.strip() or len(command) > MAX_RULE_SIZE:
+        if not isinstance(command, str) or not command.strip() or "\x00" in command or len(command) > MAX_FULL_COMMAND_SIZE:
             return False
         if type(port) is not int or not (1 <= port <= 65535) or not isinstance(user, str):
             return False
@@ -222,6 +223,8 @@ class ExecutionApprovals:
             return False
         if profile == PROFILE_FULL:
             return True
+        if len(command) > MAX_RULE_SIZE:
+            return False
         if kind == "windows":
             return windows_whitelisted(command, policy["windows"])
         return host in policy["hosts"] and command.strip() in policy["ssh_commands"]

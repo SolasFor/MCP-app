@@ -16,7 +16,7 @@ from mcp.types import ListToolsResult, Tool
 from backend.oauth_store import OAuthStore
 from backend.oauth_execution import ExecutionApprovals
 from backend.tool_permissions import (
-    BASIC_TOOLS, EXEC_TOOLS, OAUTH_TOOLS, EXEC_WINDOWS, EXEC_SSH,
+    BASIC_TOOLS, EXEC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
     allowed_tools, make_tool_middleware, require_execution_permission,
 )
 
@@ -55,7 +55,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.exec.set_profile("allowlist")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
         self.exec.set_profile("full")
-        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), FULL_TOOLS)
         self.exec.set_profile("safe")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
 
@@ -64,7 +64,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.exec.set_profile("allowlist")
         self.exec.set_client_profile("alpha", "full")
         self.exec.set_client_profile("beta", "safe")
-        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), FULL_TOOLS)
         self.assertEqual(allowed_tools(self.store, principal("beta"), self.exec), BASIC_TOOLS)
         self.exec.set_client_profile("alpha", "safe")
         self.exec.set_client_profile("beta", "allowlist")
@@ -73,6 +73,17 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.exec.set_profile("full")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
         self.assertEqual(allowed_tools(self.store, principal("beta"), self.exec), OAUTH_TOOLS)
+
+    def test_managed_server_requires_full_access(self):
+        self.exec.set_profile("allowlist")
+        with patch("backend.tool_permissions.get_access_token", return_value=principal("alpha")):
+            with self.assertRaises(PermissionError):
+                require_execution_permission(EXEC_MANAGED, self.store, self.exec)
+            self.exec.set_client_profile("alpha", "full")
+            self.assertEqual(require_execution_permission(EXEC_MANAGED, self.store, self.exec), "alpha")
+            self.exec.set_client_profile("alpha", "safe")
+            with self.assertRaises(PermissionError):
+                require_execution_permission(EXEC_MANAGED, self.store, self.exec)
 
     def test_unknown_unapproved_owner_and_missing_scope_deny(self):
         for identity in (
@@ -84,7 +95,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
 
     def test_revocation_removes_fixed_tools(self):
         self.exec.set_profile("full")
-        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), OAUTH_TOOLS)
+        self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), FULL_TOOLS)
         self.store.revoke_client("alpha")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
 

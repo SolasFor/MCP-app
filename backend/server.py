@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import secrets
+import subprocess
 import time
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -395,6 +396,7 @@ async def _oauth_windows_run(command: str, *, full: bool) -> str:
         process = await asyncio.create_subprocess_exec(
             *argv, cwd=str(WORKSPACE_DIR), stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=15)
@@ -534,6 +536,7 @@ async def run_local_command(command: str, timeout: int = 30, cwd: str | None = N
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=str(work_dir), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (

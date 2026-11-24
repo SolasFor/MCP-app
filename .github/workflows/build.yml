@@ -1,83 +1,93 @@
-# Сборка и релиз MCP app на чистой Windows (GitHub Actions).
-# Рабочее место файла: .github/workflows/build.yml
-#
-# Когда запускается:
-# * push в main, затронувший код или сборку -> если версии v<__version__> ещё нет
-#   среди релизов, собираем, проверяем (--selftest) и публикуем релиз с тегом;
-#   если такой релиз уже есть — только сборка без публикации (проверка, что всё собирается);
-# * вручную: Actions -> Build -> Run workflow.
-#
-# Чтобы выпустить новую версию, достаточно поднять __version__ в app/__init__.py и влить в main.
+# Unified gated build and release workflow for MCP app.
+# - Push to main: verifies tests, lint/types, security audit, and builds Windows artifacts (NO publish).
+# - Tag push v* or workflow_dispatch(publish=true): gated release publication after verify + build-windows.
 name: Build
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish GitHub Release for current app/__init__.py version"
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [main]
-    paths:
-      - "app/**"
-      - "backend/**"
-      - "main.py"
-      - "requirements*.txt"
-      - "requirements.lock"
-      - "packaging/**"
-      - ".github/workflows/build.yml"
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  verify:
+    name: Verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Version
-        id: version
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $v = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          "version=$v" >> $env:GITHUB_OUTPUT
-          gh release view "v$v" --repo "${{ github.repository }}" *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "Release v$v already exists - build only, no publish"
-            "publish=false" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "Release v$v not found - will publish after a successful build"
-            "publish=true" >> $env:GITHUB_OUTPUT
-          }
-          $global:LASTEXITCODE = 0
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3
+      - name: Install pinned runtime and dev dependencies
+        run: python -m pip install -r requirements.lock -r requirements-dev.txt
+      - name: Compile, lint, typecheck, licenses, audit
+        run: |
+          python -m compileall -q backend app tests tools
+          python -m ruff check app backend tests tools
+          python -m mypy
+          python tools/check_licenses.py
+          python -m pip_audit -r requirements.lock --no-deps --disable-pip
+      - name: Unit and integration tests
+        run: |
+          python -m unittest discover -s tests/unit -p "test_*.py" -v
+          python -m unittest discover -s tests/integration -p "test_*.py" -v
 
-      - name: Inno Setup
+  build-windows:
+    name: Build Windows
+    needs: verify
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Inno Setup 6
         run: choco install innosetup -y --no-progress
-
       - name: Build
         shell: pwsh
         run: ./packaging/build.ps1 -Python python
-
-      - name: Verify build and generate checksums
+      - name: Verify build outputs
         shell: pwsh
         run: |
           $v = "${{ steps.version.outputs.version }}"
-          $files = @("dist/MCPApp-Setup-$v.exe", "dist/MCPApp-$v-portable.zip")
+          $files = @(
+            "dist/MCPApp-Setup-$v.exe",
+            "dist/MCPApp-$v-portable.zip",
+            "dist/SBOM.cdx.json",
+            "dist/SHA256SUMS.txt"
+          )
           if ((Get-Content "build/selftest.txt" -Raw -Encoding UTF8) -notmatch 'RESULT OK') { throw "EXE self-test failed" }
-          $lines = foreach ($file in $files) {
+          foreach ($file in $files) {
             if (-not (Test-Path $file)) { throw "Missing $file" }
-            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $(Split-Path $file -Leaf)"
           }
-          $lines | Set-Content "dist/SHA256SUMS.txt" -Encoding ASCII
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -85,25 +95,48 @@ jobs:
           path: |
             dist/*.exe
             dist/*.zip
-            build/selftest.txt
+            dist/SBOM.cdx.json
             dist/SHA256SUMS.txt
-          if-no-files-found: ignore
+            build/selftest.txt
 
-      - name: Release
-        if: steps.version.outputs.publish == 'true' && github.ref == 'refs/heads/main'
+  release:
+    name: Publish gated release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: MCPApp-${{ needs.build-windows.outputs.version }}
+          path: dist
+      - name: Prevent overwriting existing release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ needs.build-windows.outputs.version }}"
+          if (Test-Path "dist/build/selftest.txt") { Remove-Item "dist/build" -Recurse -Force }
+          gh release view "v$v" --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) { throw "Release v$v already exists - refusing to overwrite" }
+          $global:LASTEXITCODE = 0
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
+          tag_name: v${{ needs.build-windows.outputs.version }}
           target_commitish: ${{ github.sha }}
-          name: MCP app ${{ steps.version.outputs.version }}
+          name: MCP app ${{ needs.build-windows.outputs.version }}
           generate_release_notes: true
           body: |
-            **Установка:** скачайте `MCPApp-Setup-${{ steps.version.outputs.version }}.exe` и запустите. Права администратора не нужны.
-            **Без установки:** `MCPApp-${{ steps.version.outputs.version }}-portable.zip` — распакуйте и запустите `MCPApp.exe`.
+            **Установка:** скачайте `MCPApp-Setup-${{ needs.build-windows.outputs.version }}.exe` и запустите. Права администратора не нужны.
+            **Без установки:** `MCPApp-${{ needs.build-windows.outputs.version }}-portable.zip` — распакуйте и запустите `MCPApp.exe`.
 
-            Сборка не подписана сертификатом издателя; Windows SmartScreen может показать предупреждение. Контрольные суммы SHA-256 доступны в SHA256SUMS.txt.
+            Сборка не подписана сертификатом издателя (если явно не приложена подпись владельца); контрольные суммы SHA-256 и SBOM приложены (`SHA256SUMS.txt`, `SBOM.cdx.json`).
           fail_on_unmatched_files: true
           files: |
             dist/*.exe
             dist/*.zip
+            dist/SBOM.cdx.json
             dist/SHA256SUMS.txt

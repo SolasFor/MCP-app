@@ -1,9 +1,7 @@
 """OAuth tool capability: Windows, SSH and Full-only managed servers.
 
-Each OAuth client can have an owner-selected profile overriding the global
-default. Safe hides command/SSH tools; whitelist/full expose both.
-There are no note/file tools and no network-accessible permission controls.
-Exact command/host allowlists apply only to allowlist clients.
+Delegates discovery and per-call authorization to `backend.tool_registry.ToolRegistry`.
+Each OAuth client can have an owner-selected profile overriding the global default.
 """
 from __future__ import annotations
 
@@ -13,20 +11,51 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.shared.exceptions import MCPError
 from mcp.types import ListToolsResult
 
-try:
-    from .oauth_store import OAuthStore
+if __package__:
     from .oauth_execution import ExecutionApprovals
-except ImportError:
-    from oauth_store import OAuthStore
+    from .oauth_store import OAuthStore
+    from .tool_registry import (
+        BASIC_TOOLS,
+        DEFAULT_REGISTRY,
+        EXEC_MANAGED,
+        EXEC_SSH,
+        EXEC_TOOLS,
+        EXEC_WINDOWS,
+        FULL_TOOLS,
+        OAUTH_TOOLS,
+        ToolRegistry,
+    )
+else:
     from oauth_execution import ExecutionApprovals
+    from oauth_store import OAuthStore
+    from tool_registry import (
+        BASIC_TOOLS,
+        DEFAULT_REGISTRY,
+        EXEC_MANAGED,
+        EXEC_SSH,
+        EXEC_TOOLS,
+        EXEC_WINDOWS,
+        FULL_TOOLS,
+        OAUTH_TOOLS,
+        ToolRegistry,
+    )
 
-EXEC_WINDOWS = "oauth_windows_command"
-EXEC_SSH = "oauth_ssh_command"
-EXEC_MANAGED = "oauth_managed_server"
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
-BASIC_TOOLS = frozenset({"server_info"})
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH}
-FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
+__all__ = [
+    "BASIC_TOOLS",
+    "DEFAULT_REGISTRY",
+    "EXEC_MANAGED",
+    "EXEC_SSH",
+    "EXEC_TOOLS",
+    "EXEC_WINDOWS",
+    "FORBIDDEN_TOOL",
+    "FULL_TOOLS",
+    "OAUTH_TOOLS",
+    "ToolRegistry",
+    "allowed_tools",
+    "make_tool_middleware",
+    "require_execution_permission",
+]
+
 FORBIDDEN_TOOL = -32602
 
 
@@ -34,58 +63,58 @@ def allowed_tools(
     store: OAuthStore | None,
     principal: Any,
     execution: ExecutionApprovals | None = None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
 ) -> frozenset[str]:
-    """An approved OAuth principal gets both capabilities; never cache approval."""
-    if store is None or execution is None or principal is None:
-        return BASIC_TOOLS
-    client_id = getattr(principal, "client_id", None)
-    scopes = getattr(principal, "scopes", None) or []
-    if not isinstance(client_id, str) or "mcp:read" not in scopes:
-        return BASIC_TOOLS
-    if not execution.client_approved(client_id):
-        return BASIC_TOOLS
-    # Live read from SQLite on every tools/list and tools/call. Upgrading to
-    # full mode never makes stale, unapproved bearer tokens privileged.
-    profile = execution.profile_for(client_id)
-    if profile == "full":
-        return FULL_TOOLS
-    return OAUTH_TOOLS if profile == "allowlist" else BASIC_TOOLS
+    """Return tools permitted for this OAuth principal; never caches approval."""
+    return registry.allowed_tools(store, principal, execution)
 
 
 def require_execution_permission(
-    tool: str, store: OAuthStore | None,
+    tool: str,
+    store: OAuthStore | None,
     execution: ExecutionApprovals | None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
 ) -> str:
     principal = get_access_token()
-    if tool not in EXEC_TOOLS or tool not in allowed_tools(store, principal, execution):
+    if tool not in EXEC_TOOLS:
         raise PermissionError("OAuth client is not authorized to request execution")
-    return principal.client_id
+    return registry.authorize_call(tool, store, principal, execution)
 
 
 def make_tool_middleware(
-    store: OAuthStore | None, execution: ExecutionApprovals | None = None,
+    store: OAuthStore | None,
+    execution: ExecutionApprovals | None = None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
 ):
     async def restrict_tools(ctx, call_next):
         if ctx.method not in ("tools/list", "tools/call"):
             return await call_next(ctx)
-        allowed = allowed_tools(store, get_access_token(), execution)
+        allowed = allowed_tools(store, get_access_token(), execution, registry)
         if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
             if name in EXEC_TOOLS and name not in allowed:
-                raise MCPError(code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client")
+                raise MCPError(
+                    code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
+                )
             return await call_next(ctx)
         result = await call_next(ctx)
         if isinstance(result, ListToolsResult):
-            return result.model_copy(update={
-                "tools": [tool for tool in result.tools if tool.name in allowed],
-            })
+            return result.model_copy(
+                update={
+                    "tools": [tool for tool in result.tools if tool.name in allowed],
+                }
+            )
         if isinstance(result, dict) and isinstance(result.get("tools"), list):
-            return {**result, "tools": [
-                tool for tool in result["tools"]
-                if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)) in allowed
-            ]}
-        # Avoid leaking unexpected SDK registry types.
+            return {
+                **result,
+                "tools": [
+                    tool
+                    for tool in result["tools"]
+                    if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None))
+                    in allowed
+                ],
+            }
         raise MCPError(code=-32603, message="Unrecognized tools/list response type")
 
     return restrict_tools

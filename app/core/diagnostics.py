@@ -1,21 +1,32 @@
-"""Safe, synchronous MCP connectivity diagnostics (call from a background thread).
+"""Safe, synchronous MCP connectivity diagnostics and redacted diagnostic report export.
 
 Network requests deliberately separate the *local* Bearer-authenticated MCP
 probe from *public* unauthenticated HTTP/OAuth checks. Never send the owner
 token to Cloudflare or to any redirected URL.
 
-No tokens or OAuth credentials are included in diagnostic messages.
+No tokens or OAuth credentials are included in diagnostic messages or exported reports.
 """
 from __future__ import annotations
 
 import json
+import os
 import ssl
+import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import (
-    HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen,
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
 )
+
+from app.core.redaction import SecretRedactor
+from app.platform import get_platform
 
 TIMEOUT_SECONDS = 5
 MAX_RESPONSE_BYTES = 65536
@@ -46,7 +57,9 @@ def _origin(url: str, *, public: bool) -> tuple[str, str]:
         raise ValueError("Адрес MCP не должен содержать query или fragment")
     if public and parsed.scheme != "https":
         raise ValueError("Публичный MCP-адрес должен использовать HTTPS")
-    if not public and (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")):
+    if not public and (
+        parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+    ):
         raise ValueError("Локальная диагностика доступна только через loopback HTTP")
     if not public and parsed.port is None:
         raise ValueError("Локальный URL должен содержать порт")
@@ -54,7 +67,11 @@ def _origin(url: str, *, public: bool) -> tuple[str, str]:
 
 
 def _request(
-    url: str, *, public: bool, method: str = "GET", token: str = "",
+    url: str,
+    *,
+    public: bool,
+    method: str = "GET",
+    token: str = "",
     payload: dict | None = None,
 ) -> tuple[int, str, bytes]:
     headers = {
@@ -75,8 +92,6 @@ def _request(
     with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
         code = response.status
         ctype = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        # SSE responses may never end. The HTTP 200 handshake is meaningful,
-        # and reading the full stream can hang on otherwise healthy servers.
         body = b"" if ctype == "text/event-stream" else response.read(MAX_RESPONSE_BYTES + 1)
         if len(body) > MAX_RESPONSE_BYTES:
             raise ValueError("Диагностический ответ превышает 64 KiB")
@@ -87,7 +102,6 @@ def _short_error(error: Exception) -> str:
     if isinstance(error, HTTPError):
         return f"HTTP {error.code}"
     if isinstance(error, URLError):
-        # Avoid printing raw URLs or bearer tokens from untrusted errors.
         return f"Сетевое соединение недоступно ({type(error.reason).__name__})"
     if isinstance(error, (TimeoutError, ssl.SSLError)):
         return type(error).__name__
@@ -117,7 +131,8 @@ def _health(url: str, *, public: bool) -> str:
 
 def _metadata(origin: str) -> str:
     status, ctype, body = _request(
-        origin + "/.well-known/oauth-authorization-server", public=True,
+        origin + "/.well-known/oauth-authorization-server",
+        public=True,
     )
     if status != 200 or ctype != "application/json":
         raise ValueError(f"OAuth discovery: HTTP {status}, {ctype}")
@@ -136,9 +151,14 @@ def _mcp_initialize(mcp_url: str, owner_token: str) -> str:
     if not owner_token:
         raise ValueError("Токен владельца не задан")
     status, ctype, body = _request(
-        mcp_url, public=False, method="POST", token=owner_token,
+        mcp_url,
+        public=False,
+        method="POST",
+        token=owner_token,
         payload={
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
             "params": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
@@ -159,7 +179,9 @@ def _mcp_initialize(mcp_url: str, owner_token: str) -> str:
 
 
 def probe_connection(
-    public_url: str, local_port: int, health_path: str,
+    public_url: str,
+    local_port: int,
+    health_path: str,
     owner_token: str,
 ) -> list[ProbeResult]:
     """Return four independent results; no network operation runs on GUI thread."""
@@ -179,3 +201,62 @@ def probe_connection(
         _result("OAuth discovery", lambda: _metadata(public_origin)),
         _result("MCP initialize (локально)", lambda: _mcp_initialize(local_mcp_url, owner_token)),
     ]
+
+
+def build_diagnostic_report(
+    *,
+    app_version: str,
+    public_url: str,
+    local_port: int,
+    health_path: str,
+    tunnel_mode: str,
+    tunnel_protocol: str,
+    probe_results: list[ProbeResult],
+    recent_logs: Iterable[str] = (),
+    secrets_to_redact: Iterable[str] = (),
+) -> dict:
+    """Assemble a redacted diagnostic report safe to share with support."""
+    redactor = SecretRedactor(secrets_to_redact)
+    clean_url = redactor.redact_text(public_url)
+    # Also strip any unexpected query/userinfo from public_url
+    try:
+        parsed = urlsplit(clean_url)
+        if parsed.scheme and parsed.hostname:
+            host_lit = f"[{parsed.hostname}]" if ":" in parsed.hostname else parsed.hostname
+            netloc = f"{host_lit}:{parsed.port}" if parsed.port else host_lit
+            clean_url = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    except ValueError:
+        pass
+
+    report = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "app_version": app_version,
+        "platform": sys.platform,
+        "capabilities": get_platform().capabilities(),
+        "public_url": clean_url,
+        "local_port": int(local_port),
+        "health_path": redactor.redact_text(health_path),
+        "tunnel_mode": tunnel_mode,
+        "tunnel_protocol": tunnel_protocol,
+        "probes": [
+            {
+                "label": redactor.redact_text(item.label),
+                "passed": bool(item.passed),
+                "message": redactor.redact_text(item.message),
+            }
+            for item in probe_results
+        ],
+        "recent_logs": [redactor.redact_text(str(line)) for line in list(recent_logs)[-200:]],
+    }
+    return redactor.redact_mapping(report)
+
+
+def export_diagnostic_report(path: Path, report: dict) -> Path:
+    """Atomically write a redacted diagnostic JSON report with private ACL."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, target)
+    get_platform().restrict_path_acl(target, is_dir=False)
+    return target

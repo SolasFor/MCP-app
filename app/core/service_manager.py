@@ -53,8 +53,11 @@ from app.core import proxy as px
 from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
 from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
-from app.core.tunnel_log import classify_tunnel_error
+from app.core.network_watch import SystemResilienceMonitor
 from app.core.process import ManagedProcess, ProcState
+from app.core.reconnect import BackoffPolicy
+from app.core.redaction import SecretRedactor
+from app.core.tunnel_log import classify_tunnel_error, classify_tunnel_event
 from app.paths import (
     backend_command,
     default_backend_workdir,
@@ -163,6 +166,21 @@ class ServiceManager(QObject):
 
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at: dict[str, float | None] = {name: None for name in self._procs}
+        self._backoff = BackoffPolicy(
+            base_seconds=2.0,
+            max_seconds=60.0,
+            jitter_ratio=0.25,
+            max_attempts=MAX_RESTARTS,
+            stable_uptime_seconds=STABLE_UPTIME_S,
+        )
+        self._redactor = SecretRedactor()
+        self._resilience = SystemResilienceMonitor(interval_ms=5000, parent=self)
+        self._resilience.system_resumed.connect(self._on_system_resumed)
+        self._resilience.network_changed.connect(self._on_network_changed)
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.setInterval(5000)
+        self._recovery_timer.timeout.connect(self._on_recovery_grace_timeout)
         self._want_running = False
         self._error = False
         self._overall = Overall.STOPPED
@@ -180,6 +198,7 @@ class ServiceManager(QObject):
         self._diagnosis_ready.connect(self._on_diagnosis)
 
         self._token = self._load_or_create_token()
+        self._redactor.register(self._token)
 
     # ================================================================== состояние
     @property
@@ -264,7 +283,9 @@ class ServiceManager(QObject):
             token_store.save(token)
         except OSError as exc:
             return f"Не удалось сохранить токен: {exc}"
+        self._redactor.unregister(self._token)
         self._token = token
+        self._redactor.register(token)
         self._log(f"✔ Токен изменён ({token_store.mask(token)}). Обновите его в подключённых клиентах.")
         self.token_changed.emit()
         self._restart_if_running("новый токен")
@@ -376,7 +397,9 @@ class ServiceManager(QObject):
         self._origin_hint_shown = False
         self._proxy_hint_shown = False
         self._set_quick_url("")
+        self._set_oauth_emergency_stop(False)
         self.health.start()
+        self._resilience.start()
         if self.is_quick:
             self._log("Запуск: сначала туннель — жду временный адрес от Cloudflare…")
             self._start_tunnel()
@@ -606,6 +629,7 @@ class ServiceManager(QObject):
         # Preserve raw cloudflared error lines. Provide one contextual hint
         # per kind; canceled requests and actual origin failures are different.
         issue = classify_tunnel_error(line)
+        event = classify_tunnel_event(line)
         if issue == "request_canceled" and not self._cancel_hint_shown:
             self._cancel_hint_shown = True
             if self.server.is_alive() and self.tunnel.is_alive() and self._want_running:
@@ -626,6 +650,8 @@ class ServiceManager(QObject):
                 f"Проверьте http://127.0.0.1:{self.settings.server_port}"
                 f"{self.settings.server_health_path}, порт и журнал сервера."
             )
+        elif event is not None and event.category == "rate_limited":
+            self._log(f"⚠ {event.detail}")
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)
             if match:
@@ -716,21 +742,21 @@ class ServiceManager(QObject):
             return
 
         healthy_at = self._healthy_at[name]
-        if healthy_at is not None and time.monotonic() - healthy_at > STABLE_UPTIME_S:
+        if self._backoff.should_reset_attempts(healthy_at):
             self._restart_attempts[name] = 0  # долго работал — это не crash-loop
         self._healthy_at[name] = None
         self._restart_attempts[name] += 1
         attempt = self._restart_attempts[name]
-        if attempt > MAX_RESTARTS:
+        if self._backoff.exhausted(attempt):
             self._log(f"✖ {name} падает слишком часто — останавливаю всё")
             if name == TUNNEL and self.is_quick and not self._quick_url:
                 self._log(f"   • Временный адрес так и не выдан. Попробуйте позже или подключите свой домен. "
                           f"{DOMAIN_GUIDE_HINT}")
             self._fail()
             return
-        delay_s = min(2 ** attempt, 30)  # 2, 4, 8, 16, 30
-        self._log(f"⚠ {name} упал (код {exit_code}), перезапуск через {delay_s} с")
-        self._restart_timers[name].start(delay_s * 1000)
+        delay_s = self._backoff.next_delay(attempt)
+        self._log(f"⚠ {name} упал (код {exit_code}), перезапуск через {delay_s:.1f} с")
+        self._restart_timers[name].start(int(round(delay_s * 1000)))
         self._recompute()
 
     def _on_proc_state(self, name: str, state: ProcState) -> None:
@@ -796,7 +822,80 @@ class ServiceManager(QObject):
         for timer in self._restart_timers.values():
             timer.stop()
         self.health.stop()
+        self._resilience.stop()
+        self._recovery_timer.stop()
         self._bridge.stop()
+
+    def _on_system_resumed(self, gap_seconds: float) -> None:
+        if not self._want_running:
+            return
+        self._log(f"↻ Выход из спящего режима (~{gap_seconds:.0f} с): проверяю соединение…")
+        self._restart_attempts = {name: 0 for name in self._procs}
+        self.health.probe_now()
+        self._recovery_timer.start()
+
+    def _on_network_changed(self, summary: str) -> None:
+        if not self._want_running:
+            return
+        self._log(f"↻ Изменение сети ({summary}): проверяю сервер и туннель…")
+        self._restart_attempts = {name: 0 for name in self._procs}
+        self.health.probe_now()
+        self._recovery_timer.start()
+
+    def _on_recovery_grace_timeout(self) -> None:
+        if not self._want_running or self._diagnosing or self._restart_timers[TUNNEL].isActive():
+            return
+        if self.tunnel.state != ProcState.RUNNING:
+            self._log("↻ Туннель не восстановился после смены сети/сна — переподключаю…")
+            if self.tunnel.is_alive():
+                self.tunnel.stop()
+            else:
+                self._start_tunnel()
+
+    def _set_oauth_emergency_stop(self, active: bool, reason: str = "") -> bool:
+        url = self.public_url
+        if not url:
+            return False
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return False
+        issuer = f"{parts.scheme}://{parts.netloc}"
+        try:
+            from backend.oauth_store import OAuthStore, default_store_path
+
+            store = OAuthStore(default_store_path(), issuer, url)
+            store.set_emergency_stop(active, reason=reason)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def emergency_stop(self, reason: str = "Аварийная остановка владельцем") -> dict:
+        """Немедленно заблокировать новые вызовы и остановить контролируемые процессы."""
+        oauth_flagged = self._set_oauth_emergency_stop(True, reason=reason)
+        self._restart_all_pending = False
+        self._log(f"🛑 АВАРИЙНАЯ ОСТАНОВКА: {reason}")
+        self.stop_all()
+        return {
+            "stopped_services": ["tunnel", "server"],
+            "oauth_emergency_flag_set": oauth_flagged,
+            "reason": reason,
+            "warning": (
+                "Новые вызовы OAuth-инструментов заблокированы, а контролируемые сервисы "
+                "остановлены. Независимые GUI-программы или внешние процессы, запущенные "
+                "отдельно, не могут быть гарантированно остановлены автоматически."
+            ),
+        }
+
+    def clear_emergency_stop(self) -> None:
+        self._set_oauth_emergency_stop(False)
+
+    def redact_text(self, text: str) -> str:
+        wizard = self.wizard_domain()
+        if wizard.tunnel_token:
+            self._redactor.register(wizard.tunnel_token)
+        if self._token:
+            self._redactor.register(self._token)
+        return self._redactor.redact_text(text)
 
     def _fail(self) -> None:
         self._error = True

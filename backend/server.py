@@ -2,7 +2,6 @@ import asyncio
 import hmac
 import logging
 import os
-import re
 import secrets
 import subprocess
 import tempfile
@@ -27,6 +26,8 @@ if __package__:
     from .oauth_execution import ExecutionApprovals
     from .execution_audit import ExecutionAudit, classify_command_output
     from .managed_servers import ManagedServers
+    from .output_stream import decode_process_bytes
+    from .process_runner import ProcessRunner
     from .tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -42,6 +43,8 @@ else:
     from oauth_execution import ExecutionApprovals
     from execution_audit import ExecutionAudit, classify_command_output
     from managed_servers import ManagedServers
+    from output_stream import decode_process_bytes
+    from process_runner import ProcessRunner
     from tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -50,6 +53,8 @@ else:
         MAX_WRITE_BYTES, allowed_ssh_host, enabled, exact_allowlist,
         parse_allowed_command, workspace_path,
     )
+
+from app.core.redaction import RedactingLogFilter, SecretRedactor
 
 # ==========================================
 # 1. КОНФИГУРАЦИЯ И ЛОГИРОВАНИЕ
@@ -88,6 +93,12 @@ if not SECRET_TOKEN:
     # Только при ручном запуске без GUI: иначе временный токен негде узнать.
     logger.warning("MCP_SECRET_TOKEN not set: temporary token generated (never logged). Set a token before remote use.")
 
+REDACTOR = SecretRedactor([SECRET_TOKEN])
+_REDACT_FILTER = RedactingLogFilter(REDACTOR)
+logger.addFilter(_REDACT_FILTER)
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_REDACT_FILTER)
+
 # The GUI passes the active Quick Tunnel URL and MCP path for each server start.
 MCP_PATH = validate_mcp_path(os.environ.get("MCP_PATH", "/mcp"))
 # Local loopback only by default; cloudflared exposes the public HTTPS endpoint.
@@ -112,9 +123,13 @@ ALLOW_QUERY_TOKEN = False  # OAuth or Bearer header only; forbid ?token= in publ
 JSON_RESPONSE = _env_flag("MCP_JSON_RESPONSE", PUBLIC_HOST.endswith(".trycloudflare.com"))
 
 WORKSPACE_DIR = Path(os.environ.get("MCP_WORKSPACE_DIR", os.getcwd())).resolve()
+PROCESS_RUNNER = ProcessRunner(
+    spool_dir=Path(os.environ.get("MCP_SPOOL_DIR") or (WORKSPACE_DIR / "spool")),
+    redactor=REDACTOR,
+)
 MANAGED_SERVERS = ManagedServers(Path(
     os.environ.get("MCP_MANAGED_SERVERS_PATH") or WORKSPACE_DIR / "managed_servers.json"
-))
+), runner=PROCESS_RUNNER)
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
 OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
@@ -366,9 +381,17 @@ def _restricted_windows_argv(command: str) -> list[str]:
 
 
 async def _oauth_windows_run(
-    command: str, *, full: bool, shell: str = "cmd", timeout: int = 15,
+    command: str,
+    *,
+    full: bool,
+    shell: str = "cmd",
+    timeout: int = 15,
+    client_id: str = "system",
+    pre_dispatch_check=None,
+    output_offset: int = 0,
+    output_limit: int = MAX_OUTPUT_LEN,
 ) -> str:
-    """Bounded execution, with shell semantics only in explicit full mode."""
+    """Bounded execution via ProcessRunner, with shell semantics only in explicit full mode."""
     if shell not in ("cmd", "powershell") or not (1 <= timeout <= 600):
         return "❌ Invalid shell or timeout (1–600 seconds)."
     if not full and (shell != "cmd" or timeout > 15):
@@ -377,12 +400,18 @@ async def _oauth_windows_run(
     program = command.strip().split(" ", 1)[0].lower()
     if not full:
         if program == "pwd" and command.strip().lower() == "pwd":
+            if pre_dispatch_check is not None:
+                pre_dispatch_check()
             return str(WORKSPACE_DIR)
         if program in ("ls", "dir") and command.strip().lower() == program:
+            if pre_dispatch_check is not None:
+                pre_dispatch_check()
             return truncate_output("\n".join(sorted(
                 path.name for path in WORKSPACE_DIR.iterdir()
             )))
         if program == "echo":
+            if pre_dispatch_check is not None:
+                pre_dispatch_check()
             return truncate_output(
                 command.strip()[5:] if command.strip().lower().startswith("echo ") else ""
             )
@@ -393,15 +422,10 @@ async def _oauth_windows_run(
         if not argv:
             return "❌ Недопустимые аргументы встроенной команды."
     else:
-        # Full mode deliberately permits Windows command interpreter syntax:
-        # pipes, built-ins, redirection, chained commands. This is an
-        # explicit high-risk owner choice, not the default or allowlist path.
         if os.name == "nt":
             system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
             if shell == "powershell":
                 executable = str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
-                # Short commands run normally. Long scripts use a file and
-                # remain subject to the user's PowerShell execution policy.
                 if len(command) <= 8000:
                     argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
                             "-Command", command]
@@ -434,39 +458,29 @@ async def _oauth_windows_run(
                 return "❌ Invalid command syntax."
         if not argv:
             return "❌ Пустая команда."
-    process = None
+
     try:
-        process = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(WORKSPACE_DIR), stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        result = await PROCESS_RUNNER.run_command(
+            argv,
+            cwd=WORKSPACE_DIR,
+            timeout=timeout,
+            client_id=client_id,
+            kind="windows",
+            spawn_fn=asyncio.create_subprocess_exec,
+            output_offset=output_offset,
+            output_limit=output_limit,
+            pre_dispatch_check=pre_dispatch_check,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            if process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            # A descendant may retain inherited pipe handles. Do not hold
-            # the MCP request indefinitely waiting for those handles to close.
-            try:
-                await asyncio.wait_for(process.wait(), timeout=2)
-            except asyncio.TimeoutError:
-                pass
+        if result.timed_out:
             return f"❌ Команда превысила лимит {timeout} секунд."
         return (
-            f"Exit code: {process.returncode}\n"
-            f"STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}\n"
-            f"STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
+            f"Exit code: {result.exit_code}\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
         )
-    except asyncio.CancelledError:
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.wait()
-        raise
-    except (OSError, ValueError) as exc:
+    except PermissionError:
+        return "❌ Эта Windows-команда недоступна в выбранном режиме."
+    except (OSError, ValueError, RuntimeError) as exc:
         return f"❌ Не удалось выполнить Windows-команду: {type(exc).__name__}"
     finally:
         if script_path:
@@ -500,6 +514,16 @@ async def oauth_windows_command(
             event="denied", command=command,
         )
         return "❌ Эта Windows-команда недоступна в выбранном режиме."
+
+    def recheck_before_spawn() -> None:
+        live_client = require_execution_permission(
+            EXEC_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        if not oauth_execution.can_request(
+            live_client, "windows", command=command, expected_profile=profile
+        ):
+            raise PermissionError("Execution access revoked before dispatch")
+
     action_id = secrets.token_hex(8)
     started = time.monotonic()
     EXEC_AUDIT.record(
@@ -507,7 +531,22 @@ async def oauth_windows_command(
         event="started", command=command, action_id=action_id,
     )
     try:
-        output = await _oauth_windows_run(command, full=profile == "full", shell=shell, timeout=timeout)
+        async with PROCESS_RUNNER.request_slot():
+            output = await _oauth_windows_run(
+                command,
+                full=profile == "full",
+                shell=shell,
+                timeout=timeout,
+                client_id=client_id,
+                pre_dispatch_check=recheck_before_spawn,
+            )
+    except PermissionError:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile,
+            event="denied", command=command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return "❌ Эта Windows-команда недоступна в выбранном режиме."
     except BaseException:
         EXEC_AUDIT.record(
             client_id=client_id, kind="windows", profile=profile,
@@ -516,7 +555,6 @@ async def oauth_windows_command(
         )
         raise
     outcome, exit_code = classify_command_output(output)
-    # Shell-free builtins return their output without an exit-code prefix.
     if profile == "allowlist" and command.strip().split(" ", 1)[0].lower() in (
         "pwd", "ls", "dir", "echo",
     ) and not output.startswith("❌"):
@@ -557,18 +595,22 @@ async def oauth_managed_server(
     EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
                       event="started", command=audit_command, action_id=action_id)
     try:
-        operation = MANAGED_SERVERS.start if action == "start" else MANAGED_SERVERS.stop
-        if action not in ("start", "stop"):
-            raise ValueError("Invalid operation")
-        # Recheck current privileges just before dispatch.
-        if oauth_execution.profile_for(client_id) != "full":
-            raise PermissionError("Access changed")
-        result = await asyncio.to_thread(operation, client_id, name)
-        EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
-                          event="completed", command=audit_command, action_id=action_id,
-                          duration_ms=int((time.monotonic() - started) * 1000))
-        return result
-    except (OSError, ValueError, PermissionError, subprocess.TimeoutExpired) as exc:
+        async with PROCESS_RUNNER.request_slot():
+            operation = MANAGED_SERVERS.start if action == "start" else MANAGED_SERVERS.stop
+            if action not in ("start", "stop"):
+                raise ValueError("Invalid operation")
+            # Recheck current privileges just before dispatch.
+            require_execution_permission(
+                EXEC_MANAGED, oauth_provider.store if oauth_provider else None, oauth_execution
+            )
+            if oauth_execution.profile_for(client_id) != "full":
+                raise PermissionError("Access changed")
+            result = await asyncio.to_thread(operation, client_id, name)
+            EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
+                              event="completed", command=audit_command, action_id=action_id,
+                              duration_ms=int((time.monotonic() - started) * 1000))
+            return result
+    except (OSError, ValueError, PermissionError, RuntimeError, subprocess.TimeoutExpired) as exc:
         EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
                           event="failed", command=audit_command, action_id=action_id,
                           duration_ms=int((time.monotonic() - started) * 1000))
@@ -599,6 +641,17 @@ async def oauth_ssh_command(
             event="denied", command=command, host=host, port=port,
         )
         return "❌ SSH-хост или команда недоступны в выбранном режиме."
+
+    def recheck_before_spawn() -> None:
+        live_client = require_execution_permission(
+            EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        if not oauth_execution.can_request(
+            live_client, "ssh", command=command, host=host, user=user, port=port,
+            expected_profile=profile,
+        ):
+            raise PermissionError("SSH access revoked before dispatch")
+
     action_id = secrets.token_hex(8)
     started = time.monotonic()
     EXEC_AUDIT.record(
@@ -607,7 +660,23 @@ async def oauth_ssh_command(
         action_id=action_id,
     )
     try:
-        output = await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, timeout)
+        async with PROCESS_RUNNER.request_slot():
+            output = await PROCESS_RUNNER.run_ssh(
+                lambda cancel_ev, reg_cb: _sync_ssh_exec(
+                    host, user, command, port, timeout,
+                    cancel_event=cancel_ev, register_transport=reg_cb,
+                ),
+                client_id=client_id,
+                pre_dispatch_check=recheck_before_spawn,
+            )
+    except PermissionError:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile,
+            event="denied", command=command, host=host, port=port,
+            action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return "❌ SSH-хост или команда недоступны в выбранном режиме."
     except BaseException as exc:
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,
@@ -631,11 +700,7 @@ async def oauth_ssh_command(
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
 async def run_local_command(command: str, timeout: int = 30, cwd: str | None = None) -> str:
-    """Execute one explicitly allowlisted executable, without a command shell.
-
-    This is an administrator-only capability. The allowlist must not contain
-    interpreters or programs that can run arbitrary scripts.
-    """
+    """Execute one explicitly allowlisted executable, without a command shell."""
     try:
         argv = parse_allowed_command(command, ALLOWED_EXECUTABLES)
         work_dir = workspace_path(WORKSPACE_DIR, cwd) if cwd else WORKSPACE_DIR
@@ -645,27 +710,35 @@ async def run_local_command(command: str, timeout: int = 30, cwd: str | None = N
         return f"❌ Команда запрещена: {exc}"
     timeout = min(max(timeout, 1), 120)
     logger.info("[LOCAL] executable=%s (arguments redacted)", Path(argv[0]).name)
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv, cwd=str(work_dir), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        result = await PROCESS_RUNNER.run_command(
+            argv,
+            cwd=work_dir,
+            timeout=timeout,
+            client_id="legacy",
+            kind="local",
+            spawn_fn=asyncio.create_subprocess_exec,
+            output_limit=MAX_OUTPUT_LEN,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if result.timed_out:
+            return f"❌ Таймаут: команда превысила лимит {timeout} сек."
         return (
-            f"Exit code: {proc.returncode}\n✅ STDOUT:\n{truncate_output(stdout.decode(errors='replace'))}"
-            f"\n❌ STDERR:\n{truncate_output(stderr.decode(errors='replace'))}"
+            f"Exit code: {result.exit_code}\n✅ STDOUT:\n{result.stdout}"
+            f"\n❌ STDERR:\n{result.stderr}"
         )
-    except asyncio.TimeoutError:
-        if proc:
-            proc.kill()
-            await proc.wait()
-        return f"❌ Таймаут: команда превысила лимит {timeout} сек."
     except OSError as exc:
         return f"❌ Не удалось запустить разрешённую программу: {type(exc).__name__}"
 
-def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) -> str:
+def _sync_ssh_exec(
+    host: str,
+    user: str,
+    command: str,
+    port: int,
+    timeout: int,
+    *,
+    cancel_event=None,
+    register_transport=None,
+) -> str:
     client = paramiko.SSHClient()
     known_hosts = Path.home() / ".ssh" / "known_hosts"
     client.load_system_host_keys()
@@ -680,21 +753,30 @@ def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) 
         cfg = paramiko.SSHConfig.from_path(str(ssh_cfg_path))
         host_cfg = cfg.lookup(host)
         actual_host = host_cfg.get("hostname", host)
-        if not actual_user: actual_user = host_cfg.get("user")
-        if port == 22 and "port" in host_cfg: actual_port = int(host_cfg["port"])
+        if not actual_user:
+            actual_user = host_cfg.get("user")
+        if port == 22 and "port" in host_cfg:
+            actual_port = int(host_cfg["port"])
         key_filename = host_cfg.get("identityfile")
 
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            return "❌ SSH command cancelled."
+        if register_transport is not None:
+            register_transport(client, None)
         client.connect(hostname=actual_host, port=actual_port, username=actual_user, key_filename=key_filename, timeout=10, banner_timeout=10)
+        if cancel_event is not None and cancel_event.is_set():
+            return "❌ SSH command cancelled."
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
-        # Paramiko recv_exit_status() alone can wait forever if the remote
-        # program never exits. Enforce a total deadline before reading output.
         deadline = time.monotonic() + min(max(timeout, 1), 600)
         channel = stdout.channel
+        if register_transport is not None:
+            register_transport(client, channel)
         out, err = bytearray(), bytearray()
-        # Drain both streams as the program runs to avoid SSH window deadlocks.
-        # Retain only bounded output, not an arbitrary amount of remote data.
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                channel.close()
+                return "❌ SSH command cancelled."
             if time.monotonic() >= deadline:
                 channel.close()
                 return "❌ SSH command timed out."
@@ -712,8 +794,8 @@ def _sync_ssh_exec(host: str, user: str, command: str, port: int, timeout: int) 
             if not progressed:
                 time.sleep(0.05)
         exit_status = channel.recv_exit_status()
-        out_str = truncate_output(out.decode(errors="replace"))
-        err_str = truncate_output(err.decode(errors="replace"))
+        out_str = REDACTOR.redact_text(truncate_output(decode_process_bytes(bytes(out))))
+        err_str = REDACTOR.redact_text(truncate_output(decode_process_bytes(bytes(err))))
         return f"Exit code: {exit_status}\n✅ STDOUT:\n{out_str}\n❌ STDERR:\n{err_str}"
     finally:
         client.close()
@@ -816,6 +898,7 @@ def main() -> None:
         uvicorn.run(build_app(), host=HOST, port=PORT)
     finally:
         MANAGED_SERVERS.close()
+        PROCESS_RUNNER.close()
 
 
 if __name__ == "__main__":

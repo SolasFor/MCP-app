@@ -33,6 +33,8 @@ workspace/
 
 # --- Логи ---
 *.log
+*.jsonl
+spool/
 
 # --- IDE / OS ---
 .idea/

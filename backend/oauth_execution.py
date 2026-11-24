@@ -2,33 +2,33 @@
 
 safe (default): no command/SSH tools.
 allowlist: Windows command lines and SSH host+commands must match exact owner
-           entries; no per-call confirmation.
+           entries (global or per-client); no per-call confirmation.
 full: approved OAuth clients can run Windows shell/SSH commands immediately.
 
-The global default and per-client profile overrides are stored encrypted in
-SQLite and reread for each tool discovery and invocation. No remote admin
-route can mutate permissions.
+Supports per-client allowlist overrides, time-bounded temporary grants, and
+emergency-stop fail-closed enforcement. No remote admin route can mutate permissions.
 """
 from __future__ import annotations
 
 import re
+import secrets
+import time
 from typing import Literal
 
-try:
+if __package__:
     from .oauth_store import OAuthStore
-except ImportError:
-    from oauth_store import OAuthStore
+else:
+    from oauth_store import OAuthStore  # type: ignore[no-redef]
 
 ActionKind = Literal["windows", "ssh"]
 PROFILE_SAFE = "safe"
 PROFILE_ALLOWLIST = "allowlist"
 PROFILE_FULL = "full"
 PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
+_PROFILE_RANK = {PROFILE_SAFE: 0, PROFILE_ALLOWLIST: 1, PROFILE_FULL: 2}
 MAX_RULES = 24
 MAX_RULE_SIZE = 512
 MAX_FULL_COMMAND_SIZE = 65536  # transport/resource bound, not a command allowlist
-# Standard Windows read-only helpers. These are preloaded as a policy,
-# but the OAuth execution profile itself always defaults to "safe".
 DEFAULT_WINDOWS_ALLOWLIST = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,251}$")
 
@@ -64,10 +64,7 @@ def windows_whitelisted(command: str, entries: tuple[str, ...]) -> bool:
 
 
 class ExecutionApprovals:
-    """Retained class name for compatibility with existing GUI/backend imports.
-
-    No approvals or tickets are created in any of the three scenarios.
-    """
+    """Encrypted SQLite execution policy, per-client allowlists, and temporary grants."""
 
     def __init__(self, store: OAuthStore) -> None:
         self.store = store
@@ -85,36 +82,37 @@ class ExecutionApprovals:
                 );
                 DROP TABLE IF EXISTS exec_grants;
             """)
-            # Seed new installations once, so the GUI's allowlist is populated
-            # immediately. Never overwrite an existing owner-edited policy:
-            # users may intentionally have removed or disabled commands.
             db.execute(
                 "INSERT OR IGNORE INTO exec_policy(issuer, encrypted) VALUES (?,?)",
-                (store.issuer, store._encrypt({
-                    "profile": PROFILE_SAFE,
-                    "windows": list(DEFAULT_WINDOWS_ALLOWLIST),
-                    "hosts": [], "ssh_commands": [],
-                })),
+                (
+                    store.issuer,
+                    store._encrypt({
+                        "profile": PROFILE_SAFE,
+                        "windows": list(DEFAULT_WINDOWS_ALLOWLIST),
+                        "hosts": [],
+                        "ssh_commands": [],
+                    }),
+                ),
             )
-            # Old short-lived approval tickets cannot authorize anything here.
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
                 db.execute("DELETE FROM exec_requests WHERE issuer=?", (store.issuer,))
 
     def policy(self) -> dict:
         with self.store._db() as db:
-            row = db.execute("SELECT encrypted FROM exec_policy WHERE issuer=?",
-                             (self.store.issuer,)).fetchone()
+            row = db.execute(
+                "SELECT encrypted FROM exec_policy WHERE issuer=?", (self.store.issuer,)
+            ).fetchone()
         if not row:
             return {
-                "profile": PROFILE_SAFE, "windows": DEFAULT_WINDOWS_ALLOWLIST,
-                "hosts": (), "ssh_commands": (),
+                "profile": PROFILE_SAFE,
+                "windows": DEFAULT_WINDOWS_ALLOWLIST,
+                "hosts": (),
+                "ssh_commands": (),
             }
         payload = self.store._decrypt(row[0])
         profile = payload.get("profile", PROFILE_SAFE)
         if profile not in PROFILES:
             profile = PROFILE_SAFE
-        # Existing records from earlier builds contain lists but no profile:
-        # never silently convert them to command execution privileges.
         return {
             "profile": profile,
             "windows": tuple(payload.get("windows", DEFAULT_WINDOWS_ALLOWLIST)),
@@ -125,25 +123,29 @@ class ExecutionApprovals:
     def profile(self) -> str:
         return self.policy()["profile"]
 
-    def profile_for(self, client_id: str) -> str:
-        """Return this approved client's explicit profile, else the global default.
+    def emergency_stopped(self) -> bool:
+        return bool(self.store.emergency_stop_state().get("active"))
 
-        A revoked, unapproved or unknown client can never receive privileges.
-        The encrypted SQLite row is read anew for every list and call, allowing
-        the owner to downgrade access immediately without reconnecting.
-        """
-        if not self.client_approved(client_id):
+    def profile_for(self, client_id: str) -> str:
+        """Return effective profile for an approved client (emergency stop forces safe)."""
+        if self.emergency_stopped() or not self.client_approved(client_id):
             return PROFILE_SAFE
         with self.store._db() as db:
             row = db.execute(
-                "SELECT encrypted FROM exec_client_profiles "
-                "WHERE issuer=? AND client_id=?",
+                "SELECT encrypted FROM exec_client_profiles WHERE issuer=? AND client_id=?",
                 (self.store.issuer, client_id),
             ).fetchone()
         if row:
             stored = self.store._decrypt(row[0]).get("profile")
-            return stored if stored in PROFILES else PROFILE_SAFE
-        return self.profile()
+            base = stored if stored in PROFILES else PROFILE_SAFE
+        else:
+            base = self.profile()
+
+        for grant in self.active_temporary_grants(client_id):
+            gp = grant.get("profile")
+            if gp in PROFILES and _PROFILE_RANK[gp] > _PROFILE_RANK[base]:
+                base = gp
+        return base
 
     def set_client_profile(self, client_id: str, profile: str) -> None:
         """Called exclusively from the local GUI, never an exposed MCP route."""
@@ -154,23 +156,154 @@ class ExecutionApprovals:
         with self.store._db() as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute(
-                "SELECT 1 FROM clients WHERE issuer=? AND client_id=? "
-                "AND approved_at IS NOT NULL",
+                "SELECT 1 FROM clients WHERE issuer=? AND client_id=? AND approved_at IS NOT NULL",
                 (self.store.issuer, client_id),
             ).fetchone():
                 raise ValueError("Cannot assign access to unapproved or revoked client")
             db.execute(
-                "INSERT OR REPLACE INTO exec_client_profiles "
-                "(issuer,client_id,encrypted) VALUES (?,?,?)",
-                (self.store.issuer, client_id,
-                 self.store._encrypt({"profile": profile})),
+                "INSERT OR REPLACE INTO exec_client_profiles (issuer,client_id,encrypted) VALUES (?,?,?)",
+                (self.store.issuer, client_id, self.store._encrypt({"profile": profile})),
             )
+
+    def client_allowlist(self, client_id: str) -> dict | None:
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT encrypted FROM exec_client_allowlists WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            ).fetchone()
+        if not row:
+            return None
+        payload = self.store._decrypt(row[0])
+        return {
+            "windows": tuple(payload.get("windows", ())),
+            "hosts": tuple(payload.get("hosts", ())),
+            "ssh_commands": tuple(payload.get("ssh_commands", ())),
+        }
+
+    def set_client_allowlist(
+        self, client_id: str, *, windows: str, hosts: str, ssh_commands: str
+    ) -> None:
+        if not self.client_approved(client_id):
+            raise ValueError("Cannot assign allowlist to unapproved or revoked client")
+        payload = {
+            "windows": _parse_rules(windows),
+            "hosts": _parse_rules(hosts, host=True),
+            "ssh_commands": _parse_rules(ssh_commands),
+        }
+        with self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR REPLACE INTO exec_client_allowlists (issuer,client_id,encrypted) VALUES (?,?,?)",
+                (self.store.issuer, client_id, self.store._encrypt(payload)),
+            )
+
+    def clear_client_allowlist(self, client_id: str) -> bool:
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_client_allowlists WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            )
+            return cur.rowcount > 0
+
+    def effective_policy_for(self, client_id: str) -> dict:
+        base = self.policy()
+        custom = self.client_allowlist(client_id)
+        if custom is None:
+            return base
+        return {
+            "profile": self.profile_for(client_id),
+            "windows": custom["windows"],
+            "hosts": custom["hosts"],
+            "ssh_commands": custom["ssh_commands"],
+        }
+
+    def grant_temporary_access(
+        self,
+        client_id: str,
+        *,
+        profile: str | None = None,
+        tool_names: tuple[str, ...] = (),
+        windows_commands: tuple[str, ...] = (),
+        ssh_hosts: tuple[str, ...] = (),
+        ssh_commands: tuple[str, ...] = (),
+        ttl_seconds: int = 900,
+        reason: str = "",
+    ) -> str:
+        """Issue an encrypted time-bounded grant for an approved OAuth client."""
+        if not self.client_approved(client_id):
+            raise ValueError("Cannot issue temporary grant to unapproved client")
+        if profile is not None and profile not in PROFILES:
+            raise ValueError("Invalid temporary grant profile")
+        ttl = max(1, min(int(ttl_seconds), 86400))
+        grant_id = secrets.token_hex(8)
+        now = int(time.time())
+        expires_at = now + ttl
+        payload = {
+            "profile": profile,
+            "tool_names": list(tool_names),
+            "windows_commands": list(_parse_rules("\n".join(windows_commands))),
+            "ssh_hosts": list(_parse_rules("\n".join(ssh_hosts), host=True)),
+            "ssh_commands": list(_parse_rules("\n".join(ssh_commands))),
+            "reason": str(reason)[:200],
+            "created_at": now,
+            "expires_at": expires_at,
+        }
+        with self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT INTO exec_temp_grants (grant_id,issuer,client_id,encrypted,expires_at) "
+                "VALUES (?,?,?,?,?)",
+                (grant_id, self.store.issuer, client_id, self.store._encrypt(payload), expires_at),
+            )
+        return grant_id
+
+    def active_temporary_grants(self, client_id: str) -> list[dict]:
+        now = int(time.time())
+        with self.store._db() as db:
+            rows = db.execute(
+                "SELECT grant_id, encrypted, expires_at FROM exec_temp_grants "
+                "WHERE issuer=? AND client_id=? AND expires_at>=?",
+                (self.store.issuer, client_id, now),
+            ).fetchall()
+        grants: list[dict] = []
+        for grant_id, enc, expires_at in rows:
+            data = self.store._decrypt(enc)
+            data["grant_id"] = grant_id
+            data["expires_at"] = expires_at
+            grants.append(data)
+        return grants
+
+    def revoke_temporary_grant(self, grant_id: str) -> bool:
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_temp_grants WHERE issuer=? AND grant_id=?",
+                (self.store.issuer, grant_id),
+            )
+            return cur.rowcount > 0
+
+    def revoke_client_temporary_grants(self, client_id: str) -> int:
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_temp_grants WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            )
+            return cur.rowcount
+
+    def prune_expired_grants(self) -> int:
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_temp_grants WHERE issuer=? AND expires_at<?",
+                (self.store.issuer, int(time.time())),
+            )
+            return cur.rowcount
 
     def _save(self, policy: dict) -> None:
         with self.store._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("INSERT OR REPLACE INTO exec_policy(issuer,encrypted) VALUES (?,?)",
-                       (self.store.issuer, self.store._encrypt(policy)))
+            db.execute(
+                "INSERT OR REPLACE INTO exec_policy(issuer,encrypted) VALUES (?,?)",
+                (self.store.issuer, self.store._encrypt(policy)),
+            )
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
                 db.execute("DELETE FROM exec_requests WHERE issuer=?", (self.store.issuer,))
 
@@ -196,19 +329,34 @@ class ExecutionApprovals:
         if not isinstance(client_id, str) or not client_id or client_id == "mcp-app-user":
             return False
         with self.store._db() as db:
-            return bool(db.execute(
-                "SELECT 1 FROM clients WHERE issuer=? AND client_id=? AND approved_at IS NOT NULL",
-                (self.store.issuer, client_id),
-            ).fetchone())
+            return bool(
+                db.execute(
+                    "SELECT 1 FROM clients WHERE issuer=? AND client_id=? AND approved_at IS NOT NULL",
+                    (self.store.issuer, client_id),
+                ).fetchone()
+            )
 
     def can_request(
-        self, client_id: str, kind: ActionKind, *, command: str,
-        host: str = "", user: str = "", port: int = 22,
+        self,
+        client_id: str,
+        kind: ActionKind,
+        *,
+        command: str,
+        host: str = "",
+        user: str = "",
+        port: int = 22,
         expected_profile: str | None = None,
     ) -> bool:
+        if self.emergency_stopped():
+            return False
         if kind not in ("windows", "ssh") or not self.client_approved(client_id):
             return False
-        if not isinstance(command, str) or not command.strip() or "\x00" in command or len(command) > MAX_FULL_COMMAND_SIZE:
+        if (
+            not isinstance(command, str)
+            or not command.strip()
+            or "\x00" in command
+            or len(command) > MAX_FULL_COMMAND_SIZE
+        ):
             return False
         if type(port) is not int or not (1 <= port <= 65535) or not isinstance(user, str):
             return False
@@ -218,16 +366,32 @@ class ExecutionApprovals:
             return False
         if kind == "ssh" and (not isinstance(host, str) or not _SSH_HOST_RE.fullmatch(host)):
             return False
-        policy = self.policy()
+
         profile = self.profile_for(client_id)
         if expected_profile is not None and expected_profile != profile:
             return False
+
+        # Temporary command grants can authorize a specific command even if base profile is safe/allowlist.
+        if len(command) <= MAX_RULE_SIZE:
+            for grant in self.active_temporary_grants(client_id):
+                if kind == "windows" and windows_whitelisted(
+                    command, tuple(grant.get("windows_commands", ()))
+                ):
+                    return True
+                if (
+                    kind == "ssh"
+                    and host in tuple(grant.get("ssh_hosts", ()))
+                    and command.strip() in tuple(grant.get("ssh_commands", ()))
+                ):
+                    return True
+
         if profile == PROFILE_SAFE:
             return False
         if profile == PROFILE_FULL:
             return True
         if len(command) > MAX_RULE_SIZE:
             return False
+        policy = self.effective_policy_for(client_id)
         if kind == "windows":
             return windows_whitelisted(command, policy["windows"])
         return host in policy["hosts"] and command.strip() in policy["ssh_commands"]

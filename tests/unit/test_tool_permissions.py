@@ -16,7 +16,7 @@ from mcp.types import ListToolsResult, Tool
 from backend.oauth_store import OAuthStore
 from backend.oauth_execution import ExecutionApprovals
 from backend.tool_permissions import (
-    BASIC_TOOLS, EXEC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
+    BASIC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
     allowed_tools, make_tool_middleware, require_execution_permission,
 )
 

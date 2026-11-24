@@ -315,7 +315,17 @@ class MainWindow(QMainWindow):
         self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self._toggle.setMinimumWidth(168)
         self._toggle.clicked.connect(self.manager.toggle)
-        top.addWidget(self._toggle, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._emergency_btn = _button(
+            "Аварийная остановка",
+            "Danger",
+            "Заблокировать новые OAuth-вызовы и остановить контролируемые сервисы",
+        )
+        self._emergency_btn.clicked.connect(self._on_emergency_stop)
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+        controls.addWidget(self._emergency_btn)
+        controls.addWidget(self._toggle)
+        top.addLayout(controls, 0)
         box.addLayout(top)
         box.addWidget(_divider())
         self._server_row = StatusRow("MCP-сервер")
@@ -598,8 +608,19 @@ class MainWindow(QMainWindow):
             self.settings.server_health_path,
             self.manager.token,
             self,
+            tunnel_mode=self.settings.tunnel_mode,
+            tunnel_protocol=self.manager.tunnel_protocol,
+            recent_logs=tuple(self._log_view.plain_text().splitlines()[-200:]),
         )
         dialog.exec()
+
+    def _on_emergency_stop(self) -> None:
+        report = self.manager.emergency_stop()
+        QMessageBox.warning(
+            self,
+            "Аварийная остановка",
+            f"Контролируемые сервисы остановлены.\n\n{report['warning']}",
+        )
 
     # ================================================================== Прокси
     def _build_proxy(self) -> QWidget:
@@ -922,11 +943,9 @@ class MainWindow(QMainWindow):
         self._refresh_address()
 
     def _redact(self, line: str) -> str:
-        """Токен не попадает в журнал ни целиком, ни в составе ссылки."""
-        token = self.manager.token
-        if token and token in line:
-            line = line.replace(token, token_store.mask(token))
-        return _QUERY_TOKEN_RE.sub(r"\1•••", line) if "token=" in line else line
+        """Токен и секреты не попадают в журнал ни целиком, ни в составе ссылки."""
+        cleaned = self.manager.redact_text(line)
+        return _QUERY_TOKEN_RE.sub(r"\1•••", cleaned) if "token=" in cleaned else cleaned
 
     # ================================================================== параметры
     def _on_autostart(self, enabled: bool) -> None:

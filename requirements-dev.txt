@@ -1,0 +1,6 @@
+# Development, linting, static typing, and security audit tools (not bundled into runtime app).
+ruff==0.17.6
+mypy==2.4.1
+mypy_extensions==1.2.0
+pip_audit==2.10.1
+packaging==26.4

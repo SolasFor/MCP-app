@@ -1,17 +1,16 @@
 name: RC Windows installer (no publish)
 
 on:
-  push:
-    branches: [release/rc-01-oauth-windows-ssh, feat/08-three-access-modes-unified-home, feat/09-client-access-scenario-column]
   pull_request:
-    branches: [main, release/rc-01-oauth-windows-ssh, feat/08-three-access-modes-unified-home]
+    branches: [main]
     paths:
       - "app/**"
       - "backend/**"
+      - "tools/**"
       - "main.py"
       - "requirements*.txt"
+      - "requirements.lock"
       - "packaging/**"
-      - "tools/**"
       - ".github/workflows/rc-windows.yml"
   workflow_dispatch:
 
@@ -31,28 +30,31 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Inno Setup
+      - name: Install Inno Setup 6
         shell: pwsh
         run: |
           choco install innosetup --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup installation failed" }
-      - name: Build PyInstaller, embedded cloudflared, portable ZIP and Setup.exe
+      - name: Build PyInstaller, pinned cloudflared, portable ZIP, Setup.exe, SBOM and SHA256SUMS
         shell: pwsh
         run: |
           ./packaging/build.ps1 -Python python
           if ($LASTEXITCODE -ne 0) { throw "Packaging failed" }
-      - name: Verify actual Windows installer and portable ZIP exist
+      - name: Verify actual Windows installer, portable ZIP, SBOM and selftest
         shell: pwsh
         run: |
           $version = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          $setup = "dist/MCPApp-Setup-$version.exe"
-          $portable = "dist/MCPApp-$version-portable.zip"
+          $required = @(
+            "dist/MCPApp-Setup-$version.exe",
+            "dist/MCPApp-$version-portable.zip",
+            "dist/SBOM.cdx.json",
+            "dist/SHA256SUMS.txt"
+          )
+          foreach ($item in $required) {
+            if (-not (Test-Path $item)) { throw "Missing $item" }
+          }
           $selftest = Get-Content "build/selftest.txt" -Raw -Encoding UTF8
-          if (-not (Test-Path $setup)) { throw "Missing $setup" }
-          if (-not (Test-Path $portable)) { throw "Missing $portable" }
           if ($selftest -notmatch 'RESULT OK') { throw "Built EXE self-test failed" }
-          Write-Host "Installer: $setup"
-          Write-Host "Portable: $portable"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -60,6 +62,8 @@ jobs:
           path: |
             dist/*.exe
             dist/*.zip
+            dist/SBOM.cdx.json
+            dist/SHA256SUMS.txt
             build/selftest.txt
           retention-days: 14
           if-no-files-found: warn

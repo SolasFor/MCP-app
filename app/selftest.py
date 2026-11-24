@@ -96,7 +96,9 @@ def _check_backend() -> str:
         os.chdir(tmp)
         try:
             import uvicorn  # noqa: F401
-            from backend import server
+            from app import platform as _platform  # noqa: F401
+            from app.core import redaction as _redaction, secret_store as _secret_store  # noqa: F401
+            from backend import output_stream as _out, process_runner as _pr, server, tool_registry as _tr  # noqa: F401
 
             app = server.build_app()
             if server.oauth_execution is None:
@@ -119,5 +121,6 @@ def _check_backend() -> str:
             # explicitly closed; this separate OAuth execution audit handler
             # must be released before TemporaryDirectory cleanup.
             if "server" in locals():
+                server.PROCESS_RUNNER.close()
                 server.EXEC_AUDIT.close()
             os.chdir(previous)

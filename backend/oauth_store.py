@@ -1,6 +1,7 @@
 """Local OAuth client/token storage, shared by GUI and backend via SQLite.
 
-Windows: Fernet data key is wrapped with the current user's DPAPI key.
+Windows: Fernet data key is wrapped with the current user's DPAPI key, and files
+receive user-only ACLs.
 POSIX: data key is stored in a user-private (0700) directory (0600 key file);
 this is not OS keychain protection and is documented as such.
 
@@ -10,7 +11,6 @@ is encrypted. All queries are scoped to the exact issuer URL.
 """
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import os
@@ -25,46 +25,34 @@ from cryptography.fernet import Fernet
 from mcp.server.auth.provider import AccessToken, RefreshToken
 from mcp.shared.auth import OAuthClientInformationFull
 
-SCHEMA_VERSION = 1
+from app.core.redaction import SecretRedactor
+from app.platform import get_platform
+
+SCHEMA_VERSION = 2
 _KEY_PREFIX_WIN = b"DPAPI1:"
 _KEY_PREFIX_POSIX = b"POSIX1:"
 
 
 def default_store_path() -> Path:
     from app.paths import user_data_dir
+
     return user_data_dir() / "oauth" / "connections.sqlite3"
 
 
 def _user_private(path: Path, *, directory: bool = False) -> None:
-    if os.name == "nt":
-        # The Fernet key is DPAPI-wrapped, even if filesystem ACLs were inherited.
-        return
-    path.chmod(0o700 if directory else 0o600)
+    try:
+        get_platform().restrict_path_acl(path, is_dir=directory)
+    except OSError:
+        pass
 
 
 def _win_dpapi(blob: bytes, *, decrypt: bool) -> bytes:
     if sys.platform != "win32":
         raise RuntimeError("Windows DPAPI is only supported on Windows")
-    from ctypes import wintypes
-
-    class DataBlob(ctypes.Structure):
-        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
-    input_buf = ctypes.create_string_buffer(blob)
-    source = DataBlob(len(blob), ctypes.cast(input_buf, ctypes.POINTER(ctypes.c_ubyte)))
-    output = DataBlob()
-    crypt32 = ctypes.windll.crypt32
-    fn = crypt32.CryptUnprotectData if decrypt else crypt32.CryptProtectData
+    platform = get_platform()
     if decrypt:
-        ok = fn(ctypes.byref(source), None, None, None, None, 0x01, ctypes.byref(output))
-    else:
-        ok = fn(ctypes.byref(source), "MCPApp OAuth key", None, None, None, 0x01, ctypes.byref(output))
-    if not ok:
-        raise ctypes.WinError()
-    try:
-        return ctypes.string_at(output.pbData, output.cbData)
-    finally:
-        ctypes.windll.kernel32.LocalFree(output.pbData)
+        return platform.dpapi_unprotect(blob)
+    return platform.dpapi_protect(blob, "MCPApp OAuth key")
 
 
 def _load_or_create_key(db_path: Path) -> bytes:
@@ -107,30 +95,80 @@ class OAuthStore:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _user_private(self.path.parent, directory=True)
         self._cipher = Fernet(_load_or_create_key(self.path))
-        with self._db() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS meta(
-                    issuer TEXT PRIMARY KEY, owner_fingerprint TEXT NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS clients(
-                    issuer TEXT NOT NULL, client_id TEXT NOT NULL,
-                    encrypted BLOB NOT NULL, registered_at INTEGER NOT NULL,
-                    approved_at INTEGER,
-                    PRIMARY KEY(issuer, client_id)
-                );
-                CREATE TABLE IF NOT EXISTS tokens(
-                    digest TEXT PRIMARY KEY, issuer TEXT NOT NULL,
-                    client_id TEXT NOT NULL, kind TEXT NOT NULL,
-                    encrypted BLOB NOT NULL, expires_at INTEGER NOT NULL,
-                    family TEXT NOT NULL
-                );
-                -- Remove the deprecated, superseded per-client notes grants.
-                -- OAuth now has just one fixed Windows+SSH capability.
-                DROP TABLE IF EXISTS client_permissions;
-                CREATE INDEX IF NOT EXISTS idx_token_family ON tokens(issuer, family);
-                CREATE INDEX IF NOT EXISTS idx_client_tokens ON tokens(issuer, client_id);
-            """)
+        self._apply_migrations()
         _user_private(self.path)
+
+    def _apply_migrations(self) -> None:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations(
+                    version INTEGER PRIMARY KEY,
+                    applied_at INTEGER NOT NULL,
+                    description TEXT NOT NULL
+                )
+            """)
+            applied = {
+                row[0] for row in db.execute("SELECT version FROM schema_migrations").fetchall()
+            }
+            if 1 not in applied:
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS meta(
+                        issuer TEXT PRIMARY KEY, owner_fingerprint TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS clients(
+                        issuer TEXT NOT NULL, client_id TEXT NOT NULL,
+                        encrypted BLOB NOT NULL, registered_at INTEGER NOT NULL,
+                        approved_at INTEGER,
+                        PRIMARY KEY(issuer, client_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS tokens(
+                        digest TEXT PRIMARY KEY, issuer TEXT NOT NULL,
+                        client_id TEXT NOT NULL, kind TEXT NOT NULL,
+                        encrypted BLOB NOT NULL, expires_at INTEGER NOT NULL,
+                        family TEXT NOT NULL
+                    );
+                    DROP TABLE IF EXISTS client_permissions;
+                    CREATE INDEX IF NOT EXISTS idx_token_family ON tokens(issuer, family);
+                    CREATE INDEX IF NOT EXISTS idx_client_tokens ON tokens(issuer, client_id);
+                """)
+                db.execute(
+                    "INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
+                    (1, int(time.time()), "Initial OAuth tables"),
+                )
+            if 2 not in applied:
+                db.executescript("""
+                    CREATE TABLE IF NOT EXISTS exec_client_allowlists(
+                        issuer TEXT NOT NULL,
+                        client_id TEXT NOT NULL,
+                        encrypted BLOB NOT NULL,
+                        PRIMARY KEY(issuer, client_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS exec_temp_grants(
+                        grant_id TEXT PRIMARY KEY,
+                        issuer TEXT NOT NULL,
+                        client_id TEXT NOT NULL,
+                        encrypted BLOB NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS runtime_control(
+                        issuer TEXT PRIMARY KEY,
+                        emergency_stop INTEGER NOT NULL DEFAULT 0,
+                        reason TEXT NOT NULL DEFAULT '',
+                        updated_at INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_temp_grants_client
+                        ON exec_temp_grants(issuer, client_id, expires_at);
+                """)
+                db.execute(
+                    "INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
+                    (2, int(time.time()), "Per-client allowlists, temporary grants, emergency stop"),
+                )
+
+    def schema_version(self) -> int:
+        with self._db() as db:
+            row = db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        return int(row[0] or 0) if row else 0
 
     @contextmanager
     def _db(self):
@@ -154,26 +192,58 @@ class OAuthStore:
     @staticmethod
     def _clear_exec_records(db, issuer: str, client_id: str | None = None) -> None:
         # OAuthStore also works without the optional execution module/tables.
-        existing = {row[0] for row in db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('exec_grants','exec_requests','exec_client_profiles')"
-        )}
-        for table in ("exec_grants", "exec_requests", "exec_client_profiles"):
+        tables = (
+            "exec_grants",
+            "exec_requests",
+            "exec_client_profiles",
+            "exec_client_allowlists",
+            "exec_temp_grants",
+        )
+        placeholders = ",".join("?" for _ in tables)
+        existing = {
+            row[0]
+            for row in db.execute(
+                f"SELECT name FROM sqlite_master WHERE type='table' AND name IN ({placeholders})",
+                tables,
+            )
+        }
+        for table in tables:
             if table not in existing:
                 continue
             sql = f"DELETE FROM {table} WHERE issuer=?"
-            args = (issuer,)
+            args: tuple[str, ...] = (issuer,)
             if client_id is not None:
                 sql += " AND client_id=?"
                 args = (issuer, client_id)
             db.execute(sql, args)
+
+    def set_emergency_stop(self, active: bool, reason: str = "") -> None:
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "INSERT OR REPLACE INTO runtime_control(issuer, emergency_stop, reason, updated_at) "
+                "VALUES (?,?,?,?)",
+                (self.issuer, 1 if active else 0, str(reason)[:256], int(time.time())),
+            )
+
+    def emergency_stop_state(self) -> dict:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT emergency_stop, reason, updated_at FROM runtime_control WHERE issuer=?",
+                (self.issuer,),
+            ).fetchone()
+        if not row:
+            return {"active": False, "reason": "", "updated_at": None}
+        return {"active": bool(row[0]), "reason": row[1], "updated_at": row[2]}
 
     def bind_owner(self, secret: str) -> None:
         """Changing the owner token invalidates all OAuth grants for this issuer."""
         fingerprint = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.resource_url)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT owner_fingerprint FROM meta WHERE issuer=?", (self.issuer,)).fetchone()
+            existing = db.execute(
+                "SELECT owner_fingerprint FROM meta WHERE issuer=?", (self.issuer,)
+            ).fetchone()
             if existing and existing[0] != fingerprint:
                 db.execute("DELETE FROM tokens WHERE issuer=?", (self.issuer,))
                 db.execute("DELETE FROM clients WHERE issuer=?", (self.issuer,))
@@ -186,20 +256,26 @@ class OAuthStore:
             return
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            old = [row[0] for row in db.execute(
-                "SELECT issuer FROM clients UNION SELECT issuer FROM tokens UNION SELECT issuer FROM meta"
-            )]
+            old = [
+                row[0]
+                for row in db.execute(
+                    "SELECT issuer FROM clients UNION SELECT issuer FROM tokens UNION SELECT issuer FROM meta"
+                )
+            ]
             for origin in old:
                 host = (urlsplit(origin).hostname or "").lower()
                 if origin != self.issuer and host.endswith(".trycloudflare.com"):
                     db.execute("DELETE FROM clients WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM tokens WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM meta WHERE issuer=?", (origin,))
+                    db.execute("DELETE FROM runtime_control WHERE issuer=?", (origin,))
                     self._clear_exec_records(db, origin)
 
     def count_clients(self) -> int:
         with self._db() as db:
-            return db.execute("SELECT count(*) FROM clients WHERE issuer=?", (self.issuer,)).fetchone()[0]
+            return db.execute(
+                "SELECT count(*) FROM clients WHERE issuer=?", (self.issuer,)
+            ).fetchone()[0]
 
     def save_client(self, client: OAuthClientInformationFull) -> None:
         if not client.client_id:
@@ -223,8 +299,10 @@ class OAuthStore:
 
     def mark_approved(self, client_id: str) -> None:
         with self._db() as db:
-            db.execute("UPDATE clients SET approved_at=? WHERE issuer=? AND client_id=?",
-                       (int(time.time()), self.issuer, client_id))
+            db.execute(
+                "UPDATE clients SET approved_at=? WHERE issuer=? AND client_id=?",
+                (int(time.time()), self.issuer, client_id),
+            )
 
     def list_clients(self) -> list[dict]:
         with self._db() as db:
@@ -234,28 +312,33 @@ class OAuthStore:
                    ORDER BY approved_at DESC, registered_at DESC""",
                 (self.issuer,),
             ).fetchall()
-        return [{
-            "client_id": ident,
-            "client_name": self._decrypt(enc).get("client_name") or "Без названия",
-            "registered_at": registered,
-            "approved_at": approved,
-        } for ident, enc, registered, approved in rows]
+        return [
+            {
+                "client_id": ident,
+                "client_name": self._decrypt(enc).get("client_name") or "Без названия",
+                "registered_at": registered,
+                "approved_at": approved,
+            }
+            for ident, enc, registered, approved in rows
+        ]
 
     def revoke_client(self, client_id: str) -> bool:
         """Transactionally invalidate all client tokens and its registration."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            cursor = db.execute("DELETE FROM clients WHERE issuer=? AND client_id=?",
-                                (self.issuer, client_id))
-            db.execute("DELETE FROM tokens WHERE issuer=? AND client_id=?",
-                       (self.issuer, client_id))
+            cursor = db.execute(
+                "DELETE FROM clients WHERE issuer=? AND client_id=?", (self.issuer, client_id)
+            )
+            db.execute(
+                "DELETE FROM tokens WHERE issuer=? AND client_id=?", (self.issuer, client_id)
+            )
             self._clear_exec_records(db, self.issuer, client_id)
             return cursor.rowcount > 0
 
     def save_token(self, token: AccessToken | RefreshToken, kind: str, family: str) -> None:
         if kind not in ("access", "refresh"):
             raise ValueError("Invalid token type")
-        if token.resource.rstrip("/") != self.resource_url:
+        if not isinstance(token.resource, str) or token.resource.rstrip("/") != self.resource_url:
             raise ValueError("OAuth resource mismatch")
         payload = token.model_dump(mode="json", exclude={"token"})
         with self._db() as db:
@@ -263,8 +346,15 @@ class OAuthStore:
                 """INSERT OR REPLACE INTO tokens
                    (digest,issuer,client_id,kind,encrypted,expires_at,family)
                    VALUES (?,?,?,?,?,?,?)""",
-                (_digest(token.token), self.issuer, token.client_id, kind,
-                 self._encrypt(payload), token.expires_at or 0, family),
+                (
+                    _digest(token.token),
+                    self.issuer,
+                    token.client_id,
+                    kind,
+                    self._encrypt(payload),
+                    token.expires_at or 0,
+                    family,
+                ),
             )
 
     def get_token(self, raw: str, kind: str):
@@ -295,16 +385,14 @@ class OAuthStore:
 
     def family(self, raw: str) -> str | None:
         with self._db() as db:
-            row = db.execute("SELECT family FROM tokens WHERE digest=? AND issuer=?",
-                             (_digest(raw), self.issuer)).fetchone()
+            row = db.execute(
+                "SELECT family FROM tokens WHERE digest=? AND issuer=?",
+                (_digest(raw), self.issuer),
+            ).fetchone()
         return row[0] if row else None
 
     def consume_refresh(self, raw: str, client_id: str) -> str | None:
-        """Single-use refresh token rotation across concurrent backend requests.
-
-        The old token family is removed under BEGIN IMMEDIATE so simultaneous
-        refresh exchanges cannot both succeed for the same token.
-        """
+        """Single-use refresh token rotation across concurrent backend requests."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -319,16 +407,53 @@ class OAuthStore:
             if not row or not active or (row[1] and row[1] < time.time()):
                 return None
             family = row[0]
-            db.execute("DELETE FROM tokens WHERE issuer=? AND family=?",
-                       (self.issuer, family))
+            db.execute(
+                "DELETE FROM tokens WHERE issuer=? AND family=?", (self.issuer, family)
+            )
             return family
 
     def revoke_family(self, family: str) -> None:
         with self._db() as db:
-            db.execute("DELETE FROM tokens WHERE issuer=? AND family=?",
-                       (self.issuer, family))
+            db.execute(
+                "DELETE FROM tokens WHERE issuer=? AND family=?", (self.issuer, family)
+            )
 
     def prune_expired(self) -> None:
+        now = int(time.time())
         with self._db() as db:
-            db.execute("DELETE FROM tokens WHERE issuer=? AND expires_at>0 AND expires_at<?",
-                       (self.issuer, int(time.time())))
+            db.execute(
+                "DELETE FROM tokens WHERE issuer=? AND expires_at>0 AND expires_at<?",
+                (self.issuer, now),
+            )
+            db.execute(
+                "DELETE FROM exec_temp_grants WHERE issuer=? AND expires_at<?",
+                (self.issuer, now),
+            )
+
+    def export_redacted_backup(self, dest_path: Path) -> dict:
+        """Write a non-secret backup snapshot (no tokens, digests, client_secrets, or keys)."""
+        redactor = SecretRedactor()
+        clients_safe = []
+        for entry in self.list_clients():
+            clients_safe.append({
+                "client_id": entry["client_id"],
+                "client_name": redactor.redact_text(str(entry["client_name"])),
+                "registered_at": entry["registered_at"],
+                "approved_at": entry["approved_at"],
+            })
+        snapshot = {
+            "schema_version": self.schema_version(),
+            "exported_at": int(time.time()),
+            "issuer": self.issuer,
+            "resource_url": self.resource_url,
+            "emergency_stop": self.emergency_stop_state(),
+            "clients": clients_safe,
+            "secrets_included": False,
+        }
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, dest)
+        _user_private(dest)
+        return snapshot

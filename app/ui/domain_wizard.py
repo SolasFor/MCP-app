@@ -135,7 +135,7 @@ class DomainWizard(QDialog):
             self._show_error(str(exc))
             return
         self.hostname.setText(host)
-        for label, text in zip(self._step_labels, cf_api.SETUP_STEPS):
+        for label, text in zip(self._step_labels, cf_api.SETUP_STEPS, strict=True):
             label.setText(f"{PENDING}  {text}")
         self._current = -1
         self._set_busy(True)

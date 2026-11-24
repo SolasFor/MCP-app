@@ -106,7 +106,9 @@ class OAuthHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "proc", None) is not None:
-            cls.proc.terminate()
+            from app.core.winjob import kill_process_tree
+
+            kill_process_tree(cls.proc.pid, include_parent=True)
             try:
                 cls.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -199,7 +201,8 @@ class OAuthHttpTests(unittest.TestCase):
         # Real backend restart with the same issuer: registration and access
         # token must remain valid with no new browser consent.
         cls = type(self)
-        cls.proc.terminate()
+        from app.core.winjob import kill_process_tree
+        kill_process_tree(cls.proc.pid, include_parent=True)
         cls.proc.wait(timeout=5)
         cls._start_child()
         status, _, _ = req(self.url + "/token", "POST", data=grant)

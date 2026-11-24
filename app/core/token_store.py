@@ -1,8 +1,8 @@
-"""Bearer-токен MCP-сервера: хранение, генерация, проверка.
+"""Bearer-токен MCP-сервера: хранение в DPAPI SecretStore, генерация, проверка.
 
-Токен лежит ОТДЕЛЬНО от settings.json — в %APPDATA%\\MCPApp\\token.json.
-Так settings.json можно показать или скопировать без риска, а файл с токеном
-на Windows получает ACL только для текущего пользователя.
+Хранится в зашифрованном SecretStore (`secret://owner/bearer_token`),
+а `%APPDATA%\\MCPApp\\token.json` хранит только метаданные ссылки (версия 2).
+Прежний открытый `token.json` переносится прозрачно при чтении.
 
 Бэкенду токен передаётся переменной окружения MCP_SECRET_TOKEN (см. ServiceManager),
 а НЕ аргументом командной строки: аргументы видны в Диспетчере задач и в wmic.
@@ -12,20 +12,28 @@ from __future__ import annotations
 import json
 import os
 import secrets
-import subprocess
 import sys
 from pathlib import Path
 
+from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
+from app.platform import get_platform
 
 TOKEN_FILE = "token.json"
 MIN_LENGTH = 16
 # Символы, допустимые в заголовке Authorization и в URL без кодирования.
 _ALLOWED_EXTRA = "-._~+/="
+_SECRET_NS = "owner"
+_SECRET_KEY = "bearer_token"
 
 
 def path() -> Path:
     return user_data_dir() / TOKEN_FILE
+
+
+def _store(base_dir: Path | None = None) -> SecretStore:
+    root = base_dir if base_dir is not None else path().parent
+    return SecretStore(root / "secrets")
 
 
 def generate(nbytes: int = 24) -> str:
@@ -34,20 +42,48 @@ def generate(nbytes: int = 24) -> str:
 
 
 def load() -> str:
+    target = path()
+    store = _store(target.parent)
     try:
-        data = json.loads(path().read_text(encoding="utf-8"))
+        data = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        data = None
+
+    if isinstance(data, dict):
+        legacy_token = data.get("token")
+        if isinstance(legacy_token, str) and legacy_token.strip():
+            clean = legacy_token.strip()
+            try:
+                store.set_secret(_SECRET_NS, _SECRET_KEY, clean)
+                _write_marker(target)
+            except OSError:
+                pass
+            return clean
+
+    try:
+        stored = store.get_secret(_SECRET_NS, _SECRET_KEY)
+        return stored.strip() if isinstance(stored, str) else ""
+    except (OSError, ValueError, RuntimeError):
         return ""
-    token = data.get("token") if isinstance(data, dict) else None
-    return token.strip() if isinstance(token, str) else ""
+
+
+def _write_marker(target: Path) -> None:
+    tmp = target.with_suffix(".tmp")
+    marker = {
+        "version": 2,
+        "storage": "secret_store",
+        "ref": SecretStore.secret_ref(_SECRET_NS, _SECRET_KEY),
+    }
+    tmp.write_text(json.dumps(marker, indent=2), encoding="utf-8")
+    tmp.replace(target)
+    restrict(target)
 
 
 def save(token: str) -> None:
     target = path()
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"token": token}, indent=2), encoding="utf-8")
-    tmp.replace(target)  # атомарная замена: недописанный файл не затрёт рабочий
-    restrict(target)
+    store = _store(target.parent)
+    store.set_secret(_SECRET_NS, _SECRET_KEY, token)
+    _write_marker(target)
 
 
 def problem(token: str) -> str | None:
@@ -80,17 +116,4 @@ def restrict(target: Path) -> None:
         pass
     if sys.platform != "win32":
         return
-    user = os.environ.get("USERNAME")
-    if not user:
-        return
-    try:
-        # /inheritance:r снимает наследование от %APPDATA%, дальше даём права только себе.
-        subprocess.run(
-            ["icacls", str(target), "/inheritance:r", "/grant:r", f"{user}:(F)"],
-            capture_output=True,
-            timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # без всплывающего окна
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        pass
+    get_platform().restrict_path_acl(target, is_dir=False)

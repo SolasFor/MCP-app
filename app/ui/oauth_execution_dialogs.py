@@ -5,13 +5,16 @@ Windows user's encrypted OAuth database and not exposed through Cloudflare.
 """
 from __future__ import annotations
 
-from datetime import datetime
-
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QHBoxLayout,
-    QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from backend.oauth_execution import ExecutionApprovals, DEFAULT_WINDOWS_ALLOWLIST

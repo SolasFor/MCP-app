@@ -61,10 +61,14 @@ Python и cloudflared ставить не нужно: оба внутри сбо
 некоторым AI-клиентам нужно обновить список MCP-инструментов.
 На новом адресе Quick Tunnel профиль сбрасывается в **Безопасный**.
 
+Поддержка на «Главной» также включает кнопку **«Аварийная остановка»** (немедленная блокировка новых вызовов OAuth и остановка контролируемых сервисов), сохранение **защищённого отчёта диагностики** без токенов и экспорт состояния без утечек.
+
 Подробнее: [сценарии Windows/SSH](docs/oauth-fixed-windows-ssh.md),
+[стабильность и безопасность v0.8.6](docs/stability-security.md),
 [OAuth через Cloudflare](docs/oauth-quick-tunnel.md),
 [защищённое хранение клиентов](docs/oauth-persistence.md),
-[журнал выполнения Windows/SSH и диагностика Cloudflare](docs/oauth-execution-audit.md).
+[журнал выполнения Windows/SSH и диагностика Cloudflare](docs/oauth-execution-audit.md),
+[сторонние лицензии](docs/third-party-licenses.md).
 
 ## Данные
 
@@ -105,13 +109,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
 Для установщика нужен Inno Setup: `winget install --id JRSoftware.InnoSetup`. Другой Python для сборки выбирается так: `-Python "py -3.13"`.
 
-**Зафиксируйте версии** из рабочего окружения, чтобы сборка совпадала с тем, что у вас работает:
+**Зафиксированные зависимости.** Воспроизводимая сборка использует `requirements.lock`, `requirements-build.txt` и проверенный по SHA-256 + Authenticode `packaging/cloudflared.json`. Проверка лицензий, Ruff/mypy, `pip-audit` и CycloneDX SBOM (`SBOM.cdx.json`) выполняются в CI.
 
-```powershell
-pip freeze > requirements.lock
-```
-
-**CI.** Проверки MCP находятся в `.github/workflows/transport-checks.yml`, а сборка Windows-установщика для тестирования PR — в `.github/workflows/rc-windows.yml`.
+**CI.** Проверки MCP, безопасности и сборки находятся в `.github/workflows/transport-checks.yml`, `.github/workflows/rc-windows.yml` и едином gated-workflow `.github/workflows/build.yml`.
 
 ## Структура
 

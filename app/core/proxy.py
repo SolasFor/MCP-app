@@ -23,9 +23,11 @@ import os
 import socket
 import ssl
 import struct
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+from app.core.secret_store import SecretStore
 
 EDGE_PORT = 7844
 DEFAULT_HOSTS: tuple[str, ...] = (
@@ -131,32 +133,112 @@ class ProxySettings:
         return [t for t in self.targets() if t[1] == EDGE_PORT]
 
 
+_SECRET_NS = "proxy"
+_SECRET_KEY = "credentials"
+
+
 def settings_path() -> Path:
     from app.paths import user_data_dir
 
     return Path(user_data_dir()) / "proxy.json"
 
 
+def _secret_store(base_dir: Path) -> SecretStore:
+    return SecretStore(base_dir / "secrets")
+
+
+def _strip_url_credentials(url: str) -> tuple[str, str, str]:
+    parts = urlsplit(url.strip())
+    if not parts.username and not parts.password:
+        return url, "", ""
+    host = parts.hostname or ""
+    host_lit = f"[{host}]" if ":" in host else host
+    netloc = f"{host_lit}:{parts.port}" if parts.port else host_lit
+    clean = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return clean, unquote(parts.username or ""), unquote(parts.password or "")
+
+
+def _inject_url_credentials(url: str, username: str, password: str) -> str:
+    if not username and not password:
+        return url
+    parts = urlsplit(url.strip())
+    if not parts.hostname:
+        return url
+    host_lit = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    auth = f"{quote(username, safe='')}:{quote(password, safe='')}"
+    netloc = f"{auth}@{host_lit}:{parts.port}" if parts.port else f"{auth}@{host_lit}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
 def load() -> ProxySettings:
+    path = settings_path()
     try:
-        raw = json.loads(settings_path().read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return ProxySettings()
+    if not isinstance(raw, dict):
         return ProxySettings()
     defaults = ProxySettings()
     hosts = raw.get("hosts")
-    return ProxySettings(
+    url = str(raw.get("url") or defaults.url)
+    settings = ProxySettings(
         enabled=bool(raw.get("enabled", defaults.enabled)),
-        url=str(raw.get("url") or defaults.url),
+        url=url,
         hosts=[str(h) for h in hosts] if isinstance(hosts, list) else defaults.hosts,
     )
+    clean, user, password = _strip_url_credentials(url)
+    if user or password:
+        # Legacy plaintext credentials in proxy.json: migrate to SecretStore.
+        try:
+            save(settings)
+        except OSError:
+            pass
+        return settings
+
+    ref = str(raw.get("credentials_ref") or "")
+    if ref:
+        try:
+            secret_raw = _secret_store(path.parent).resolve_ref(ref)
+            if secret_raw:
+                creds = json.loads(secret_raw)
+                if isinstance(creds, dict):
+                    settings.url = _inject_url_credentials(
+                        clean, str(creds.get("username") or ""), str(creds.get("password") or "")
+                    )
+        except (OSError, ValueError, RuntimeError):
+            pass
+    return settings
 
 
 def save(settings: ProxySettings) -> None:
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    store = _secret_store(path.parent)
+    clean_url, user, password = _strip_url_credentials(settings.url)
+    payload: dict[str, object] = {
+        "enabled": settings.enabled,
+        "url": clean_url,
+        "hosts": list(settings.hosts),
+    }
+    if user or password:
+        store.set_secret(
+            _SECRET_NS,
+            _SECRET_KEY,
+            json.dumps({"username": user, "password": password}, ensure_ascii=False),
+        )
+        payload["credentials_ref"] = SecretStore.secret_ref(_SECRET_NS, _SECRET_KEY)
+    else:
+        try:
+            store.delete_secret(_SECRET_NS, _SECRET_KEY)
+        except (OSError, ValueError, RuntimeError):
+            pass
+
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(settings), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+    from app.core import token_store
+
+    token_store.restrict(path)
 
 
 # ====================================================================== соединения

@@ -26,6 +26,8 @@ PROFILE_FULL = "full"
 PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
 MAX_RULES = 24
 MAX_RULE_SIZE = 512
+# Independent transport/resource bound; not an allowlist in full mode.
+MAX_FULL_COMMAND_SIZE = 16384
 # Standard Windows read-only helpers. These are preloaded as a policy,
 # but the OAuth execution profile itself always defaults to "safe".
 DEFAULT_WINDOWS_ALLOWLIST = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
@@ -200,28 +202,43 @@ class ExecutionApprovals:
                 (self.store.issuer, client_id),
             ).fetchone())
 
+    def authorized_profile(
+        self, client_id: str, kind: ActionKind, *, command: str,
+        host: str = "", user: str = "", port: int = 22,
+    ) -> str | None:
+        """Return the profile used to authorize this exact command.
+
+        A caller must use this same result when selecting shell semantics,
+        rather than rereading a possibly changed profile after authorization.
+        """
+        if kind not in ("windows", "ssh"):
+            return None
+        if not isinstance(command, str) or not command.strip() or "\x00" in command:
+            return None
+        if type(port) is not int or not (1 <= port <= 65535) or not isinstance(user, str):
+            return None
+        if len(user) > 64 or any(ch in user for ch in ("/", "\\", " ", "@", "\x00")):
+            return None
+        if kind == "windows" and (host or user):
+            return None
+        if kind == "ssh" and (not isinstance(host, str) or not _SSH_HOST_RE.fullmatch(host)):
+            return None
+        profile = self.profile_for(client_id)
+        if profile == PROFILE_SAFE:
+            return None
+        if profile == PROFILE_FULL:
+            return profile if len(command) <= MAX_FULL_COMMAND_SIZE else None
+        if len(command) > MAX_RULE_SIZE:
+            return None
+        policy = self.policy()
+        if kind == "windows":
+            return profile if windows_whitelisted(command, policy["windows"]) else None
+        return profile if host in policy["hosts"] and command.strip() in policy["ssh_commands"] else None
+
     def can_request(
         self, client_id: str, kind: ActionKind, *, command: str,
         host: str = "", user: str = "", port: int = 22,
     ) -> bool:
-        if kind not in ("windows", "ssh") or not self.client_approved(client_id):
-            return False
-        if not isinstance(command, str) or not command.strip() or len(command) > MAX_RULE_SIZE:
-            return False
-        if type(port) is not int or not (1 <= port <= 65535) or not isinstance(user, str):
-            return False
-        if len(user) > 64 or any(ch in user for ch in ("/", "\\", " ", "@", "\x00")):
-            return False
-        if kind == "windows" and (host or user):
-            return False
-        if kind == "ssh" and (not isinstance(host, str) or not _SSH_HOST_RE.fullmatch(host)):
-            return False
-        policy = self.policy()
-        profile = self.profile_for(client_id)
-        if profile == PROFILE_SAFE:
-            return False
-        if profile == PROFILE_FULL:
-            return True
-        if kind == "windows":
-            return windows_whitelisted(command, policy["windows"])
-        return host in policy["hosts"] and command.strip() in policy["ssh_commands"]
+        return self.authorized_profile(
+            client_id, kind, command=command, host=host, user=user, port=port,
+        ) is not None

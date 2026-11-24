@@ -204,6 +204,7 @@ class ExecutionApprovals:
     def can_request(
         self, client_id: str, kind: ActionKind, *, command: str,
         host: str = "", user: str = "", port: int = 22,
+        expected_profile: str | None = None,
     ) -> bool:
         if kind not in ("windows", "ssh") or not self.client_approved(client_id):
             return False
@@ -219,6 +220,8 @@ class ExecutionApprovals:
             return False
         policy = self.policy()
         profile = self.profile_for(client_id)
+        if expected_profile is not None and expected_profile != profile:
+            return False
         if profile == PROFILE_SAFE:
             return False
         if profile == PROFILE_FULL:

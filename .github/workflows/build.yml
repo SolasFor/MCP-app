@@ -65,6 +65,19 @@ jobs:
         shell: pwsh
         run: ./packaging/build.ps1 -Python python
 
+      - name: Verify build and generate checksums
+        shell: pwsh
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $files = @("dist/MCPApp-Setup-$v.exe", "dist/MCPApp-$v-portable.zip")
+          if ((Get-Content "build/selftest.txt" -Raw -Encoding UTF8) -notmatch 'RESULT OK') { throw "EXE self-test failed" }
+          $lines = foreach ($file in $files) {
+            if (-not (Test-Path $file)) { throw "Missing $file" }
+            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $(Split-Path $file -Leaf)"
+          }
+          $lines | Set-Content "dist/SHA256SUMS.txt" -Encoding ASCII
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -73,6 +86,7 @@ jobs:
             dist/*.exe
             dist/*.zip
             build/selftest.txt
+            dist/SHA256SUMS.txt
           if-no-files-found: ignore
 
       - name: Release
@@ -87,7 +101,9 @@ jobs:
             **Установка:** скачайте `MCPApp-Setup-${{ steps.version.outputs.version }}.exe` и запустите. Права администратора не нужны.
             **Без установки:** `MCPApp-${{ steps.version.outputs.version }}-portable.zip` — распакуйте и запустите `MCPApp.exe`.
 
-            Сборка не подписана сертификатом: при первом запуске SmartScreen покажет предупреждение — «Подробнее» → «Выполнить в любом случае».
+            Сборка не подписана сертификатом издателя; Windows SmartScreen может показать предупреждение. Контрольные суммы SHA-256 доступны в SHA256SUMS.txt.
+          fail_on_unmatched_files: true
           files: |
             dist/*.exe
             dist/*.zip
+            dist/SHA256SUMS.txt

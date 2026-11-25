@@ -56,6 +56,7 @@ from app.ui.pages import (
     ServersPage,
     SettingsPage,
     TasksPage,
+    WorkspacesPage,
 )
 from app.ui.widgets import StatusRow, repolish
 from backend.oauth_execution import ExecutionApprovals
@@ -71,10 +72,10 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("gateway", "nav.gateway", "gateway", "primary", shortcut="Ctrl+4"),
     NavItemSpec("tasks", "nav.tasks", "tasks", "primary", shortcut="Ctrl+5"),
     NavItemSpec("servers", "nav.servers", "servers", "primary", shortcut="Ctrl+6"),
-    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+7"),
-    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+8"),
-    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+9"),
-    NavItemSpec("workspaces", "nav.workspaces", "workspaces", "upcoming", tag="0.9.5"),
+    NavItemSpec("workspaces", "nav.workspaces", "workspaces", "primary", shortcut="Ctrl+7"),
+    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+8"),
+    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+9"),
+    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut=""),
     NavItemSpec("devices", "nav.devices", "devices", "upcoming", tag="0.9.8"),
     NavItemSpec("extensions", "nav.extensions", "extensions", "upcoming", tag="0.9.7"),
     NavItemSpec("automation", "nav.automation", "automation", "upcoming", tag="0.9.9"),
@@ -92,6 +93,7 @@ PAGE_CLIENTS = PAGE_IDS.index("clients")
 PAGE_GATEWAY = PAGE_IDS.index("gateway")
 PAGE_TASKS = PAGE_IDS.index("tasks")
 PAGE_SERVERS = PAGE_IDS.index("servers")
+PAGE_WORKSPACES = PAGE_IDS.index("workspaces")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
@@ -163,6 +165,11 @@ class MainWindow(QMainWindow):
             tasks_db_path=manager.tasks_db_path(),
             redactor=manager._redactor,
         )
+        self.workspaces_page = WorkspacesPage(
+            config_path=manager.workspaces_config_path(),
+            history_dir=manager.workspaces_history_dir(),
+            redactor=manager._redactor,
+        )
         self.security_page = SecurityPage()
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
@@ -174,6 +181,7 @@ class MainWindow(QMainWindow):
             "gateway": self.gateway_page,
             "tasks": self.tasks_page,
             "servers": self.servers_page,
+            "workspaces": self.workspaces_page,
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
@@ -293,6 +301,10 @@ class MainWindow(QMainWindow):
         srv.config_changed.connect(self.manager.refresh_server_secrets)
         srv.status_message.connect(self.toasts.show_toast)
 
+        ws = self.workspaces_page
+        ws.config_changed.connect(self.manager.refresh_workspace_secrets)
+        ws.status_message.connect(self.toasts.show_toast)
+
         s = self.security_page
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
@@ -330,8 +342,13 @@ class MainWindow(QMainWindow):
             self,
             activated=lambda: self.sidebar.set_collapsed(not self.sidebar.is_collapsed, emit=True),
         )
-        for index, pid in enumerate(ACTIVE_PAGE_IDS):
-            QShortcut(QKeySequence(f"Ctrl+{index + 1}"), self, activated=lambda p=pid: self.show_page(p))
+        for spec in NAV_SPECS:
+            if spec.section == "primary" and spec.shortcut:
+                QShortcut(
+                    QKeySequence(spec.shortcut),
+                    self,
+                    activated=lambda p=spec.page_id: self.show_page(p),
+                )
 
     # ================================================================== navigation & palette
     def show_page(self, target: int | str) -> None:
@@ -355,6 +372,8 @@ class MainWindow(QMainWindow):
             self.tasks_page.reload()
         elif page_id == "servers":
             self.servers_page.reload()
+        elif page_id == "workspaces":
+            self.workspaces_page.reload()
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []
@@ -1081,6 +1100,7 @@ class MainWindow(QMainWindow):
         self._persist_geometry()
         if self._allow_close:
             self.servers_page.shutdown()
+            self.workspaces_page.shutdown()
             event.accept()
             return
         event.ignore()

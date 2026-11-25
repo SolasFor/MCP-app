@@ -1,6 +1,6 @@
 [project]
 name = "mcp-app"
-version = "0.9.4"
+version = "0.9.5"
 description = "Windows desktop MCP server, gateway, and tunnel manager"
 requires-python = ">=3.12"
 
@@ -33,6 +33,7 @@ files = [
     "backend/gateway",
     "backend/tasks",
     "backend/servers",
+    "backend/workspaces",
     "backend/managed_servers.py",
     "backend/process_runner.py",
     "backend/output_stream.py",

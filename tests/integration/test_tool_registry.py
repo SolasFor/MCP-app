@@ -59,6 +59,12 @@ class ToolRegistryTests(unittest.TestCase):
         self.assertEqual(
             result["tools"],
             [
+                "git_branches",
+                "git_checkout",
+                "git_commit",
+                "git_diff",
+                "git_log",
+                "git_status",
                 "oauth_managed_server",
                 "oauth_ssh_command",
                 "oauth_windows_command",
@@ -79,6 +85,18 @@ class ToolRegistryTests(unittest.TestCase):
                 "task_result",
                 "task_start",
                 "task_status",
+                "workspace_apply_patch",
+                "workspace_delete_file",
+                "workspace_diff",
+                "workspace_history",
+                "workspace_info",
+                "workspace_list",
+                "workspace_move_file",
+                "workspace_read_file",
+                "workspace_run_task",
+                "workspace_search",
+                "workspace_tree",
+                "workspace_write_file",
             ],
         )
         self.assertEqual(result["resources"], [])

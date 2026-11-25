@@ -50,9 +50,49 @@ SERVER_TOOLS = frozenset({
     SERVER_METRICS,
     SERVER_HEALTH,
 })
+WS_LIST = "workspace_list"
+WS_INFO = "workspace_info"
+WS_TREE = "workspace_tree"
+WS_READ = "workspace_read_file"
+WS_WRITE = "workspace_write_file"
+WS_SEARCH = "workspace_search"
+WS_PATCH = "workspace_apply_patch"
+WS_MOVE = "workspace_move_file"
+WS_DELETE = "workspace_delete_file"
+WS_DIFF = "workspace_diff"
+WS_HISTORY = "workspace_history"
+WS_RUN_TASK = "workspace_run_task"
+WORKSPACE_TOOLS = frozenset({
+    WS_LIST,
+    WS_INFO,
+    WS_TREE,
+    WS_READ,
+    WS_WRITE,
+    WS_SEARCH,
+    WS_PATCH,
+    WS_MOVE,
+    WS_DELETE,
+    WS_DIFF,
+    WS_HISTORY,
+    WS_RUN_TASK,
+})
+GIT_STATUS = "git_status"
+GIT_DIFF = "git_diff"
+GIT_LOG = "git_log"
+GIT_BRANCHES = "git_branches"
+GIT_CHECKOUT = "git_checkout"
+GIT_COMMIT = "git_commit"
+GIT_TOOLS = frozenset({
+    GIT_STATUS,
+    GIT_DIFF,
+    GIT_LOG,
+    GIT_BRANCHES,
+    GIT_CHECKOUT,
+    GIT_COMMIT,
+})
 BASIC_TOOLS = frozenset({"server_info"})
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS
+EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS
+OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
@@ -91,6 +131,14 @@ class ToolRegistry:
         for server_tool in sorted(SERVER_TOOLS):
             self.register(
                 ToolSpec(server_tool, "servers", min_profile="allowlist", requires_execution=True)
+            )
+        for ws_tool in sorted(WORKSPACE_TOOLS):
+            self.register(
+                ToolSpec(ws_tool, "workspaces", min_profile="allowlist", requires_execution=True)
+            )
+        for git_tool in sorted(GIT_TOOLS):
+            self.register(
+                ToolSpec(git_tool, "git", min_profile="allowlist", requires_execution=True)
             )
 
     def register(self, spec: ToolSpec) -> None:

@@ -31,7 +31,20 @@ if __package__:
     from .output_stream import decode_process_bytes
     from .process_runner import CommandResult, ProcessRunner
     from .tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from .workspaces import (
+        FileVersionConflictError,
+        PathSecurityError,
+        WorkspaceHistory,
+        WorkspaceManager,
+        WorkspaceStore,
+    )
     from .tool_registry import (
+        GIT_BRANCHES,
+        GIT_CHECKOUT,
+        GIT_COMMIT,
+        GIT_DIFF,
+        GIT_LOG,
+        GIT_STATUS,
         SERVER_HEALTH,
         SERVER_LIST,
         SERVER_LOGS,
@@ -48,6 +61,18 @@ if __package__:
         TASK_RESULT,
         TASK_START,
         TASK_STATUS,
+        WS_DELETE,
+        WS_DIFF,
+        WS_HISTORY,
+        WS_INFO,
+        WS_LIST,
+        WS_MOVE,
+        WS_PATCH,
+        WS_READ,
+        WS_RUN_TASK,
+        WS_SEARCH,
+        WS_TREE,
+        WS_WRITE,
     )
     from app.core.secret_store import SecretStore
     from .tool_permissions import (
@@ -70,7 +95,20 @@ else:
     from output_stream import decode_process_bytes
     from process_runner import CommandResult, ProcessRunner
     from tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from workspaces import (
+        FileVersionConflictError,
+        PathSecurityError,
+        WorkspaceHistory,
+        WorkspaceManager,
+        WorkspaceStore,
+    )
     from tool_registry import (
+        GIT_BRANCHES,
+        GIT_CHECKOUT,
+        GIT_COMMIT,
+        GIT_DIFF,
+        GIT_LOG,
+        GIT_STATUS,
         SERVER_HEALTH,
         SERVER_LIST,
         SERVER_LOGS,
@@ -87,6 +125,18 @@ else:
         TASK_RESULT,
         TASK_START,
         TASK_STATUS,
+        WS_DELETE,
+        WS_DIFF,
+        WS_HISTORY,
+        WS_INFO,
+        WS_LIST,
+        WS_MOVE,
+        WS_PATCH,
+        WS_READ,
+        WS_RUN_TASK,
+        WS_SEARCH,
+        WS_TREE,
+        WS_WRITE,
     )
     from app.core.secret_store import SecretStore
     from tool_permissions import (
@@ -201,6 +251,17 @@ TASK_STORE = TaskStore(
     Path(os.environ.get("MCP_TASKS_DB_PATH") or (_TASKS_DEFAULT_DIR / "tasks.sqlite3"))
 )
 TASK_STORE.recover_interrupted()
+_WORKSPACES_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "workspaces"
+)
+WORKSPACE_STORE = WorkspaceStore(
+    Path(os.environ.get("MCP_WORKSPACES_CONFIG_PATH") or (_WORKSPACES_DEFAULT_DIR / "workspaces.json")),
+    secret_store=_SERVER_SECRET_STORE,
+)
+WORKSPACE_HISTORY = WorkspaceHistory(
+    Path(os.environ.get("MCP_WORKSPACES_HISTORY_DIR") or (_WORKSPACES_DEFAULT_DIR / "history"))
+)
 MANAGED_SERVERS = ManagedServers(
     Path(os.environ.get("MCP_MANAGED_SERVERS_PATH") or _SERVERS_DEFAULT_PATH),
     runner=PROCESS_RUNNER,
@@ -209,6 +270,12 @@ MANAGED_SERVERS = ManagedServers(
     secret_store=_SERVER_SECRET_STORE,
 )
 SERVER_MANAGER = MANAGED_SERVERS.manager
+WORKSPACE_MANAGER = WorkspaceManager(
+    WORKSPACE_STORE,
+    WORKSPACE_HISTORY,
+    runner=PROCESS_RUNNER,
+    redactor=REDACTOR,
+)
 GATEWAY_ROUTER = GatewayRouter(
     GATEWAY_STORE,
     self_urls=(
@@ -1033,6 +1100,476 @@ async def server_health(name: str, run_probe: bool = True) -> dict:
         return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
         return {"error": f"Server health failed: {type(exc).__name__}"}
+
+
+def _ws_call_error(exc: Exception) -> dict:
+    if isinstance(exc, FileVersionConflictError):
+        return {
+            "error": str(exc),
+            "conflict": True,
+            "current_sha256": exc.current_sha256,
+            "expected_sha256": exc.expected_sha256,
+        }
+    if isinstance(exc, (PermissionError, PathSecurityError)):
+        return {"error": f"Workspace access denied: {exc}"}
+    return {"error": REDACTOR.redact_text(str(exc)) or type(exc).__name__}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_list() -> dict:
+    """List owner-registered workspaces visible to the caller's OAuth client profile."""
+    client_id = require_execution_permission(
+        WS_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        items = await asyncio.to_thread(
+            WORKSPACE_MANAGER.list_workspaces, client_id=client_id, client_profile=profile_mode
+        )
+        return {"workspaces": items}
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_info(workspace_id: str) -> dict:
+    """Inspect metadata, detected language/Git/venv/Node, commands, and caller permissions."""
+    client_id = require_execution_permission(
+        WS_INFO, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.workspace_info,
+            workspace_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_tree(
+    workspace_id: str,
+    relative_path: str = "",
+    max_depth: int = 3,
+    include_ignored: bool = False,
+) -> dict:
+    """List bounded workspace directory tree respecting .gitignore, exclusions, and sensitive paths."""
+    client_id = require_execution_permission(
+        WS_TREE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.workspace_tree,
+            workspace_id,
+            relative_path=relative_path,
+            max_depth=max_depth,
+            include_ignored=include_ignored,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_read_file(
+    workspace_id: str,
+    relative_path: str,
+    offset_line: int = 1,
+    max_lines: int = 400,
+) -> dict:
+    """Read bounded, secret-redacted file lines with verified OS handle and SHA-256."""
+    client_id = require_execution_permission(
+        WS_READ, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.read_file,
+            workspace_id,
+            relative_path,
+            offset_line=offset_line,
+            max_lines=max_lines,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_write_file(
+    workspace_id: str,
+    relative_path: str,
+    content: str,
+    expected_sha256: str = "",
+    create_only: bool = False,
+) -> dict:
+    """Atomically write a workspace file with version SHA-256 precondition and local snapshot."""
+    client_id = require_execution_permission(
+        WS_WRITE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.write_file,
+            workspace_id,
+            relative_path,
+            content,
+            expected_sha256=expected_sha256,
+            create_only=create_only,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"workspace:write:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, FileVersionConflictError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_search(
+    workspace_id: str,
+    query: str,
+    relative_path: str = "",
+    regex: bool = False,
+    case_sensitive: bool = False,
+    max_matches: int = 100,
+) -> dict:
+    """Search non-ignored workspace files with bounded output and secret redaction."""
+    client_id = require_execution_permission(
+        WS_SEARCH, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.search_files,
+            workspace_id,
+            query,
+            relative_path=relative_path,
+            regex=regex,
+            case_sensitive=case_sensitive,
+            max_matches=max_matches,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_apply_patch(
+    workspace_id: str,
+    relative_path: str,
+    expected_sha256: str,
+    edits: list[dict] | None = None,
+    unified_diff: str = "",
+) -> dict:
+    """Apply exact edits or unified diff atomically under SHA-256 version precondition."""
+    client_id = require_execution_permission(
+        WS_PATCH, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.apply_patch,
+            workspace_id,
+            relative_path,
+            expected_sha256=expected_sha256,
+            edits=edits,
+            unified_diff=unified_diff,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"workspace:patch:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, FileVersionConflictError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_move_file(
+    workspace_id: str,
+    src_path: str,
+    dst_path: str,
+    expected_sha256: str = "",
+) -> dict:
+    """Move or rename a guarded file inside a workspace (requires write + delete)."""
+    client_id = require_execution_permission(
+        WS_MOVE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.move_file,
+            workspace_id,
+            src_path,
+            dst_path,
+            expected_sha256=expected_sha256,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"workspace:move:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, FileVersionConflictError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_delete_file(
+    workspace_id: str,
+    relative_path: str,
+    expected_sha256: str,
+) -> dict:
+    """Delete a workspace file under SHA-256 precondition and save rollback snapshot."""
+    client_id = require_execution_permission(
+        WS_DELETE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.delete_file,
+            workspace_id,
+            relative_path,
+            expected_sha256=expected_sha256,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"workspace:delete:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, FileVersionConflictError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_diff(
+    workspace_id: str,
+    relative_path: str = "",
+    snapshot_id: str = "",
+    staged: bool = False,
+) -> dict:
+    """Show Git diff or diff against a local edit history snapshot."""
+    client_id = require_execution_permission(
+        WS_DIFF, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.workspace_diff,
+            workspace_id,
+            relative_path=relative_path,
+            snapshot_id=snapshot_id,
+            staged=staged,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_history(
+    workspace_id: str,
+    relative_path: str = "",
+    limit: int = 20,
+    rollback_snapshot_id: str = "",
+) -> dict:
+    """List workspace edit snapshots or roll back a file to a previous snapshot."""
+    client_id = require_execution_permission(
+        WS_HISTORY, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.workspace_history,
+            workspace_id,
+            relative_path=relative_path,
+            limit=limit,
+            rollback_snapshot_id=rollback_snapshot_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, FileVersionConflictError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def workspace_run_task(
+    workspace_id: str,
+    command_name: str,
+    timeout: int = 120,
+) -> dict:
+    """Run an owner-defined named workspace command in the workspace venv/toolchain."""
+    client_id = require_execution_permission(
+        WS_RUN_TASK, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        async with PROCESS_RUNNER.request_slot():
+            res = await WORKSPACE_MANAGER.run_workspace_task(
+                workspace_id,
+                command_name,
+                timeout=timeout,
+                client_id=client_id,
+                client_profile=profile_mode,
+            )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"workspace:run:{workspace_id}:{command_name}",
+            exit_code=res.get("exit_code"),
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_status(workspace_id: str) -> dict:
+    """Inspect Git branch and working tree status with untrusted hooks suppressed."""
+    client_id = require_execution_permission(
+        GIT_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_status, workspace_id, client_id=client_id, client_profile=profile_mode
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_diff(workspace_id: str, staged: bool = False, relative_path: str = "") -> dict:
+    """Show bounded, redacted Git diff inside an authorized workspace."""
+    client_id = require_execution_permission(
+        GIT_DIFF, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_diff,
+            workspace_id,
+            staged=staged,
+            relative_path=relative_path,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_log(workspace_id: str, limit: int = 20) -> dict:
+    """Show recent Git commits inside an authorized workspace."""
+    client_id = require_execution_permission(
+        GIT_LOG, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_log, workspace_id, limit=limit, client_id=client_id, client_profile=profile_mode
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_branches(workspace_id: str) -> dict:
+    """List local Git branches inside an authorized workspace."""
+    client_id = require_execution_permission(
+        GIT_BRANCHES, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_branches, workspace_id, client_id=client_id, client_profile=profile_mode
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_checkout(workspace_id: str, branch: str, create: bool = False) -> dict:
+    """Switch or create a local Git branch inside an authorized workspace."""
+    client_id = require_execution_permission(
+        GIT_CHECKOUT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_checkout,
+            workspace_id,
+            branch,
+            create=create,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"git:checkout:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def git_commit(workspace_id: str, message: str, paths: list[str] | None = None) -> dict:
+    """Stage explicit workspace files and create a Git commit with untrusted hooks suppressed."""
+    client_id = require_execution_permission(
+        GIT_COMMIT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            WORKSPACE_MANAGER.git_commit,
+            workspace_id,
+            message,
+            paths=paths or [],
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"git:commit:{workspace_id}",
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ws_call_error(exc)
 
 
 @_conditional_tool(OAUTH_ENABLED)

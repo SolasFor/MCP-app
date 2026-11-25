@@ -1,23 +1,14 @@
-"""Unified Overview / Home page: Engine state, endpoint, and quick/named mode."""
+"""Minimalist Home page matching the approved visual reference."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import (
-    QButtonGroup,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QVBoxLayout,
-)
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
-from app.config import TUNNEL_NAMED, TUNNEL_QUICK
-from app.ui import theme
-from app.ui.components.cards import Card, Divider, ErrorBanner
+from app.ui import icons, theme
+from app.ui.components.cards import Card, CopyField, Divider, ErrorBanner
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
-from app.ui.widgets import StatusRow
+from app.ui.widgets import StatusDot, StatusRow
 
 
 def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
@@ -29,56 +20,61 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
 
 
 class HomePage(PageScaffold):
-    """Unified operational dashboard keeping quick control over Engine and endpoint."""
+    """Primary operational view: server hero card, connection URL bar, and real component statuses."""
 
     toggle_requested = pyqtSignal()
     emergency_stop_requested = pyqtSignal()
     open_page_requested = pyqtSignal(str)
     domain_wizard_requested = pyqtSignal()
-    domain_guide_requested = pyqtSignal()
-    mode_selected = pyqtSignal(str)
-    url_edited = pyqtSignal(str)
-    url_save_requested = pyqtSignal()
+    connection_diagnostics_requested = pyqtSignal()
     copy_requested = pyqtSignal(str, object)
 
-    def __init__(self, parent=None) -> None:  # noqa: ANN001
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=True, parent=parent)
+        self._is_running = False
 
-        # --- Hero Engine Card
-        self.hero_card = Card(elevated=True, margins=(20, 18, 20, 18), spacing=12)
-        top = QHBoxLayout()
-        top.setSpacing(14)
-        left = QVBoxLayout()
-        left.setSpacing(3)
-        self.services_title = QLabel()
-        self.services_title.setObjectName("SectionTitle")
-        self.mode_caption = QLabel()
-        self.mode_caption.setObjectName("Hint")
-        self.mode_caption.setWordWrap(True)
-        left.addWidget(self.services_title)
-        left.addWidget(self.mode_caption)
-        top.addLayout(left, 1)
+        # --- Hero Server Status Card (single card on Home)
+        self.hero_card = Card(margins=(16, 14, 16, 14), spacing=0)
+        hero_row = QHBoxLayout()
+        hero_row.setContentsMargins(0, 0, 0, 0)
+        hero_row.setSpacing(16)
 
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
-        self.emergency_btn = _button("", "Danger")
-        self.emergency_btn.clicked.connect(self.emergency_stop_requested.emit)
+        left_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(3)
+
+        status_line = QHBoxLayout()
+        status_line.setContentsMargins(0, 0, 0, 0)
+        status_line.setSpacing(8)
+        self.hero_dot = StatusDot(diameter=9)
+        self.status_title_lbl = QLabel()
+        self.status_title_lbl.setObjectName("HeroStatusTitle")
+        status_line.addWidget(self.hero_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        status_line.addWidget(self.status_title_lbl, 1)
+        left_col.addLayout(status_line)
+
+        self.local_addr_lbl = QLabel()
+        self.local_addr_lbl.setObjectName("ServiceDetail")
+        self.local_addr_lbl.setContentsMargins(17, 1, 0, 0)
+        left_col.addWidget(self.local_addr_lbl)
+
+        self.tunnel_status_lbl = QLabel()
+        self.tunnel_status_lbl.setObjectName("Hint")
+        self.tunnel_status_lbl.setContentsMargins(17, 0, 0, 0)
+        left_col.addWidget(self.tunnel_status_lbl)
+
+        hero_row.addLayout(left_col, 1)
+
         self.toggle_btn = _button("", "Primary")
-        self.toggle_btn.setMinimumWidth(148)
+        self.toggle_btn.setMinimumWidth(124)
+        self.toggle_btn.setMinimumHeight(34)
+        self.toggle_btn.setIconSize(QSize(13, 13))
         self.toggle_btn.clicked.connect(self.toggle_requested.emit)
-        controls.addWidget(self.emergency_btn)
-        controls.addWidget(self.toggle_btn)
-        top.addLayout(controls, 0)
-        self.hero_card.body.addLayout(top)
-        self.hero_card.body.addWidget(Divider())
-
-        self.server_row = StatusRow("")
-        self.tunnel_row = StatusRow("")
-        self.hero_card.body.addWidget(self.server_row)
-        self.hero_card.body.addWidget(self.tunnel_row)
+        hero_row.addWidget(self.toggle_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.hero_card.body.addLayout(hero_row)
         self.content.addWidget(self.hero_card)
 
-        # --- Actionable Error Banner
+        # --- Conditional Actionable Error Banner
         self.error_banner = ErrorBanner()
         self.err_logs_btn = _button("", "Link")
         self.err_logs_btn.clicked.connect(lambda: self.open_page_requested.emit("logs"))
@@ -91,133 +87,107 @@ class HomePage(PageScaffold):
         self.error_banner.hide()
         self.content.addWidget(self.error_banner)
 
-        # --- Client Endpoint & Mode Card
-        endpoint_card = Card()
-        head = QHBoxLayout()
-        self.url_card_title = QLabel()
-        self.url_card_title.setObjectName("SectionTitle")
-        head.addWidget(self.url_card_title)
-        head.addStretch(1)
+        # --- Connection URL section (flat, cardless)
+        url_block = QVBoxLayout()
+        url_block.setContentsMargins(0, 4, 0, 0)
+        url_block.setSpacing(8)
+        self.url_section_lbl = QLabel()
+        self.url_section_lbl.setObjectName("SectionTitle")
+        url_block.addWidget(self.url_section_lbl)
 
-        seg = QFrame()
-        seg.setObjectName("SegmentGroup")
-        seg_row = QHBoxLayout(seg)
-        seg_row.setContentsMargins(3, 3, 3, 3)
-        seg_row.setSpacing(2)
-        self.mode_group = QButtonGroup(self)
-        self.mode_group.setExclusive(True)
-        self.mode_buttons: dict[str, QPushButton] = {}
-        for mode in (TUNNEL_QUICK, TUNNEL_NAMED):
-            btn = _button("", "Segment")
-            btn.setCheckable(True)
-            btn.setMinimumWidth(140)
-            btn.clicked.connect(lambda _c=False, m=mode: self.mode_selected.emit(m))
-            self.mode_group.addButton(btn)
-            self.mode_buttons[mode] = btn
-            seg_row.addWidget(btn)
-        head.addWidget(seg)
-        endpoint_card.body.addLayout(head)
+        self.copy_field = CopyField()
+        self.copy_field.copy_clicked.connect(lambda _val, btn: self.copy_requested.emit("url", btn))
+        url_block.addWidget(self.copy_field)
 
-        self.ov_url = QLabel("")
-        self.ov_url.setObjectName("Mono")
-        self.ov_url.setWordWrap(True)
-        self.ov_url.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        endpoint_card.body.addWidget(self.ov_url)
+        # Backwards-compatible button aliases used by MainWindow / tests
+        self.ov_copy = self.copy_field.copy_button
+        self.url_copy = self.copy_field.copy_button
+        self.content.addLayout(url_block)
 
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
-        self.ov_copy = _button("")
-        self.ov_copy.clicked.connect(lambda: self.copy_requested.emit("url", self.ov_copy))
-        self.ov_copy_token = _button("")
-        self.ov_copy_token.clicked.connect(lambda: self.copy_requested.emit("token", self.ov_copy_token))
-        self.open_connections_btn = _button("", "Link")
-        self.open_connections_btn.clicked.connect(lambda: self.open_page_requested.emit("connections"))
-        actions.addWidget(self.ov_copy)
-        actions.addWidget(self.ov_copy_token)
-        actions.addStretch(1)
-        actions.addWidget(self.open_connections_btn)
-        endpoint_card.body.addLayout(actions)
+        # --- Component Status flat list (hairline rows, no outer card)
+        comp_block = QVBoxLayout()
+        comp_block.setContentsMargins(0, 6, 0, 0)
+        comp_block.setSpacing(2)
+        self.components_section_lbl = QLabel()
+        self.components_section_lbl.setObjectName("SectionTitle")
+        comp_block.addWidget(self.components_section_lbl)
+        comp_block.addSpacing(6)
 
-        self.mode_hint = QLabel("")
-        self.mode_hint.setObjectName("Hint")
-        self.mode_hint.setWordWrap(True)
-        endpoint_card.body.addWidget(self.mode_hint)
+        self.server_row = StatusRow("")
+        self.tunnel_row = StatusRow("")
+        self.oauth_row = StatusRow("")
+        comp_block.addWidget(self.server_row)
+        comp_block.addWidget(Divider())
+        comp_block.addWidget(self.tunnel_row)
+        comp_block.addWidget(Divider())
+        comp_block.addWidget(self.oauth_row)
+        self.content.addLayout(comp_block)
 
-        links_row = QHBoxLayout()
-        links_row.setSpacing(16)
-        self.wizard_link = _button("", "Link")
-        self.wizard_link.clicked.connect(self.domain_wizard_requested.emit)
-        self.guide_link = _button("", "Link")
-        self.guide_link.clicked.connect(self.domain_guide_requested.emit)
-        links_row.addWidget(self.wizard_link)
-        links_row.addWidget(self.guide_link)
-        links_row.addStretch(1)
-        endpoint_card.body.addLayout(links_row)
+        # --- Footer actions: secondary diagnostics link + conditional emergency stop
+        footer_row = QHBoxLayout()
+        footer_row.setContentsMargins(0, 2, 0, 0)
+        footer_row.setSpacing(12)
+        self.connection_diagnostics_btn = _button("", "SubtleLink")
+        self.connection_diagnostics_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.connection_diagnostics_btn.setIconSize(QSize(13, 13))
+        self.connection_diagnostics_btn.clicked.connect(self.connection_diagnostics_requested.emit)
+        footer_row.addWidget(self.connection_diagnostics_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        footer_row.addStretch(1)
 
-        url_edit_row = QHBoxLayout()
-        url_edit_row.setSpacing(8)
-        self.url_edit = QLineEdit()
-        self.url_edit.textEdited.connect(self.url_edited.emit)
-        self.url_edit.returnPressed.connect(self.url_save_requested.emit)
-        self.url_save = _button("", "Accent")
-        self.url_save.clicked.connect(self.url_save_requested.emit)
-        self.url_save.hide()
-        self.url_copy = _button("")
-        self.url_copy.clicked.connect(lambda: self.copy_requested.emit("url", self.url_copy))
-        url_edit_row.addWidget(self.url_edit, 1)
-        url_edit_row.addWidget(self.url_save)
-        url_edit_row.addWidget(self.url_copy)
-        endpoint_card.body.addLayout(url_edit_row)
-
-        self.url_error = QLabel("")
-        self.url_error.setObjectName("Error")
-        self.url_error.setWordWrap(True)
-        self.url_error.hide()
-        endpoint_card.body.addWidget(self.url_error)
-
-        self.client_hint = QLabel("")
-        self.client_hint.setObjectName("Hint")
-        self.client_hint.setWordWrap(True)
-        endpoint_card.body.addWidget(self.client_hint)
-        self.content.addWidget(endpoint_card)
+        self.emergency_btn = _button("", "Danger")
+        self.emergency_btn.clicked.connect(self.emergency_stop_requested.emit)
+        self.emergency_btn.hide()
+        footer_row.addWidget(self.emergency_btn, 0, Qt.AlignmentFlag.AlignRight)
+        self.content.addLayout(footer_row)
 
         self.content.addStretch(1)
         self.retranslate()
+        self.apply_theme()
 
-    def set_mode_highlight(self, mode: str | None) -> None:
-        self.mode_group.setExclusive(False)
-        for key, btn in self.mode_buttons.items():
-            btn.setChecked(mode == key)
-        self.mode_group.setExclusive(True)
+    def set_hero_status(
+        self,
+        *,
+        title: str,
+        dot_color: str,
+        pending: bool,
+        local_addr: str,
+        tunnel_line: str,
+        running: bool,
+    ) -> None:
+        self._is_running = running
+        self.hero_dot.set_state(dot_color, pending)
+        self.status_title_lbl.setText(title)
+        self.local_addr_lbl.setText(local_addr)
+        self.tunnel_status_lbl.setText(tunnel_line)
+        self._refresh_toggle_icon()
+
+    def set_endpoint(self, full_url: str, *, display_text: str | None = None, muted: bool = False) -> None:
+        self.copy_field.set_value(full_url, display_text=display_text, muted=muted)
+
+    def _refresh_toggle_icon(self) -> None:
+        icon_name = "stop" if self._is_running else "play"
+        self.toggle_btn.setIcon(icons.vector_icon(icon_name, theme.ACCENT_TEXT, 12))
 
     def retranslate(self) -> None:
-        self.services_title.setText(tr("home.services"))
-        self.emergency_btn.setText(tr("home.btn.emergency"))
-        self.emergency_btn.setToolTip(tr("home.btn.emergency_tip"))
+        self.set_header(tr("home.title"), tr("home.lead"))
+        self.url_section_lbl.setText(tr("home.url.section"))
+        self.copy_field.set_button_text(tr("common.copy"))
+        self.copy_field.set_placeholder(tr("home.url.placeholder_quick"))
+        self.components_section_lbl.setText(tr("home.components.section"))
         self.server_row.set_title(tr("home.srv.mcp"))
         self.tunnel_row.set_title(tr("home.srv.tunnel"))
+        self.oauth_row.set_title(tr("home.srv.oauth"))
+        self.connection_diagnostics_btn.setText(tr("home.diag_link"))
+        self.emergency_btn.setText(tr("home.btn.emergency"))
+        self.emergency_btn.setToolTip(tr("home.btn.emergency_tip"))
 
         self.error_banner.message_label.setText(tr("home.err.banner"))
         self.err_logs_btn.setText(tr("home.err.logs"))
         self.err_proxy_btn.setText(tr("home.err.proxy"))
         self.err_domain_btn.setText(tr("home.err.domain"))
-
-        self.url_card_title.setText(tr("home.url.title"))
-        self.mode_buttons[TUNNEL_QUICK].setText(tr("home.mode.quick"))
-        self.mode_buttons[TUNNEL_QUICK].setToolTip(tr("home.mode.quick_tip"))
-        self.mode_buttons[TUNNEL_NAMED].setText(tr("home.mode.named"))
-        self.mode_buttons[TUNNEL_NAMED].setToolTip(tr("home.mode.named_tip"))
-        self.ov_copy.setText(tr("home.url.copy"))
-        self.ov_copy_token.setText(tr("home.url.copy_token"))
-        self.open_connections_btn.setText(tr("home.connections.open"))
-        self.guide_link.setText(tr("home.guide.open"))
-        self.url_save.setText(tr("common.save"))
-        self.url_copy.setText(tr("conn.token.copy"))
-        self.client_hint.setText(tr("home.url.client_hint"))
+        self.apply_theme()
 
     def apply_theme(self) -> None:
         self.error_banner.apply_theme()
-        if not self.ov_url.text().startswith("http"):
-            self.ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
-        else:
-            self.ov_url.setStyleSheet("")
+        self._refresh_toggle_icon()
+        self.connection_diagnostics_btn.setIcon(icons.vector_icon("chevron-right", theme.TEXT_MUTED, 13))

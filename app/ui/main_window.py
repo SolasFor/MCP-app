@@ -37,13 +37,13 @@ from app.core.logging_manager import LogConfig, get_logging_manager
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
 from app.paths import user_data_dir
-from app.ui import icons, theme
-from app.ui.components.cards import Badge
+from app.ui import icons, theme, tokens
 from app.ui.components.command_palette import CommandPaletteDialog, PaletteAction
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.sidebar import NavItemSpec, Sidebar
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.toast import ToastManager
+from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
 from app.ui.i18n import LANG_EN, LANG_RU, i18n, tr
@@ -136,7 +136,7 @@ class MainWindow(QMainWindow):
         self.setObjectName("MainWindow")
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
-        self.setMinimumSize(860, 600)
+        self.setMinimumSize(tokens.WINDOW_MIN_W, tokens.WINDOW_MIN_H)
         self._restore_geometry()
 
         root = QWidget()
@@ -233,7 +233,7 @@ class MainWindow(QMainWindow):
         # Backwards-compatible aliases expected by existing tests and callers
         self._toggle = self.home_page.toggle_btn
         self._emergency_btn = self.home_page.emergency_btn
-        self._mode_buttons = self.home_page.mode_buttons
+        self._mode_buttons: dict[str, QPushButton] = {}
         self._url_copy = self.home_page.url_copy
         self._access_profile = self.security_page.access_profile
         self._log_view = self.logs_page.viewer.log_view
@@ -254,6 +254,7 @@ class MainWindow(QMainWindow):
         self._on_overall(manager.overall)
         self.show_page("home")
         self._apply_theme()
+        self.sidebar.button("home").setFocus()
 
         theme.manager().theme_changed.connect(self._on_theme_changed)
         i18n.language_changed.connect(self._on_language_changed)
@@ -263,17 +264,15 @@ class MainWindow(QMainWindow):
     def _build_topbar(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("TopBar")
-        bar.setFixedHeight(44)
+        bar.setFixedHeight(36)
         row = QHBoxLayout(bar)
-        row.setContentsMargins(20, 6, 20, 6)
-        row.setSpacing(10)
+        row.setContentsMargins(20, 4, 20, 0)
+        row.setSpacing(8)
 
+        # Kept hidden so page headers never duplicate in the top chrome
         self._topbar_title = QLabel()
         self._topbar_title.setObjectName("TopBarTitle")
-        row.addWidget(self._topbar_title)
-
-        self._transport_badge = Badge("Quick Tunnel", variant="accent")
-        row.addWidget(self._transport_badge)
+        self._topbar_title.hide()
 
         self._desktop_indicator_btn = QPushButton("")
         self._desktop_indicator_btn.setObjectName("Danger")
@@ -283,17 +282,20 @@ class MainWindow(QMainWindow):
         row.addWidget(self._desktop_indicator_btn)
         row.addStretch(1)
 
-        self._palette_top_btn = QPushButton(tr("topbar.palette"))
-        self._palette_top_btn.setObjectName("PaletteTrigger")
-        self._palette_top_btn.setIconSize(QSize(13, 13))
+        self._palette_top_btn = QPushButton("")
+        self._palette_top_btn.setObjectName("IconBtn")
+        self._palette_top_btn.setFixedSize(28, 28)
+        self._palette_top_btn.setIconSize(QSize(14, 14))
+        self._palette_top_btn.setToolTip(tr("topbar.palette"))
+        self._palette_top_btn.setAccessibleName(tr("topbar.palette"))
         self._palette_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._palette_top_btn.clicked.connect(self.open_command_palette)
         row.addWidget(self._palette_top_btn)
 
         self._theme_combo = SafeComboBox()
         self._theme_combo.setObjectName("ThemeCombo")
-        self._theme_combo.setMinimumWidth(142)
-        self._theme_combo.setIconSize(QSize(14, 14))
+        self._theme_combo.setMinimumWidth(116)
+        self._theme_combo.setIconSize(QSize(13, 13))
         self._theme_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_combo.addItem("", theme.THEME_LIGHT)
         self._theme_combo.addItem("", theme.THEME_DARK)
@@ -308,10 +310,7 @@ class MainWindow(QMainWindow):
         h.emergency_stop_requested.connect(self._on_emergency_stop)
         h.open_page_requested.connect(self.show_page)
         h.domain_wizard_requested.connect(self.show_domain_wizard)
-        h.domain_guide_requested.connect(self.show_domain_guide)
-        h.mode_selected.connect(self._on_mode_clicked)
-        h.url_edited.connect(self._on_url_edited)
-        h.url_save_requested.connect(self._save_url)
+        h.connection_diagnostics_requested.connect(self._open_connection_diagnostics)
         h.copy_requested.connect(self._handle_copy_request)
 
         c = self.connections_page
@@ -562,45 +561,13 @@ class MainWindow(QMainWindow):
             self._domain_guide.apply_theme()
 
     def _refresh_status_colors(self) -> None:
-        state = self.manager.overall
-        text, color = theme.overall_label_color(state.value)
-        pending = state.value in theme.PENDING
-        host = urlsplit(self.manager.public_url).hostname if self.manager.public_url else ""
-        quick = self.settings.is_quick_tunnel
-        detail = host or tr("common.quick_short" if quick else "common.named_short")
-        self.sidebar.set_engine_status(text, detail, color, pending)
-
-        m = self.manager
-        pid = m.active_provider
-        self._apply_row(
-            self.home_page.server_row,
-            m.server.state,
-            waiting=m.is_active and m.is_quick and m.server.state == ProcState.STOPPED,
-            waiting_text=tr("status.waiting_url"),
-        )
-        if pid == PROVIDER_LOCAL:
-            self.home_page.tunnel_row.set_state(
-                tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
-                theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
-            )
-        elif pid == PROVIDER_TAILSCALE:
-            ts_on = m._tailscale_active
-            self.home_page.tunnel_row.set_state(
-                tr("status.service.running") if ts_on else tr("status.service.stopped"),
-                theme.OK if ts_on else theme.IDLE,
-            )
-        else:
-            self._apply_row(
-                self.home_page.tunnel_row,
-                m.tunnel.state,
-                waiting=m.is_active and not m.is_quick and m.tunnel.state == ProcState.STOPPED,
-                waiting_text=tr("status.waiting_server"),
-            )
+        self._on_overall_visual_sync()
 
     def _retranslate_all(self) -> None:
         self.sidebar.retranslate()
         self._topbar_title.setText(tr(_PAGE_NAV_KEY[self._current_page_id]))
-        self._palette_top_btn.setText(tr("topbar.palette"))
+        self._palette_top_btn.setToolTip(tr("topbar.palette"))
+        self._palette_top_btn.setAccessibleName(tr("topbar.palette"))
         self._sync_theme_controls()
         for page in self._pages_by_id.values():
             if hasattr(page, "retranslate"):
@@ -615,23 +582,19 @@ class MainWindow(QMainWindow):
         self.settings_page.sync_selections(self.settings.theme_mode, self.settings.language, collapsed)
 
     # ================================================================== status & services
-    def _on_overall(self, state: Overall) -> None:
-        text, color = theme.overall_label_color(state.value)
+    def _on_overall_visual_sync(self) -> None:
+        state = self.manager.overall
+        sidebar_label = tr(f"sidebar.server.{state.value}")
+        _overall_text, color = theme.overall_label_color(state.value)
         pending = state.value in theme.PENDING
         host = urlsplit(self.manager.public_url).hostname if self.manager.public_url else ""
         quick = self.settings.is_quick_tunnel
         detail = host or tr("common.quick_short" if quick else "common.named_short")
-        self.sidebar.set_engine_status(text, detail, color, pending)
+        self.sidebar.set_engine_status(sidebar_label, detail, color, pending)
+        self._refresh_services()
 
-        title = tr(f"overview.{state.value}.title")
-        lead = tr(f"overview.{state.value}.lead")
-        if state == Overall.STARTING and quick and not self.manager.public_url:
-            lead = tr("overview.starting.quick_wait")
-        elif state == Overall.DEGRADED and self.manager.is_diagnosing:
-            title = tr("overview.degraded.diagnosing")
-            lead = tr("overview.degraded.diagnosing_lead")
-        self.home_page.set_header(title, lead)
-
+    def _on_overall(self, state: Overall) -> None:
+        self._on_overall_visual_sync()
         self.home_page.error_banner.setVisible(state == Overall.ERROR)
         self.home_page.err_domain_btn.setVisible(not self.manager.has_domain())
 
@@ -640,18 +603,22 @@ class MainWindow(QMainWindow):
         self._toggle.setProperty("running", active)
         repolish(self._toggle)
         self._toggle.setEnabled(active or state != Overall.STOPPING)
-        self._refresh_services()
+        self._emergency_btn.setVisible(active)
 
     def _refresh_services(self) -> None:
         m, s = self.manager, self.settings
         pid = m.active_provider
         quick = m.is_quick
+
+        # 1. MCP Server row
         self._apply_row(
             self.home_page.server_row,
             m.server.state,
             waiting=m.is_active and quick and m.server.state == ProcState.STOPPED,
             waiting_text=tr("status.waiting_url"),
         )
+
+        # 2. Tunnel / active transport row
         tunnel_titles = {
             PROVIDER_CF_QUICK: "Cloudflare Tunnel",
             PROVIDER_CF_NAMED: "Cloudflare Tunnel",
@@ -661,25 +628,51 @@ class MainWindow(QMainWindow):
             PROVIDER_NONE: tr("conn.provider.none"),
         }
         self.home_page.tunnel_row.set_title(tunnel_titles.get(pid, "Tunnel"))
-        if pid in (PROVIDER_LOCAL, PROVIDER_NONE, PROVIDER_TAILSCALE):
-            if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
-                self.home_page.tunnel_row.set_state(
-                    tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
-                    theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
-                )
-            else:
-                ts_on = m._tailscale_active
-                self.home_page.tunnel_row.set_state(
-                    tr("status.service.running") if ts_on else tr("status.service.stopped"),
-                    theme.OK if ts_on else theme.IDLE,
-                )
+        if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
+            srv_running = m.server.state == ProcState.RUNNING
+            tunnel_state_text = tr("status.service.running" if srv_running else "status.service.stopped")
+            tunnel_color = theme.OK if srv_running else theme.IDLE
+            tunnel_line = tr("home.tunnel.none")
+            self.home_page.tunnel_row.set_state(tunnel_state_text, tunnel_color)
+        elif pid == PROVIDER_TAILSCALE:
+            ts_on = m._tailscale_active
+            tunnel_state_text = tr("status.tunnel.connected" if ts_on else "status.service.stopped")
+            tunnel_color = theme.OK if ts_on else theme.IDLE
+            tunnel_line = tr("home.tunnel.running" if ts_on else "home.tunnel.stopped")
+            self.home_page.tunnel_row.set_state(tunnel_state_text, tunnel_color)
         else:
-            self._apply_row(
-                self.home_page.tunnel_row,
-                m.tunnel.state,
-                waiting=m.is_active and not quick and m.tunnel.state == ProcState.STOPPED,
-                waiting_text=tr("status.waiting_server"),
-            )
+            waiting_srv = m.is_active and not quick and m.tunnel.state == ProcState.STOPPED
+            if waiting_srv:
+                self.home_page.tunnel_row.set_state(tr("status.waiting_server"), theme.WARN, pending=True)
+                tunnel_line = tr("home.tunnel.starting")
+            else:
+                t_state = m.tunnel.state
+                if t_state == ProcState.RUNNING:
+                    self.home_page.tunnel_row.set_state(tr("status.tunnel.connected"), theme.OK)
+                    tunnel_line = tr("home.tunnel.running")
+                elif t_state == ProcState.STARTING:
+                    self.home_page.tunnel_row.set_state(tr("status.service.starting"), theme.WARN, pending=True)
+                    tunnel_line = tr("home.tunnel.starting")
+                elif t_state == ProcState.STOPPING:
+                    self.home_page.tunnel_row.set_state(tr("status.service.stopping"), theme.WARN, pending=True)
+                    tunnel_line = tr("home.tunnel.stopping")
+                elif t_state == ProcState.FAILED:
+                    self.home_page.tunnel_row.set_state(tr("status.service.failed"), theme.ERR)
+                    tunnel_line = tr("home.tunnel.failed")
+                else:
+                    self.home_page.tunnel_row.set_state(tr("status.service.stopped"), theme.IDLE)
+                    tunnel_line = tr("home.tunnel.stopped")
+
+        # 3. OAuth readiness row (honest state derived from running MCP server + effective OAuth URL)
+        oauth_ready = m.server.state == ProcState.RUNNING and bool(self._effective_oauth_url())
+        if oauth_ready:
+            self.home_page.oauth_row.set_state(tr("home.oauth.ready"), theme.OK)
+        elif m.is_active and m.overall in (Overall.STARTING, Overall.DEGRADED):
+            self.home_page.oauth_row.set_state(tr("home.oauth.waiting"), theme.WARN, pending=True)
+        else:
+            self.home_page.oauth_row.set_state(tr("home.oauth.stopped"), theme.IDLE)
+
+        local_addr = f"MCP {s.local_host()}:{s.server_port}"
         self.home_page.server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
         if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
@@ -698,21 +691,18 @@ class MainWindow(QMainWindow):
             detail = "  ·  ".join(parts)
         self.home_page.tunnel_row.set_detail(detail)
 
-        provider_badges = {
-            PROVIDER_CF_QUICK: (tr("home.mode.quick_caption"), "Cloudflare Quick"),
-            PROVIDER_CF_NAMED: (
-                tr("home.mode.named_wizard_caption" if m.uses_wizard_domain() else "home.mode.named_config_caption"),
-                "Cloudflare Named",
-            ),
-            PROVIDER_NGROK: ("Transport: ngrok Agent v3", "ngrok"),
-            PROVIDER_TAILSCALE: ("Transport: Tailscale Funnel (HTTPS)", "Tailscale Funnel"),
-            PROVIDER_LOCAL: ("Transport: Local Only (127.0.0.1)", "Local Only"),
-            PROVIDER_NONE: (tr("conn.provider.none"), tr("conn.provider.none")),
-        }
-        caption, badge_text = provider_badges.get(pid, ("", pid))
-        self.home_page.mode_caption.setText(caption)
-        self._transport_badge.setText(badge_text)
-        self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else ("warn" if pid == PROVIDER_NONE else "accent"))
+        overall_state = m.overall
+        hero_title = tr(f"home.hero.{overall_state.value}")
+        _lbl, dot_color = theme.overall_label_color(overall_state.value)
+        self.home_page.set_hero_status(
+            title=hero_title,
+            dot_color=dot_color,
+            pending=overall_state.value in theme.PENDING,
+            local_addr=local_addr,
+            tunnel_line=tunnel_line,
+            running=m.is_active,
+        )
+
         try:
             statuses = m.connections.list_statuses(
                 local_host=s.local_host(),
@@ -860,42 +850,32 @@ class MainWindow(QMainWindow):
             "ok" if removed else "info",
         )
 
+    def _open_connection_diagnostics(self) -> None:
+        url = (
+            self.manager.public_url
+            or f"http://{self.settings.local_host()}:{self.settings.server_port}{self.settings.mcp_path}"
+        )
+        recent = tuple(
+            line for line in self._log_view.plain_text().splitlines()[-40:] if line.strip()
+        )
+        dlg = ConnectionDiagnosticsDialog(
+            url,
+            self.settings.server_port,
+            self.settings.health_path,
+            self.manager.token,
+            self,
+            tunnel_mode=self.manager.active_provider,
+            tunnel_protocol=self.manager.tunnel_protocol,
+            recent_logs=recent,
+        )
+        dlg.exec()
+
     def _refresh_mode(self) -> None:
-        s, m = self.settings, self.manager
-        pid = m.active_provider
-        quick = m.is_quick
-        wizard = m.wizard_domain()
-        if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED):
-            self.home_page.set_mode_highlight(s.tunnel_mode)
-        else:
-            self.home_page.set_mode_highlight(None)
-        if pid == PROVIDER_CF_QUICK:
-            hint = tr("home.mode.quick_hint")
-            if not m.has_domain():
-                hint += "\n" + tr("home.mode.no_domain_hint")
-        elif pid == PROVIDER_CF_NAMED and wizard.is_configured:
-            hint = tr("home.mode.named_wizard_hint", host=wizard.hostname)
-        elif pid == PROVIDER_CF_NAMED:
-            hint = tr("home.mode.named_config_hint")
-        elif pid in (PROVIDER_LOCAL, PROVIDER_NONE):
-            hint = tr("conn.provider.none")
-        else:
-            hint = tr("conn.providers.note")
-        h = self.home_page
-        h.mode_hint.setText(hint)
-        h.wizard_link.setText(tr("home.wizard.edit" if wizard.is_configured else "home.wizard.setup"))
-        h.url_edit.setReadOnly(pid != PROVIDER_CF_NAMED)
-        h.url_edit.setPlaceholderText(tr("home.url.placeholder_quick") if quick else "mcp.example.com")
-        h.url_edit.setText(self.manager.public_url)
-        h.url_save.hide()
-        self._set_field_error(h.url_edit, h.url_error, None)
         self._refresh_address()
         self._refresh_access_profile()
         self._refresh_services()
 
-    def _on_public_url(self, url: str) -> None:
-        if self.manager.active_provider != PROVIDER_CF_NAMED or not self.home_page.url_save.isVisible():
-            self.home_page.url_edit.setText(url)
+    def _on_public_url(self, _url: str) -> None:
         self._refresh_address()
         self._refresh_access_profile()
         self._refresh_services()
@@ -906,47 +886,23 @@ class MainWindow(QMainWindow):
         url = self.manager.public_url
         h = self.home_page
         if url:
-            h.ov_url.setText(url)
-            h.ov_url.setStyleSheet("")
+            h.set_endpoint(url, muted=False)
         elif ident.provider_id == PROVIDER_LOCAL:
-            h.ov_url.setText(tr("home.url.local_only_value", local_url=ident.local_url))
-            h.ov_url.setStyleSheet("")
-        elif ident.provider_id == PROVIDER_NONE:
-            h.ov_url.setText(tr("conn.provider.none"))
-            h.ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
-        else:
-            h.ov_url.setText(
-                tr("home.url.placeholder_quick" if self.settings.is_quick_tunnel else "home.url.placeholder_named")
+            h.set_endpoint(
+                ident.local_url,
+                display_text=tr("home.url.local_only_value", local_url=ident.local_url),
+                muted=False,
             )
-            h.ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
-        for btn in (h.url_copy, h.ov_copy):
-            btn.setEnabled(bool(url))
-
-    def _on_url_edited(self, text: str) -> None:
-        h = self.home_page
-        h.url_save.setVisible(text.strip() != self.settings.public_url)
-        self._set_field_error(h.url_edit, h.url_error, None)
-
-    def _save_url(self) -> None:
-        if self.settings.is_quick_tunnel:
-            return
-        h = self.home_page
-        text = h.url_edit.text().strip()
-        if text == self.settings.public_url:
-            h.url_save.hide()
-            return
-        if self.manager.is_active and not self._confirm(
-            "Применить новый адрес?", "Сервисы перезапустятся с новым адресом."
-        ):
-            return
-        error = self.manager.set_public_url(text)
-        if error:
-            self._set_field_error(h.url_edit, h.url_error, error)
-            return
-        h.url_save.hide()
-        h.url_edit.setText(self.settings.public_url)
-        self._refresh_address()
-        self._flash(h.url_copy, tr("home.url.copied"))
+        elif ident.provider_id == PROVIDER_NONE:
+            h.set_endpoint("", display_text=tr("conn.provider.none"), muted=True)
+        else:
+            h.set_endpoint(
+                "",
+                display_text=tr(
+                    "home.url.placeholder_quick" if self.settings.is_quick_tunnel else "home.url.placeholder_named"
+                ),
+                muted=True,
+            )
 
     # ================================================================== OAuth & security
     def _oauth_store_path(self):  # noqa: ANN202
@@ -1217,7 +1173,10 @@ class MainWindow(QMainWindow):
 
     # ================================================================== utilities & window geometry
     def _handle_copy_request(self, kind: str, button: object) -> None:
-        text = self.manager.public_url if kind == "url" else self.manager.token
+        if kind == "url":
+            text = self.manager.public_url or self.home_page.copy_field.full_text()
+        else:
+            text = self.manager.token
         if isinstance(button, QPushButton):
             self._copy(text, button)
 
@@ -1270,8 +1229,12 @@ class MainWindow(QMainWindow):
             self.manager.log_line.emit(APP, f"✖ Не удалось сохранить настройки: {exc}")
 
     def _restore_geometry(self) -> None:
-        w = max(860, self.settings.window_width)
-        h = max(600, self.settings.window_height)
+        raw_w = self.settings.window_width
+        raw_h = self.settings.window_height
+        if self.settings.window_x is None and self.settings.window_y is None and (raw_w, raw_h) == (1120, 760):
+            raw_w, raw_h = tokens.WINDOW_DEFAULT_W, tokens.WINDOW_DEFAULT_H
+        w = max(tokens.WINDOW_MIN_W, raw_w)
+        h = max(tokens.WINDOW_MIN_H, raw_h)
         self.resize(w, h)
         if self.settings.window_x is not None and self.settings.window_y is not None:
             screen = QGuiApplication.primaryScreen()
@@ -1288,8 +1251,8 @@ class MainWindow(QMainWindow):
         self.settings.window_maximized = maximized
         if not maximized:
             geo = self.geometry()
-            self.settings.window_width = max(860, geo.width())
-            self.settings.window_height = max(600, geo.height())
+            self.settings.window_width = max(tokens.WINDOW_MIN_W, geo.width())
+            self.settings.window_height = max(tokens.WINDOW_MIN_H, geo.height())
             self.settings.window_x = geo.x()
             self.settings.window_y = geo.y()
         self._save_settings()

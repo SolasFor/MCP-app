@@ -11,6 +11,7 @@ __all__ = [
     "PlannedPage",
     "SecurityPage",
     "SettingsPage",
+    "TasksPage",
 ]
 
 from app.ui.pages.base import PageScaffold
@@ -22,3 +23,4 @@ from app.ui.pages.logs_page import LogsPage
 from app.ui.pages.planned_page import PlannedPage
 from app.ui.pages.security_page import SecurityPage
 from app.ui.pages.settings_page import SettingsPage
+from app.ui.pages.tasks_page import TasksPage

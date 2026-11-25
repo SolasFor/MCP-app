@@ -19,6 +19,7 @@ from backend.tool_permissions import (
     BASIC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
     allowed_tools, make_tool_middleware, require_execution_permission,
 )
+from backend.tool_registry import TASK_TOOLS
 
 BASE = "https://fixed.example.com"
 RESOURCE = BASE + "/mcp"
@@ -116,7 +117,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         middleware = make_tool_middleware(self.store, self.exec)
         all_tools = [
             Tool(name=name, input_schema={"type": "object", "properties": {}})
-            for name in ("server_info", EXEC_WINDOWS, EXEC_SSH, "shared_note_read")
+            for name in ("server_info", EXEC_WINDOWS, EXEC_SSH, *sorted(TASK_TOOLS), "shared_note_read")
         ]
         async def next_list(ctx):
             return ListToolsResult(tools=all_tools)
@@ -133,8 +134,9 @@ class FixedOAuthToolsTests(unittest.TestCase):
         middleware = make_tool_middleware(self.store, self.exec)
         async def next_list(ctx):
             return {"tools": [
-                {"name": "server_info"}, {"name": EXEC_WINDOWS},
-                {"name": EXEC_SSH}, {"name": "shared_notes_list"},
+                {"name": "server_info"}, {"name": EXEC_WINDOWS}, {"name": EXEC_SSH},
+                *({"name": n} for n in sorted(TASK_TOOLS)),
+                {"name": "shared_notes_list"},
             ]}
         ctx = SimpleNamespace(method="tools/list", params={})
         self.exec.set_profile("allowlist")

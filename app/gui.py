@@ -171,6 +171,7 @@ def run_gui(argv: list[str]) -> int:
         tray = TrayIcon(manager, settings, should_notify=lambda: not window.isVisible())
         tray.show_requested.connect(window.show_and_raise)
         tray.quit_requested.connect(app.quit)
+        window.task_notification.connect(tray.notify_task_event)
         window.hidden_to_tray.connect(lambda: tray.showMessage(
             APP_NAME,
             "Приложение продолжает работать в трее. Выход — правой кнопкой по значку.",

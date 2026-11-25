@@ -29,7 +29,18 @@ if __package__:
     from .gateway.security import check_loop_headers
     from .managed_servers import ManagedServers
     from .output_stream import decode_process_bytes
-    from .process_runner import ProcessRunner
+    from .process_runner import CommandResult, ProcessRunner
+    from .tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from .tool_registry import (
+        TASK_ARTIFACTS,
+        TASK_CANCEL,
+        TASK_LIST,
+        TASK_OUTPUT,
+        TASK_RESTART,
+        TASK_RESULT,
+        TASK_START,
+        TASK_STATUS,
+    )
     from .tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -48,7 +59,18 @@ else:
     from gateway.security import check_loop_headers
     from managed_servers import ManagedServers
     from output_stream import decode_process_bytes
-    from process_runner import ProcessRunner
+    from process_runner import CommandResult, ProcessRunner
+    from tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from tool_registry import (
+        TASK_ARTIFACTS,
+        TASK_CANCEL,
+        TASK_LIST,
+        TASK_OUTPUT,
+        TASK_RESTART,
+        TASK_RESULT,
+        TASK_START,
+        TASK_STATUS,
+    )
     from tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -139,9 +161,17 @@ _GATEWAY_DEFAULT_PATH = (
     / "gateway"
     / "servers.json"
 )
+_TASKS_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "tasks"
+)
 GATEWAY_STORE = GatewayConfigStore(
     Path(os.environ.get("MCP_GATEWAY_CONFIG_PATH") or _GATEWAY_DEFAULT_PATH)
 )
+TASK_STORE = TaskStore(
+    Path(os.environ.get("MCP_TASKS_DB_PATH") or (_TASKS_DEFAULT_DIR / "tasks.sqlite3"))
+)
+TASK_STORE.recover_interrupted()
 GATEWAY_ROUTER = GatewayRouter(
     GATEWAY_STORE,
     self_urls=(
@@ -415,6 +445,72 @@ def _restricted_windows_argv(command: str) -> list[str]:
     return argv
 
 
+def _prepare_windows_argv(
+    command: str,
+    *,
+    full: bool,
+    shell: str = "cmd",
+    timeout: int = 15,
+) -> tuple[list[str] | None, str | None, Path | None]:
+    """Validate and build argv for Windows/allowlist command execution without duplicating logic."""
+    if shell not in ("cmd", "powershell") or not (1 <= timeout <= 600):
+        return None, "❌ Invalid shell or timeout (1–600 seconds).", None
+    if not full and (shell != "cmd" or timeout > 15):
+        return None, "❌ Shell and extended timeout require Full Access.", None
+    script_path: Path | None = None
+    program = command.strip().split(" ", 1)[0].lower()
+    if not full:
+        if program == "pwd" and command.strip().lower() == "pwd":
+            return None, str(WORKSPACE_DIR), None
+        if program in ("ls", "dir") and command.strip().lower() == program:
+            return None, truncate_output("\n".join(sorted(p.name for p in WORKSPACE_DIR.iterdir()))), None
+        if program == "echo":
+            val = command.strip()[5:] if command.strip().lower().startswith("echo ") else ""
+            return None, truncate_output(val), None
+        try:
+            argv = _restricted_windows_argv(command)
+        except (OSError, ValueError, IndexError) as exc:
+            return None, f"❌ Недопустимая команда белого списка: {type(exc).__name__}", None
+        if not argv:
+            return None, "❌ Недопустимые аргументы встроенной команды.", None
+        return argv, None, None
+
+    if os.name == "nt":
+        system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        if shell == "powershell":
+            executable = str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+            if len(command) <= 8000:
+                argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+            else:
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", encoding="utf-8-sig", suffix=".ps1", delete=False,
+                    ) as script:
+                        script_path = Path(script.name)
+                        script.write(command)
+                except OSError:
+                    if script_path:
+                        script_path.unlink(missing_ok=True)
+                    return None, "❌ Could not prepare PowerShell script.", None
+                argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script_path)]
+        else:
+            if len(command) > 8000:
+                return None, "❌ CMD command line too long; use PowerShell.", None
+            executable = str(system_root / "System32" / "cmd.exe")
+            argv = [executable, "/d", "/s", "/c", command]
+    else:
+        if shell != "cmd":
+            return None, "❌ Windows PowerShell is only available on Windows.", None
+        import shlex
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return None, "❌ Invalid command syntax.", None
+    if not argv:
+        return None, "❌ Пустая команда.", None
+    return argv, None, script_path
+
+
 async def _oauth_windows_run(
     command: str,
     *,
@@ -425,74 +521,19 @@ async def _oauth_windows_run(
     pre_dispatch_check=None,
     output_offset: int = 0,
     output_limit: int = MAX_OUTPUT_LEN,
+    run_id: str | None = None,
 ) -> str:
     """Bounded execution via ProcessRunner, with shell semantics only in explicit full mode."""
-    if shell not in ("cmd", "powershell") or not (1 <= timeout <= 600):
-        return "❌ Invalid shell or timeout (1–600 seconds)."
-    if not full and (shell != "cmd" or timeout > 15):
-        return "❌ Shell and extended timeout require Full Access."
-    script_path = None
-    program = command.strip().split(" ", 1)[0].lower()
-    if not full:
-        if program == "pwd" and command.strip().lower() == "pwd":
-            if pre_dispatch_check is not None:
-                pre_dispatch_check()
-            return str(WORKSPACE_DIR)
-        if program in ("ls", "dir") and command.strip().lower() == program:
-            if pre_dispatch_check is not None:
-                pre_dispatch_check()
-            return truncate_output("\n".join(sorted(
-                path.name for path in WORKSPACE_DIR.iterdir()
-            )))
-        if program == "echo":
-            if pre_dispatch_check is not None:
-                pre_dispatch_check()
-            return truncate_output(
-                command.strip()[5:] if command.strip().lower().startswith("echo ") else ""
-            )
-        try:
-            argv = _restricted_windows_argv(command)
-        except (OSError, ValueError, IndexError) as exc:
-            return f"❌ Недопустимая команда белого списка: {type(exc).__name__}"
-        if not argv:
-            return "❌ Недопустимые аргументы встроенной команды."
-    else:
-        if os.name == "nt":
-            system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-            if shell == "powershell":
-                executable = str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
-                if len(command) <= 8000:
-                    argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                            "-Command", command]
-                else:
-                    try:
-                        with tempfile.NamedTemporaryFile(
-                            mode="w", encoding="utf-8-sig", suffix=".ps1",
-                            delete=False,
-                        ) as script:
-                            script_path = Path(script.name)
-                            script.write(command)
-                    except OSError:
-                        if script_path:
-                            script_path.unlink(missing_ok=True)
-                        return "❌ Could not prepare PowerShell script."
-                    argv = [executable, "-NoLogo", "-NoProfile", "-NonInteractive",
-                            "-File", str(script_path)]
-            else:
-                if len(command) > 8000:
-                    return "❌ CMD command line too long; use PowerShell."
-                executable = str(system_root / "System32" / "cmd.exe")
-                argv = [executable, "/d", "/s", "/c", command]
-        else:
-            if shell != "cmd":
-                return "❌ Windows PowerShell is only available on Windows."
-            import shlex
-            try:
-                argv = shlex.split(command)
-            except ValueError:
-                return "❌ Invalid command syntax."
-        if not argv:
-            return "❌ Пустая команда."
+    argv, immediate, script_path = _prepare_windows_argv(
+        command, full=full, shell=shell, timeout=timeout,
+    )
+    if immediate is not None or argv is None:
+        if immediate is not None and not immediate.startswith("❌") and pre_dispatch_check is not None:
+            pre_dispatch_check()
+        if run_id and immediate is not None and not immediate.startswith("❌"):
+            writer = PROCESS_RUNNER.spool.create_spool(run_id)
+            writer.write("stdout", immediate.encode("utf-8", errors="replace"))
+        return immediate or "❌ Пустая команда."
 
     try:
         result = await PROCESS_RUNNER.run_command(
@@ -505,6 +546,7 @@ async def _oauth_windows_run(
             output_offset=output_offset,
             output_limit=output_limit,
             pre_dispatch_check=pre_dispatch_check,
+            run_id=run_id,
         )
         if result.timed_out:
             return f"❌ Команда превысила лимит {timeout} секунд."
@@ -733,6 +775,220 @@ async def oauth_ssh_command(
     return output
 
 
+def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
+    """Fail-closed live check for task submission, dispatch, and restart."""
+    if oauth_provider is None or oauth_execution is None:
+        raise PermissionError("OAuth task execution is unavailable")
+    if oauth_execution.emergency_stopped():
+        raise PermissionError("Emergency stop is active")
+    if not oauth_execution.client_approved(client_id):
+        raise PermissionError("OAuth client is not approved")
+    profile = oauth_execution.profile_for(client_id)
+    if profile not in ("allowlist", "full"):
+        raise PermissionError("Background tasks are disabled in safe mode")
+    if spec.kind == "windows":
+        max_to = 600 if profile == "full" else 15
+        if not (1 <= spec.timeout <= max_to) or (profile != "full" and spec.shell != "cmd"):
+            raise PermissionError("Windows task timeout or shell is outside the active profile")
+        if not oauth_execution.can_request(
+            client_id, "windows", command=spec.command, expected_profile=profile
+        ):
+            raise PermissionError("Windows command is not permitted in the active profile")
+    else:
+        max_to = 600 if profile == "full" else 12
+        if not (1 <= spec.timeout <= max_to):
+            raise PermissionError("SSH task timeout is outside the active profile")
+        if not oauth_execution.can_request(
+            client_id, "ssh", command=spec.command, host=spec.host,
+            user=spec.user, port=spec.port, expected_profile=profile,
+        ):
+            raise PermissionError("SSH host or command is not permitted in the active profile")
+    return profile
+
+
+def _task_auth_rechecker(rec: TaskRecord, spec: TaskSpec) -> None:
+    _authorize_task_spec(rec.owner_client_id, spec)
+
+
+async def _task_command_executor(rec: TaskRecord, spec: TaskSpec) -> CommandResult | str:
+    profile = _authorize_task_spec(rec.owner_client_id, spec)
+
+    def pre_dispatch() -> None:
+        _authorize_task_spec(rec.owner_client_id, spec)
+
+    if spec.kind == "windows":
+        full = profile == "full"
+        argv, immediate, script_path = _prepare_windows_argv(
+            spec.command, full=full, shell=spec.shell, timeout=spec.timeout,
+        )
+        if immediate is not None or argv is None:
+            if immediate and not immediate.startswith("❌"):
+                writer = PROCESS_RUNNER.spool.create_spool(rec.spool_run_id or rec.task_id)
+                writer.write("stdout", immediate.encode("utf-8", errors="replace"))
+            return immediate or "❌ Пустая команда."
+        try:
+            async with PROCESS_RUNNER.request_slot():
+                return await PROCESS_RUNNER.run_command(
+                    argv,
+                    cwd=WORKSPACE_DIR,
+                    timeout=spec.timeout,
+                    client_id=rec.owner_client_id,
+                    kind="windows",
+                    spawn_fn=asyncio.create_subprocess_exec,
+                    output_offset=0,
+                    output_limit=MAX_OUTPUT_LEN,
+                    pre_dispatch_check=pre_dispatch,
+                    run_id=rec.spool_run_id or rec.task_id,
+                )
+        finally:
+            if script_path:
+                script_path.unlink(missing_ok=True)
+
+    async with PROCESS_RUNNER.request_slot():
+        out = await PROCESS_RUNNER.run_ssh(
+            lambda cancel_ev, reg_cb: _sync_ssh_exec(
+                spec.host, spec.user, spec.command, spec.port, spec.timeout,
+                cancel_event=cancel_ev, register_transport=reg_cb,
+            ),
+            client_id=rec.owner_client_id,
+            pre_dispatch_check=pre_dispatch,
+            run_id=rec.spool_run_id or rec.task_id,
+        )
+    writer = PROCESS_RUNNER.spool.create_spool(rec.spool_run_id or rec.task_id)
+    writer.write("stdout", out.encode("utf-8", errors="replace"))
+    return out
+
+
+TASK_MANAGER = TaskManager(
+    TASK_STORE,
+    PROCESS_RUNNER,
+    artifacts_dir=Path(os.environ.get("MCP_TASKS_ARTIFACTS_DIR") or (_TASKS_DEFAULT_DIR / "artifacts")),
+    redactor=REDACTOR,
+    auth_rechecker=_task_auth_rechecker,
+    command_executor=_task_command_executor,
+)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_start(
+    command: str,
+    kind: Literal["windows", "ssh"] = "windows",
+    shell: Literal["cmd", "powershell"] = "cmd",
+    timeout: int = 60,
+    host: str = "",
+    user: str = "",
+    port: int = 22,
+    priority: int = 0,
+    idempotency_key: str = "",
+    title: str = "",
+) -> dict:
+    """Queue a durable background task whose execution continues across client disconnects."""
+    client_id = require_execution_permission(
+        TASK_START, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    spec = TaskSpec(
+        kind=kind, command=command, shell=shell, timeout=timeout,
+        host=host, user=user, port=port,
+    )
+    spec.validate()
+    profile = _authorize_task_spec(client_id, spec)
+    rec, deduplicated = await TASK_MANAGER.submit(
+        owner_client_id=client_id,
+        profile=profile,
+        spec=spec,
+        priority=priority,
+        idempotency_key=idempotency_key,
+        title=title,
+    )
+    EXEC_AUDIT.record(
+        client_id=client_id, kind=kind, profile=profile,
+        event="started", command=command, host=host or None, port=port if host else None,
+        action_id=rec.task_id,
+    )
+    return {**rec.to_public_dict(REDACTOR), "deduplicated": deduplicated, "mcp_task": rec.to_mcp_task_dict(REDACTOR)}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_status(task_id: str) -> dict:
+    """Inspect status, elapsed time, and optional known progress for an owned background task."""
+    client_id = require_execution_permission(
+        TASK_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return TASK_MANAGER.status_dict(task_id, owner_client_id=client_id)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_list(status: str = "", limit: int = 50) -> dict:
+    """List durable background tasks owned by this OAuth client."""
+    client_id = require_execution_permission(
+        TASK_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return {"tasks": TASK_MANAGER.list_dicts(owner_client_id=client_id, status=status or None, limit=limit)}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_output(
+    task_id: str,
+    stream: Literal["stdout", "stderr"] = "stdout",
+    offset: int = 0,
+    limit: int = 8000,
+) -> dict:
+    """Read paginated, redacted stdout or stderr output from disk spool for an owned task."""
+    client_id = require_execution_permission(
+        TASK_OUTPUT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return TASK_MANAGER.read_output(
+        task_id, owner_client_id=client_id, stream=stream, offset=offset, limit=limit,
+    )
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_result(task_id: str) -> dict:
+    """Return final outcome, exit code, and redacted summary artifact for an owned task."""
+    client_id = require_execution_permission(
+        TASK_RESULT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return TASK_MANAGER.result_dict(task_id, owner_client_id=client_id)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_cancel(task_id: str) -> dict:
+    """Cancel an owned queued or running task, terminating its controlled process tree."""
+    client_id = require_execution_permission(
+        TASK_CANCEL, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return TASK_MANAGER.cancel(task_id, owner_client_id=client_id)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_restart(task_id: str) -> dict:
+    """Explicitly re-enqueue an owned completed, failed, cancelled, or interrupted task."""
+    client_id = require_execution_permission(
+        TASK_RESTART, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    spec = TASK_STORE.get_spec(task_id)
+    if spec is None:
+        raise KeyError(f"Unknown task: {task_id!r}")
+    profile = _authorize_task_spec(client_id, spec)
+    return await TASK_MANAGER.restart(task_id, owner_client_id=client_id, new_profile=profile)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def task_artifacts(
+    task_id: str,
+    artifact_name: str = "",
+    offset: int = 0,
+    limit: int = 16000,
+) -> dict:
+    """List or read paginated redacted output artifacts for an owned background task."""
+    client_id = require_execution_permission(
+        TASK_ARTIFACTS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    return TASK_MANAGER.read_artifacts(
+        task_id, owner_client_id=client_id, artifact_name=artifact_name, offset=offset, limit=limit,
+    )
+
+
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
 async def run_local_command(command: str, timeout: int = 30, cwd: str | None = None) -> str:
     """Execute one explicitly allowlisted executable, without a command shell."""
@@ -932,6 +1188,10 @@ def main() -> None:
     try:
         uvicorn.run(build_app(), host=HOST, port=PORT)
     finally:
+        try:
+            asyncio.run(TASK_MANAGER.close())
+        except Exception:
+            pass
         try:
             asyncio.run(GATEWAY_ROUTER.close_all())
         except Exception:

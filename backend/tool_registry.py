@@ -14,9 +14,27 @@ else:
 EXEC_WINDOWS = "oauth_windows_command"
 EXEC_SSH = "oauth_ssh_command"
 EXEC_MANAGED = "oauth_managed_server"
+TASK_START = "task_start"
+TASK_STATUS = "task_status"
+TASK_LIST = "task_list"
+TASK_OUTPUT = "task_output"
+TASK_RESULT = "task_result"
+TASK_CANCEL = "task_cancel"
+TASK_RESTART = "task_restart"
+TASK_ARTIFACTS = "task_artifacts"
+TASK_TOOLS = frozenset({
+    TASK_START,
+    TASK_STATUS,
+    TASK_LIST,
+    TASK_OUTPUT,
+    TASK_RESULT,
+    TASK_CANCEL,
+    TASK_RESTART,
+    TASK_ARTIFACTS,
+})
 BASIC_TOOLS = frozenset({"server_info"})
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH}
+EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS
+OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
@@ -48,6 +66,10 @@ class ToolRegistry:
         self.register(
             ToolSpec(EXEC_MANAGED, "execution", min_profile="full", requires_execution=True)
         )
+        for task_tool in sorted(TASK_TOOLS):
+            self.register(
+                ToolSpec(task_tool, "tasks", min_profile="allowlist", requires_execution=True)
+            )
 
     def register(self, spec: ToolSpec) -> None:
         if spec.min_profile not in _PROFILE_RANK:

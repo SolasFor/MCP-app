@@ -54,6 +54,7 @@ from app.ui.pages import (
     PlannedPage,
     SecurityPage,
     SettingsPage,
+    TasksPage,
 )
 from app.ui.widgets import StatusRow, repolish
 from backend.oauth_execution import ExecutionApprovals
@@ -67,10 +68,10 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("connections", "nav.connections", "connections", "primary", shortcut="Ctrl+2"),
     NavItemSpec("clients", "nav.clients", "clients", "primary", shortcut="Ctrl+3"),
     NavItemSpec("gateway", "nav.gateway", "gateway", "primary", shortcut="Ctrl+4"),
-    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+5"),
-    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+6"),
-    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+7"),
-    NavItemSpec("tasks", "nav.tasks", "tasks", "upcoming", tag="0.9.3"),
+    NavItemSpec("tasks", "nav.tasks", "tasks", "primary", shortcut="Ctrl+5"),
+    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+6"),
+    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+7"),
+    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+8"),
     NavItemSpec("servers", "nav.servers", "servers", "upcoming", tag="0.9.4"),
     NavItemSpec("workspaces", "nav.workspaces", "workspaces", "upcoming", tag="0.9.5"),
     NavItemSpec("devices", "nav.devices", "devices", "upcoming", tag="0.9.8"),
@@ -88,6 +89,7 @@ PAGE_CONNECTION = PAGE_OVERVIEW
 PAGE_CONNECTIONS = PAGE_IDS.index("connections")
 PAGE_CLIENTS = PAGE_IDS.index("clients")
 PAGE_GATEWAY = PAGE_IDS.index("gateway")
+PAGE_TASKS = PAGE_IDS.index("tasks")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
@@ -98,6 +100,7 @@ _PAGE_NAV_KEY = {spec.page_id: spec.i18n_key for spec in NAV_SPECS}
 class MainWindow(QMainWindow):
     quit_requested = pyqtSignal()
     hidden_to_tray = pyqtSignal()
+    task_notification = pyqtSignal(str, str, str)
 
     def __init__(
         self,
@@ -147,6 +150,12 @@ class MainWindow(QMainWindow):
         self.connections_page = ConnectionsPage()
         self.clients_page = ClientsPage()
         self.gateway_page = GatewayPage(config_path=manager.gateway_config_path())
+        self.tasks_page = TasksPage(
+            db_path=manager.tasks_db_path(),
+            spool_dir=manager.tasks_spool_dir(),
+            artifacts_dir=manager.tasks_artifacts_dir(),
+            redactor=manager._redactor,
+        )
         self.security_page = SecurityPage()
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
@@ -156,6 +165,7 @@ class MainWindow(QMainWindow):
             "connections": self.connections_page,
             "clients": self.clients_page,
             "gateway": self.gateway_page,
+            "tasks": self.tasks_page,
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
@@ -267,6 +277,10 @@ class MainWindow(QMainWindow):
         gw.config_changed.connect(self.manager.refresh_gateway_secrets)
         gw.status_message.connect(self.toasts.show_toast)
 
+        tsk = self.tasks_page
+        tsk.status_message.connect(self.toasts.show_toast)
+        tsk.task_finished.connect(self.task_notification.emit)
+
         s = self.security_page
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
@@ -325,6 +339,8 @@ class MainWindow(QMainWindow):
             self.clients_page.set_public_url(self._effective_oauth_url())
         elif page_id == "gateway":
             self.gateway_page.reload()
+        elif page_id == "tasks":
+            self.tasks_page.reload()
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []

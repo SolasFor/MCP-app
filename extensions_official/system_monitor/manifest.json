@@ -1,0 +1,32 @@
+{
+  "id": "system_monitor",
+  "name": "System Monitor",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "entrypoint": "main.py",
+  "description": "CPU, RAM, disk usage, and top processes telemetry via psutil.",
+  "author": "MCP-app",
+  "official": true,
+  "permissions": ["read_metrics", "process_info"],
+  "min_profile": "allowlist",
+  "tools": [
+    {
+      "name": "system_metrics",
+      "description": "Read current CPU, RAM, disk, and uptime telemetry.",
+      "permission": "read_metrics",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+      "name": "top_processes",
+      "description": "List top running processes sorted by memory usage.",
+      "permission": "process_info",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 10}}}
+    }
+  ],
+  "ui_components": [
+    {"id": "status", "type": "status_card", "title": "System Monitor", "description": "Live host telemetry"},
+    {"id": "cpu_ram", "type": "metric", "title": "Read System Metrics", "tool": "system_metrics"}
+  ]
+}

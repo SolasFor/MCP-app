@@ -1,0 +1,31 @@
+{
+  "id": "docker_manager",
+  "name": "Docker Manager",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "entrypoint": "main.py",
+  "description": "Local Docker daemon status, containers, and image listing when Docker is installed.",
+  "author": "MCP-app",
+  "official": true,
+  "permissions": ["docker_read"],
+  "min_profile": "allowlist",
+  "tools": [
+    {
+      "name": "docker_status",
+      "description": "Check Docker CLI and daemon availability honestly.",
+      "permission": "docker_read",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+      "name": "docker_containers",
+      "description": "List local Docker containers when daemon is reachable.",
+      "permission": "docker_read",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {"all_containers": {"type": "boolean", "default": true}}}
+    }
+  ],
+  "ui_components": [
+    {"id": "docker_card", "type": "status_card", "title": "Docker Engine", "tool": "docker_status"}
+  ]
+}

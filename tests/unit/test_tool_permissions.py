@@ -19,7 +19,15 @@ from backend.tool_permissions import (
     BASIC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
     allowed_tools, make_tool_middleware, require_execution_permission,
 )
-from backend.tool_registry import DESKTOP_TOOLS, GIT_TOOLS, SERVER_TOOLS, TASK_TOOLS, WORKSPACE_TOOLS
+from backend.tool_registry import (
+    DESKTOP_TOOLS,
+    EXTENSION_ALLOWLIST_TOOLS,
+    EXTENSION_FULL_TOOLS,
+    GIT_TOOLS,
+    SERVER_TOOLS,
+    TASK_TOOLS,
+    WORKSPACE_TOOLS,
+)
 
 BASE = "https://fixed.example.com"
 RESOURCE = BASE + "/mcp"
@@ -120,7 +128,8 @@ class FixedOAuthToolsTests(unittest.TestCase):
             for name in (
                 "server_info", EXEC_WINDOWS, EXEC_SSH,
                 *sorted(TASK_TOOLS), *sorted(SERVER_TOOLS),
-                *sorted(WORKSPACE_TOOLS), *sorted(GIT_TOOLS), *sorted(DESKTOP_TOOLS), "shared_note_read",
+                *sorted(WORKSPACE_TOOLS), *sorted(GIT_TOOLS), *sorted(DESKTOP_TOOLS),
+                *sorted(EXTENSION_ALLOWLIST_TOOLS), *sorted(EXTENSION_FULL_TOOLS), "shared_note_read",
             )
         ]
         async def next_list(ctx):
@@ -144,6 +153,8 @@ class FixedOAuthToolsTests(unittest.TestCase):
                 *({"name": n} for n in sorted(WORKSPACE_TOOLS)),
                 *({"name": n} for n in sorted(GIT_TOOLS)),
                 *({"name": n} for n in sorted(DESKTOP_TOOLS)),
+                *({"name": n} for n in sorted(EXTENSION_ALLOWLIST_TOOLS)),
+                *({"name": n} for n in sorted(EXTENSION_FULL_TOOLS)),
                 {"name": "shared_notes_list"},
             ]}
         ctx = SimpleNamespace(method="tools/list", params={})

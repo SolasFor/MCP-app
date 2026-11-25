@@ -1,0 +1,35 @@
+{
+  "id": "browser_automation",
+  "name": "Browser Automation",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "entrypoint": "main.py",
+  "description": "Strict http/https URL validation, isolated browser profiles, and explicit local browser launch.",
+  "author": "MCP-app",
+  "official": true,
+  "permissions": ["browser_control"],
+  "min_profile": "full",
+  "tools": [
+    {
+      "name": "browser_profiles",
+      "description": "Detect installed browsers and list isolated extension profile directories.",
+      "permission": "browser_control",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+      "name": "browser_open_url",
+      "description": "Validate an http(s) URL and open it inside an isolated extension browser profile.",
+      "permission": "browser_control",
+      "read_only": false,
+      "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}, "profile": {"type": "string", "default": "default"}},
+        "required": ["url"]
+      }
+    }
+  ],
+  "ui_components": [
+    {"id": "browser_notice", "type": "notice", "title": "Isolated Profile Only", "description": "Only http/https URLs are accepted; owner cookies are not reused by default."}
+  ]
+}

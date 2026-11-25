@@ -4,6 +4,7 @@ from __future__ import annotations
 __all__ = [
     "ClientsPage",
     "ConnectionsPage",
+    "ExtensionsPage",
     "GatewayPage",
     "HomePage",
     "LogsPage",
@@ -19,6 +20,7 @@ __all__ = [
 from app.ui.pages.base import PageScaffold
 from app.ui.pages.clients_page import ClientsPage
 from app.ui.pages.connections_page import ConnectionsPage
+from app.ui.pages.extensions_page import ExtensionsPage
 from app.ui.pages.gateway_page import GatewayPage
 from app.ui.pages.home_page import HomePage
 from app.ui.pages.logs_page import LogsPage

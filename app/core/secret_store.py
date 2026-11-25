@@ -30,6 +30,7 @@ VALID_NAMESPACES = frozenset({
     "proxy",
     "servers",
     "workspaces",
+    "extensions",
 })
 _KEY_PREFIX_WIN = b"DPAPI1:"
 _KEY_PREFIX_POSIX = b"POSIX1:"

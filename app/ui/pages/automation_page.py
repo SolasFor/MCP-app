@@ -347,7 +347,7 @@ class AutomationPage(PageScaffold):
         self.history_view = QPlainTextEdit()
         self.history_view.setObjectName("ConsoleLog")
         self.history_view.setReadOnly(True)
-        self.history_view.setMaximumHeight(130)
+        self.history_view.setMaximumHeight(110)
         hist_sec.body.addWidget(self.history_view)
         col.addWidget(hist_sec)
         return page

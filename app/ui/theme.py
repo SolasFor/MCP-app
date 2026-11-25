@@ -288,7 +288,7 @@ QPushButton#Nav:pressed {
     background: $CONTROL_PRESSED;
 }
 QPushButton#Nav:focus {
-    border: 1px solid $ACCENT;
+    border: 1px solid $BORDER_STRONG;
 }
 QPushButton#Nav:checked {
     background: $ACTIVE;
@@ -415,7 +415,7 @@ QPushButton#CopyFieldBtn:pressed {
     background: $CONTROL_PRESSED;
 }
 QPushButton#CopyFieldBtn:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 QPushButton#CopyFieldBtn:disabled {
     color: $TEXT_FAINT;
@@ -468,7 +468,7 @@ QPushButton:hover {
     border-color: $BORDER_STRONG;
 }
 QPushButton:pressed { background: $CONTROL_PRESSED; }
-QPushButton:focus { border-color: $ACCENT; }
+QPushButton:focus { border-color: $TEXT_MUTED; }
 QPushButton:disabled {
     color: $TEXT_FAINT;
     background: $SURFACE;
@@ -520,7 +520,7 @@ QPushButton#Accent:pressed {
     background: $BTN_EMPHASIS_PRESSED;
 }
 QPushButton#Accent:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 QPushButton#Accent:disabled {
     background: $SURFACE;
@@ -563,7 +563,7 @@ QPushButton#Ghost:pressed {
     background: $CONTROL_PRESSED;
 }
 QPushButton#Ghost:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 QPushButton#Ghost:disabled {
     color: $TEXT_FAINT;
@@ -585,7 +585,7 @@ QPushButton#IconBtn:pressed {
     background: $CONTROL_PRESSED;
 }
 QPushButton#IconBtn:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 
 QPushButton#Link {
@@ -624,7 +624,7 @@ QPushButton#SubtleLink:pressed {
     background: $CONTROL_PRESSED;
 }
 QPushButton#SubtleLink:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 
 QFrame#SegmentGroup {
@@ -636,7 +636,7 @@ QPushButton#Segment {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 5px;
-    padding: 4px 10px;
+    padding: 4px 12px;
     min-height: 18px;
     color: $TEXT_MUTED;
     font-weight: 500;
@@ -646,7 +646,7 @@ QPushButton#Segment:checked {
     background: $ACTIVE;
     border-color: $BORDER;
     color: $TEXT_STRONG;
-    font-weight: 600;
+    font-weight: 500;
 }
 
 QPushButton#FilterPill {
@@ -688,9 +688,17 @@ QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QSpinBox:hover, QDoubleS
     border-color: $BORDER_STRONG;
 }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
-QLineEdit:read-only { color: $TEXT_MUTED; }
+QLineEdit:read-only, QTextEdit[readOnly="true"], QPlainTextEdit[readOnly="true"] { color: $TEXT_MUTED; }
+QTextEdit[readOnly="true"]:focus, QPlainTextEdit[readOnly="true"]:focus {
+    border-color: $BORDER;
+}
+QPlainTextEdit#ConsoleLog {
+    font-family: $FONT_MONO;
+    font-size: 12px;
+    color: $TEXT;
+}
 QLineEdit[invalid="true"] { border-color: $ERR; }
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
     width: 18px;
@@ -709,7 +717,7 @@ QComboBox {
     font-weight: 500;
 }
 QComboBox:hover { border-color: $BORDER_STRONG; }
-QComboBox:focus, QComboBox:on { border-color: $ACCENT; }
+QComboBox:focus, QComboBox:on { border-color: $TEXT_MUTED; }
 QComboBox:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $HAIRLINE; }
 QComboBox::drop-down {
     subcontrol-origin: padding;
@@ -748,7 +756,7 @@ QComboBox#ThemeCombo:hover {
     color: $TEXT_STRONG;
 }
 QComboBox#ThemeCombo:focus {
-    border-color: $ACCENT;
+    border-color: $TEXT_MUTED;
 }
 QComboBox#ThemeCombo::drop-down { width: 20px; }
 

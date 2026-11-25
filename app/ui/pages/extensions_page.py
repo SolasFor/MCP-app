@@ -230,11 +230,12 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.trust"),
             tr("extensions.col.perms"),
         ])
-        self.installed_table.setMinimumHeight(120)
+        self.installed_table.setMinimumHeight(88)
         self.installed_table.itemSelectionChanged.connect(self._on_installed_selected)
         top_lay.addWidget(self.installed_table, 1)
 
         self.empty_state = EmptyState("extensions", tr("extensions.empty.title"), tr("extensions.empty.desc"))
+        self.empty_state.setMinimumHeight(112)
         top_lay.addWidget(self.empty_state)
 
         self._catalog_hdr = SectionHeader(tr("extensions.catalog.title"))
@@ -246,30 +247,43 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.perms"),
             tr("extensions.col.desc"),
         ])
-        self.catalog_table.setMinimumHeight(110)
+        self.catalog_table.setMinimumHeight(88)
         top_lay.addWidget(self.catalog_table, 1)
         splitter.addWidget(top_widget)
 
         bottom_pane = QWidget()
-        bottom_lay = QVBoxLayout(bottom_pane)
-        bottom_lay.setContentsMargins(0, 6, 0, 0)
-        bottom_lay.setSpacing(6)
+        bottom_row = QHBoxLayout(bottom_pane)
+        bottom_row.setContentsMargins(0, 6, 0, 0)
+        bottom_row.setSpacing(12)
+
+        ui_col = QVBoxLayout()
+        ui_col.setContentsMargins(0, 0, 0, 0)
+        ui_col.setSpacing(4)
         self._ui_hdr = SectionHeader(tr("extensions.details.ui"))
-        bottom_lay.addWidget(self._ui_hdr)
+        ui_col.addWidget(self._ui_hdr)
         self.ui_preview = QPlainTextEdit()
         self.ui_preview.setObjectName("ConsoleLog")
         self.ui_preview.setReadOnly(True)
-        self.ui_preview.setMaximumHeight(90)
-        bottom_lay.addWidget(self.ui_preview)
+        self.ui_preview.setMinimumHeight(64)
+        ui_col.addWidget(self.ui_preview, 1)
 
+        logs_col = QVBoxLayout()
+        logs_col.setContentsMargins(0, 0, 0, 0)
+        logs_col.setSpacing(4)
         self._logs_hdr = SectionHeader(tr("extensions.details.logs"))
-        bottom_lay.addWidget(self._logs_hdr)
+        logs_col.addWidget(self._logs_hdr)
         self.logs_view = QPlainTextEdit()
         self.logs_view.setObjectName("ConsoleLog")
         self.logs_view.setReadOnly(True)
-        self.logs_view.setMinimumHeight(96)
-        bottom_lay.addWidget(self.logs_view, 1)
+        self.logs_view.setMinimumHeight(64)
+        logs_col.addWidget(self.logs_view, 1)
+
+        bottom_row.addLayout(ui_col, 1)
+        bottom_row.addLayout(logs_col, 1)
         splitter.addWidget(bottom_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 120])
 
         self.content.addWidget(splitter, 1)
         self.refresh_all()

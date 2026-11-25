@@ -307,6 +307,9 @@ class DevicesPage(PageScaffold):
         self.output_view.setReadOnly(True)
         bottom_lay.addWidget(self.output_view, 1)
         splitter.addWidget(bottom_pane)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([280, 160])
 
         self.content.addWidget(splitter, 1)
         self.refresh_all()

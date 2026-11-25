@@ -61,6 +61,7 @@ class OAuthClientsDialog(SilentDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(34)
@@ -147,7 +148,8 @@ class OAuthClientsDialog(SilentDialog):
                 self.table.setItem(idx, 2, QTableWidgetItem("Нет доступа"))
             self.table.setItem(idx, 3, QTableWidgetItem(when))
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(2, max(245, self.table.columnWidth(2)))
+        self.table.setColumnWidth(0, min(260, max(140, self.table.columnWidth(0))))
+        self.table.setColumnWidth(2, max(230, self.table.columnWidth(2)))
         self._selection_changed()
 
     def _change_client_profile(self, client_id: str, combo: SafeComboBox) -> None:

@@ -110,6 +110,8 @@ class Badge(QLabel):
     def __init__(self, text: str = "", variant: str = "neutral", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setObjectName("Pill")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.set_variant(variant)
 
     def set_variant(self, variant: str) -> None:
@@ -130,9 +132,13 @@ class SectionHeader(QWidget):
         texts.setSpacing(2)
         self.title_label = QLabel(title)
         self.title_label.setObjectName("SectionTitle")
+        self.title_label.setWordWrap(True)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.subtitle_label = QLabel(subtitle)
         self.subtitle_label.setObjectName("Hint")
         self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setMinimumWidth(0)
         self.subtitle_label.setVisible(bool(subtitle))
         texts.addWidget(self.title_label)
         texts.addWidget(self.subtitle_label)
@@ -311,13 +317,13 @@ class EmptyState(QFrame):
     ) -> None:
         super().__init__(parent)
         self.setObjectName("EmptyState")
-        self.setMinimumHeight(110)
+        self.setMinimumHeight(124)
         self._icon_name = icon_name
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 18, 16, 18)
-        layout.setSpacing(6)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(5)
+        layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
         self._icon_label = QLabel()
         self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -348,7 +354,7 @@ class EmptyState(QFrame):
         self.cta_button.setVisible(bool(cta_text))
 
     def apply_theme(self) -> None:
-        self._icon_label.setPixmap(icons.vector_icon(self._icon_name, theme.TEXT_MUTED, 24).pixmap(24, 24))
+        self._icon_label.setPixmap(icons.vector_icon(self._icon_name, theme.TEXT_MUTED, 20).pixmap(20, 20))
 
 
 class ErrorBanner(QFrame):

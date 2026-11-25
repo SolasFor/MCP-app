@@ -327,7 +327,7 @@ class AcceptanceGuiFixesTests(unittest.TestCase):
             "diagnostics_requested",
         ):
             self.assertFalse(hasattr(self.window.home_page, attr), f"HomePage still has {attr}")
-        self.assertEqual(len(self.window.home_page.findChildren(Card)), 2)
+        self.assertEqual(len(self.window.home_page.findChildren(Card)), 1)
 
         for attr in (
             "action_title",

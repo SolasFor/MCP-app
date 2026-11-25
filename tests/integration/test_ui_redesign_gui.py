@@ -66,9 +66,9 @@ class UiRedesignGuiTests(unittest.TestCase):
         self.window.set_theme_mode(theme.THEME_LIGHT)
         self.assertEqual(theme.manager().resolved, theme.THEME_LIGHT)
         self.assertEqual(self.settings.theme_mode, theme.THEME_LIGHT)
-        self.assertIn("#F8F9FC", theme.manager().current_stylesheet)
-        self.assertIn("#F8F9FC", self.window.home_page.styleSheet())
-        self.assertIn("#F8F9FC", self.window.sidebar.styleSheet())
+        self.assertIn("#F7F8F9", theme.manager().current_stylesheet)
+        self.assertIn("#F7F8F9", self.window.home_page.styleSheet())
+        self.assertIn("#F7F8F9", self.window.sidebar.styleSheet())
 
         self.window.set_language(LANG_EN)
         self.assertEqual(self.settings.language, LANG_EN)
@@ -78,8 +78,8 @@ class UiRedesignGuiTests(unittest.TestCase):
         self.window.set_theme_mode(theme.THEME_DARK)
         self.window.set_language(LANG_RU)
         self.assertEqual(self.window.sidebar.button("home").text(), "Главная")
-        self.assertIn("#14151A", theme.manager().current_stylesheet)
-        self.assertIn("#14151A", self.window.home_page.styleSheet())
+        self.assertIn("#151617", theme.manager().current_stylesheet)
+        self.assertIn("#151617", self.window.home_page.styleSheet())
 
     def test_sidebar_collapse_and_window_geometry_persist(self) -> None:
         self.window.sidebar.set_collapsed(True, emit=True)
@@ -87,11 +87,11 @@ class UiRedesignGuiTests(unittest.TestCase):
         self.assertEqual(self.window.sidebar.width(), self.window.sidebar.COLLAPSED_WIDTH)
         self.assertTrue(Settings.load().sidebar_collapsed)
 
-        for w, h in ((860, 600), (1120, 760), (1440, 900)):
+        for w, h in ((800, 540), (960, 640), (1120, 760), (1440, 900)):
             self.window.resize(w, h)
             self.app.processEvents()
-            self.assertGreaterEqual(self.window.width(), 860)
-            self.assertGreaterEqual(self.window.height(), 600)
+            self.assertGreaterEqual(self.window.width(), 800)
+            self.assertGreaterEqual(self.window.height(), 540)
 
     def test_command_palette_filters_and_navigates(self) -> None:
         def drive_dialog() -> None:

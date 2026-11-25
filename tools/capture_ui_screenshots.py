@@ -45,7 +45,7 @@ def verify_layout_geometry(scale: str = "1.0") -> dict[str, str]:
             theme.apply(app, theme.THEME_DARK)
             mgr = ServiceManager(settings)
             win = MainWindow(mgr, settings, tray_available=False)
-            for width, height in ((860, 600), (1120, 760), (1440, 900)):
+            for width, height in ((800, 540), (960, 640), (1440, 900)):
                 win.resize(width, height)
                 win.show()
                 app.processEvents()
@@ -81,7 +81,7 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             mgr = ServiceManager(settings)
             mgr._quick_url = "https://mcp-preview.trycloudflare.com/mcp"
             win = MainWindow(mgr, settings, tray_available=False)
-            win.resize(1120, 760)
+            win.resize(960, 640)
             win.show()
             app.processEvents()
 
@@ -175,7 +175,7 @@ def main() -> int:
         print(f"DPI check scale={res['scale']}: {res['status']}")
         return 0
 
-    for scale in ("1.0", "1.25", "1.5", "2.0"):
+    for scale in ("1.0", "1.25", "1.5", "1.75", "2.0"):
         env = dict(os.environ)
         env["QT_SCALE_FACTOR"] = scale
         subprocess.run(

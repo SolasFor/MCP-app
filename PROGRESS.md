@@ -14,16 +14,44 @@
 | 8. Computer Use | v0.9.6 | VERIFIED | [PR #27](https://github.com/SolasFor/MCP-app/pull/27), коммит `e5837ef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45580710966), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45580711115) |
 | 9. Extensions | v0.9.7 | VERIFIED | [PR #28](https://github.com/SolasFor/MCP-app/pull/28), коммит `62c6708`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45588509164), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45588509142) |
 | 10. Remote Management | v0.9.8 | VERIFIED | [PR #29](https://github.com/SolasFor/MCP-app/pull/29), коммит `72f98de`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45595306144), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45595303716) |
-| 11. Automation & Monitoring | v0.9.9 | TODO | — |
-| 12. Stable Release | v1.0.0 | TODO | — |
+| 11. Automation & Monitoring | v0.9.9 | VERIFIED | [PR #30](https://github.com/SolasFor/MCP-app/pull/30), коммит `a7827cc`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45612560560), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45612560580) |
+| 12. Stable Release | v1.0.0 | IN_PROGRESS | Ветка `release/v1.0.0` |
 
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/remote-management`, `72f98de` (stacked на `feat/extensions` / PR #28).
-- Статус Этапа 10 (`v0.9.8 — Remote Management`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#29 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/automation-monitoring`, `a7827cc` (stacked на `feat/remote-management` / PR #29).
+- Статус Этапа 11 (`v0.9.9 — Automation & Monitoring`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#30 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/automation-monitoring` от `feat/remote-management` и реализовать Этап 11 (`v0.9.9 — Automation & Monitoring`).
+- Следующее действие: отвести ветку `release/v1.0.0` от `feat/automation-monitoring` и выполнить Этап 12 (`v1.0.0 — Stable Release`).
+
+## Этап 11: v0.9.9 — Automation & Monitoring (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 11 / `v0.9.9` / `feat/automation-monitoring` / `a7827cc`
+- Реализованные задачи:
+  - Пакет `backend/automation/` (`{__init__,scheduler,monitoring,admin_api,backup_updater}.py`):
+    - `scheduler.py`: 5-полевой cron с поддержкой TZ/DST (`resolve_timezone`, `ZoneInfo`, корректный UTC-fallback при отсутствии `tzdata`), интервалы, `startup` и `event`-триггеры; политики пропусков (`skip` / `coalesce` / `run_once`), конкурентности (`forbid` / `allow`), идемпотентность (`idempotency_key`), запрет автоповторов при `safe_retry=False`, живая перепроверка прав с автопаузой при отзыве (`paused_revoked`), запрет мутации расписаний не-владельцу без `full`.
+    - `monitoring.py`: потокобезопасный `MetricsRegistry` (счётчики, ошибки, `avg_ms` / `p95_ms`), системный срез `psutil` (`collect_system_snapshot`), фильтрация и ротация аудита (`filter_audit_entries`, `prune_audit_file`), экспорт `export_redacted_diagnostics`.
+    - `admin_api.py`: строго изолированный от публичных туннелей локальный Admin REST API (`/api/v1/monitoring`, `/api/v1/schedules`, `/api/v1/schedules/{id}/run`, `/api/v1/diagnostics/export`), принимающий только loopback (`127.0.0.1` / `localhost` / `::1`), отклоняющий заголовки туннелей (`Cf-Ray`, `X-Forwarded-For`, `Ngrok-Trace-Id`, `Tailscale-User-Login`) с `403` и требующий скоупированный bearer/`X-MCP-Admin-Token` (`401`/`403`).
+    - `backup_updater.py`: `BackupManager` (schema `v1`, исключение секретов/vault/OAuth по умолчанию, явное предупреждение о непереносимости DPAPI, защита от zip-slip/symlink/подмены SHA-256, атомарное восстановление + откат `.pre_restore_backup.zip`) и `StagedUpdater` (разбор GitHub Releases, проверка SHA-256 + Ed25519, откат установки и постоянно выключенный `auto_install_enabled = False`).
+  - Интеграция в ядро и UI: `backend/tool_permissions.py`, `backend/server.py` (`METRICS_REGISTRY`, `AUTOMATION_SCHEDULER`, `build_local_admin_app`, `invoke_playground_tool`), `main.py --headless`, `ServiceManager.automation_dir`, `app/selftest.py`, `packaging/mcp_app.spec`, страница `app/ui/pages/automation_page.py` (4 вкладки: Расписание, Мониторинг, MCP Playground с предупреждением о LIVE-выполнении, Бэкап/Обновления), `MainWindow` (перевод `automation` в активное меню — 13/13 разделов, 0 upcoming), устранение утечки сигналов и лишней перерисовки стиля Fusion (`app/ui/{theme,main_window,tray}.py`), `i18n.py` (616 ключей RU/EN с 100% паритетом), `docs/automation-monitoring.md` (включая Session 0 separation).
+- Оставшиеся задачи и зависимости: последовательный merge [PR #30](https://github.com/SolasFor/MCP-app/pull/30) в `main` после PR #20–#29; переход к Этапу 12 (`v1.0.0`).
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.9`), `main.py`, `packaging/mcp_app.spec`, `backend/automation/`, `backend/{tool_permissions,server}.py`, `app/core/service_manager.py`, `app/selftest.py`, `app/ui/{i18n,main_window,theme,tray}.py`, `app/ui/components/sidebar.py`, `app/ui/pages/{__init__,automation_page}.py`, `docs/automation-monitoring.md`, `README.md`, `tests/unit/test_automation_security.py`, `tests/integration/{test_automation_monitoring,test_ui_redesign_gui,test_unified_home_gui}.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff`, `mypy` (win32 + `--platform linux`): PASS (67 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей); `i18n` parity: PASS (616 ключей)
+    - `tests/unit`: PASS (163/163 — cron/DST, misfire/concurrency/idempotency/safe-retry/revoke, отрицательные проверки Admin REST API, redacted diagnostics, zip-slip/tamper backup, неподписанные/битые обновления)
+    - `tests/integration`: PASS (47/47 за 147.475s; всего 210/210 — живой `build_local_admin_app` + `invoke_playground_tool`, `BackupManager` + `StagedUpdater` Ed25519 rollback, живой `main.py --headless` `/health` 200, headless `AutomationPage` RU/EN)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.9-portable.zip` 67.0 MB, живой frozen `MCPApp.exe --headless` `/health` 200 `FROZEN_HEADLESS_OK`)
+  - GitHub Actions CI на `a7827cc`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`1m54s`) — https://github.com/SolasFor/MCP-app/actions/runs/45612560560/job/139199584143
+    - `Verify & Test (windows-latest)`: PASS (`5m3s`) — https://github.com/SolasFor/MCP-app/actions/runs/45612560560/job/139199583547
+    - `windows-package` (`RC Windows installer (no publish)`): PASS (`2m39s`) — https://github.com/SolasFor/MCP-app/actions/runs/45612560580/job/139199584501
+- Live tests отдельно от mocks: реальный локальный `--headless` (source и frozen `MCPApp.exe`), реальный HTTP `/api/v1/*`, Playground и Ed25519 stage/apply/rollback — **PASS**; проверка реальных GitHub Releases по сети и Windows Service Session 0 вручную не разворачивались (чтобы не менять службы ОС владельца).
+- Риски / ограничения / блокеры: автоустановка обновлений остаётся отключённой до появления доверенного Authenticode-сертификата; DPAPI-секреты непереносимы между учётными записями/ПК и не включаются в резервные копии.
+- PR / релиз: [PR #30](https://github.com/SolasFor/MCP-app/pull/30) (`feat/automation-monitoring` → `feat/remote-management`).
+- Следующий точный шаг: Этап 12 (`v1.0.0 — Stable Release`) на ветке `release/v1.0.0`.
+
 
 ## Этап 10: v0.9.8 — Remote Management (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 10 / `v0.9.8` / `feat/remote-management` / `72f98de`

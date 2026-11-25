@@ -1,6 +1,6 @@
 [project]
 name = "mcp-app"
-version = "0.9.0"
+version = "0.9.1"
 description = "Windows desktop MCP server, gateway, and tunnel manager"
 requires-python = ">=3.12"
 
@@ -27,6 +27,7 @@ files = [
     "app/core/secret_store.py",
     "app/core/redaction.py",
     "app/core/reconnect.py",
+    "app/core/tunnels",
     "app/ui/tokens.py",
     "app/ui/i18n.py",
     "backend/process_runner.py",

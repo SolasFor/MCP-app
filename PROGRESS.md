@@ -10,7 +10,7 @@
 | 4. MCP Gateway | v0.9.2 | VERIFIED | [PR #23](https://github.com/SolasFor/MCP-app/pull/23), коммит `87e7fef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45563300320), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45563300338) |
 | 5. Task Manager | v0.9.3 | VERIFIED | [PR #24](https://github.com/SolasFor/MCP-app/pull/24), коммит `2ccd259`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45567201054), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45567201051) |
 | 6. Server Manager | v0.9.4 | VERIFIED | [PR #25](https://github.com/SolasFor/MCP-app/pull/25), коммит `f5c87b1`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45571994338), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45571994344) |
-| 7. Workspaces | v0.9.5 | TODO | — |
+| 7. Workspaces | v0.9.5 | VERIFIED | [PR #26](https://github.com/SolasFor/MCP-app/pull/26), коммит `d8f7f7a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45574728778), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45574728818) |
 | 8. Computer Use | v0.9.6 | TODO | — |
 | 9. Extensions | v0.9.7 | TODO | — |
 | 10. Remote Management | v0.9.8 | TODO | — |
@@ -20,10 +20,36 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/server-manager`, `f5c87b1` (stacked на `feat/task-manager` / PR #24).
-- Статус Этапа 6 (`v0.9.4 — Server Manager`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#25 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/workspaces`, `d8f7f7a` (stacked на `feat/server-manager` / PR #25).
+- Статус Этапа 7 (`v0.9.5 — Workspaces`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#26 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/workspaces` от `feat/server-manager` и реализовать Этап 7 (`v0.9.5 — Workspaces`).
+- Следующее действие: отвести ветку `feat/computer-use` от `feat/workspaces` и реализовать Этап 8 (`v0.9.6 — Computer Use`).
+
+## Этап 7: v0.9.5 — Workspaces (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 7 / `v0.9.5` / `feat/workspaces` / `d8f7f7a`
+- Реализованные задачи:
+  - Реализован пакет `backend/workspaces/` (`{__init__,models,path_security,history,store,git_ops,manager}.py`): реестр `workspaces.json` с автоопределением языка/Git root/Python `.venv`/Node и команд (`detect_workspace_metadata`), DPAPI-секретами env (`secret://workspaces/<ws>__<KEY>`, namespace `workspaces` в `app/core/secret_store.py`), экспортом/импортом без секретов и связью с серверами/задачами/расширениями.
+  - Безопасность путей Windows/POSIX (`backend/workspaces/path_security.py`): запрет `..` traversal, абсолютных путей, UNC (`\\...`), префиксов устройств (`\\?\`, `\\.\`), зарезервированных имён Windows (`CON`, `NUL`, `COM1..9`, `LPT1..9`), NTFS ADS (`:`), чувствительных файлов (`.env*`, `.git`, ключи/сертификаты), symlink и Windows NTFS junctions (`FILE_ATTRIBUTE_REPARSE_POINT`) на каждом сегменте; проверка фактически открытого дескриптора (`GetFinalPathNameByHandleW` на Windows и `fstat`/`lstat` на POSIX); атомарная запись (`os.replace`) с обязательным `expected_sha256` precondition для защиты от перезаписи пользовательских правок, `.gitignore` и пользовательские исключения, локальные снимки и откат (`WorkspaceHistory`).
+  - Безопасный Git (`backend/workspaces/git_ops.py`): запуск без окон консоли (`CREATE_NO_WINDOW`) и с подавлением недоверенных hooks/filters (`core.hooksPath`, `core.fsmonitor=false`, `credential.helper=`, `--no-verify`) при `trust_git_hooks=False` (по умолчанию).
+  - Гранулярные права по проектам и клиентам (`read`, `write`, `delete`, `execute`, `git`), добавление 18 OAuth-инструментов (`12 workspace_*` + `6 git_*`) в `backend/tool_registry.py` и `backend/server.py`, изоляция `ServiceManager` и `app/selftest.py`.
+  - Создана страница `app/ui/pages/workspaces_page.py` (`WorkspacesPage`, `WorkspaceProfileDialog` с автоопределением, дерево файлов, поиск по файлам, статус Git, запуск именованных задач, экспорт без секретов), раздел переведён в активное меню `Ctrl+7` (исправлена привязка горячих клавиш для >9 вкладок в `app/ui/main_window.py`, RU/EN `app/ui/i18n.py`), добавлена документация `docs/workspaces.md` (с честным указанием, что Full Access CMD/PowerShell не изолирован) и ссылка в `README.md`.
+- Оставшиеся задачи и зависимости: последовательный merge [PR #26](https://github.com/SolasFor/MCP-app/pull/26) после PR #20–#25.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.5`), `packaging/mcp_app.spec`, `app/core/{secret_store,service_manager}.py`, `app/selftest.py`, `app/ui/{i18n,main_window}.py`, `app/ui/pages/{__init__,workspaces_page}.py`, `backend/workspaces/`, `backend/{tool_registry,server}.py`, `docs/workspaces.md`, `README.md`, `tests/unit/{test_workspaces_security,test_tool_permissions}.py`, `tests/integration/{test_workspaces,test_tool_registry,test_oauth_http,test_ui_redesign_gui,test_unified_home_gui}.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend tests main.py`, `mypy` (win32 + `--platform linux`): PASS (44 файла, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (145/145 за 10.729s — включая traversal, UNC, ADS, reserved names, `.env`/`.git`, Windows NTFS junction escape `mklink /J`, конфликт `expected_sha256` без потери правки пользователя, откат, `.gitignore`, подавление Git pre-commit hook)
+    - `tests/integration`: PASS (34/34 за 144.946s; всего 179/179 — включая реальный Python-проект + реальный `venv.create` + реальный `git init`, поиск, `apply_patch`, diff снимка, запуск unit-тестов в `.venv` с редактированием секрета, `move`/`delete`, `git_checkout`/`git_commit`/`git_log`, кросс-клиентскую изоляцию и headless `WorkspacesPage` GUI)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.5-portable.zip` 66.8 MB)
+  - GitHub Actions CI на `d8f7f7a`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`1m29s`) — https://github.com/SolasFor/MCP-app/actions/runs/45574728778/job/139069717418
+    - `Verify & Test (windows-latest)`: PASS (`4m25s`) — https://github.com/SolasFor/MCP-app/actions/runs/45574728778/job/139069716931
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m30s`) — https://github.com/SolasFor/MCP-app/actions/runs/45574728818/job/139069717623
+- Live tests отдельно от mocks: реальные локальные файлы, реальные Windows NTFS junctions (`mklink /J`), реальные Python venv, `git`, и headless Qt `WorkspacesPage` — **PASS**.
+- Риски / ограничения / блокеры: специализированные инструменты защищены каноническими проверками путей и открытых дескрипторов, однако режим `full` (`oauth_windows_command`) выполняется с правами текущего пользователя Windows и не является OS-песочницей; сборка без Authenticode-сертификата.
+- PR / релиз: [PR #26](https://github.com/SolasFor/MCP-app/pull/26) (`feat/workspaces` → `feat/server-manager`).
+- Следующий точный шаг: Этап 8 (`v0.9.6 — Computer Use`) на ветке `feat/computer-use`.
 
 ## Этап 6: v0.9.4 — Server Manager (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 6 / `v0.9.4` / `feat/server-manager` / `f5c87b1`

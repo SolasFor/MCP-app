@@ -25,6 +25,8 @@ if not cloudflared.is_file():
 datas = [(str(cloudflared), "bin")]
 if (ROOT / "assets").is_dir():
     datas.append((str(ROOT / "assets"), "assets"))
+if (ROOT / "extensions_official").is_dir():
+    datas.append((str(ROOT / "extensions_official"), "extensions_official"))
 
 # Сервер импортируется лениво (только в режиме --backend), а uvicorn и mcp подгружают
 # часть модулей через importlib — PyInstaller их не видит без подсказки.
@@ -50,6 +52,7 @@ hiddenimports = [
     *collect_submodules("backend.servers"),
     *collect_submodules("backend.workspaces"),
     *collect_submodules("backend.desktop"),
+    *collect_submodules("backend.extensions"),
     *collect_submodules("app.ui"),
     *collect_submodules("uvicorn"),
     *collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli")),

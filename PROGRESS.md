@@ -12,7 +12,7 @@
 | 6. Server Manager | v0.9.4 | VERIFIED | [PR #25](https://github.com/SolasFor/MCP-app/pull/25), коммит `f5c87b1`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45571994338), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45571994344) |
 | 7. Workspaces | v0.9.5 | VERIFIED | [PR #26](https://github.com/SolasFor/MCP-app/pull/26), коммит `d8f7f7a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45574728778), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45574728818) |
 | 8. Computer Use | v0.9.6 | VERIFIED | [PR #27](https://github.com/SolasFor/MCP-app/pull/27), коммит `e5837ef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45580710966), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45580711115) |
-| 9. Extensions | v0.9.7 | TODO | — |
+| 9. Extensions | v0.9.7 | VERIFIED | [PR #28](https://github.com/SolasFor/MCP-app/pull/28), коммит `62c6708`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45588509164), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45588509142) |
 | 10. Remote Management | v0.9.8 | TODO | — |
 | 11. Automation & Monitoring | v0.9.9 | TODO | — |
 | 12. Stable Release | v1.0.0 | TODO | — |
@@ -20,10 +20,39 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/computer-use`, `e5837ef` (stacked на `feat/workspaces` / PR #26).
-- Статус Этапа 8 (`v0.9.6 — Computer Use`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#27 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/extensions`, `62c6708` (stacked на `feat/computer-use` / PR #27).
+- Статус Этапа 9 (`v0.9.7 — Extensions`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#28 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/extensions` от `feat/computer-use` и реализовать Этап 9 (`v0.9.7 — Extensions`).
+- Следующее действие: отвести ветку `feat/remote-management` от `feat/extensions` и реализовать Этап 10 (`v0.9.8 — Remote Management`).
+
+## Этап 9: v0.9.7 — Extensions (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 9 / `v0.9.7` / `feat/extensions` / `62c6708`
+- Реализованные задачи:
+  - Реализован пакет `backend/extensions/` (`{__init__,models,sdk,packaging,store,runtime,manager}.py`):
+    - Версионируемый SDK (`ExtensionApp`, `SDK_API_VERSION="1.0"`, совместимость `1.0..1.2`, JSON-RPC 2.0 по newline-delimited stdio без импортов GUI/OAuth ядра).
+    - Безопасная проверка и распаковка ZIP (`verify_and_extract_zip`): отклонение path traversal (`..`), абсолютных путей, symlink-записей, дубликатов и лимитов размера/файлов; fail-closed доверие только по **Ed25519-подписи** (`CHECKSUMS.sha256` + `SIGNATURE.ed25519` против `trusted_keys.json`) либо явному владельческому **SHA-256 пину** + подтверждению владельца.
+    - Отдельный дочерний процесс `ExtensionProcessHost` с очищенным окружением (`MCPApp.exe --run-extension <entrypoint>` в frozen-сборке и `python -u` в dev), `CREATE_NO_WINDOW`, изолированным каталогом `data/<id>` (сохраняемым при отключении/обновлении/откате), резервной копией и откатом (`backups/<id>/<version>`), детектированием сбоя и автоматическим перезапуском воркера без падения ядра, секретами только для объявленных `secret_keys` (`SecretStore("extensions")`) и редактированием логов.
+  - Создан локальный официальный каталог `extensions_official/`: `system_monitor` (`psutil`), `git_manager` (подавление hooks `core.hooksPath=`), `docker_manager` (честная проверка Docker CLI/daemon), `browser_automation` (валидация `http`/`https` и изолированные профили) и `starter_template`.
+  - Добавлены 6 OAuth-инструментов `extension_*` в `backend/tool_registry.py` и `backend/server.py` (`extension_list`, `extension_info`, `extension_call_tool`, `extension_logs` — `allowlist`; `extension_enable`, `extension_disable` — `full`), интеграция с `ServiceManager.extensions_dir()` / `MCP_EXTENSIONS_DIR` и `app/selftest.py`.
+  - Создана страница `app/ui/pages/extensions_page.py` (`ExtensionsPage`, диалоги ZIP/SHA-256 и прав), раздел «Расширения» переведён в активное меню (`app/ui/main_window.py`, RU/EN `app/ui/i18n.py`), добавлена документация `docs/extensions.md` и ссылка в `README.md`.
+- Оставшиеся задачи и зависимости: последовательный merge [PR #28](https://github.com/SolasFor/MCP-app/pull/28) после PR #20–#27.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.7`), `main.py`, `packaging/mcp_app.spec`, `app/core/{secret_store,service_manager}.py`, `app/selftest.py`, `app/ui/{i18n,main_window}.py`, `app/ui/pages/{__init__,extensions_page}.py`, `backend/extensions/`, `extensions_official/`, `backend/{tool_registry,server}.py`, `docs/extensions.md`, `README.md`, `tests/unit/{test_extensions_security,test_tool_permissions}.py`, `tests/integration/{test_extensions,test_tool_registry,test_oauth_http,test_ui_redesign_gui,test_unified_home_gui}.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend extensions_official tests tools main.py`, `mypy` (win32 + `--platform linux`): PASS (57 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (152/152 за 12.006s — валидация manifest/api_version, traversal/symlink/подмена/недоверенный ключ Ed25519, отказ без SHA-256 пина, изоляция секретов и кросс-клиентских/инструментальных прав)
+    - `tests/integration`: PASS (39/39; всего 191/191 — реальная установка подписанного ZIP без пересборки ядра, JSON-RPC IPC, сохранение `data/<id>` при disable/update/rollback, восстановление после падения воркера, `system_monitor`, `git_manager`, OAuth `extension_*` и headless `ExtensionsPage` GUI)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.7-portable.zip` 66.9 MB; живой тест frozen `MCPApp.exe --run-extension ...system_monitor/main.py` → `FROZEN_WORKER_OK 12`)
+  - GitHub Actions CI на `62c6708`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`2m24s`) — https://github.com/SolasFor/MCP-app/actions/runs/45588509164/job/139116198545
+    - `Verify & Test (windows-latest)`: PASS (`6m4s`) — https://github.com/SolasFor/MCP-app/actions/runs/45588509164/job/139116197776
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m26s`) — https://github.com/SolasFor/MCP-app/actions/runs/45588509142/job/139116199040
+- Live tests отдельно от mocks: реальные дочерние процессы Python и собранный `MCPApp.exe --run-extension` (`system_monitor` / `git_manager`), реальная генерация/проверка Ed25519 ZIP — **PASS**; `ExtensionsPage` проверялся через `QT_QPA_PLATFORM=offscreen`.
+- Риски / ограничения / блокеры: отдельный OS-процесс изолирует падения и секреты/env ядра, но НЕ является песочницей ОС (явно зафиксировано в UI и `docs/extensions.md`). Опциональные CAD (`SolidWorks`, `КОМПАС-3D`, `Mathcad`) и `Database Manager` не входят в базовые расширения (`BLOCKED`/опционально; SolidWorks поддерживается через Gateway). Сборка без Authenticode-сертификата.
+- PR / релиз: [PR #28](https://github.com/SolasFor/MCP-app/pull/28) (`feat/extensions` → `feat/computer-use`).
+- Следующий точный шаг: Этап 10 (`v0.9.8 — Remote Management`) на ветке `feat/remote-management`.
+
 
 ## Этап 8: v0.9.6 — Computer Use (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 8 / `v0.9.6` / `feat/computer-use` / `e5837ef`

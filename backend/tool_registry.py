@@ -118,10 +118,43 @@ DESKTOP_TOOLS = frozenset({
     DT_DRAG,
     DT_WAIT_FOR_ELEMENT,
 })
+EXT_LIST = "extension_list"
+EXT_INFO = "extension_info"
+EXT_CALL_TOOL = "extension_call_tool"
+EXT_ENABLE = "extension_enable"
+EXT_DISABLE = "extension_disable"
+EXT_LOGS = "extension_logs"
+EXTENSION_TOOLS = frozenset({
+    EXT_LIST,
+    EXT_INFO,
+    EXT_CALL_TOOL,
+    EXT_ENABLE,
+    EXT_DISABLE,
+    EXT_LOGS,
+})
+EXTENSION_ALLOWLIST_TOOLS = frozenset({EXT_LIST, EXT_INFO, EXT_CALL_TOOL, EXT_LOGS})
+EXTENSION_FULL_TOOLS = frozenset({EXT_ENABLE, EXT_DISABLE})
 BASIC_TOOLS = frozenset({"server_info"})
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS
-FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
+EXEC_TOOLS = (
+    frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
+    | TASK_TOOLS
+    | SERVER_TOOLS
+    | WORKSPACE_TOOLS
+    | GIT_TOOLS
+    | DESKTOP_TOOLS
+    | EXTENSION_TOOLS
+)
+OAUTH_TOOLS = (
+    BASIC_TOOLS
+    | {EXEC_WINDOWS, EXEC_SSH}
+    | TASK_TOOLS
+    | SERVER_TOOLS
+    | WORKSPACE_TOOLS
+    | GIT_TOOLS
+    | DESKTOP_TOOLS
+    | EXTENSION_ALLOWLIST_TOOLS
+)
+FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED} | EXTENSION_FULL_TOOLS
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
@@ -171,6 +204,14 @@ class ToolRegistry:
         for dt_tool in sorted(DESKTOP_TOOLS):
             self.register(
                 ToolSpec(dt_tool, "desktop", min_profile="allowlist", requires_execution=True)
+            )
+        for ext_tool in sorted(EXTENSION_ALLOWLIST_TOOLS):
+            self.register(
+                ToolSpec(ext_tool, "extensions", min_profile="allowlist", requires_execution=True)
+            )
+        for ext_full_tool in sorted(EXTENSION_FULL_TOOLS):
+            self.register(
+                ToolSpec(ext_full_tool, "extensions", min_profile="full", requires_execution=True)
             )
 
     def register(self, spec: ToolSpec) -> None:

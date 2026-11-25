@@ -49,6 +49,7 @@ if __package__:
         UnavailableDesktopBackend,
         Win32DesktopBackend,
     )
+    from .extensions import ExtensionManager, ExtensionStore
     from .tool_registry import (
         DT_CLICK,
         DT_CLOSE_WINDOW,
@@ -63,6 +64,12 @@ if __package__:
         DT_SCROLL,
         DT_TYPE,
         DT_WAIT_FOR_ELEMENT,
+        EXT_CALL_TOOL,
+        EXT_DISABLE,
+        EXT_ENABLE,
+        EXT_INFO,
+        EXT_LIST,
+        EXT_LOGS,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -133,6 +140,7 @@ else:
         UnavailableDesktopBackend,
         Win32DesktopBackend,
     )
+    from extensions import ExtensionManager, ExtensionStore
     from tool_registry import (
         DT_CLICK,
         DT_CLOSE_WINDOW,
@@ -147,6 +155,12 @@ else:
         DT_SCROLL,
         DT_TYPE,
         DT_WAIT_FOR_ELEMENT,
+        EXT_CALL_TOOL,
+        EXT_DISABLE,
+        EXT_ENABLE,
+        EXT_INFO,
+        EXT_LIST,
+        EXT_LOGS,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -333,6 +347,18 @@ _DESKTOP_BACKEND: DesktopBackend = (
 DESKTOP_MANAGER = DesktopManager(
     DESKTOP_POLICY_STORE,
     _DESKTOP_BACKEND,
+    redactor=REDACTOR,
+)
+_EXTENSIONS_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "extensions"
+)
+EXTENSION_STORE = ExtensionStore(
+    Path(os.environ.get("MCP_EXTENSIONS_DIR") or _EXTENSIONS_DEFAULT_DIR),
+    secret_store=_SERVER_SECRET_STORE,
+)
+EXTENSION_MANAGER = ExtensionManager(
+    EXTENSION_STORE,
     redactor=REDACTOR,
 )
 GATEWAY_ROUTER = GatewayRouter(
@@ -1983,6 +2009,103 @@ async def desktop_wait_for_element(
         return _desktop_call_error(exc)
 
 
+def _ext_call_error(exc: Exception) -> dict:
+    if isinstance(exc, PermissionError):
+        return {"error": f"Extension denied: {exc}"}
+    return {"error": REDACTOR.redact_text(str(exc)) or type(exc).__name__}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_list(query: str = "") -> dict:
+    """List installed extensions and the local official catalog."""
+    require_execution_permission(
+        EXT_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    try:
+        return await asyncio.to_thread(
+            lambda: {
+                "installed": EXTENSION_MANAGER.list_extensions(query=query),
+                "catalog": EXTENSION_MANAGER.list_catalog(query=query),
+            }
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _ext_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_info(extension_id: str) -> dict:
+    """Inspect metadata, permissions, tools, and worker status for one installed extension."""
+    require_execution_permission(
+        EXT_INFO, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    try:
+        return await asyncio.to_thread(EXTENSION_MANAGER.info, extension_id)
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ext_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_call_tool(
+    extension_id: str,
+    tool_name: str,
+    arguments: dict | None = None,
+) -> dict:
+    """Invoke a tool provided by an enabled extension under client and permission checks."""
+    client_id = require_execution_permission(
+        EXT_CALL_TOOL, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            EXTENSION_MANAGER.call_tool,
+            extension_id,
+            tool_name,
+            arguments or {},
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, TimeoutError) as exc:
+        return _ext_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_enable(extension_id: str) -> dict:
+    """Enable an installed extension and start its isolated worker process (Full profile)."""
+    require_execution_permission(
+        EXT_ENABLE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    try:
+        return await asyncio.to_thread(EXTENSION_MANAGER.enable, extension_id)
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ext_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_disable(extension_id: str) -> dict:
+    """Disable an installed extension and stop its worker process (Full profile)."""
+    require_execution_permission(
+        EXT_DISABLE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    try:
+        return await asyncio.to_thread(EXTENSION_MANAGER.disable, extension_id)
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ext_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def extension_logs(extension_id: str, tail: int = 80) -> dict:
+    """Read redacted logs from an installed extension worker process."""
+    require_execution_permission(
+        EXT_LOGS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    try:
+        lines = await asyncio.to_thread(EXTENSION_MANAGER.get_logs, extension_id, tail=tail)
+        return {"extension_id": extension_id, "lines": lines}
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _ext_call_error(exc)
+
+
 @_conditional_tool(OAUTH_ENABLED)
 async def oauth_ssh_command(
     host: str, command: str, user: str = "", port: int = 22, timeout: int = 12,
@@ -2485,6 +2608,7 @@ def main() -> None:
             asyncio.run(GATEWAY_ROUTER.close_all())
         except Exception:
             pass
+        EXTENSION_MANAGER.shutdown_all()
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()
 

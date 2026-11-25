@@ -7,4 +7,4 @@ APP_ID = "MCPApp"
 # Прежнее имя (SouronMCP): из его папки и ключа автозапуска переносятся данные.
 LEGACY_APP_ID = "SouronMCP"
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"

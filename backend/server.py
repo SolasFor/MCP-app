@@ -50,6 +50,7 @@ if __package__:
         Win32DesktopBackend,
     )
     from .extensions import ExtensionManager, ExtensionStore
+    from .remote import DeviceStore, RemoteManager, SSHConnectionError
     from .tool_registry import (
         DT_CLICK,
         DT_CLOSE_WINDOW,
@@ -70,6 +71,18 @@ if __package__:
         EXT_INFO,
         EXT_LIST,
         EXT_LOGS,
+        RM_DEVICE_HEALTH,
+        RM_DEVICE_INFO,
+        RM_DEVICE_LIST,
+        RM_METRICS,
+        RM_SFTP_DOWNLOAD,
+        RM_SFTP_LIST,
+        RM_SFTP_UPLOAD,
+        RM_SSH_EXECUTE,
+        RM_SSH_TASK_START,
+        RM_SVC_LIST,
+        RM_SVC_START,
+        RM_SVC_STOP,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -141,6 +154,7 @@ else:
         Win32DesktopBackend,
     )
     from extensions import ExtensionManager, ExtensionStore
+    from remote import DeviceStore, RemoteManager, SSHConnectionError
     from tool_registry import (
         DT_CLICK,
         DT_CLOSE_WINDOW,
@@ -161,6 +175,18 @@ else:
         EXT_INFO,
         EXT_LIST,
         EXT_LOGS,
+        RM_DEVICE_HEALTH,
+        RM_DEVICE_INFO,
+        RM_DEVICE_LIST,
+        RM_METRICS,
+        RM_SFTP_DOWNLOAD,
+        RM_SFTP_LIST,
+        RM_SFTP_UPLOAD,
+        RM_SSH_EXECUTE,
+        RM_SSH_TASK_START,
+        RM_SVC_LIST,
+        RM_SVC_START,
+        RM_SVC_STOP,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -359,6 +385,18 @@ EXTENSION_STORE = ExtensionStore(
 )
 EXTENSION_MANAGER = ExtensionManager(
     EXTENSION_STORE,
+    redactor=REDACTOR,
+)
+_REMOTE_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "remote"
+)
+REMOTE_STORE = DeviceStore(
+    Path(os.environ.get("MCP_DEVICES_CONFIG_PATH") or (_REMOTE_DEFAULT_DIR / "devices.json")),
+    secret_store=_SERVER_SECRET_STORE,
+)
+REMOTE_MANAGER = RemoteManager(
+    REMOTE_STORE,
     redactor=REDACTOR,
 )
 GATEWAY_ROUTER = GatewayRouter(
@@ -2106,6 +2144,265 @@ async def extension_logs(extension_id: str, tail: int = 80) -> dict:
         return _ext_call_error(exc)
 
 
+def _remote_call_error(exc: Exception) -> dict:
+    if isinstance(exc, PermissionError):
+        return {"error": f"Remote access denied: {exc}"}
+    return {"error": REDACTOR.redact_text(str(exc)) or type(exc).__name__}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def device_list(group: str = "") -> dict:
+    """List remote SSH/SFTP device profiles accessible to the caller."""
+    client_id = require_execution_permission(
+        RM_DEVICE_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.list_devices,
+            group=group,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def device_info(device_id: str) -> dict:
+    """Inspect a configured remote device profile and recent redacted logs."""
+    client_id = require_execution_permission(
+        RM_DEVICE_INFO, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.device_info,
+            device_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def device_health(device_id: str) -> dict:
+    """Probe remote SSH reachability with strict known_hosts host-key verification."""
+    client_id = require_execution_permission(
+        RM_DEVICE_HEALTH, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.device_health,
+            device_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, TimeoutError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def ssh_execute(device_id: str, command: str, timeout: int = 12) -> dict:
+    """Execute an SSH command on a named device profile under strict host-key & profile checks."""
+    client_id = require_execution_permission(
+        RM_SSH_EXECUTE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            REMOTE_MANAGER.ssh_execute,
+            device_id,
+            command,
+            timeout=timeout,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile_mode,
+            event="completed", command=command, host=device_id,
+            exit_code=res.get("exit_code"),
+        )
+        return res
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, TimeoutError, SSHConnectionError) as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="ssh", profile=profile_mode,
+            event="denied" if isinstance(exc, PermissionError) else "failed",
+            command=command, host=device_id,
+        )
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def ssh_task_start(device_id: str, command: str, timeout: int = 60) -> dict:
+    """Start an asynchronous remote SSH job (disconnects fail honestly without fake resume)."""
+    client_id = require_execution_permission(
+        RM_SSH_TASK_START, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.ssh_task_start,
+            device_id,
+            command,
+            timeout=timeout,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def sftp_list(device_id: str, path: str) -> dict:
+    """List remote directory contents inside configured allowed SFTP roots."""
+    client_id = require_execution_permission(
+        RM_SFTP_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.sftp_list,
+            device_id,
+            path,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def sftp_download(device_id: str, path: str, as_base64: bool = False) -> dict:
+    """Download a bounded file inside allowed SFTP roots (symlinks rejected)."""
+    client_id = require_execution_permission(
+        RM_SFTP_DOWNLOAD, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.sftp_download,
+            device_id,
+            path,
+            as_base64=as_base64,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def sftp_upload(device_id: str, path: str, content: str, encoding: str = "utf-8") -> dict:
+    """Upload bounded content into an allowed remote SFTP directory."""
+    client_id = require_execution_permission(
+        RM_SFTP_UPLOAD, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.sftp_upload,
+            device_id,
+            path,
+            content,
+            encoding=encoding,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def remote_service_list(device_id: str) -> dict:
+    """List remote OS services (without automatic sudo elevation)."""
+    client_id = require_execution_permission(
+        RM_SVC_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.remote_service_list,
+            device_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def remote_service_start(device_id: str, service_name: str) -> dict:
+    """Start an allowed remote service using configured device user rights."""
+    client_id = require_execution_permission(
+        RM_SVC_START, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.remote_service_action,
+            device_id,
+            service_name,
+            "start",
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def remote_service_stop(device_id: str, service_name: str) -> dict:
+    """Stop an allowed remote service using configured device user rights."""
+    client_id = require_execution_permission(
+        RM_SVC_STOP, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.remote_service_action,
+            device_id,
+            service_name,
+            "stop",
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def remote_metrics(device_id: str) -> dict:
+    """Read remote host CPU/RAM/disk/uptime metrics over strict SSH."""
+    client_id = require_execution_permission(
+        RM_METRICS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            REMOTE_MANAGER.remote_metrics,
+            device_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
+        return _remote_call_error(exc)
+
+
 @_conditional_tool(OAUTH_ENABLED)
 async def oauth_ssh_command(
     host: str, command: str, user: str = "", port: int = 22, timeout: int = 12,
@@ -2608,6 +2905,7 @@ def main() -> None:
             asyncio.run(GATEWAY_ROUTER.close_all())
         except Exception:
             pass
+        REMOTE_MANAGER.close()
         EXTENSION_MANAGER.shutdown_all()
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()

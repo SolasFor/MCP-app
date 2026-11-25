@@ -11,7 +11,6 @@ from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -19,8 +18,8 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
-    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -28,7 +27,9 @@ from PyQt6.QtWidgets import (
 
 from app.core import proxy as px
 from app.core.logging_manager import get_logging_manager
+from app.ui.components.cards import FlowLayout
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.table import DataTable
 from app.ui.i18n import LANG_EN, i18n, tr
 
 
@@ -68,6 +69,7 @@ class ProxyPage(QWidget):
 
         self.host_edit = QLineEdit()
         self.host_edit.setObjectName("UiInput")
+        self.host_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.host_edit.setPlaceholderText("127.0.0.1 или proxy.corp.local")
 
         self.port_spin = QSpinBox()
@@ -77,31 +79,39 @@ class ProxyPage(QWidget):
 
         self.username_edit = QLineEdit()
         self.username_edit.setObjectName("UiInput")
+        self.username_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.username_edit.setPlaceholderText("необязательно")
 
         self.password_edit = QLineEdit()
         self.password_edit.setObjectName("UiInput")
+        self.password_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.password_edit.setPlaceholderText("необязательно (DPAPI)")
         self.password_eye = _button(tr("conn.token.show"), "Ghost")
         self.password_eye.clicked.connect(self._toggle_password_eye)
         pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
         pw_row.addWidget(self.password_edit, 1)
         pw_row.addWidget(self.password_eye)
 
         self.hosts = QPlainTextEdit()
         self.hosts.setObjectName("UiInput")
-        self.hosts.setMinimumHeight(96)
+        self.hosts.setFixedHeight(76)
 
         self._manual_box = QWidget()
         manual_form = QFormLayout(self._manual_box)
         manual_form.setContentsMargins(0, 0, 0, 0)
-        manual_form.setSpacing(6)
+        manual_form.setSpacing(8)
         self._scheme_lbl = QLabel()
+        self._scheme_lbl.setObjectName("FieldLabel")
         self._host_lbl = QLabel()
+        self._host_lbl.setObjectName("FieldLabel")
         self._port_lbl = QLabel()
+        self._port_lbl.setObjectName("FieldLabel")
         self._user_lbl = QLabel()
+        self._user_lbl.setObjectName("FieldLabel")
         self._pass_lbl = QLabel()
+        self._pass_lbl.setObjectName("FieldLabel")
         manual_form.addRow(self._scheme_lbl, self.scheme_combo)
         manual_form.addRow(self._host_lbl, self.host_edit)
         manual_form.addRow(self._port_lbl, self.port_spin)
@@ -110,9 +120,11 @@ class ProxyPage(QWidget):
 
         top_form = QFormLayout()
         top_form.setContentsMargins(0, 0, 0, 0)
-        top_form.setSpacing(6)
+        top_form.setSpacing(8)
         self._mode_lbl = QLabel()
+        self._mode_lbl.setObjectName("FieldLabel")
         self._hosts_lbl = QLabel()
+        self._hosts_lbl.setObjectName("FieldLabel")
         top_form.addRow(self._mode_lbl, self.mode_combo)
         top_form.addRow(self._hosts_lbl, self.hosts)
 
@@ -125,27 +137,21 @@ class ProxyPage(QWidget):
         self.reset_btn = _button("", "Ghost")
         self.reset_btn.clicked.connect(self._reset_hosts)
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(8)
+        buttons = FlowLayout(spacing=8)
         for button in (self.save_btn, self.check_btn, self.detect_btn, self.reset_btn):
             buttons.addWidget(button)
-        buttons.addStretch(1)
 
         self.status = QLabel("")
         self.status.setObjectName("Hint")
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
-        self.table = QTableWidget(0, 5)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.table.setMinimumHeight(180)
+        self.table = DataTable(["", "", "", "", ""])
+        self.table.setSelectionMode(DataTable.SelectionMode.NoSelection)
+        self.table.setMinimumHeight(160)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        for col in range(4):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.hide()
 
@@ -265,7 +271,11 @@ class ProxyPage(QWidget):
     def _sync_mode_ui(self) -> None:
         mode = str(self.mode_combo.currentData() or px.PROXY_MODE_NONE)
         self._manual_box.setVisible(mode == px.PROXY_MODE_MANUAL)
-        self.hosts.setEnabled(mode != px.PROXY_MODE_NONE)
+        has_proxy = mode != px.PROXY_MODE_NONE
+        self._hosts_lbl.setVisible(has_proxy)
+        self.hosts.setVisible(has_proxy)
+        self.hosts.setEnabled(has_proxy)
+        self.reset_btn.setVisible(has_proxy)
 
     def current(self) -> px.ProxySettings:
         mode = str(self.mode_combo.currentData() or px.PROXY_MODE_NONE)

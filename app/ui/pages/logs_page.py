@@ -1,4 +1,4 @@
-"""Logs page hosting the filterable, exportable LogViewerWidget."""
+"""Logs page hosting the compact, full-height LogViewerWidget."""
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget
@@ -11,6 +11,8 @@ from app.ui.pages.base import PageScaffold
 class LogsPage(PageScaffold):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setContentsMargins(0, 4, 0, 14)
+        self.content.setSpacing(10)
         self.viewer = LogViewerWidget()
         self.content.addWidget(self.viewer, 1)
         self.retranslate()

@@ -1,16 +1,16 @@
-"""Settings page: Dark/Light/System theme, RU/EN language, sidebar, startup, persistent logging, and storage."""
+"""Settings page: flat hairline sections with SettingRow controls."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QWidget,
 )
@@ -21,7 +21,7 @@ from app.core import autostart
 from app.core.logging_manager import get_logging_manager
 from app.paths import user_data_dir
 from app.ui import theme
-from app.ui.components.cards import Card, Divider
+from app.ui.components.cards import Divider, Section, SettingRow
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.toggle_switch import ToggleSwitch
 from app.ui.i18n import LANG_EN, LANG_RU, tr
@@ -49,16 +49,10 @@ class SettingsPage(PageScaffold):
         self.settings = settings
         self._tray_available = tray_available
 
-        # --- Appearance & Language
-        app_card = Card(spacing=10)
-        self.appearance_title = QLabel()
-        self.appearance_title.setObjectName("SectionTitle")
-        app_card.body.addWidget(self.appearance_title)
+        # --- Section 1: Appearance & Language
+        app_sec = Section(spacing=4)
+        self.appearance_title = app_sec.header.title_label
 
-        theme_row = QHBoxLayout()
-        self.theme_label = QLabel()
-        self.theme_label.setObjectName("FieldLabel")
-        theme_row.addWidget(self.theme_label, 1)
         theme_seg = QFrame()
         theme_seg.setObjectName("SegmentGroup")
         t_box = QHBoxLayout(theme_seg)
@@ -76,13 +70,11 @@ class SettingsPage(PageScaffold):
             self._theme_group.addButton(btn)
             self.theme_buttons[mode] = btn
             t_box.addWidget(btn)
-        theme_row.addWidget(theme_seg)
-        app_card.body.addLayout(theme_row)
+        self._theme_row = SettingRow("", theme_seg)
+        self.theme_label = self._theme_row.title_label
+        app_sec.body.addWidget(self._theme_row)
+        app_sec.body.addWidget(Divider())
 
-        lang_row = QHBoxLayout()
-        self.lang_label = QLabel()
-        self.lang_label.setObjectName("FieldLabel")
-        lang_row.addWidget(self.lang_label, 1)
         lang_seg = QFrame()
         lang_seg.setObjectName("SegmentGroup")
         l_box = QHBoxLayout(lang_seg)
@@ -100,61 +92,81 @@ class SettingsPage(PageScaffold):
             self._lang_group.addButton(btn)
             self.lang_buttons[lang] = btn
             l_box.addWidget(btn)
-        lang_row.addWidget(lang_seg)
-        app_card.body.addLayout(lang_row)
+        self._lang_row = SettingRow("", lang_seg)
+        self.lang_label = self._lang_row.title_label
+        app_sec.body.addWidget(self._lang_row)
+        app_sec.body.addWidget(Divider())
 
-        app_card.body.addWidget(Divider())
-        self.compact_check = QCheckBox()
-        self.compact_check.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compact_check = ToggleSwitch()
         self.compact_check.setChecked(settings.sidebar_collapsed)
         self.compact_check.toggled.connect(self.sidebar_compact_toggled.emit)
-        app_card.body.addWidget(self.compact_check)
-        self.content.addWidget(app_card)
+        self._compact_row = SettingRow("", self.compact_check)
+        app_sec.body.addWidget(self._compact_row)
+        self.content.addWidget(app_sec)
 
-        # --- Startup & Behavior
-        start_card = Card(spacing=6)
-        self.startup_title = QLabel()
-        self.startup_title.setObjectName("SectionTitle")
-        start_card.body.addWidget(self.startup_title)
+        self.content.addWidget(Divider())
 
-        self.autostart = QCheckBox()
+        # --- Section 2: Startup & Behavior
+        start_sec = Section(spacing=4)
+        self.startup_title = start_sec.header.title_label
+
+        self.autostart = ToggleSwitch()
         self.autostart.setEnabled(autostart.is_supported())
         self.autostart.setChecked(autostart.is_enabled())
         self.autostart.toggled.connect(self.autostart_toggled.emit)
 
-        self.start_on_launch = QCheckBox()
+        self.start_on_launch = ToggleSwitch()
         self.start_on_launch.setChecked(settings.start_services_on_launch)
         self.start_on_launch.toggled.connect(self.start_on_launch_toggled.emit)
 
-        self.minimize = QCheckBox()
+        self.minimize = ToggleSwitch()
         self.minimize.setEnabled(tray_available)
         self.minimize.setChecked(tray_available and settings.minimize_to_tray_on_close)
         self.minimize.toggled.connect(self.minimize_toggled.emit)
 
-        self.auto_restart = QCheckBox()
+        self.auto_restart = ToggleSwitch()
         self.auto_restart.setChecked(settings.auto_restart)
         self.auto_restart.toggled.connect(self.auto_restart_toggled.emit)
 
-        for check in (self.autostart, self.start_on_launch, self.minimize, self.auto_restart):
-            check.setCursor(Qt.CursorShape.PointingHandCursor)
-            start_card.body.addWidget(check)
-        self.content.addWidget(start_card)
+        self._autostart_row = SettingRow("", self.autostart)
+        self._start_launch_row = SettingRow("", self.start_on_launch)
+        self._minimize_row = SettingRow("", self.minimize)
+        self._auto_restart_row = SettingRow("", self.auto_restart)
+        for idx, r in enumerate((
+            self._autostart_row,
+            self._start_launch_row,
+            self._minimize_row,
+            self._auto_restart_row,
+        )):
+            if idx > 0:
+                start_sec.body.addWidget(Divider())
+            start_sec.body.addWidget(r)
+        self.content.addWidget(start_sec)
 
-        # --- Persistent Logging (%APPDATA%\MCPApp\logs\)
-        log_card = Card(spacing=8)
-        self.logging_title = QLabel()
-        self.logging_title.setObjectName("SectionTitle")
-        log_card.body.addWidget(self.logging_title)
+        self.content.addWidget(Divider())
+
+        # --- Section 3: Persistent Logging
+        log_sec = Section(spacing=6)
+        self.logging_title = log_sec.header.title_label
 
         self.logging_enabled = ToggleSwitch()
         self.logging_auto_rotate = ToggleSwitch()
         self.logging_archive_enabled = ToggleSwitch()
         for sw in (self.logging_enabled, self.logging_auto_rotate, self.logging_archive_enabled):
             sw.toggled.connect(lambda _v: self._emit_logging_settings())
-            log_card.body.addWidget(sw)
+
+        self._log_enabled_row = SettingRow("", self.logging_enabled)
+        self._log_rotate_row = SettingRow("", self.logging_auto_rotate)
+        self._log_archive_row = SettingRow("", self.logging_archive_enabled)
+        log_sec.body.addWidget(self._log_enabled_row)
+        log_sec.body.addWidget(Divider())
+        log_sec.body.addWidget(self._log_rotate_row)
+        log_sec.body.addWidget(Divider())
+        log_sec.body.addWidget(self._log_archive_row)
+        log_sec.body.addSpacing(4)
 
         log_form = QFormLayout()
-        log_form.setSpacing(6)
+        log_form.setSpacing(8)
         self.logging_level_combo = SafeComboBox()
         for lvl in LOG_LEVEL_NAMES:
             self.logging_level_combo.addItem(lvl, lvl)
@@ -183,13 +195,23 @@ class SettingsPage(PageScaffold):
         self._logging_max_file_lbl = log_form.labelForField(self.logging_max_file_spin)
         self._logging_retention_lbl = log_form.labelForField(self.logging_retention_spin)
         self._logging_max_total_lbl = log_form.labelForField(self.logging_max_total_spin)
-        log_card.body.addLayout(log_form)
+        for lbl in (
+            self._logging_level_lbl,
+            self._logging_max_file_lbl,
+            self._logging_retention_lbl,
+            self._logging_max_total_lbl,
+        ):
+            if isinstance(lbl, QLabel):
+                lbl.setObjectName("FieldLabel")
+        log_sec.body.addLayout(log_form)
 
-        log_dir = get_logging_manager().base_dir
+        log_dir = str(get_logging_manager().base_dir)
         log_path_row = QHBoxLayout()
-        log_path_lbl = QLabel(str(log_dir))
+        log_path_row.setSpacing(8)
+        log_path_lbl = QLabel(log_dir)
         log_path_lbl.setObjectName("ServiceDetail")
-        log_path_lbl.setWordWrap(True)
+        log_path_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        log_path_lbl.setToolTip(log_dir)
         log_path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         log_path_row.addWidget(log_path_lbl, 1)
         self.open_logs_folder_btn = QPushButton()
@@ -198,43 +220,49 @@ class SettingsPage(PageScaffold):
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logging_manager().base_dir)))
         )
         log_path_row.addWidget(self.open_logs_folder_btn)
-        log_card.body.addLayout(log_path_row)
-        self.content.addWidget(log_card)
+        log_sec.body.addLayout(log_path_row)
+        self.content.addWidget(log_sec)
 
-        # --- Components & Storage
-        comp_card = Card()
-        self.components_title = QLabel()
-        self.components_title.setObjectName("SectionTitle")
-        comp_card.body.addWidget(self.components_title)
+        self.content.addWidget(Divider())
 
+        # --- Section 4: Components & Data
+        comp_sec = Section(spacing=6)
+        self.components_title = comp_sec.header.title_label
+
+        cf_row = QHBoxLayout()
+        cf_row.setSpacing(10)
         cf_lbl = QLabel("cloudflared")
         cf_lbl.setObjectName("FieldLabel")
-        comp_card.body.addWidget(cf_lbl)
         cf_val = QLabel(cloudflared_path or "not found")
         cf_val.setObjectName("ServiceDetail")
-        cf_val.setWordWrap(True)
+        cf_val.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        cf_val.setToolTip(cloudflared_path or "not found")
         cf_val.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        comp_card.body.addWidget(cf_val)
+        cf_row.addWidget(cf_lbl, 0)
+        cf_row.addWidget(cf_val, 1)
+        comp_sec.body.addLayout(cf_row)
 
-        data_dir = user_data_dir()
+        data_dir = str(user_data_dir())
         data_row = QHBoxLayout()
-        data_label = QLabel(str(data_dir))
+        data_row.setSpacing(8)
+        data_label = QLabel(data_dir)
         data_label.setObjectName("ServiceDetail")
-        data_label.setWordWrap(True)
+        data_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        data_label.setToolTip(data_dir)
         data_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         data_row.addWidget(data_label, 1)
         self.open_folder_btn = QPushButton()
         self.open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_folder_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(data_dir)))
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(data_dir))
         )
         data_row.addWidget(self.open_folder_btn)
-        comp_card.body.addLayout(data_row)
+        comp_sec.body.addLayout(data_row)
 
         ver = QLabel(f"MCP app {__version__}")
-        ver.setObjectName("Hint")
-        comp_card.body.addWidget(ver)
-        self.content.addWidget(comp_card)
+        ver.setObjectName("Caption")
+        comp_sec.body.addWidget(ver)
+        self.content.addWidget(comp_sec)
 
         self.content.addStretch(1)
         self.sync_selections(settings.theme_mode, settings.language, settings.sidebar_collapsed)
@@ -296,18 +324,18 @@ class SettingsPage(PageScaffold):
         self.lang_label.setText(tr("settings.lang.label"))
         self.lang_buttons[LANG_RU].setText(tr("settings.lang.ru"))
         self.lang_buttons[LANG_EN].setText(tr("settings.lang.en"))
-        self.compact_check.setText(tr("settings.sidebar_compact"))
+        self._compact_row.set_texts(tr("settings.sidebar_compact"))
 
         self.startup_title.setText(tr("settings.startup.title"))
-        self.autostart.setText(tr("settings.autostart"))
-        self.start_on_launch.setText(tr("settings.start_on_launch"))
-        self.minimize.setText(tr("settings.minimize"))
-        self.auto_restart.setText(tr("settings.auto_restart"))
+        self._autostart_row.set_texts(tr("settings.autostart"))
+        self._start_launch_row.set_texts(tr("settings.start_on_launch"))
+        self._minimize_row.set_texts(tr("settings.minimize"))
+        self._auto_restart_row.set_texts(tr("settings.auto_restart"))
 
         self.logging_title.setText(tr("settings.logging.title"))
-        self.logging_enabled.setText(tr("settings.logging.enabled"))
-        self.logging_auto_rotate.setText(tr("settings.logging.auto_rotate"))
-        self.logging_archive_enabled.setText(tr("settings.logging.archive_enabled"))
+        self._log_enabled_row.set_texts(tr("settings.logging.enabled"))
+        self._log_rotate_row.set_texts(tr("settings.logging.auto_rotate"))
+        self._log_archive_row.set_texts(tr("settings.logging.archive_enabled"))
         if isinstance(self._logging_level_lbl, QLabel):
             self._logging_level_lbl.setText(tr("settings.logging.level"))
         if isinstance(self._logging_max_file_lbl, QLabel):
@@ -322,5 +350,14 @@ class SettingsPage(PageScaffold):
         self.open_folder_btn.setText(tr("settings.open_folder"))
 
     def apply_theme(self) -> None:
-        for sw in (self.logging_enabled, self.logging_auto_rotate, self.logging_archive_enabled):
+        for sw in (
+            self.compact_check,
+            self.autostart,
+            self.start_on_launch,
+            self.minimize,
+            self.auto_restart,
+            self.logging_enabled,
+            self.logging_auto_rotate,
+            self.logging_archive_enabled,
+        ):
             sw.apply_theme()

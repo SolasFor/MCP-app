@@ -1,9 +1,17 @@
-"""Connections & Transports page: 4 UI transport providers, owner token editor, and proxy."""
+"""Connections & Transports page: flat hairline sections for providers, owner token, and proxy."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config import (
     PROVIDER_CF_NAMED,
@@ -11,7 +19,7 @@ from app.config import (
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
 )
-from app.ui.components.cards import Badge, Card, Divider, ErrorBanner, SectionHeader
+from app.ui.components.cards import Badge, Divider, ErrorBanner, FlowLayout, Section
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from app.ui.proxy_page import ProxyPage
@@ -58,19 +66,30 @@ class ConnectionsPage(PageScaffold):
         self.migration_banner.hide()
         self.content.addWidget(self.migration_banner)
 
-        self.providers_card = Card()
-        self.providers_header = SectionHeader()
-        self.providers_card.body.addWidget(self.providers_header)
+        # --- Section 1: Transport providers (flat hairline list)
+        self.providers_section = Section(spacing=6)
+        self.providers_header = self.providers_section.header
 
         # provider_id -> (key, name_label, active_badge, select_btn, config_btn, diag_btn)
         self.provider_rows: dict[
             str,
             tuple[str, QLabel, Badge, QPushButton, QPushButton, QPushButton],
         ] = {}
-        for pid, key in _PROVIDER_SPEC:
-            row = QHBoxLayout()
+        list_col = QVBoxLayout()
+        list_col.setContentsMargins(0, 4, 0, 0)
+        list_col.setSpacing(0)
+        for idx, (pid, key) in enumerate(_PROVIDER_SPEC):
+            if idx > 0:
+                list_col.addWidget(Divider())
+            row_w = QWidget()
+            row_w.setMinimumHeight(38)
+            row = QHBoxLayout(row_w)
+            row.setContentsMargins(0, 4, 0, 4)
             row.setSpacing(8)
+
             name = QLabel()
+            name.setObjectName("SettingTitle")
+            name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             active_badge = Badge("", variant="ok")
             active_badge.hide()
 
@@ -82,75 +101,75 @@ class ConnectionsPage(PageScaffold):
             diag_btn.clicked.connect(lambda _c=False, p=pid: self.provider_diagnose_requested.emit(p))
 
             row.addWidget(name, 1)
-            row.addWidget(active_badge)
-            row.addWidget(select_btn)
-            row.addWidget(config_btn)
-            row.addWidget(diag_btn)
-            self.providers_card.body.addLayout(row)
+            row.addWidget(active_badge, 0)
+            row.addWidget(select_btn, 0)
+            row.addWidget(config_btn, 0)
+            row.addWidget(diag_btn, 0)
+            list_col.addWidget(row_w)
             self.provider_rows[pid] = (key, name, active_badge, select_btn, config_btn, diag_btn)
+        self.providers_section.body.addLayout(list_col)
 
-        self.providers_card.body.addWidget(Divider())
-        transport_actions = QHBoxLayout()
-        transport_actions.setSpacing(12)
+        transport_actions = FlowLayout(spacing=10)
         self.wizard_btn = _button("", "Accent")
         self.wizard_btn.clicked.connect(self.domain_wizard_requested.emit)
-        self.guide_btn = _button("", "Link")
+        self.guide_btn = _button("", "SubtleLink")
         self.guide_btn.clicked.connect(self.domain_guide_requested.emit)
         transport_actions.addWidget(self.wizard_btn)
         transport_actions.addWidget(self.guide_btn)
-        transport_actions.addStretch(1)
-        self.providers_card.body.addLayout(transport_actions)
-        self.content.addWidget(self.providers_card)
+        self.providers_section.body.addLayout(transport_actions)
+        self.content.addWidget(self.providers_section)
 
-        # --- Owner Access Token Card (MCP Server Owner Token)
-        token_card = Card()
-        self.token_header = SectionHeader()
-        token_card.body.addWidget(self.token_header)
+        self.content.addWidget(Divider())
 
-        t_row = QHBoxLayout()
-        t_row.setSpacing(8)
+        # --- Section 2: MCP Owner Token
+        self.token_section = Section(spacing=8)
+        self.token_header = self.token_section.header
+
+        t_input_row = QHBoxLayout()
+        t_input_row.setSpacing(6)
         self.token_edit = QLineEdit()
         self.token_edit.setObjectName("UiInput")
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.token_edit.setMinimumWidth(140)
+        self.token_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.token_edit.textEdited.connect(self.token_edited.emit)
         self.token_edit.returnPressed.connect(self.token_save_requested.emit)
         self.token_eye = _button("", "Ghost")
         self.token_eye.clicked.connect(self.toggle_token_visibility)
+        self.token_copy = _button("")
+        self.token_copy.clicked.connect(lambda: self.copy_requested.emit("token", self.token_copy))
+        t_input_row.addWidget(self.token_edit, 1)
+        t_input_row.addWidget(self.token_eye, 0)
+        t_input_row.addWidget(self.token_copy, 0)
+        self.token_section.body.addLayout(t_input_row)
+
+        t_actions = FlowLayout(spacing=6)
         self.token_paste = _button("", "Ghost")
         self.token_paste.clicked.connect(self._paste_token)
+        self.token_gen = _button("")
+        self.token_gen.clicked.connect(self.token_generate_requested.emit)
         self.token_save = _button("", "Accent")
         self.token_save.clicked.connect(self.token_save_requested.emit)
         self.token_save.hide()
-        self.token_copy = _button("")
-        self.token_copy.clicked.connect(lambda: self.copy_requested.emit("token", self.token_copy))
-        self.token_gen = _button("")
-        self.token_gen.clicked.connect(self.token_generate_requested.emit)
-        for w in (
-            self.token_edit,
-            self.token_eye,
-            self.token_paste,
-            self.token_save,
-            self.token_copy,
-            self.token_gen,
-        ):
-            t_row.addWidget(w, 1 if w is self.token_edit else 0)
-        token_card.body.addLayout(t_row)
+        for w in (self.token_paste, self.token_gen, self.token_save):
+            t_actions.addWidget(w)
+        self.token_section.body.addLayout(t_actions)
 
         self.token_error = QLabel("")
         self.token_error.setObjectName("Error")
         self.token_error.setWordWrap(True)
         self.token_error.hide()
-        token_card.body.addWidget(self.token_error)
-        self.content.addWidget(token_card)
+        self.token_section.body.addWidget(self.token_error)
+        self.content.addWidget(self.token_section)
 
-        # --- Proxy Card
-        proxy_card = Card()
-        self.proxy_title = QLabel()
-        self.proxy_title.setObjectName("SectionTitle")
-        proxy_card.body.addWidget(self.proxy_title)
+        self.content.addWidget(Divider())
+
+        # --- Section 3: Proxy
+        self.proxy_section = Section(spacing=8)
+        self.proxy_title = self.proxy_section.header.title_label
         self.proxy_page = ProxyPage()
-        proxy_card.body.addWidget(self.proxy_page)
-        self.content.addWidget(proxy_card)
+        self.proxy_section.body.addWidget(self.proxy_page)
+        self.content.addWidget(self.proxy_section)
 
         self.content.addStretch(1)
         self.retranslate()
@@ -223,7 +242,9 @@ class ConnectionsPage(PageScaffold):
         self.purge_openai_secret_btn.setText(tr("conn.openai_removed.purge_btn"))
         self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
         for _pid, (key, name, active_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
-            name.setText(tr(f"conn.provider.{key}"))
+            text = tr(f"conn.provider.{key}")
+            name.setText(text)
+            name.setToolTip(text)
             active_badge.setText(tr("conn.badge.active"))
             select_btn.setText(tr("conn.btn.select"))
             config_btn.setText(tr("conn.btn.configure"))

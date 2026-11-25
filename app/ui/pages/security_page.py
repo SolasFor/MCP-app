@@ -1,15 +1,23 @@
-"""Security & Boundaries page: access policy, SecretStore, and auto-saved Computer Use toggles."""
+"""Security & Boundaries page: flat hairline sections for access profiles, Computer Use, DPAPI."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget
+from PyQt6.QtWidgets import (
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.core.logging_manager import get_logging_manager
 from app.paths import user_data_dir
-from app.ui.components.cards import Badge, Card, SectionHeader
+from app.ui.components.cards import Badge, Divider, FlowLayout, Section
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.toggle_switch import ToggleSwitch
@@ -50,16 +58,15 @@ class SecurityPage(PageScaffold):
             desktop_policy_path or (user_data_dir() / "desktop" / "policy.json")
         )
 
-        # --- Policy Card
-        policy_card = Card()
-        self.policy_header = SectionHeader()
+        # --- Section 1: Execution Access Policy
+        self.policy_section = Section(spacing=8)
+        self.policy_header = self.policy_section.header
         self.mode_badge = Badge("safe", variant="ok")
         self.policy_header.right_box.addWidget(self.mode_badge)
-        policy_card.body.addWidget(self.policy_header)
 
         self.access_label = QLabel()
         self.access_label.setObjectName("FieldLabel")
-        policy_card.body.addWidget(self.access_label)
+        self.policy_section.body.addWidget(self.access_label)
 
         self.access_profile = SafeComboBox()
         self.access_profile.addItem("", "safe")
@@ -67,85 +74,98 @@ class SecurityPage(PageScaffold):
         self.access_profile.addItem("", "full")
         self.access_profile.setCurrentIndex(1)
         self.access_profile.currentIndexChanged.connect(self.access_profile_changed.emit)
-        policy_card.body.addWidget(self.access_profile)
+        self.policy_section.body.addWidget(self.access_profile)
 
         self.access_profile_hint = QLabel()
         self.access_profile_hint.setObjectName("Hint")
         self.access_profile_hint.setWordWrap(True)
-        policy_card.body.addWidget(self.access_profile_hint)
+        self.policy_section.body.addWidget(self.access_profile_hint)
 
-        p_row = QHBoxLayout()
-        p_row.setSpacing(8)
+        p_row = FlowLayout(spacing=8)
         self.allowlist_btn = _button("")
         self.allowlist_btn.clicked.connect(self.allowlist_requested.emit)
         self.clients_btn = _button("", "Accent")
         self.clients_btn.clicked.connect(self.clients_requested.emit)
         p_row.addWidget(self.allowlist_btn)
         p_row.addWidget(self.clients_btn)
-        p_row.addStretch(1)
-        policy_card.body.addLayout(p_row)
-        self.content.addWidget(policy_card)
+        self.policy_section.body.addLayout(p_row)
+        self.content.addWidget(self.policy_section)
 
-        # --- Computer Use Opt-In Card (ToggleSwitch + immediate auto-save, default OFF)
-        desktop_card = Card()
-        self.desktop_header = SectionHeader()
-        self.desktop_badge = Badge("", variant="ok")
+        self.content.addWidget(Divider())
+
+        # --- Section 2: Computer Use Opt-In (master toggle + indented dependent toggles)
+        self.desktop_section = Section(spacing=8)
+        self.desktop_header = self.desktop_section.header
+        self.desktop_badge = Badge("", variant="neutral")
         self.desktop_header.right_box.addWidget(self.desktop_badge)
-        desktop_card.body.addWidget(self.desktop_header)
 
         self.desktop_enabled_sw = ToggleSwitch()
         self.desktop_screen_sw = ToggleSwitch()
         self.desktop_control_sw = ToggleSwitch()
         self.desktop_secrets_sw = ToggleSwitch()
-        # Backwards-compatible aliases (QAbstractButton API: isChecked/setChecked/toggled)
+        # Backwards-compatible aliases
         self.desktop_enabled_chk = self.desktop_enabled_sw
         self.desktop_screen_chk = self.desktop_screen_sw
         self.desktop_control_chk = self.desktop_control_sw
         self.desktop_secrets_chk = self.desktop_secrets_sw
 
+        self.desktop_enabled_sw.toggled.connect(self._on_desktop_control_changed)
+        self.desktop_section.body.addWidget(self.desktop_enabled_sw)
+
+        dep_box = QVBoxLayout()
+        dep_box.setContentsMargins(20, 2, 0, 2)
+        dep_box.setSpacing(6)
         for sw in (
-            self.desktop_enabled_sw,
             self.desktop_screen_sw,
             self.desktop_control_sw,
             self.desktop_secrets_sw,
         ):
             sw.toggled.connect(self._on_desktop_control_changed)
-            desktop_card.body.addWidget(sw)
+            dep_box.addWidget(sw)
+        self.desktop_section.body.addLayout(dep_box)
 
         d_form = QFormLayout()
-        d_form.setSpacing(6)
+        d_form.setContentsMargins(0, 4, 0, 0)
+        d_form.setSpacing(8)
         self.desktop_clients_edit = QLineEdit()
         self.desktop_clients_edit.setObjectName("UiInput")
+        self.desktop_clients_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.desktop_clients_edit.editingFinished.connect(self._on_desktop_control_changed)
         self.desktop_apps_edit = QLineEdit()
         self.desktop_apps_edit.setObjectName("UiInput")
+        self.desktop_apps_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.desktop_apps_edit.editingFinished.connect(self._on_desktop_control_changed)
         d_form.addRow(QLabel(), self.desktop_clients_edit)
         d_form.addRow(QLabel(), self.desktop_apps_edit)
         self._desktop_clients_lbl = d_form.labelForField(self.desktop_clients_edit)
         self._desktop_apps_lbl = d_form.labelForField(self.desktop_apps_edit)
-        desktop_card.body.addLayout(d_form)
+        if isinstance(self._desktop_clients_lbl, QLabel):
+            self._desktop_clients_lbl.setObjectName("FieldLabel")
+        if isinstance(self._desktop_apps_lbl, QLabel):
+            self._desktop_apps_lbl.setObjectName("FieldLabel")
+        self.desktop_section.body.addLayout(d_form)
 
         self.desktop_clear_stop_btn = _button("", "Secondary")
         self.desktop_clear_stop_btn.clicked.connect(self.clear_emergency_stop)
         self.desktop_clear_stop_btn.hide()
-        desktop_card.body.addWidget(self.desktop_clear_stop_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self.desktop_section.body.addWidget(self.desktop_clear_stop_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.desktop_refresh_hint = QLabel()
         self.desktop_refresh_hint.setObjectName("Hint")
         self.desktop_refresh_hint.setWordWrap(True)
-        desktop_card.body.addWidget(self.desktop_refresh_hint)
-        self.content.addWidget(desktop_card)
+        self.desktop_section.body.addWidget(self.desktop_refresh_hint)
+        self.content.addWidget(self.desktop_section)
 
-        # --- Secret Storage & Honest Sandbox Notice Card
-        secret_card = Card()
-        self.secret_header = SectionHeader()
-        secret_card.body.addWidget(self.secret_header)
+        self.content.addWidget(Divider())
+
+        # --- Section 3: Secret Storage & Honest Sandbox Notice
+        self.secret_section = Section(spacing=6)
+        self.secret_header = self.secret_section.header
         self.secret_desc = QLabel()
         self.secret_desc.setObjectName("Hint")
         self.secret_desc.setWordWrap(True)
-        secret_card.body.addWidget(self.secret_desc)
-        self.content.addWidget(secret_card)
+        self.secret_section.body.addWidget(self.secret_desc)
+        self.content.addWidget(self.secret_section)
 
         self.content.addStretch(1)
         self.reload_desktop_policy()
@@ -194,7 +214,7 @@ class SecurityPage(PageScaffold):
             self.desktop_badge.set_variant("err")
         elif not pol.enabled:
             self.desktop_badge.setText(tr("security.desktop.status.off"))
-            self.desktop_badge.set_variant("ok")
+            self.desktop_badge.set_variant("neutral")
         elif pol.allow_input_control:
             self.desktop_badge.setText(tr("security.desktop.status.control"))
             self.desktop_badge.set_variant("err")
@@ -203,7 +223,7 @@ class SecurityPage(PageScaffold):
             self.desktop_badge.set_variant("warn")
         else:
             self.desktop_badge.setText(tr("security.desktop.status.off"))
-            self.desktop_badge.set_variant("ok")
+            self.desktop_badge.set_variant("neutral")
 
     def _on_desktop_control_changed(self, *_args: object) -> None:
         if self._loading_desktop:

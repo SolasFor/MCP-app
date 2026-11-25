@@ -1,4 +1,4 @@
-"""AI Clients page: inline OAuth client management, search filter, per-client roles, and revocation."""
+"""AI Clients page: flat DataTable with search, per-client execution rights, and revocation."""
 from __future__ import annotations
 
 from datetime import datetime
@@ -7,9 +7,18 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidgetItem
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 
-from app.ui.components.cards import Card, EmptyState
+from app.ui.components.cards import EmptyState, FlowLayout
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable
@@ -38,14 +47,18 @@ class ClientsPage(PageScaffold):
         self._store: OAuthStore | None = None
         self._execution: ExecutionApprovals | None = None
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        search_row = QHBoxLayout()
+        search_row.setSpacing(8)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
+        self.search_edit.setMinimumWidth(160)
+        self.search_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.search_edit.textChanged.connect(lambda q: self.table.filter_rows(q))
-        toolbar.addWidget(self.search_edit, 1)
+        search_row.addWidget(self.search_edit, 1)
 
+        actions = FlowLayout(spacing=6)
         self.refresh_button = QPushButton()
+        self.refresh_button.setObjectName("Ghost")
         self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.reload)
         self.allowlist_button = QPushButton()
@@ -58,13 +71,16 @@ class ClientsPage(PageScaffold):
         self.revoke_button.clicked.connect(self.revoke_selected)
 
         for btn in (self.refresh_button, self.allowlist_button, self.revoke_button):
-            toolbar.addWidget(btn)
-        self.content.addLayout(toolbar)
+            actions.addWidget(btn)
+        self.content.addLayout(search_row)
+        self.content.addLayout(actions)
 
-        self.table_card = Card(margins=(12, 12, 12, 12))
+        self.table_card = QWidget()
+        tbl_lay = QVBoxLayout(self.table_card)
+        tbl_lay.setContentsMargins(0, 0, 0, 0)
         self.table = DataTable(["", "", "", ""])
         self.table.itemSelectionChanged.connect(self._selection_changed)
-        self.table_card.body.addWidget(self.table, 1)
+        tbl_lay.addWidget(self.table, 1)
         self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("clients")
@@ -157,10 +173,11 @@ class ClientsPage(PageScaffold):
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
             when = datetime.fromtimestamp(approved).strftime("%d.%m.%Y %H:%M") if approved else "—"
-            name = QTableWidgetItem(entry["client_name"])
+            cname = str(entry["client_name"] or entry["client_id"])
+            name = QTableWidgetItem(cname)
             client_id = entry["client_id"]
             name.setData(Qt.ItemDataRole.UserRole, client_id)
-            name.setToolTip(f"ID: {client_id}")
+            name.setToolTip(f"{cname}\nID: {client_id}")
             self.table.setItem(idx, 0, name)
             self.table.setItem(
                 idx,
@@ -169,7 +186,8 @@ class ClientsPage(PageScaffold):
             )
             if approved and self._execution is not None:
                 selector = SafeComboBox(self.table)
-                selector.setMinimumWidth(190)
+                selector.setMinimumWidth(160)
+                selector.setFixedHeight(28)
                 for key in ("safe", "allowlist", "full"):
                     selector.addItem(tr(f"clients.role.{key}"), key)
                 mode = self._execution.profile_for(client_id)
@@ -182,7 +200,7 @@ class ClientsPage(PageScaffold):
                 self.table.setItem(idx, 2, QTableWidgetItem(tr("clients.no_access")))
             self.table.setItem(idx, 3, QTableWidgetItem(when))
 
-        self.table.setColumnWidth(2, 210)
+        self.table.setColumnWidth(2, 180)
         self.table.filter_rows(self.search_edit.text())
         self._selection_changed()
         self.clients_updated.emit(self.client_summaries())

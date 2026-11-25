@@ -51,8 +51,8 @@ class ProviderConfigDialog(SilentDialog):
         self.setWindowTitle(f"Настройка транспорта: {provider_id}")
         self.setMinimumWidth(560)
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
 
         det = self.provider.detect()
         det_text = f"{'✓ Найден' if det.installed else '✕ Не найден'}: {det.version or det.executable or det.detail}"
@@ -62,7 +62,7 @@ class ProviderConfigDialog(SilentDialog):
         root.addWidget(self.det_label)
 
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(6)
         cfg = self.provider.export_config()
 
         self.fields: dict[str, Any] = {}
@@ -135,13 +135,16 @@ class ProviderConfigDialog(SilentDialog):
         root.addLayout(form)
 
         self.diag_output = QTextEdit()
+        self.diag_output.setObjectName("ConsoleLog")
         self.diag_output.setReadOnly(True)
         self.diag_output.setMaximumHeight(130)
         self.diag_output.setPlaceholderText("Результаты проверки конфигурации появятся здесь.")
         root.addWidget(self.diag_output)
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(6)
         self.diag_btn = QPushButton("Проверить")
+        self.diag_btn.setObjectName("Ghost")
         self.diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diag_btn.clicked.connect(self._run_diagnose)
         buttons.addWidget(self.diag_btn)

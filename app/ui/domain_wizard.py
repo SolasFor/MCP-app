@@ -80,6 +80,7 @@ class DomainWizard(SilentDialog):
             "Постоянный адрес вида <b>mcp.example.com</b> вместо временного. "
             "Не путайте ключи: здесь вводятся ключи Cloudflare, а не MCP Owner Token."
         )
+        intro.setObjectName("Hint")
         intro.setWordWrap(True)
 
         self.mode_combo = SafeComboBox()
@@ -198,14 +199,15 @@ class DomainWizard(SilentDialog):
         self.cancel_btn = _button("Отмена", "Ghost")
         self.cancel_btn.clicked.connect(self.reject)
         buttons = QHBoxLayout()
+        buttons.setSpacing(6)
         buttons.addWidget(manual)
         buttons.addStretch(1)
         buttons.addWidget(self.cancel_btn)
         buttons.addWidget(self.run_btn)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 18)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
         layout.addWidget(intro)
         layout.addLayout(mode_row)
         layout.addLayout(host_form)

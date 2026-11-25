@@ -48,8 +48,8 @@ class CommandPaletteDialog(QDialog):
         frame = QFrame()
         frame.setObjectName("PaletteCard")
         box = QVBoxLayout(frame)
-        box.setContentsMargins(12, 12, 12, 12)
-        box.setSpacing(8)
+        box.setContentsMargins(10, 10, 10, 10)
+        box.setSpacing(6)
 
         search_row = QHBoxLayout()
         search_row.setSpacing(8)

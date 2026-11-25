@@ -861,7 +861,7 @@ class MainWindow(QMainWindow):
         dlg = ConnectionDiagnosticsDialog(
             url,
             self.settings.server_port,
-            self.settings.health_path,
+            self.settings.server_health_path,
             self.manager.token,
             self,
             tunnel_mode=self.manager.active_provider,

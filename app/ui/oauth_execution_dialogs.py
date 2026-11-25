@@ -5,8 +5,8 @@ Windows user's encrypted OAuth database and not exposed through Cloudflare.
 """
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QDialogButtonBox,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -24,27 +24,38 @@ class ExecutionPolicyDialog(SilentDialog):
         super().__init__(parent)
         self.approvals = approvals
         self.setWindowTitle("Белые списки Windows и SSH")
-        self.resize(660, 570)
+        self.setMinimumSize(520, 480)
+        self.resize(620, 540)
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
         warning = QLabel(
             "Режим «Белый список»: команды выполняются БЕЗ дополнительного "
             "подтверждения, но только при точном совпадении с этими строками. "
             "Режим «Полный доступ» игнорирует эти списки. "
             "Списки сохраняются локально и не предоставляются клиенту для изменения."
         )
+        warning.setObjectName("Hint")
         warning.setWordWrap(True)
         root.addWidget(warning)
         policy = approvals.policy()
         self.windows = QPlainTextEdit("\n".join(policy["windows"]))
+        self.windows.setObjectName("ConsoleLog")
         self.windows.setPlaceholderText("\n".join(DEFAULT_WINDOWS_ALLOWLIST))
         self.hosts = QPlainTextEdit("\n".join(policy["hosts"]))
+        self.hosts.setObjectName("ConsoleLog")
         self.hosts.setPlaceholderText("SSH-хосты или алиасы, по одному в строке")
         self.ssh_commands = QPlainTextEdit("\n".join(policy["ssh_commands"]))
+        self.ssh_commands.setObjectName("ConsoleLog")
         self.ssh_commands.setPlaceholderText("Точные удалённые команды:\nuptime\nhostname")
-        root.addWidget(QLabel("Windows: точные команды, по одной в строке"))
-        root.addWidget(self.windows)
+        win_lbl = QLabel("Windows: точные команды, по одной в строке")
+        win_lbl.setObjectName("FieldLabel")
+        root.addWidget(win_lbl)
+        root.addWidget(self.windows, 1)
         reset_row = QHBoxLayout()
         self.reset_windows = QPushButton("Восстановить базовые команды")
+        self.reset_windows.setObjectName("Ghost")
+        self.reset_windows.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_windows.setToolTip(
             "ls, pwd, dir, echo, whoami, ipconfig, systeminfo. "
             "Изменение сохранится только после нажатия «Сохранить»."
@@ -59,15 +70,25 @@ class ExecutionPolicyDialog(SilentDialog):
             ("SSH: точные разрешённые имена хостов/алиасы", self.hosts),
             ("SSH: точные команды (по строкам)", self.ssh_commands),
         ):
-            root.addWidget(QLabel(label))
-            root.addWidget(widget)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save |
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.save)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+            lbl = QLabel(label)
+            lbl.setObjectName("FieldLabel")
+            root.addWidget(lbl)
+            root.addWidget(widget, 1)
+        footer = QHBoxLayout()
+        footer.setSpacing(6)
+        footer.addStretch(1)
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setObjectName("Ghost")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Сохранить")
+        save_btn.setObjectName("Accent")
+        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self.save)
+        footer.addWidget(cancel_btn)
+        footer.addWidget(save_btn)
+        root.addLayout(footer)
 
     def save(self) -> None:
         try:

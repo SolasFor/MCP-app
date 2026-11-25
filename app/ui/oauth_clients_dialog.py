@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app.ui.components.cards import EmptyState
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from backend.oauth_store import OAuthStore, default_store_path
@@ -30,12 +31,12 @@ class OAuthClientsDialog(SilentDialog):
         self.store = OAuthStore(default_store_path(), issuer, public_url)
         self.execution = ExecutionApprovals(self.store)
         self.setWindowTitle("OAuth-клиенты MCP app")
-        self.setMinimumSize(700, 420)
-        self.resize(820, 490)
+        self.setMinimumSize(680, 400)
+        self.resize(780, 470)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
         title = QLabel("OAuth-клиенты")
         title.setObjectName("SectionTitle")
         root.addWidget(title)
@@ -47,6 +48,7 @@ class OAuthClientsDialog(SilentDialog):
             "клиента не выбран свой. Команды из белого списка и полного "
             "доступа выполняются без отдельного подтверждения."
         )
+        explanation.setObjectName("Hint")
         explanation.setWordWrap(True)
         root.addWidget(explanation)
 
@@ -57,19 +59,36 @@ class OAuthClientsDialog(SilentDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         root.addWidget(self.table, 1)
 
+        self.empty_state = EmptyState(
+            "clients",
+            "Нет зарегистрированных OAuth-клиентов",
+            "Клиенты появятся здесь после регистрации и подтверждения доступа.",
+        )
+        self.empty_state.hide()
+        root.addWidget(self.empty_state, 1)
+
         footer = QHBoxLayout()
+        footer.setSpacing(6)
         self.refresh_button = QPushButton("Обновить")
+        self.refresh_button.setObjectName("Ghost")
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.reload)
         self.revoke_button = QPushButton("Отозвать OAuth-доступ")
+        self.revoke_button.setObjectName("Danger")
+        self.revoke_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
         close_button = QPushButton("Закрыть")
+        close_button.setObjectName("Ghost")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         close_button.clicked.connect(self.accept)
         for btn in (
             self.refresh_button, self.revoke_button,
@@ -88,6 +107,9 @@ class OAuthClientsDialog(SilentDialog):
                 self, "OAuth", f"Не удалось прочитать хранилище: {type(exc).__name__}"
             )
             return
+        has_clients = bool(clients)
+        self.table.setVisible(has_clients)
+        self.empty_state.setVisible(not has_clients)
         self.table.setRowCount(len(clients))
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
@@ -105,7 +127,8 @@ class OAuthClientsDialog(SilentDialog):
             )
             if approved:
                 selector = SafeComboBox(self.table)
-                selector.setMinimumWidth(225)
+                selector.setMinimumWidth(205)
+                selector.setFixedHeight(26)
                 selector.addItem("Безопасный", "safe")
                 selector.addItem("Белый список", "allowlist")
                 selector.addItem("Полный доступ", "full")

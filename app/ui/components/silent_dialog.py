@@ -62,11 +62,11 @@ class SilentMessageBox(SilentDialog):
         self._custom_buttons: list[QPushButton] = []
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
 
         body = QHBoxLayout()
-        body.setSpacing(12)
+        body.setSpacing(10)
         body.setAlignment(Qt.AlignmentFlag.AlignTop)
 
         icon_name, icon_color = {

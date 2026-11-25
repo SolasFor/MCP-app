@@ -21,7 +21,7 @@ class _ToastItem(QFrame):
         repolish(self)
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(12, 9, 10, 9)
+        row.setContentsMargins(10, 8, 10, 8)
         row.setSpacing(8)
 
         icon_name, color = {

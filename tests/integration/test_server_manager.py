@@ -263,13 +263,25 @@ class ServerManagerIntegrationTests(unittest.TestCase):
         self.manager.stop_server("db", client_id="owner")
 
         # Port conflict with foreign listener refuses start without closing listener
+        conflict_port = _free_port()
+        self.store.upsert_profile(
+            ServerProfile(
+                name="db",
+                argv=(sys.executable, FIXTURE_SERVER, "--port", str(conflict_port)),
+                cwd=str(self.root),
+                host="127.0.0.1",
+                port=conflict_port,
+                readiness=ReadinessConfig(kind="http", host="127.0.0.1", port=conflict_port, timeout_seconds=8.0),
+            )
+        )
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", port_db))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", conflict_port))
         sock.listen(1)
         try:
             with self.assertRaises(RuntimeError):
                 self.manager.start_server("app", client_id="owner")
-            self.assertEqual(sock.getsockname()[1], port_db)
+            self.assertEqual(sock.getsockname()[1], conflict_port)
             self.assertFalse(self.manager.status_server("app", client_id="owner")["running"])
         finally:
             sock.close()

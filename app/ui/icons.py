@@ -1,21 +1,13 @@
-"""Vector icons and app logo drawn with QPainter (no external raster icon assets needed)."""
+"""Crisp vector line icons and layered green emblem drawn with QPainter."""
 from __future__ import annotations
 
+import math
 import struct
 from functools import lru_cache
 from pathlib import Path
 
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRectF, Qt
-from PyQt6.QtGui import (
-    QBrush,
-    QColor,
-    QIcon,
-    QLinearGradient,
-    QPainter,
-    QPainterPath,
-    QPen,
-    QPixmap,
-)
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 
 from app.paths import resource_dir
 from app.ui import theme
@@ -49,38 +41,37 @@ def _draw_logo(p: QPainter, size: int) -> None:
         )
         return
 
-    inset = size * 0.04
-    rect = QRectF(inset, inset, size - 2 * inset, size - 2 * inset)
-    gradient = QLinearGradient(rect.topLeft(), rect.bottomRight())
-    gradient.setColorAt(0.0, QColor("#818CF8"))
-    gradient.setColorAt(1.0, QColor("#5B5EE6"))
+    # Minimalist stacked emerald diamond emblem matching reference UI
+    cx = size * 0.50
+    rx = size * 0.40
+    ry = size * 0.21
+
+    # Lower stacked chevron layer (muted deep emerald)
+    lower_top = size * 0.50
+    lower_mid = size * 0.68
+    lower_bot = size * 0.86
+    lower = QPolygonF([
+        QPointF(cx - rx, lower_top),
+        QPointF(cx, lower_mid),
+        QPointF(cx + rx, lower_top),
+        QPointF(cx + rx, lower_top + size * 0.08),
+        QPointF(cx, lower_bot),
+        QPointF(cx - rx, lower_top + size * 0.08),
+    ])
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(gradient))
-    radius = size * 0.24
-    p.drawRoundedRect(rect, radius, radius)
+    p.setBrush(QColor("#3C8C5D"))
+    p.drawPolygon(lower)
 
-    ink = QColor("#FFFFFF")
-    cx, cy = size / 2, size * 0.56
-    spread = size * 0.22
-    node = max(1.6, size * 0.085)
-    left, right = QPointF(cx - spread, cy), QPointF(cx + spread, cy)
-
-    arc = QPainterPath(left)
-    arc.cubicTo(
-        QPointF(cx - spread, cy - size * 0.30),
-        QPointF(cx + spread, cy - size * 0.30),
-        right,
-    )
-    pen = QPen(ink, max(1.4, size * 0.075))
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawPath(arc)
-
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(ink)
-    p.drawEllipse(left, node, node)
-    p.drawEllipse(right, node, node)
+    # Upper crisp diamond (emerald green)
+    cy_top = size * 0.34
+    diamond = QPolygonF([
+        QPointF(cx, cy_top - ry),
+        QPointF(cx + rx, cy_top),
+        QPointF(cx, cy_top + ry),
+        QPointF(cx - rx, cy_top),
+    ])
+    p.setBrush(QColor("#69B78B"))
+    p.drawPolygon(diamond)
 
 
 def _render(size: int, status_color: str | None, ring_bg: str | None = None) -> QPixmap:
@@ -91,7 +82,7 @@ def _render(size: int, status_color: str | None, ring_bg: str | None = None) -> 
     _draw_logo(p, size)
 
     if status_color:
-        diameter = size * 0.46
+        diameter = size * 0.44
         ring = max(1.0, size * 0.08)
         dot = QRectF(size - diameter, size - diameter, diameter, diameter)
         dot = dot.adjusted(ring / 2, ring / 2, -ring / 2, -ring / 2)
@@ -130,30 +121,47 @@ def _draw_vector_glyph(p: QPainter, name: str, s: float, pen: QPen, fill: QColor
         path = QPainterPath(QPointF(s * 0.16, s * 0.46))
         path.lineTo(QPointF(s * 0.50, s * 0.18))
         path.lineTo(QPointF(s * 0.84, s * 0.46))
+        path.lineTo(QPointF(s * 0.78, s * 0.46))
+        path.lineTo(QPointF(s * 0.78, s * 0.82))
+        path.lineTo(QPointF(s * 0.58, s * 0.82))
+        path.lineTo(QPointF(s * 0.58, s * 0.60))
+        path.lineTo(QPointF(s * 0.42, s * 0.60))
+        path.lineTo(QPointF(s * 0.42, s * 0.82))
+        path.lineTo(QPointF(s * 0.22, s * 0.82))
+        path.lineTo(QPointF(s * 0.22, s * 0.46))
+        path.closeSubpath()
         p.drawPath(path)
-        body = QPainterPath(QPointF(s * 0.24, s * 0.44))
-        body.lineTo(QPointF(s * 0.24, s * 0.82))
-        body.lineTo(QPointF(s * 0.76, s * 0.82))
-        body.lineTo(QPointF(s * 0.76, s * 0.44))
-        p.drawPath(body)
     elif name == "connections":
-        p.drawEllipse(QRectF(s * 0.14, s * 0.36, s * 0.28, s * 0.28))
-        p.drawEllipse(QRectF(s * 0.58, s * 0.36, s * 0.28, s * 0.28))
-        p.drawLine(QPointF(s * 0.42, s * 0.50), QPointF(s * 0.58, s * 0.50))
+        # Clean diagonal chain link
+        p.save()
+        p.translate(s * 0.50, s * 0.50)
+        p.rotate(-45.0)
+        p.drawRoundedRect(QRectF(-s * 0.34, -s * 0.12, s * 0.28, s * 0.24), s * 0.11, s * 0.11)
+        p.drawRoundedRect(QRectF(s * 0.06, -s * 0.12, s * 0.28, s * 0.24), s * 0.11, s * 0.11)
+        p.drawLine(QPointF(-s * 0.12, 0.0), QPointF(s * 0.12, 0.0))
+        p.restore()
+    elif name == "proxy":
+        # Bidirectional horizontal arrows
+        p.drawLine(QPointF(s * 0.20, s * 0.34), QPointF(s * 0.78, s * 0.34))
+        p.drawLine(QPointF(s * 0.64, s * 0.20), QPointF(s * 0.78, s * 0.34))
+        p.drawLine(QPointF(s * 0.64, s * 0.48), QPointF(s * 0.78, s * 0.34))
+        p.drawLine(QPointF(s * 0.80, s * 0.66), QPointF(s * 0.22, s * 0.66))
+        p.drawLine(QPointF(s * 0.36, s * 0.52), QPointF(s * 0.22, s * 0.66))
+        p.drawLine(QPointF(s * 0.36, s * 0.80), QPointF(s * 0.22, s * 0.66))
     elif name == "clients":
         p.drawEllipse(QRectF(s * 0.34, s * 0.18, s * 0.32, s * 0.32))
         arc = QPainterPath(QPointF(s * 0.18, s * 0.82))
         arc.cubicTo(QPointF(s * 0.22, s * 0.56), QPointF(s * 0.78, s * 0.56), QPointF(s * 0.82, s * 0.82))
         p.drawPath(arc)
     elif name == "gateway":
-        p.drawRoundedRect(QRectF(s * 0.18, s * 0.22, s * 0.26, s * 0.56), 2, 2)
-        p.drawRoundedRect(QRectF(s * 0.56, s * 0.22, s * 0.26, s * 0.56), 2, 2)
-        p.drawLine(QPointF(s * 0.44, s * 0.40), QPointF(s * 0.56, s * 0.40))
-        p.drawLine(QPointF(s * 0.44, s * 0.60), QPointF(s * 0.56, s * 0.60))
+        p.drawRoundedRect(QRectF(s * 0.18, s * 0.22, s * 0.24, s * 0.56), 2, 2)
+        p.drawRoundedRect(QRectF(s * 0.58, s * 0.22, s * 0.24, s * 0.56), 2, 2)
+        p.drawLine(QPointF(s * 0.42, s * 0.40), QPointF(s * 0.58, s * 0.40))
+        p.drawLine(QPointF(s * 0.42, s * 0.60), QPointF(s * 0.58, s * 0.60))
     elif name == "tasks":
-        p.drawRoundedRect(QRectF(s * 0.20, s * 0.18, s * 0.60, s * 0.64), 2, 2)
-        p.drawLine(QPointF(s * 0.34, s * 0.40), QPointF(s * 0.66, s * 0.40))
-        p.drawLine(QPointF(s * 0.34, s * 0.58), QPointF(s * 0.58, s * 0.58))
+        p.drawRoundedRect(QRectF(s * 0.22, s * 0.18, s * 0.56, s * 0.64), 2, 2)
+        p.drawLine(QPointF(s * 0.35, s * 0.40), QPointF(s * 0.65, s * 0.40))
+        p.drawLine(QPointF(s * 0.35, s * 0.58), QPointF(s * 0.57, s * 0.58))
     elif name == "servers":
         p.drawRoundedRect(QRectF(s * 0.18, s * 0.20, s * 0.64, s * 0.24), 2, 2)
         p.drawRoundedRect(QRectF(s * 0.18, s * 0.56, s * 0.64, s * 0.24), 2, 2)
@@ -178,9 +186,15 @@ def _draw_vector_glyph(p: QPainter, name: str, s: float, pen: QPen, fill: QColor
         p.drawRoundedRect(QRectF(s * 0.20, s * 0.54, s * 0.26, s * 0.26), 2, 2)
         p.drawRoundedRect(QRectF(s * 0.54, s * 0.54, s * 0.26, s * 0.26), 2, 2)
     elif name == "automation":
-        p.drawEllipse(QRectF(s * 0.18, s * 0.18, s * 0.64, s * 0.64))
-        p.drawLine(QPointF(s * 0.50, s * 0.30), QPointF(s * 0.50, s * 0.52))
-        p.drawLine(QPointF(s * 0.50, s * 0.52), QPointF(s * 0.64, s * 0.60))
+        # Crisp lightning bolt matching reference image
+        path = QPainterPath(QPointF(s * 0.54, s * 0.14))
+        path.lineTo(QPointF(s * 0.24, s * 0.54))
+        path.lineTo(QPointF(s * 0.48, s * 0.54))
+        path.lineTo(QPointF(s * 0.42, s * 0.86))
+        path.lineTo(QPointF(s * 0.76, s * 0.46))
+        path.lineTo(QPointF(s * 0.52, s * 0.46))
+        path.closeSubpath()
+        p.drawPath(path)
     elif name in ("security", "shield"):
         path = QPainterPath(QPointF(s * 0.50, s * 0.16))
         path.lineTo(QPointF(s * 0.80, s * 0.28))
@@ -191,13 +205,21 @@ def _draw_vector_glyph(p: QPainter, name: str, s: float, pen: QPen, fill: QColor
         path.closeSubpath()
         p.drawPath(path)
     elif name in ("logs", "terminal"):
-        p.drawRoundedRect(QRectF(s * 0.16, s * 0.20, s * 0.68, s * 0.60), 2, 2)
-        p.drawLine(QPointF(s * 0.28, s * 0.40), QPointF(s * 0.40, s * 0.50))
-        p.drawLine(QPointF(s * 0.40, s * 0.50), QPointF(s * 0.28, s * 0.60))
-        p.drawLine(QPointF(s * 0.48, s * 0.60), QPointF(s * 0.68, s * 0.60))
+        p.drawRoundedRect(QRectF(s * 0.20, s * 0.16, s * 0.60, s * 0.68), 2, 2)
+        p.drawLine(QPointF(s * 0.34, s * 0.36), QPointF(s * 0.66, s * 0.36))
+        p.drawLine(QPointF(s * 0.34, s * 0.52), QPointF(s * 0.66, s * 0.52))
+        p.drawLine(QPointF(s * 0.34, s * 0.68), QPointF(s * 0.54, s * 0.68))
     elif name == "settings":
-        p.drawEllipse(QRectF(s * 0.34, s * 0.34, s * 0.32, s * 0.32))
-        p.drawEllipse(QRectF(s * 0.18, s * 0.18, s * 0.64, s * 0.64))
+        # Crisp gear with 8 subtle teeth
+        cx, cy = s * 0.50, s * 0.50
+        p.drawEllipse(QRectF(s * 0.38, s * 0.38, s * 0.24, s * 0.24))
+        p.drawEllipse(QRectF(s * 0.24, s * 0.24, s * 0.52, s * 0.52))
+        for i in range(8):
+            angle = math.radians(i * 45.0)
+            p.drawLine(
+                QPointF(cx + math.cos(angle) * s * 0.28, cy + math.sin(angle) * s * 0.28),
+                QPointF(cx + math.cos(angle) * s * 0.38, cy + math.sin(angle) * s * 0.38),
+            )
     elif name == "search":
         p.drawEllipse(QRectF(s * 0.18, s * 0.18, s * 0.46, s * 0.46))
         p.drawLine(QPointF(s * 0.58, s * 0.58), QPointF(s * 0.82, s * 0.82))
@@ -236,13 +258,37 @@ def _draw_vector_glyph(p: QPainter, name: str, s: float, pen: QPen, fill: QColor
     elif name == "refresh":
         p.drawArc(QRectF(s * 0.20, s * 0.20, s * 0.60, s * 0.60), 30 * 16, 280 * 16)
         p.drawLine(QPointF(s * 0.72, s * 0.20), QPointF(s * 0.78, s * 0.38))
+    elif name == "play":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        poly = QPolygonF([
+            QPointF(s * 0.28, s * 0.20),
+            QPointF(s * 0.80, s * 0.50),
+            QPointF(s * 0.28, s * 0.80),
+        ])
+        p.drawPolygon(poly)
+    elif name == "stop":
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(QRectF(s * 0.24, s * 0.24, s * 0.52, s * 0.52), 2.0, 2.0)
+    elif name == "chevron-right":
+        p.drawLine(QPointF(s * 0.38, s * 0.24), QPointF(s * 0.64, s * 0.50))
+        p.drawLine(QPointF(s * 0.64, s * 0.50), QPointF(s * 0.38, s * 0.76))
+    elif name == "copy":
+        p.drawRoundedRect(QRectF(s * 0.34, s * 0.34, s * 0.46, s * 0.48), 2, 2)
+        path = QPainterPath(QPointF(s * 0.64, s * 0.34))
+        path.lineTo(QPointF(s * 0.64, s * 0.20))
+        path.lineTo(QPointF(s * 0.20, s * 0.20))
+        path.lineTo(QPointF(s * 0.20, s * 0.66))
+        path.lineTo(QPointF(s * 0.34, s * 0.66))
+        p.drawPath(path)
     else:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(fill)
         p.drawEllipse(QRectF(s * 0.34, s * 0.34, s * 0.32, s * 0.32))
 
 
-@lru_cache(maxsize=256)
+@lru_cache(maxsize=512)
 def vector_icon(name: str, color: str, size: int = 16) -> QIcon:
     """Create a crisp 1x/2x vector icon using QPainter."""
     icon = QIcon()
@@ -253,7 +299,7 @@ def vector_icon(name: str, color: str, size: int = 16) -> QIcon:
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         qcolor = QColor(color)
-        pen = QPen(qcolor, 1.55 * scale)
+        pen = QPen(qcolor, 1.5 * scale)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         _draw_vector_glyph(p, name, float(px), pen, qcolor)

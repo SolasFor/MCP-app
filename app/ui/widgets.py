@@ -1,4 +1,4 @@
-"""Core status, navigation, and log-view widgets (Linear + Docker Desktop theme-aware)."""
+"""Core status, navigation, and log-view widgets (Minimalist Desktop UI)."""
 from __future__ import annotations
 
 import re
@@ -6,14 +6,12 @@ from datetime import datetime
 from html import escape
 from typing import Callable
 
-from PyQt6.QtCore import QPointF, QSize, Qt, QTimer, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QPointF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QTextOption
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QSizePolicy, QWidget
 
 from app.ui import icons, theme
 from app.ui.i18n import tr
-
-_RUNNING = QVariantAnimation.State.Running
 
 _ERR_RE = re.compile(r"✖|\bERR\b|\bERROR\b|Traceback|\bCRITICAL\b", re.IGNORECASE)
 _WARN_RE = re.compile(r"⚠|\bWRN\b|\bWARN(?:ING)?\b", re.IGNORECASE)
@@ -29,35 +27,18 @@ def repolish(widget: QWidget) -> None:
 
 
 class StatusDot(QWidget):
-    """Colored status dot with a subtle pulse ring only during pending transitions."""
+    """Static crisp status indicator dot (zero idle pulsing animation)."""
 
     def __init__(self, diameter: int = 8, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._diameter = diameter
         self._color = QColor(theme.IDLE)
         self._pending = False
-        self._phase = 0.0
-        self.setFixedSize(diameter + 10, diameter + 10)
-        self._anim = QVariantAnimation(self)
-        self._anim.setDuration(1400)
-        self._anim.setStartValue(0.0)
-        self._anim.setEndValue(1.0)
-        self._anim.setLoopCount(-1)
-        self._anim.valueChanged.connect(self._on_phase)
+        self.setFixedSize(diameter + 6, diameter + 6)
 
     def set_state(self, color: str, pending: bool = False) -> None:
         self._color = QColor(color)
         self._pending = pending
-        running = self._anim.state() == _RUNNING
-        if pending and not running:
-            self._anim.start()
-        elif not pending and running:
-            self._anim.stop()
-            self._phase = 0.0
-        self.update()
-
-    def _on_phase(self, value: object) -> None:
-        self._phase = float(value)  # type: ignore[arg-type]
         self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001
@@ -66,43 +47,41 @@ class StatusDot(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         center = QPointF(self.width() / 2, self.height() / 2)
         radius = self._diameter / 2
-        if self._pending:
-            halo = QColor(self._color)
-            halo.setAlphaF(0.40 * (1.0 - self._phase))
-            painter.setBrush(halo)
-            spread = radius + 4.5 * self._phase
-            painter.drawEllipse(center, spread, spread)
         painter.setBrush(self._color)
         painter.drawEllipse(center, radius, radius)
         painter.end()
 
 
 class StatusRow(QWidget):
-    """Service health row: dot + service title/detail on left, status label on right."""
+    """Compact component status row: title on left, dot + status label on right."""
 
     def __init__(self, name: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setMinimumHeight(34)
         row = QHBoxLayout(self)
-        row.setContentsMargins(0, 4, 0, 4)
-        row.setSpacing(8)
+        row.setContentsMargins(0, 6, 0, 6)
+        row.setSpacing(10)
 
-        self._dot = StatusDot()
-        row.addWidget(self._dot, 0, Qt.AlignmentFlag.AlignTop)
-
-        texts = QVBoxLayout()
-        texts.setSpacing(2)
         self._title = QLabel(name)
         self._title.setObjectName("ServiceName")
+        self._title.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        row.addWidget(self._title, 1)
+
         self._detail = QLabel("")
         self._detail.setObjectName("ServiceDetail")
         self._detail.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        texts.addWidget(self._title)
-        texts.addWidget(self._detail)
-        row.addLayout(texts, 1)
+        self._detail.hide()
+        row.addWidget(self._detail, 0)
 
+        right = QHBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)
+        self._dot = StatusDot(diameter=8)
+        right.addWidget(self._dot, 0, Qt.AlignmentFlag.AlignVCenter)
         self._state = QLabel("")
         self._state.setObjectName("ServiceState")
-        row.addWidget(self._state, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+        right.addWidget(self._state, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addLayout(right, 0)
 
     def set_title(self, text: str) -> None:
         self._title.setText(text)
@@ -110,15 +89,23 @@ class StatusRow(QWidget):
     def set_state(self, text: str, color: str, pending: bool = False) -> None:
         self._dot.set_state(color, pending)
         self._state.setText(text)
-        self._state.setStyleSheet(f"color: {color};")
+        # Keep running/stopped text crisp neutral; only warn/error tint the label
+        if color in (theme.WARN, theme.ERR):
+            self._state.setStyleSheet(f"color: {color};")
+        elif color == theme.IDLE:
+            self._state.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        else:
+            self._state.setStyleSheet("")
 
-    def set_detail(self, text: str) -> None:
+    def set_detail(self, text: str, *, show_inline: bool = False) -> None:
         self._detail.setText(text)
-        self._detail.setVisible(bool(text))
+        self._detail.setVisible(show_inline and bool(text))
+        if text:
+            self.setToolTip(text)
 
 
 class NavButton(QPushButton):
-    """Sidebar navigation item with vector icon, collapsible label, and optional tag/badge."""
+    """Sidebar navigation item with 16px vector icon, collapsible label, and optional badge."""
 
     def __init__(
         self,
@@ -138,8 +125,9 @@ class NavButton(QPushButton):
         self.setCheckable(True)
         self.setAutoExclusive(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMinimumHeight(32)
-        self.setIconSize(QSize(15, 15))
+        self.setFixedHeight(32)
+        self.setIconSize(QSize(16, 16))
+        self.setAccessibleName(text)
 
         self._badge = QLabel(self)
         self._badge.setObjectName("Badge")
@@ -157,6 +145,7 @@ class NavButton(QPushButton):
 
     def set_label(self, text: str) -> None:
         self._full_text = text
+        self.setAccessibleName(text)
         self.setText("" if self._collapsed else text)
 
     def set_collapsed(self, collapsed: bool) -> None:
@@ -176,8 +165,8 @@ class NavButton(QPushButton):
             self._place_decorations()
 
     def refresh_theme(self) -> None:
-        color = theme.ACCENT if self.isChecked() else theme.TEXT_MUTED
-        self.setIcon(icons.vector_icon(self._icon_name, color, 15))
+        color = theme.TEXT_STRONG if self.isChecked() else theme.TEXT_MUTED
+        self.setIcon(icons.vector_icon(self._icon_name, color, 16))
         if self._tag_text and not self._collapsed:
             self.setStyleSheet("QPushButton#Nav { padding-right: 54px; }")
         else:

@@ -1,4 +1,4 @@
-"""ThemeManager (Dark / Light / System) and QSS styling in Linear + Docker Desktop style."""
+"""ThemeManager (Dark / Light / System) and QSS styling in minimalist graphite desktop style."""
 from __future__ import annotations
 
 import os
@@ -18,13 +18,14 @@ THEME_DARK = "dark"
 THEME_LIGHT = "light"
 THEME_MODES = (THEME_SYSTEM, THEME_DARK, THEME_LIGHT)
 
-# Dynamic active color tokens synced on every theme switch for backwards-compatible imports.
+# Dynamic active color tokens synced on every theme switch.
 BG = tok.DARK_TOKENS.bg
 SIDEBAR = tok.DARK_TOKENS.sidebar
 SURFACE = tok.DARK_TOKENS.surface
 ELEVATED = tok.DARK_TOKENS.elevated
 CONTROL = tok.DARK_TOKENS.control
 CONTROL_HOVER = tok.DARK_TOKENS.control_hover
+CONTROL_PRESSED = tok.DARK_TOKENS.control_pressed
 ACTIVE = tok.DARK_TOKENS.active
 INPUT = tok.DARK_TOKENS.input
 HAIRLINE = tok.DARK_TOKENS.hairline
@@ -41,6 +42,11 @@ ACCENT_PRESSED = tok.DARK_TOKENS.accent_pressed
 ACCENT_TEXT = tok.DARK_TOKENS.accent_text
 ACCENT_SOFT_BG = tok.DARK_TOKENS.accent_soft_bg
 ACCENT_SOFT_BORDER = tok.DARK_TOKENS.accent_soft_border
+BTN_EMPHASIS = tok.DARK_TOKENS.btn_emphasis
+BTN_EMPHASIS_HOVER = tok.DARK_TOKENS.btn_emphasis_hover
+BTN_EMPHASIS_PRESSED = tok.DARK_TOKENS.btn_emphasis_pressed
+BTN_EMPHASIS_BORDER = tok.DARK_TOKENS.btn_emphasis_border
+BTN_EMPHASIS_TEXT = tok.DARK_TOKENS.btn_emphasis_text
 LINK = tok.DARK_TOKENS.link
 OK = tok.DARK_TOKENS.ok
 OK_SOFT_BG = tok.DARK_TOKENS.ok_soft_bg
@@ -52,6 +58,10 @@ ERR = tok.DARK_TOKENS.err
 ERR_SOFT_BG = tok.DARK_TOKENS.err_soft_bg
 ERR_SOFT_BORDER = tok.DARK_TOKENS.err_soft_border
 IDLE = tok.DARK_TOKENS.idle
+
+SUCCESS = OK
+WARNING = WARN
+ERROR = ERR
 
 PENDING = {"starting", "degraded", "stopping"}
 SERIF_FAMILIES = list(tok.SANS_FAMILIES)
@@ -66,12 +76,13 @@ LOG_SOURCES: dict[str, tuple[str, str]] = {}
 
 
 def _sync_globals(active: tok.ThemeTokens) -> None:
-    global BG, SIDEBAR, SURFACE, ELEVATED, CONTROL, CONTROL_HOVER, ACTIVE, INPUT
+    global BG, SIDEBAR, SURFACE, ELEVATED, CONTROL, CONTROL_HOVER, CONTROL_PRESSED, ACTIVE, INPUT
     global HAIRLINE, BORDER, BORDER_STRONG, TEXT_STRONG, TEXT, TEXT_MUTED, TEXT_FAINT
     global ACCENT, ACCENT_HOVER, ACCENT_STRONG, ACCENT_PRESSED, ACCENT_TEXT
-    global ACCENT_SOFT_BG, ACCENT_SOFT_BORDER, LINK
-    global OK, OK_SOFT_BG, OK_SOFT_BORDER, WARN, WARN_SOFT_BG, WARN_SOFT_BORDER
-    global ERR, ERR_SOFT_BG, ERR_SOFT_BORDER, IDLE
+    global ACCENT_SOFT_BG, ACCENT_SOFT_BORDER
+    global BTN_EMPHASIS, BTN_EMPHASIS_HOVER, BTN_EMPHASIS_PRESSED, BTN_EMPHASIS_BORDER, BTN_EMPHASIS_TEXT
+    global LINK, OK, OK_SOFT_BG, OK_SOFT_BORDER, WARN, WARN_SOFT_BG, WARN_SOFT_BORDER
+    global ERR, ERR_SOFT_BG, ERR_SOFT_BORDER, IDLE, SUCCESS, WARNING, ERROR
     global OVERALL, SERVICE, LOG_SOURCES
 
     BG = active.bg
@@ -80,6 +91,7 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
     ELEVATED = active.elevated
     CONTROL = active.control
     CONTROL_HOVER = active.control_hover
+    CONTROL_PRESSED = active.control_pressed
     ACTIVE = active.active
     INPUT = active.input
     HAIRLINE = active.hairline
@@ -96,6 +108,11 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
     ACCENT_TEXT = active.accent_text
     ACCENT_SOFT_BG = active.accent_soft_bg
     ACCENT_SOFT_BORDER = active.accent_soft_border
+    BTN_EMPHASIS = active.btn_emphasis
+    BTN_EMPHASIS_HOVER = active.btn_emphasis_hover
+    BTN_EMPHASIS_PRESSED = active.btn_emphasis_pressed
+    BTN_EMPHASIS_BORDER = active.btn_emphasis_border
+    BTN_EMPHASIS_TEXT = active.btn_emphasis_text
     LINK = active.link
     OK = active.ok
     OK_SOFT_BG = active.ok_soft_bg
@@ -107,6 +124,9 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
     ERR_SOFT_BG = active.err_soft_bg
     ERR_SOFT_BORDER = active.err_soft_border
     IDLE = active.idle
+    SUCCESS = OK
+    WARNING = WARN
+    ERROR = ERR
 
     OVERALL = {
         "stopped": (tr("status.overall.stopped"), IDLE),
@@ -124,18 +144,18 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
         "failed": (tr("status.service.failed"), ERR),
     }
     LOG_SOURCES = {
-        "server": ("backend", LINK),
-        "backend": ("backend", LINK),
+        "server": ("backend", TEXT_STRONG),
+        "backend": ("backend", TEXT_STRONG),
         "tunnel": ("tunnel", OK),
         "app": ("app", TEXT_MUTED),
-        "oauth": ("oauth", ACCENT_TEXT),
-        "proxy": ("proxy", LINK),
+        "oauth": ("oauth", TEXT_STRONG),
+        "proxy": ("proxy", TEXT_MUTED),
         "computer_use": ("desktop", WARN),
-        "gateway": ("gateway", LINK),
+        "gateway": ("gateway", TEXT_STRONG),
         "tasks": ("tasks", TEXT),
         "servers": ("servers", TEXT),
         "workspaces": ("work", TEXT),
-        "extensions": ("ext", ACCENT_TEXT),
+        "extensions": ("ext", TEXT_STRONG),
         "ssh": ("ssh", WARN),
         "automation": ("auto", OK),
         "errors": ("errors", ERR),
@@ -144,6 +164,23 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
 
 
 _sync_globals(tok.DARK_TOKENS)
+
+
+def animations_enabled() -> bool:
+    """Return True only when OS reduced-motion is off and platform is interactive."""
+    if QApplication.platformName() in ("offscreen", "minimal"):
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            enabled = ctypes.c_int(1)
+            # SPI_GETCLIENTAREAANIMATION = 0x1042
+            if ctypes.windll.user32.SystemParametersInfoW(0x1042, 0, ctypes.byref(enabled), 0):
+                return bool(enabled.value)
+        except (AttributeError, OSError):
+            pass
+    return True
 
 
 def overall_label_color(state: str) -> tuple[str, str]:
@@ -217,7 +254,7 @@ QScrollArea#NavScroll, QScrollArea#NavScroll > QWidget, QScrollArea#NavScroll > 
     border: none;
 }
 
-/* ---------- sidebar & topbar ---------- */
+/* ---------- sidebar & utility topbar ---------- */
 QFrame#Sidebar {
     background: $SIDEBAR;
     border: none;
@@ -226,34 +263,18 @@ QFrame#Sidebar {
 QFrame#TopBar {
     background: $BG;
     border: none;
-    border-bottom: 1px solid $HAIRLINE;
-}
-QLabel#TopBarTitle {
-    color: $TEXT_STRONG;
-    font-size: 13px;
-    font-weight: 600;
 }
 QLabel#Wordmark {
     color: $TEXT_STRONG;
-    font-size: 15px;
-    font-weight: 700;
-}
-QLabel#SidebarSection {
-    color: $TEXT_FAINT;
-    font-size: 10px;
-    font-weight: 700;
-    padding: 6px 8px 2px 8px;
-}
-QLabel#Version {
-    color: $TEXT_FAINT;
-    font-size: 11px;
-    padding: 0 6px;
+    font-size: 14px;
+    font-weight: 600;
 }
 QPushButton#Nav {
     background: transparent;
-    border: 1px solid transparent;
-    border-radius: 7px;
-    padding: 6px 10px;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 10px;
+    min-height: 22px;
     text-align: left;
     color: $TEXT_MUTED;
     font-weight: 500;
@@ -263,37 +284,29 @@ QPushButton#Nav:hover {
     background: $CONTROL;
     color: $TEXT_STRONG;
 }
+QPushButton#Nav:pressed {
+    background: $CONTROL_PRESSED;
+}
+QPushButton#Nav:focus {
+    border: 1px solid $ACCENT;
+}
 QPushButton#Nav:checked {
     background: $ACTIVE;
-    border-color: $HAIRLINE;
     color: $TEXT_STRONG;
-    font-weight: 600;
+    font-weight: 500;
 }
 QPushButton#Nav[collapsed="true"] {
-    padding: 6px 4px;
+    padding: 5px 4px;
     text-align: center;
 }
-QFrame#StatusChip {
-    background: $BG;
-    border: 1px solid $HAIRLINE;
-    border-radius: 8px;
+QFrame#SidebarFooter {
+    background: transparent;
+    border: none;
 }
-QLabel#ChipText { font-size: 12px; font-weight: 600; }
-QLabel#ChipDetail { color: $TEXT_FAINT; font-size: 11px; }
-
-QPushButton#PaletteTrigger {
-    background: $INPUT;
+QLabel#SidebarStatus {
     color: $TEXT_MUTED;
-    border: 1px solid $BORDER;
-    border-radius: 7px;
-    padding: 5px 10px;
-    text-align: left;
-    font-weight: 500;
     font-size: 12px;
-}
-QPushButton#PaletteTrigger:hover {
-    border-color: $BORDER_STRONG;
-    color: $TEXT_STRONG;
+    font-weight: 400;
 }
 
 /* ---------- typography ---------- */
@@ -304,20 +317,23 @@ QLabel#PageTitle {
 }
 QLabel#PageLead { color: $TEXT_MUTED; font-size: 13px; }
 QLabel#SectionTitle { color: $TEXT_STRONG; font-size: 14px; font-weight: 600; }
-QLabel#FieldLabel { color: $TEXT_MUTED; font-size: 12px; font-weight: 600; }
-QLabel#Hint { color: $TEXT_FAINT; font-size: 12px; }
+QLabel#HeroStatusTitle { color: $TEXT_STRONG; font-size: 15px; font-weight: 600; }
+QLabel#FieldLabel { color: $TEXT; font-size: 12px; font-weight: 600; }
+QLabel#SettingTitle { color: $TEXT; font-size: 13px; font-weight: 500; }
+QLabel#Hint { color: $TEXT_MUTED; font-size: 12px; }
+QLabel#Caption { color: $TEXT_FAINT; font-size: 11px; }
 QLabel#Error { color: $ERR; font-size: 12px; font-weight: 500; }
 QLabel#Mono { font-family: $FONT_MONO; font-size: 12px; color: $TEXT_STRONG; }
-QLabel#ServiceName { color: $TEXT_STRONG; font-weight: 600; font-size: 13px; }
-QLabel#ServiceDetail { color: $TEXT_FAINT; font-size: 12px; font-family: $FONT_MONO; }
-QLabel#ServiceState { font-size: 12px; font-weight: 600; }
+QLabel#ServiceName { color: $TEXT; font-weight: 500; font-size: 13px; }
+QLabel#ServiceDetail { color: $TEXT_MUTED; font-size: 12px; font-family: $FONT_MONO; }
+QLabel#ServiceState { color: $TEXT; font-size: 12px; font-weight: 500; }
 
 /* ---------- badges & pills ---------- */
 QLabel#Badge {
     background: $ERR_SOFT_BG;
     color: $ERR;
     border: 1px solid $ERR_SOFT_BORDER;
-    border-radius: 6px;
+    border-radius: 5px;
     padding: 1px 6px;
     font-size: 11px;
     font-weight: 600;
@@ -326,10 +342,10 @@ QLabel#Pill {
     background: $CONTROL;
     color: $TEXT_MUTED;
     border: 1px solid $BORDER;
-    border-radius: 6px;
-    padding: 2px 8px;
+    border-radius: 5px;
+    padding: 2px 7px;
     font-size: 11px;
-    font-weight: 600;
+    font-weight: 500;
 }
 QLabel#Pill[variant="accent"] {
     background: $ACCENT_SOFT_BG;
@@ -352,21 +368,64 @@ QLabel#Pill[variant="err"] {
     border-color: $ERR_SOFT_BORDER;
 }
 
-/* ---------- cards & banners ---------- */
+/* ---------- surfaces, cards, copy field & banners ---------- */
 QFrame#Card {
     background: $SURFACE;
     border: 1px solid $HAIRLINE;
-    border-radius: 10px;
+    border-radius: 8px;
 }
 QFrame#Elevated {
     background: $ELEVATED;
     border: 1px solid $BORDER;
-    border-radius: 10px;
+    border-radius: 8px;
+}
+QFrame#CopyField {
+    background: $INPUT;
+    border: 1px solid $BORDER;
+    border-radius: 7px;
+}
+QFrame#CopyField:hover {
+    border-color: $BORDER_STRONG;
+}
+QLineEdit#CopyFieldInput {
+    background: transparent;
+    border: none;
+    color: $TEXT_STRONG;
+    font-family: $FONT_MONO;
+    font-size: 13px;
+    padding: 0 4px;
+    selection-background-color: $ACCENT_STRONG;
+    selection-color: $ACCENT_TEXT;
+}
+QPushButton#CopyFieldBtn {
+    background: $CONTROL;
+    color: $TEXT_STRONG;
+    border: 1px solid $BORDER;
+    border-radius: 5px;
+    padding: 4px 12px;
+    min-height: 20px;
+    font-size: 12px;
+    font-weight: 500;
+}
+QPushButton#CopyFieldBtn:hover {
+    background: $CONTROL_HOVER;
+    border-color: $BORDER_STRONG;
+}
+QPushButton#CopyFieldBtn:pressed {
+    background: $CONTROL_PRESSED;
+}
+QPushButton#CopyFieldBtn:focus {
+    border-color: $ACCENT;
+}
+QPushButton#CopyFieldBtn:disabled {
+    color: $TEXT_FAINT;
+    background: $SURFACE;
+    border-color: $HAIRLINE;
 }
 QFrame#EmptyState {
     background: $SURFACE;
-    border: 1px dashed $BORDER_STRONG;
-    border-radius: 10px;
+    border: 1px solid $HAIRLINE;
+    border-radius: 8px;
 }
 QFrame#ErrorBanner {
     background: $ERR_SOFT_BG;
@@ -384,7 +443,7 @@ QFrame#Toast[variant="err"] { border-color: $ERR_SOFT_BORDER; }
 QFrame#PaletteCard {
     background: $ELEVATED;
     border: 1px solid $BORDER_STRONG;
-    border-radius: 10px;
+    border-radius: 8px;
 }
 QFrame#Divider {
     background: $HAIRLINE;
@@ -398,16 +457,17 @@ QPushButton {
     background: $CONTROL;
     color: $TEXT_STRONG;
     border: 1px solid $BORDER;
-    border-radius: 7px;
-    padding: 6px 13px;
-    font-weight: 600;
+    border-radius: 6px;
+    padding: 5px 12px;
+    min-height: 20px;
+    font-weight: 500;
     font-size: 12px;
 }
 QPushButton:hover {
     background: $CONTROL_HOVER;
     border-color: $BORDER_STRONG;
 }
-QPushButton:pressed { background: $ACTIVE; }
+QPushButton:pressed { background: $CONTROL_PRESSED; }
 QPushButton:focus { border-color: $ACCENT; }
 QPushButton:disabled {
     color: $TEXT_FAINT;
@@ -415,12 +475,14 @@ QPushButton:disabled {
     border-color: $HAIRLINE;
 }
 
+/* Primary button: reserved exclusively for main server Start/Stop action */
 QPushButton#Primary {
     background: $ACCENT_STRONG;
     color: $ACCENT_TEXT;
     border: 1px solid $ACCENT_STRONG;
-    border-radius: 8px;
-    padding: 8px 18px;
+    border-radius: 6px;
+    padding: 6px 16px;
+    min-height: 20px;
     font-size: 13px;
     font-weight: 600;
 }
@@ -432,37 +494,36 @@ QPushButton#Primary:pressed {
     background: $ACCENT_PRESSED;
     border-color: $ACCENT_PRESSED;
 }
+QPushButton#Primary:focus {
+    border-color: $TEXT_STRONG;
+}
 QPushButton#Primary:disabled {
     background: $CONTROL;
     border-color: $HAIRLINE;
     color: $TEXT_FAINT;
 }
-QPushButton#Primary[running="true"] {
-    background: $CONTROL;
-    color: $TEXT_STRONG;
-    border: 1px solid $BORDER_STRONG;
-}
-QPushButton#Primary[running="true"]:hover {
-    background: $ERR_SOFT_BG;
-    border-color: $ERR_SOFT_BORDER;
-    color: $ERR;
-}
 
+/* Accent button: crisp neutral high-emphasis for Save/Add/Confirm actions */
 QPushButton#Accent {
-    background: $ACCENT_STRONG;
-    color: $ACCENT_TEXT;
-    border: 1px solid $ACCENT_STRONG;
+    background: $BTN_EMPHASIS;
+    color: $BTN_EMPHASIS_TEXT;
+    border: 1px solid $BTN_EMPHASIS_BORDER;
+    border-radius: 6px;
+    padding: 5px 13px;
+    font-weight: 600;
 }
 QPushButton#Accent:hover {
-    background: $ACCENT_HOVER;
-    border-color: $ACCENT_HOVER;
+    background: $BTN_EMPHASIS_HOVER;
+    border-color: $BORDER_STRONG;
 }
 QPushButton#Accent:pressed {
-    background: $ACCENT_PRESSED;
-    border-color: $ACCENT_PRESSED;
+    background: $BTN_EMPHASIS_PRESSED;
+}
+QPushButton#Accent:focus {
+    border-color: $ACCENT;
 }
 QPushButton#Accent:disabled {
-    background: $CONTROL;
+    background: $SURFACE;
     border-color: $HAIRLINE;
     color: $TEXT_FAINT;
 }
@@ -471,9 +532,15 @@ QPushButton#Danger {
     background: $ERR_SOFT_BG;
     color: $ERR;
     border: 1px solid $ERR_SOFT_BORDER;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-weight: 500;
 }
 QPushButton#Danger:hover {
     border-color: $ERR;
+}
+QPushButton#Danger:pressed {
+    background: $CONTROL_PRESSED;
 }
 QPushButton#Danger:disabled {
     background: $SURFACE;
@@ -484,16 +551,41 @@ QPushButton#Danger:disabled {
 QPushButton#Ghost {
     background: transparent;
     border: 1px solid transparent;
+    border-radius: 6px;
     color: $TEXT_MUTED;
-    padding: 6px 10px;
+    padding: 5px 9px;
 }
 QPushButton#Ghost:hover {
     color: $TEXT_STRONG;
     background: $CONTROL;
 }
+QPushButton#Ghost:pressed {
+    background: $CONTROL_PRESSED;
+}
+QPushButton#Ghost:focus {
+    border-color: $ACCENT;
+}
 QPushButton#Ghost:disabled {
     color: $TEXT_FAINT;
     background: transparent;
+}
+
+QPushButton#IconBtn {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 3px;
+    min-height: 20px;
+}
+QPushButton#IconBtn:hover {
+    background: $CONTROL;
+    border-color: $HAIRLINE;
+}
+QPushButton#IconBtn:pressed {
+    background: $CONTROL_PRESSED;
+}
+QPushButton#IconBtn:focus {
+    border-color: $ACCENT;
 }
 
 QPushButton#Link {
@@ -501,23 +593,51 @@ QPushButton#Link {
     border: none;
     color: $LINK;
     padding: 2px 0;
+    min-height: 18px;
     font-weight: 500;
     text-align: left;
 }
 QPushButton#Link:hover {
     text-decoration: underline;
 }
+QPushButton#Link:focus {
+    color: $TEXT_STRONG;
+    text-decoration: underline;
+}
+
+QPushButton#SubtleLink {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    color: $TEXT_MUTED;
+    padding: 4px 6px;
+    min-height: 20px;
+    font-size: 12px;
+    font-weight: 400;
+    text-align: left;
+}
+QPushButton#SubtleLink:hover {
+    color: $TEXT_STRONG;
+    background: $CONTROL;
+}
+QPushButton#SubtleLink:pressed {
+    background: $CONTROL_PRESSED;
+}
+QPushButton#SubtleLink:focus {
+    border-color: $ACCENT;
+}
 
 QFrame#SegmentGroup {
     background: $INPUT;
     border: 1px solid $BORDER;
-    border-radius: 8px;
+    border-radius: 7px;
 }
 QPushButton#Segment {
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 6px;
-    padding: 5px 12px;
+    border-radius: 5px;
+    padding: 4px 10px;
+    min-height: 18px;
     color: $TEXT_MUTED;
     font-weight: 500;
 }
@@ -534,6 +654,7 @@ QPushButton#FilterPill {
     border: 1px solid $BORDER;
     border-radius: 6px;
     padding: 4px 10px;
+    min-height: 20px;
     color: $TEXT_MUTED;
     font-size: 12px;
     font-weight: 500;
@@ -543,36 +664,47 @@ QPushButton#FilterPill:hover {
     color: $TEXT_STRONG;
 }
 QPushButton#FilterPill:checked {
-    background: $ACCENT_SOFT_BG;
-    border-color: $ACCENT_SOFT_BORDER;
-    color: $ACCENT;
+    background: $ACTIVE;
+    border-color: $BORDER_STRONG;
+    color: $TEXT_STRONG;
     font-weight: 600;
 }
 
-/* ---------- inputs & combos ---------- */
-QLineEdit, QTextEdit, QPlainTextEdit {
+/* ---------- inputs, spinboxes & combos ---------- */
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox {
     background: $INPUT;
     color: $TEXT_STRONG;
     border: 1px solid $BORDER;
-    border-radius: 7px;
-    padding: 7px 10px;
+    border-radius: 6px;
+    padding: 5px 10px;
+    min-height: 20px;
     font-size: 12px;
     selection-background-color: $ACCENT_STRONG;
-    selection-color: #ffffff;
+    selection-color: $ACCENT_TEXT;
 }
 QLineEdit { font-family: $FONT_MONO; }
 QLineEdit#UiInput { font-family: $FONT_UI; font-size: 13px; }
-QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover { border-color: $BORDER_STRONG; }
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus { border-color: $ACCENT; }
+QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border-color: $BORDER_STRONG;
+}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+    border-color: $ACCENT;
+}
 QLineEdit:read-only { color: $TEXT_MUTED; }
 QLineEdit[invalid="true"] { border-color: $ERR; }
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    width: 18px;
+    border: none;
+    background: transparent;
+}
 
 QComboBox {
     background: $INPUT;
     color: $TEXT_STRONG;
     border: 1px solid $BORDER;
-    border-radius: 7px;
-    padding: 6px 28px 6px 10px;
+    border-radius: 6px;
+    padding: 5px 26px 5px 10px;
+    min-height: 20px;
     font-size: 12px;
     font-weight: 500;
 }
@@ -582,7 +714,7 @@ QComboBox:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $HA
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
-    width: 24px;
+    width: 22px;
     border: none;
 }
 QComboBox::down-arrow {
@@ -594,10 +726,65 @@ QComboBox QAbstractItemView {
     background: $ELEVATED;
     color: $TEXT_STRONG;
     border: 1px solid $BORDER_STRONG;
-    border-radius: 7px;
+    border-radius: 6px;
     padding: 4px;
     selection-background-color: $ACTIVE;
     selection-color: $TEXT_STRONG;
+}
+
+QComboBox#ThemeCombo {
+    background: transparent;
+    border: 1px solid $HAIRLINE;
+    border-radius: 6px;
+    padding: 3px 24px 3px 8px;
+    min-height: 18px;
+    font-size: 12px;
+    font-weight: 500;
+    color: $TEXT_MUTED;
+}
+QComboBox#ThemeCombo:hover {
+    background: $CONTROL;
+    border-color: $BORDER;
+    color: $TEXT_STRONG;
+}
+QComboBox#ThemeCombo:focus {
+    border-color: $ACCENT;
+}
+QComboBox#ThemeCombo::drop-down { width: 20px; }
+
+/* ---------- tabs & splitters ---------- */
+QTabWidget::pane {
+    border: none;
+    border-top: 1px solid $HAIRLINE;
+    background: transparent;
+    padding-top: 12px;
+}
+QTabBar::tab {
+    background: transparent;
+    color: $TEXT_MUTED;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 6px 12px;
+    margin-right: 4px;
+    font-size: 13px;
+    font-weight: 500;
+}
+QTabBar::tab:hover {
+    color: $TEXT_STRONG;
+}
+QTabBar::tab:selected {
+    color: $TEXT_STRONG;
+    font-weight: 600;
+    border-bottom: 2px solid $ACCENT;
+}
+QTabBar::tab:focus {
+    color: $TEXT_STRONG;
+}
+QSplitter::handle {
+    background: $HAIRLINE;
+}
+QSplitter::handle:hover {
+    background: $BORDER_STRONG;
 }
 
 /* ---------- tables & lists ---------- */
@@ -610,8 +797,11 @@ QTableWidget {
     selection-background-color: $ACTIVE;
     selection-color: $TEXT_STRONG;
 }
+QTableWidget:focus {
+    border-color: $BORDER_STRONG;
+}
 QTableWidget::item {
-    padding: 6px 10px;
+    padding: 5px 10px;
     border-bottom: 1px solid $HAIRLINE;
 }
 QTableWidget::item:selected {
@@ -623,7 +813,7 @@ QHeaderView::section {
     color: $TEXT_MUTED;
     border: none;
     border-bottom: 1px solid $BORDER;
-    padding: 7px 10px;
+    padding: 6px 10px;
     font-size: 11px;
     font-weight: 600;
     text-align: left;
@@ -634,9 +824,9 @@ QListWidget {
     color: $TEXT;
 }
 QListWidget::item {
-    border-radius: 7px;
-    padding: 8px 10px;
-    margin: 2px 0;
+    border-radius: 6px;
+    padding: 7px 10px;
+    margin: 1px 0;
 }
 QListWidget::item:hover { background: $CONTROL; }
 QListWidget::item:selected {
@@ -644,8 +834,8 @@ QListWidget::item:selected {
     color: $TEXT_STRONG;
 }
 
-/* ---------- toggles ---------- */
-QCheckBox { spacing: 10px; padding: 4px 0; color: $TEXT; }
+/* ---------- toggles & checkboxes ---------- */
+QCheckBox { spacing: 8px; padding: 3px 0; color: $TEXT; font-size: 13px; }
 QCheckBox:disabled { color: $TEXT_FAINT; }
 QCheckBox::indicator { width: 32px; height: 18px; image: url("$TOGGLE_OFF"); }
 QCheckBox::indicator:checked { image: url("$TOGGLE_ON"); }
@@ -655,21 +845,21 @@ QCheckBox::indicator:checked:disabled { image: url("$TOGGLE_ON_DISABLED"); }
 /* ---------- log viewer ---------- */
 QPlainTextEdit#Log {
     background: $INPUT;
-    color: $TEXT_MUTED;
+    color: $TEXT;
     border: 1px solid $HAIRLINE;
     border-radius: 8px;
     padding: 10px;
     font-family: $FONT_MONO;
     font-size: 12px;
     selection-background-color: $ACCENT_STRONG;
-    selection-color: #ffffff;
+    selection-color: $ACCENT_TEXT;
 }
 
-QScrollBar:vertical { background: transparent; width: 10px; margin: 4px 2px; }
-QScrollBar::handle:vertical { background: $BORDER; border-radius: 3px; min-height: 28px; }
+QScrollBar:vertical { background: transparent; width: 9px; margin: 3px 2px; }
+QScrollBar::handle:vertical { background: $BORDER; border-radius: 3px; min-height: 24px; }
 QScrollBar::handle:vertical:hover { background: $BORDER_STRONG; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px 4px; }
-QScrollBar::handle:horizontal { background: $BORDER; border-radius: 3px; min-width: 28px; }
+QScrollBar:horizontal { background: transparent; height: 9px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: $BORDER; border-radius: 3px; min-width: 24px; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 
@@ -679,7 +869,8 @@ QToolTip {
     color: $TEXT_STRONG;
     border: 1px solid $BORDER_STRONG;
     border-radius: 6px;
-    padding: 5px 8px;
+    padding: 4px 8px;
+    font-size: 12px;
 }
 QMenu {
     background: $ELEVATED;
@@ -688,24 +879,10 @@ QMenu {
     border-radius: 8px;
     padding: 4px;
 }
-QMenu::item { padding: 6px 20px 6px 12px; border-radius: 6px; }
+QMenu::item { padding: 6px 18px 6px 12px; border-radius: 5px; font-size: 12px; }
 QMenu::item:selected { background: $ACTIVE; color: $TEXT_STRONG; }
 QMenu::item:disabled { color: $TEXT_FAINT; }
-QMenu::separator { height: 1px; background: $BORDER; margin: 4px 6px; }
-QComboBox#ThemeCombo {
-    background: $SURFACE;
-    border: 1px solid $BORDER;
-    border-radius: 7px;
-    padding: 4px 28px 4px 10px;
-    min-height: 18px;
-    font-weight: 500;
-    color: $TEXT_STRONG;
-}
-QComboBox#ThemeCombo:hover {
-    background: $CONTROL_HOVER;
-    border-color: $BORDER_STRONG;
-}
-QComboBox#ThemeCombo::drop-down { width: 22px; }
+QMenu::separator { height: 1px; background: $HAIRLINE; margin: 4px 6px; }
 QMessageBox { background: $SURFACE; }
 QMessageBox QLabel { color: $TEXT; }
 """)
@@ -739,12 +916,12 @@ def _draw_chevron(scale: int, color: str) -> QImage:
     image.fill(Qt.GlobalColor.transparent)
     p = QPainter(image)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color), 1.6 * scale)
+    pen = QPen(QColor(color), 1.5 * scale)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     p.setPen(pen)
-    p.drawLine(QPointF(size * 0.22, size * 0.38), QPointF(size * 0.50, size * 0.66))
-    p.drawLine(QPointF(size * 0.50, size * 0.66), QPointF(size * 0.78, size * 0.38))
+    p.drawLine(QPointF(size * 0.24, size * 0.38), QPointF(size * 0.50, size * 0.64))
+    p.drawLine(QPointF(size * 0.50, size * 0.64), QPointF(size * 0.76, size * 0.38))
     p.end()
     return image
 
@@ -759,7 +936,7 @@ def _toggle_images(active: tok.ThemeTokens) -> dict[str, str]:
 
     folder = user_data_dir() / "ui"
     suffix = active.name
-    cache_key = (str(folder), suffix)
+    cache_key = (str(folder), f"v2_{suffix}")
     cached = _TOGGLE_CACHE.get(cache_key)
     if cached is not None and all(Path(p).exists() for p in cached.values()):
         return cached
@@ -772,7 +949,7 @@ def _toggle_images(active: tok.ThemeTokens) -> dict[str, str]:
         ("TOGGLE_OFF_DISABLED", False, True),
         ("TOGGLE_ON_DISABLED", True, True),
     ):
-        base = folder / f"{key.lower()}_{suffix}.png"
+        base = folder / f"v2_{key.lower()}_{suffix}.png"
         base_2x = base.with_name(base.stem + "@2x.png")
         if not base.exists():
             _draw_toggle(on, 1, disabled, active).save(str(base))
@@ -780,7 +957,7 @@ def _toggle_images(active: tok.ThemeTokens) -> dict[str, str]:
             _draw_toggle(on, 2, disabled, active).save(str(base_2x))
         paths[key] = Path(base).as_posix()
 
-    chevron = folder / f"chevron_down_{suffix}.png"
+    chevron = folder / f"v2_chevron_down_{suffix}.png"
     chevron_2x = chevron.with_name(chevron.stem + "@2x.png")
     if not chevron.exists():
         _draw_chevron(1, active.text_muted).save(str(chevron))
@@ -805,6 +982,7 @@ def stylesheet(active: tok.ThemeTokens | None = None) -> str:
         "ELEVATED": current.elevated,
         "CONTROL": current.control,
         "CONTROL_HOVER": current.control_hover,
+        "CONTROL_PRESSED": current.control_pressed,
         "ACTIVE": current.active,
         "INPUT": current.input,
         "HAIRLINE": current.hairline,
@@ -821,6 +999,11 @@ def stylesheet(active: tok.ThemeTokens | None = None) -> str:
         "ACCENT_TEXT": current.accent_text,
         "ACCENT_SOFT_BG": current.accent_soft_bg,
         "ACCENT_SOFT_BORDER": current.accent_soft_border,
+        "BTN_EMPHASIS": current.btn_emphasis,
+        "BTN_EMPHASIS_HOVER": current.btn_emphasis_hover,
+        "BTN_EMPHASIS_PRESSED": current.btn_emphasis_pressed,
+        "BTN_EMPHASIS_BORDER": current.btn_emphasis_border,
+        "BTN_EMPHASIS_TEXT": current.btn_emphasis_text,
         "LINK": current.link,
         "OK": current.ok,
         "OK_SOFT_BG": current.ok_soft_bg,
@@ -869,6 +1052,7 @@ def _palette(active: tok.ThemeTokens) -> QPalette:
     disabled = QPalette.ColorGroup.Disabled
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
         pal.setColor(disabled, role, QColor(active.text_faint))
+    _PALETTE_CACHE[active.name] = pal
     return pal
 
 

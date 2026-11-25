@@ -1,14 +1,14 @@
-"""Theme-aware ToggleSwitch widget in Linear + Docker Desktop style."""
+"""Theme-aware ToggleSwitch widget respecting OS reduced-motion preferences."""
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QRectF, QSize, Qt, QVariantAnimation
+from PyQt6.QtCore import QEasingCurve, QEvent, QRectF, QSize, Qt, QVariantAnimation
 from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPaintEvent, QPen
-from PyQt6.QtWidgets import QAbstractButton, QApplication, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QAbstractButton, QSizePolicy, QWidget
 
 from app.ui import theme
 
-_TRACK_W = 38
-_TRACK_H = 20
+_TRACK_W = 34
+_TRACK_H = 18
 _GAP = 10
 
 
@@ -25,7 +25,8 @@ class ToggleSwitch(QAbstractButton):
 
         self._thumb_pos = 0.0
         self._anim = QVariantAnimation(self)
-        self._anim.setDuration(130)
+        self._anim.setDuration(150)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._anim.valueChanged.connect(self._on_anim_value)
         self.toggled.connect(self._animate_to_state)
 
@@ -35,7 +36,7 @@ class ToggleSwitch(QAbstractButton):
 
     def _animate_to_state(self, checked: bool) -> None:
         target = 1.0 if checked else 0.0
-        if QApplication.platformName() in ("offscreen", "minimal"):
+        if not theme.animations_enabled():
             self._anim.stop()
             self._thumb_pos = target
             self.update()
@@ -48,7 +49,7 @@ class ToggleSwitch(QAbstractButton):
     def setChecked(self, checked: bool) -> None:  # noqa: N802
         was_blocked = self.signalsBlocked()
         super().setChecked(checked)
-        if was_blocked:
+        if was_blocked or not theme.animations_enabled():
             self._anim.stop()
             self._thumb_pos = 1.0 if checked else 0.0
             self.update()
@@ -98,9 +99,8 @@ class ToggleSwitch(QAbstractButton):
             painter.setBrush(track_color)
             painter.drawRoundedRect(track_rect, radius, radius)
         else:
-            # Neutral greyed-out pill so disabled dependent toggles never look clickable or active.
             track_color = QColor(theme.BORDER_STRONG)
-            track_color.setAlphaF(0.55)
+            track_color.setAlphaF(0.50)
             painter.setPen(QPen(QColor(theme.BORDER), 1.0))
             painter.setBrush(track_color)
             painter.drawRoundedRect(track_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)

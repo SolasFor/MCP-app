@@ -1,6 +1,7 @@
-"""Styled Docker Desktop-like data table helper."""
+"""Minimalist data table with 34px compact rows, right-eliding, and pixel-smooth scroll."""
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QWidget
 
 
@@ -11,16 +12,22 @@ class DataTable(QTableWidget):
         super().__init__(0, len(headers), parent)
         self.setHorizontalHeaderLabels(headers)
         self.verticalHeader().setVisible(False)
-        self.verticalHeader().setDefaultSectionSize(38)
+        self.verticalHeader().setDefaultSectionSize(34)
+        self.verticalHeader().setMinimumSectionSize(30)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setAlternatingRowColors(False)
         self.setShowGrid(False)
-        self.setFocusPolicy(self.focusPolicy())
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         header = self.horizontalHeader()
         header.setHighlightSections(False)
-        header.setDefaultAlignment(header.defaultAlignment())
+        header.setFixedHeight(30)
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         if headers:
             header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             for col in range(1, len(headers)):

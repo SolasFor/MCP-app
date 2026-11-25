@@ -1,4 +1,4 @@
-"""Shared responsive page scaffold (centered column up to MAX_WIDTH inside optional scroll area)."""
+"""Shared responsive page scaffold (20px content padding, 16px section rhythm)."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QScrollArea, QVBoxLayou
 
 
 class PageScaffold(QWidget):
-    MAX_WIDTH = 920
+    MAX_WIDTH = 960
 
     def __init__(self, *, scroll: bool = True, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -19,13 +19,13 @@ class PageScaffold(QWidget):
         column = QWidget()
         column.setMaximumWidth(self.MAX_WIDTH)
         self.content = QVBoxLayout(column)
-        self.content.setContentsMargins(0, 24, 0, 28)
-        self.content.setSpacing(14)
+        self.content.setContentsMargins(0, 8, 0, 20)
+        self.content.setSpacing(16)
 
         header = QHBoxLayout()
         header.setSpacing(12)
         title_box = QVBoxLayout()
-        title_box.setSpacing(4)
+        title_box.setSpacing(3)
         self.title_label = QLabel("")
         self.title_label.setObjectName("PageTitle")
         self.title_label.setWordWrap(True)
@@ -44,7 +44,7 @@ class PageScaffold(QWidget):
         canvas = QWidget()
         canvas.setObjectName("Canvas")
         row = QHBoxLayout(canvas)
-        row.setContentsMargins(28, 0, 28, 0)
+        row.setContentsMargins(20, 0, 20, 0)
         row.addStretch(1)
         row.addWidget(column, 100)
         row.addStretch(1)

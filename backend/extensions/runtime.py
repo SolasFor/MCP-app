@@ -181,6 +181,10 @@ class ExtensionProcessHost:
             proc.stdin.write(payload + "\n")
             proc.stdin.flush()
         except OSError as exc:
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
             self.last_error = f"Extension IPC write failed: {exc}"
             raise RuntimeError(self.last_error) from exc
 
@@ -191,7 +195,10 @@ class ExtensionProcessHost:
                 self.last_error = f"Extension RPC timeout after {timeout_seconds:.1f}s ({method})"
                 raise TimeoutError(self.last_error) from exc
             if msg is None:
-                rc = proc.poll()
+                try:
+                    rc = proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    rc = proc.poll()
                 self.last_error = f"Extension worker exited unexpectedly (exit={rc})"
                 raise RuntimeError(self.last_error)
             if msg.get("id") != rid:

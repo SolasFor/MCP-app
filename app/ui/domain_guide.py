@@ -109,22 +109,21 @@ class DomainGuideDialog(QDialog):
     def __init__(self, settings: Settings, cloudflared: str | None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
+        self._cloudflared = cloudflared
         self.setWindowTitle(f"{APP_NAME} — как подключить свой домен")
         self.setModal(False)
         self.resize(760, 680)
-        self.setStyleSheet(f"QDialog {{ background: {theme.SURFACE}; }}")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 16)
         layout.setSpacing(12)
 
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(True)
-        browser.setFrameShape(QTextBrowser.Shape.NoFrame)
-        browser.setStyleSheet(f"QTextBrowser {{ background: {theme.SURFACE}; border: none; }}")
-        browser.document().setDocumentMargin(4)
-        browser.setHtml(guide_html(settings, cloudflared))
-        layout.addWidget(browser, 1)
+        self._browser = QTextBrowser()
+        self._browser.setOpenExternalLinks(True)
+        self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
+        self._browser.document().setDocumentMargin(4)
+        self.apply_theme()
+        layout.addWidget(self._browser, 1)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -161,3 +160,6 @@ class DomainGuideDialog(QDialog):
         except OSError:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def apply_theme(self) -> None:
+        self._browser.setHtml(guide_html(self.settings, self._cloudflared))

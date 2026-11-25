@@ -63,12 +63,21 @@ Python и cloudflared ставить не нужно: оба внутри сбо
 
 Поддержка на «Главной» также включает кнопку **«Аварийная остановка»** (немедленная блокировка новых вызовов OAuth и остановка контролируемых сервисов), сохранение **защищённого отчёта диагностики** без токенов и экспорт состояния без утечек.
 
-Подробнее: [сценарии Windows/SSH](docs/oauth-fixed-windows-ssh.md),
+Подробнее: [дизайн-система UI v0.9.0](docs/ui-design-system.md),
+[сценарии Windows/SSH](docs/oauth-fixed-windows-ssh.md),
 [стабильность и безопасность v0.8.6](docs/stability-security.md),
 [OAuth через Cloudflare](docs/oauth-quick-tunnel.md),
 [защищённое хранение клиентов](docs/oauth-persistence.md),
 [журнал выполнения Windows/SSH и диагностика Cloudflare](docs/oauth-execution-audit.md),
 [сторонние лицензии](docs/third-party-licenses.md).
+
+## Интерфейс (v0.9.0)
+
+- Стиль **Linear + Docker Desktop**: сворачиваемая боковая панель (`Ctrl+B`), палитра команд (`Ctrl+K`), фильтруемый журнал с экспортом и редактированием секретов, разделы **Главная**, **Подключения**, **AI-клиенты**, **Безопасность**, **Журналы**, **Настройки** и дорожная карта модулей `v0.9.2–v0.9.9`.
+- **Dark / Light / System** темы и живое переключение языка **RU / EN** без перезапуска с сохранением геометрии окна и поддержкой HiDPI (`100–200%`).
+
+![Главная — тёмная тема](docs/screenshots/home-dark.png)
+![Главная — светлая тема](docs/screenshots/home-light.png)
 
 ## Данные
 
@@ -119,7 +128,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 main.py                 точка входа: GUI / --backend / --selftest
 app/gui.py              QApplication, трей, один экземпляр, перенос данных
 app/core/               ServiceManager, процессы, health-check, токен, автозапуск
-app/ui/                 окно в стиле Claude Desktop, тема, эффекты, иконки
+app/ui/                 дизайн-система Linear + Docker, Dark/Light/System, RU/EN, компоненты и страницы
 backend/server.py       MCP-сервер (uvicorn + MCP SDK)
 packaging/              PyInstaller spec, build.ps1, installer.iss, CI
 ```

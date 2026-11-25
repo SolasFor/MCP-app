@@ -32,6 +32,14 @@ if __package__:
     from .process_runner import CommandResult, ProcessRunner
     from .tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
     from .tool_registry import (
+        SERVER_HEALTH,
+        SERVER_LIST,
+        SERVER_LOGS,
+        SERVER_METRICS,
+        SERVER_RESTART,
+        SERVER_START,
+        SERVER_STATUS,
+        SERVER_STOP,
         TASK_ARTIFACTS,
         TASK_CANCEL,
         TASK_LIST,
@@ -41,6 +49,7 @@ if __package__:
         TASK_START,
         TASK_STATUS,
     )
+    from app.core.secret_store import SecretStore
     from .tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -62,6 +71,14 @@ else:
     from process_runner import CommandResult, ProcessRunner
     from tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
     from tool_registry import (
+        SERVER_HEALTH,
+        SERVER_LIST,
+        SERVER_LOGS,
+        SERVER_METRICS,
+        SERVER_RESTART,
+        SERVER_START,
+        SERVER_STATUS,
+        SERVER_STOP,
         TASK_ARTIFACTS,
         TASK_CANCEL,
         TASK_LIST,
@@ -71,6 +88,7 @@ else:
         TASK_START,
         TASK_STATUS,
     )
+    from app.core.secret_store import SecretStore
     from tool_permissions import (
         EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
         require_execution_permission,
@@ -153,17 +171,28 @@ PROCESS_RUNNER = ProcessRunner(
     spool_dir=Path(os.environ.get("MCP_SPOOL_DIR") or (WORKSPACE_DIR / "spool")),
     redactor=REDACTOR,
 )
-MANAGED_SERVERS = ManagedServers(Path(
-    os.environ.get("MCP_MANAGED_SERVERS_PATH") or WORKSPACE_DIR / "managed_servers.json"
-), runner=PROCESS_RUNNER)
-_GATEWAY_DEFAULT_PATH = (
-    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
-    / "gateway"
-    / "servers.json"
+_SERVERS_DEFAULT_PATH = (
+    WORKSPACE_DIR / "managed_servers.json"
+    if (WORKSPACE_DIR / "managed_servers.json").is_file()
+    else (
+        Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+        / "servers"
+        / "managed_servers.json"
+    )
+)
+_SERVER_SECRET_STORE = (
+    SecretStore(Path(os.environ["MCP_SECRETS_DIR"]))
+    if os.environ.get("MCP_SECRETS_DIR")
+    else None
 )
 _TASKS_DEFAULT_DIR = (
     Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
     / "tasks"
+)
+_GATEWAY_DEFAULT_PATH = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "gateway"
+    / "servers.json"
 )
 GATEWAY_STORE = GatewayConfigStore(
     Path(os.environ.get("MCP_GATEWAY_CONFIG_PATH") or _GATEWAY_DEFAULT_PATH)
@@ -172,6 +201,14 @@ TASK_STORE = TaskStore(
     Path(os.environ.get("MCP_TASKS_DB_PATH") or (_TASKS_DEFAULT_DIR / "tasks.sqlite3"))
 )
 TASK_STORE.recover_interrupted()
+MANAGED_SERVERS = ManagedServers(
+    Path(os.environ.get("MCP_MANAGED_SERVERS_PATH") or _SERVERS_DEFAULT_PATH),
+    runner=PROCESS_RUNNER,
+    redactor=REDACTOR,
+    task_store=TASK_STORE,
+    secret_store=_SERVER_SECRET_STORE,
+)
+SERVER_MANAGER = MANAGED_SERVERS.manager
 GATEWAY_ROUTER = GatewayRouter(
     GATEWAY_STORE,
     self_urls=(
@@ -692,6 +729,310 @@ async def oauth_managed_server(
                           event="failed", command=audit_command, action_id=action_id,
                           duration_ms=int((time.monotonic() - started) * 1000))
         return {"error": f"Managed server operation failed: {type(exc).__name__}"}
+
+
+def _authorize_managed_server(client_id: str, tool_name: str, server_name: str = "") -> str:
+    """Verify OAuth client authorization and active profile for Server Manager tools."""
+    verified_client = require_execution_permission(
+        tool_name, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(verified_client)
+    if server_name:
+        srv_profile = MANAGED_SERVERS.store.get_profile(server_name)
+        if srv_profile is not None:
+            SERVER_MANAGER._authorize_profile(
+                srv_profile, client_id=verified_client, client_profile=profile_mode
+            )
+    return profile_mode
+
+
+def _server_auth_rechecker(client_id: str, srv_profile) -> None:
+    if oauth_provider is None or oauth_execution is None:
+        raise PermissionError("OAuth server management is unavailable")
+    if oauth_execution.emergency_stopped():
+        raise PermissionError("Emergency stop is active")
+    if not oauth_execution.client_approved(client_id):
+        raise PermissionError("OAuth client is not approved")
+    profile_mode = oauth_execution.profile_for(client_id)
+    SERVER_MANAGER._authorize_profile(
+        srv_profile, client_id=client_id, client_profile=profile_mode
+    )
+
+
+SERVER_MANAGER.auth_rechecker = _server_auth_rechecker
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_list() -> dict:
+    """List owner-configured managed servers visible to the caller's access profile."""
+    client_id = require_execution_permission(
+        SERVER_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        items = await asyncio.to_thread(
+            SERVER_MANAGER.list_servers, client_id=client_id, client_profile=profile_mode
+        )
+        return {"servers": items}
+    except (OSError, ValueError) as exc:
+        return {"error": f"Server list failed: {type(exc).__name__}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_start(
+    name: str,
+    start_dependencies: bool = True,
+    wait_readiness: bool = True,
+    linked_task_id: str = "",
+    run_pre_start_task: bool = False,
+) -> dict:
+    """Start an owner-configured managed server, resolving dependencies and readiness checks."""
+    client_id = require_execution_permission(
+        SERVER_START, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    audit_command = f"server:start:{name}"
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile_mode,
+        event="started", command=audit_command, action_id=action_id,
+    )
+    try:
+        async with PROCESS_RUNNER.request_slot():
+            profile_mode = _authorize_managed_server(client_id, SERVER_START, name)
+            effective_task_id: str | None = None
+            if linked_task_id:
+                trec = TASK_STORE.get_task(linked_task_id)
+                if trec is None or trec.owner_client_id != client_id:
+                    raise PermissionError("Linked task not found for this client")
+                effective_task_id = trec.task_id
+            elif run_pre_start_task:
+                srv_profile = MANAGED_SERVERS.store.get_profile(name)
+                if srv_profile is not None and srv_profile.pre_start_task_command:
+                    pre_spec = TaskSpec(kind="windows", command=srv_profile.pre_start_task_command)
+                    pre_spec.validate()
+                    task_prof = _authorize_task_spec(client_id, pre_spec)
+                    trec, _ = await TASK_MANAGER.submit(
+                        owner_client_id=client_id,
+                        profile=task_prof,
+                        spec=pre_spec,
+                        title=f"pre-start:{name}",
+                    )
+                    effective_task_id = trec.task_id
+
+            result = await asyncio.to_thread(
+                SERVER_MANAGER.start_server,
+                name,
+                client_id=client_id,
+                client_profile=profile_mode,
+                start_dependencies=start_dependencies,
+                wait_readiness=wait_readiness,
+                linked_task_id=effective_task_id,
+            )
+            EXEC_AUDIT.record(
+                client_id=client_id, kind="windows", profile=profile_mode,
+                event="completed", command=audit_command, action_id=action_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result
+    except PermissionError as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="denied", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="failed", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server start failed: {REDACTOR.redact_text(str(exc))}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_stop(name: str) -> dict:
+    """Stop a controlled managed server owned by this client; independent servers stay detached."""
+    client_id = require_execution_permission(
+        SERVER_STOP, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    audit_command = f"server:stop:{name}"
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile_mode,
+        event="started", command=audit_command, action_id=action_id,
+    )
+    try:
+        async with PROCESS_RUNNER.request_slot():
+            profile_mode = _authorize_managed_server(client_id, SERVER_STOP, name)
+            result = await asyncio.to_thread(
+                SERVER_MANAGER.stop_server,
+                name,
+                client_id=client_id,
+                client_profile=profile_mode,
+            )
+            EXEC_AUDIT.record(
+                client_id=client_id, kind="windows", profile=profile_mode,
+                event="completed", command=audit_command, action_id=action_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result
+    except PermissionError as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="denied", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="failed", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server stop failed: {type(exc).__name__}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_restart(name: str, wait_readiness: bool = True) -> dict:
+    """Restart an owned controlled managed server and wait for readiness if configured."""
+    client_id = require_execution_permission(
+        SERVER_RESTART, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    audit_command = f"server:restart:{name}"
+    action_id = secrets.token_hex(8)
+    started = time.monotonic()
+    EXEC_AUDIT.record(
+        client_id=client_id, kind="windows", profile=profile_mode,
+        event="started", command=audit_command, action_id=action_id,
+    )
+    try:
+        async with PROCESS_RUNNER.request_slot():
+            profile_mode = _authorize_managed_server(client_id, SERVER_RESTART, name)
+            result = await asyncio.to_thread(
+                SERVER_MANAGER.restart_server,
+                name,
+                client_id=client_id,
+                client_profile=profile_mode,
+                wait_readiness=wait_readiness,
+            )
+            EXEC_AUDIT.record(
+                client_id=client_id, kind="windows", profile=profile_mode,
+                event="completed", command=audit_command, action_id=action_id,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return result
+    except PermissionError as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="denied", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="failed", command=audit_command, action_id=action_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return {"error": f"Server restart failed: {REDACTOR.redact_text(str(exc))}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_status(name: str) -> dict:
+    """Inspect runtime status, uptime, restarts, and linked task for an authorized server."""
+    client_id = require_execution_permission(
+        SERVER_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            SERVER_MANAGER.status_server, name, client_id=client_id, client_profile=profile_mode
+        )
+    except PermissionError as exc:
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError) as exc:
+        return {"error": f"Server status failed: {type(exc).__name__}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_logs(
+    name: str,
+    stream: Literal["stdout", "stderr"] = "stdout",
+    offset: int = 0,
+    limit: int = 8000,
+) -> dict:
+    """Read bounded, secret-redacted stdout or stderr logs for an authorized managed server."""
+    client_id = require_execution_permission(
+        SERVER_LOGS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            SERVER_MANAGER.logs_server,
+            name,
+            client_id=client_id,
+            client_profile=profile_mode,
+            stream=stream,
+            offset=offset,
+            limit=limit,
+        )
+    except PermissionError as exc:
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError) as exc:
+        return {"error": f"Server logs failed: {type(exc).__name__}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_metrics(name: str) -> dict:
+    """Collect identity-verified CPU/RAM/thread metrics for an authorized managed server."""
+    client_id = require_execution_permission(
+        SERVER_METRICS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            SERVER_MANAGER.metrics_server, name, client_id=client_id, client_profile=profile_mode
+        )
+    except PermissionError as exc:
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError) as exc:
+        return {"error": f"Server metrics failed: {type(exc).__name__}"}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def server_health(name: str, run_probe: bool = True) -> dict:
+    """Run or inspect readiness health probe results for an authorized managed server."""
+    client_id = require_execution_permission(
+        SERVER_HEALTH, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            SERVER_MANAGER.health_server,
+            name,
+            client_id=client_id,
+            client_profile=profile_mode,
+            run_probe=run_probe,
+        )
+    except PermissionError as exc:
+        return {"error": f"Server access denied: {exc}"}
+    except (OSError, ValueError) as exc:
+        return {"error": f"Server health failed: {type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)

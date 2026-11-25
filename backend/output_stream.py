@@ -271,40 +271,43 @@ class BoundedOutputBuffer:
         self._tail = bytearray()
         self._spool = spool
         self._stream_name: Literal["stdout", "stderr"] = stream_name
+        self._lock = threading.RLock()
         self.total_bytes = 0
         self.dropped_memory_bytes = 0
 
     @property
     def memory_bytes_used(self) -> int:
-        return len(self._head) + len(self._tail)
+        with self._lock:
+            return len(self._head) + len(self._tail)
 
     def append(self, chunk: bytes) -> None:
         if not chunk:
             return
-        self.total_bytes += len(chunk)
-        if self._spool is not None:
-            self._spool.write(self._stream_name, chunk)
+        with self._lock:
+            self.total_bytes += len(chunk)
+            if self._spool is not None:
+                self._spool.write(self._stream_name, chunk)
 
-        view = memoryview(chunk)
-        if len(self._head) < self._head_limit:
-            take = min(len(view), self._head_limit - len(self._head))
-            self._head.extend(view[:take])
-            view = view[take:]
+            view = memoryview(chunk)
+            if len(self._head) < self._head_limit:
+                take = min(len(view), self._head_limit - len(self._head))
+                self._head.extend(view[:take])
+                view = view[take:]
 
-        if len(view) == 0:
-            return
+            if len(view) == 0:
+                return
 
-        if len(view) >= self._tail_limit:
-            self.dropped_memory_bytes += len(self._tail) + (len(view) - self._tail_limit)
-            self._tail = bytearray(view[-self._tail_limit:])
-            return
+            if len(view) >= self._tail_limit:
+                self.dropped_memory_bytes += len(self._tail) + (len(view) - self._tail_limit)
+                self._tail = bytearray(view[-self._tail_limit:])
+                return
 
-        combined_len = len(self._tail) + len(view)
-        if combined_len > self._tail_limit:
-            evict = combined_len - self._tail_limit
-            self.dropped_memory_bytes += evict
-            del self._tail[:evict]
-        self._tail.extend(view)
+            combined_len = len(self._tail) + len(view)
+            if combined_len > self._tail_limit:
+                evict = combined_len - self._tail_limit
+                self.dropped_memory_bytes += evict
+                del self._tail[:evict]
+            self._tail.extend(view)
 
     def render(
         self,
@@ -317,20 +320,24 @@ class BoundedOutputBuffer:
         safe_offset = max(0, int(offset))
         safe_limit = max(1, int(limit))
 
-        if safe_offset > 0 and self._spool is not None and spool_manager is not None:
-            page = spool_manager.read_page(
-                self._spool.run_id,
-                self._stream_name,
-                offset=safe_offset,
-                limit=safe_limit,
-                redactor=redactor,
-            )
-            return page.text
+        with self._lock:
+            spool_run_id = self._spool.run_id if self._spool is not None else None
+            if safe_offset > 0 and spool_run_id is not None and spool_manager is not None:
+                page = spool_manager.read_page(
+                    spool_run_id,
+                    self._stream_name,
+                    offset=safe_offset,
+                    limit=safe_limit,
+                    redactor=redactor,
+                )
+                return page.text
 
-        head_text = decode_process_bytes(bytes(self._head))
-        tail_text = decode_process_bytes(bytes(self._tail))
-        if self.dropped_memory_bytes > 0:
-            marker = f"\n\n... [ВЫВОД ОБРЕЗАН: пропущено {self.dropped_memory_bytes} байт] ...\n\n"
+            head_text = decode_process_bytes(bytes(self._head))
+            tail_text = decode_process_bytes(bytes(self._tail))
+            dropped = self.dropped_memory_bytes
+
+        if dropped > 0:
+            marker = f"\n\n... [ВЫВОД ОБРЕЗАН: пропущено {dropped} байт] ...\n\n"
             text = head_text + marker + tail_text
         else:
             text = head_text + tail_text

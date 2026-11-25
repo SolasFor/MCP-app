@@ -200,6 +200,7 @@ def run_gui(argv: list[str]) -> int:
 
     if not (minimized and tray_available):
         window.show_and_raise()
+    QTimer.singleShot(0, window.servers_page.start_autostart_servers)
     if settings.start_services_on_launch:
         QTimer.singleShot(0, manager.start_all)
 

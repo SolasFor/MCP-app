@@ -32,9 +32,27 @@ TASK_TOOLS = frozenset({
     TASK_RESTART,
     TASK_ARTIFACTS,
 })
+SERVER_LIST = "server_list"
+SERVER_START = "server_start"
+SERVER_STOP = "server_stop"
+SERVER_RESTART = "server_restart"
+SERVER_STATUS = "server_status"
+SERVER_LOGS = "server_logs"
+SERVER_METRICS = "server_metrics"
+SERVER_HEALTH = "server_health"
+SERVER_TOOLS = frozenset({
+    SERVER_LIST,
+    SERVER_START,
+    SERVER_STOP,
+    SERVER_RESTART,
+    SERVER_STATUS,
+    SERVER_LOGS,
+    SERVER_METRICS,
+    SERVER_HEALTH,
+})
 BASIC_TOOLS = frozenset({"server_info"})
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS
+EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS
+OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
@@ -69,6 +87,10 @@ class ToolRegistry:
         for task_tool in sorted(TASK_TOOLS):
             self.register(
                 ToolSpec(task_tool, "tasks", min_profile="allowlist", requires_execution=True)
+            )
+        for server_tool in sorted(SERVER_TOOLS):
+            self.register(
+                ToolSpec(server_tool, "servers", min_profile="allowlist", requires_execution=True)
             )
 
     def register(self, spec: ToolSpec) -> None:

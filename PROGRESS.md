@@ -9,7 +9,7 @@
 | 3. Connection Manager | v0.9.1 | VERIFIED | [PR #22](https://github.com/SolasFor/MCP-app/pull/22), коммит `424481a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45522273057), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45522273017) |
 | 4. MCP Gateway | v0.9.2 | VERIFIED | [PR #23](https://github.com/SolasFor/MCP-app/pull/23), коммит `87e7fef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45563300320), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45563300338) |
 | 5. Task Manager | v0.9.3 | VERIFIED | [PR #24](https://github.com/SolasFor/MCP-app/pull/24), коммит `2ccd259`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45567201054), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45567201051) |
-| 6. Server Manager | v0.9.4 | TODO | — |
+| 6. Server Manager | v0.9.4 | VERIFIED | [PR #25](https://github.com/SolasFor/MCP-app/pull/25), коммит `f5c87b1`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45571994338), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45571994344) |
 | 7. Workspaces | v0.9.5 | TODO | — |
 | 8. Computer Use | v0.9.6 | TODO | — |
 | 9. Extensions | v0.9.7 | TODO | — |
@@ -20,10 +20,36 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/task-manager`, `2ccd259` (stacked на `feat/mcp-gateway` / PR #23).
-- Статус Этапа 5 (`v0.9.3 — Task Manager`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#24 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/server-manager`, `f5c87b1` (stacked на `feat/task-manager` / PR #24).
+- Статус Этапа 6 (`v0.9.4 — Server Manager`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#25 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/server-manager` от `feat/task-manager` и реализовать Этап 6 (`v0.9.4 — Server Manager`).
+- Следующее действие: отвести ветку `feat/workspaces` от `feat/server-manager` и реализовать Этап 7 (`v0.9.5 — Workspaces`).
+
+## Этап 6: v0.9.4 — Server Manager (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 6 / `v0.9.4` / `feat/server-manager` / `f5c87b1`
+- Реализованные задачи:
+  - Реализован пакет `backend/servers/` (`{__init__,models,templates,store,probes,manager}.py`) и сохранён полностью совместимый фасад `backend/managed_servers.py`: бесшовная миграция legacy v1 `managed_servers.json` в схему v2 (`ServerConfigStore.migrate_legacy_file` с сохранением `.v1.bak` и дефолтом `min_profile="full"`), хранение секретных env-переменных в DPAPI `SecretStore` (`secret://servers/<server>__<KEY>`, namespace `servers` в `app/core/secret_store.py`), граф зависимостей `depends_on` с топологической сортировкой и отклонением циклов.
+  - Реализованы проверенные встроенные шаблоны (`python_fastapi`, `python_flask`, `node_express`, `vite_next`, `docker_compose`, `static_http`, `custom`) без shell-инъекций, path traversal, автоустановки зависимостей (`pip`/`npm`/`npx`) и автоматического внешнего биндинга (loopback `127.0.0.1` по умолчанию).
+  - Обеспечены проверка конфликтов портов без убийства чужих PID (`check_port_conflict`), identity-проверенные метрики CPU/RAM/threads через `psutil` (`collect_process_metrics`), TCP/HTTP readiness probes (`probe_readiness`), перезапуски по политике `never`/`on-failure`/`always` с exponential backoff и живой перепроверкой OAuth-доступа (`_server_auth_rechecker`), потокобезопасный `BoundedOutputBuffer` (`backend/output_stream.py`) и неблокирующее чтение живых логов `read1` + POSIX `start_new_session=True` в `backend/process_runner.py`, а также честное разделение `controlled` (остановка дерева) и `independent` (detached, без принудительного завершения).
+  - Добавлены 8 OAuth-инструментов в `backend/tool_registry.py` и `backend/server.py` (`server_list`, `server_start`, `server_stop`, `server_restart`, `server_status`, `server_logs`, `server_metrics`, `server_health`) с сохранением `oauth_managed_server` и связью с `TaskManager` (`linked_task_id`, `run_pre_start_task`), изоляцией `ServiceManager.managed_servers_path()` / `MCP_SECRETS_DIR` (`app/core/service_manager.py`) и `app/selftest.py`.
+  - Создана страница `app/ui/pages/servers_page.py` (`ServersPage`, `ServerProfileDialog`, `TemplateWizardDialog`), раздел «Серверы» переведён в активное меню `Ctrl+6` (`app/ui/main_window.py`, RU/EN `app/ui/i18n.py`, автозапуск `start_autostart_servers()` в `app/gui.py`), добавлена документация `docs/server-manager.md` и ссылка в `README.md`.
+- Оставшиеся задачи и зависимости: последовательный merge [PR #25](https://github.com/SolasFor/MCP-app/pull/25) после PR #20–#24.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.4`), `packaging/mcp_app.spec`, `app/core/{secret_store,service_manager}.py`, `app/{gui,selftest}.py`, `app/ui/{i18n,main_window}.py`, `app/ui/pages/{__init__,servers_page}.py`, `backend/servers/`, `backend/{managed_servers,output_stream,process_runner,tool_registry,server}.py`, `docs/server-manager.md`, `README.md`, `tests/fixtures/dev_http_server.py`, `tests/unit/{test_server_manager,test_tool_permissions}.py`, `tests/integration/{test_server_manager,test_tool_registry,test_oauth_http,test_ui_redesign_gui,test_unified_home_gui}.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend tests main.py`, `mypy` (win32 + `--platform linux`): PASS (37 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (140/140 за 9.833s — включая миграцию v1→v2, SecretStore, DAG/циклы, все шаблоны + негативные проверки, конфликт порта на живом сокете)
+    - `tests/integration`: PASS (32/32 за 112.797s; всего 172/172 — включая реальный HTTP-сервер с readiness/метриками/отредактированными живыми логами/связью с `TaskStore`, crash restart + backoff и отзыв OAuth, дерево процессов и `independent` режим, порядок зависимостей, конфликт порта, совместимость `ManagedServers` и headless `ServersPage` + диалоги)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.4-portable.zip` 66.7 MB)
+  - GitHub Actions CI на `f5c87b1`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`1m38s`) — https://github.com/SolasFor/MCP-app/actions/runs/45571994338/job/139060631225
+    - `Verify & Test (windows-latest)`: PASS (`3m38s`) — https://github.com/SolasFor/MCP-app/actions/runs/45571994338/job/139060631584
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m39s`) — https://github.com/SolasFor/MCP-app/actions/runs/45571994344/job/139060631778
+- Live tests отдельно от mocks: реальные локальные HTTP-серверы (`dev_http_server.py`), дочерние деревья процессов, реальные сокеты/порты, `psutil` метрики, SecretStore и headless Qt `ServersPage` — **PASS**.
+- Риски / ограничения / блокеры: сборка без Authenticode-сертификата; внешние Docker/Node рантаймы проверяются при их наличии на машине владельца.
+- PR / релиз: [PR #25](https://github.com/SolasFor/MCP-app/pull/25) (`feat/server-manager` → `feat/task-manager`).
+- Следующий точный шаг: Этап 7 (`v0.9.5 — Workspaces`) на ветке `feat/workspaces`.
 
 ## Этап 5: v0.9.3 — Task Manager (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 5 / `v0.9.3` / `feat/task-manager` / `2ccd259`

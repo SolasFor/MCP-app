@@ -13,6 +13,7 @@ permissions:
 jobs:
   transport:
     name: Verify & Test (${{ matrix.os }})
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -44,6 +45,8 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests/unit -p "test_*.py" -v
       - name: Integration tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests/integration -p "test_*.py" -v
       - name: Verify ASGI app initialization
         env:

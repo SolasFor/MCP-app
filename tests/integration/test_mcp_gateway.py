@@ -1,6 +1,10 @@
 """Integration tests for Stage 4 MCP Gateway across stdio, Streamable HTTP, SSE, OAuth permissions & GUI."""
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import asyncio
 import json
 import socket

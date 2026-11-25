@@ -80,9 +80,14 @@ class UpstreamSessionHandle:
             name=f"gateway-{self.profile.server_id}",
         )
         try:
-            return await ready
-        except Exception:
+            return await asyncio.wait_for(
+                ready,
+                timeout=min(float(self.profile.timeout_seconds) + 2.0, 35.0),
+            )
+        except BaseException as exc:
             await self.close()
+            if isinstance(exc, asyncio.CancelledError):
+                raise ConnectionError(f"Upstream {self.profile.server_id} connection aborted") from exc
             raise
 
     async def _run_lifecycle(
@@ -178,12 +183,21 @@ class UpstreamSessionHandle:
             if not ready.done():
                 ready.set_result(self.capabilities)
             await stop_event.wait()
-        except Exception as exc:
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) and stop_event.is_set():
+                raise
+            err: Exception = (
+                ConnectionError(f"Upstream {self.profile.server_id} transport aborted")
+                if not isinstance(exc, Exception)
+                else exc
+            )
             self.health = "error"
-            self.last_error = self._redactor.redact_text(f"{type(exc).__name__}: {exc}")
+            self.last_error = self._redactor.redact_text(f"{type(err).__name__}: {err}")
             self._log(f"Connect failed: {self.last_error}")
             if not ready.done():
-                ready.set_exception(exc)
+                ready.set_exception(err)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
         finally:
             self.session = None
             self.capabilities = None
@@ -191,6 +205,10 @@ class UpstreamSessionHandle:
                 await stack.aclose()
             except BaseException:
                 pass
+            if not ready.done():
+                ready.set_exception(
+                    ConnectionError(f"Upstream {self.profile.server_id} exited before initialization")
+                )
 
     async def list_tools(self) -> list[Tool]:
         if self.session is None:
@@ -259,11 +277,11 @@ class UpstreamSessionHandle:
             stop_event.set()
         if task is not None and not task.done():
             try:
-                await asyncio.wait_for(task, timeout=3.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except BaseException:
                 task.cancel()
                 try:
-                    await task
+                    await asyncio.wait_for(task, timeout=1.5)
                 except BaseException:
                     pass
 

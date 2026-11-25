@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from app import __version__
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
-from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.cards import Divider, EmptyState, FlowLayout, Section
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog
 from app.ui.components.table import DataTable
@@ -301,11 +301,10 @@ class AutomationPage(PageScaffold):
     def _build_schedules_tab(self) -> QWidget:
         page = QWidget()
         col = QVBoxLayout(page)
-        col.setContentsMargins(0, 8, 0, 0)
-        col.setSpacing(10)
+        col.setContentsMargins(0, 10, 0, 0)
+        col.setSpacing(12)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
+        toolbar = FlowLayout(spacing=6)
         self.add_sched_btn = QPushButton(tr("automation.sched.add"))
         self.add_sched_btn.setObjectName("Accent")
         self.add_sched_btn.clicked.connect(self.open_add_schedule_dialog)
@@ -321,12 +320,10 @@ class AutomationPage(PageScaffold):
         for btn in (self.add_sched_btn, self.run_sched_btn, self.del_sched_btn, self.refresh_sched_btn):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             toolbar.addWidget(btn)
-        toolbar.addStretch(1)
         col.addLayout(toolbar)
 
-        table_card = Card(margins=(12, 12, 12, 12))
-        self._sched_hdr = SectionHeader(tr("automation.sched.table_title"))
-        table_card.body.addWidget(self._sched_hdr)
+        sched_sec = Section(tr("automation.sched.table_title"), spacing=6)
+        self._sched_hdr = sched_sec.header
         self.schedules_table = DataTable([
             tr("automation.col.id"),
             tr("automation.col.name"),
@@ -336,36 +333,36 @@ class AutomationPage(PageScaffold):
             tr("automation.col.status"),
         ])
         self.schedules_table.setMinimumHeight(130)
-        table_card.body.addWidget(self.schedules_table, 1)
+        sched_sec.body.addWidget(self.schedules_table, 1)
         self.empty_state = EmptyState(
             "automation", tr("automation.sched.empty_title"), tr("automation.sched.empty_desc")
         )
-        table_card.body.addWidget(self.empty_state)
-        col.addWidget(table_card, 1)
+        sched_sec.body.addWidget(self.empty_state)
+        col.addWidget(sched_sec, 1)
 
-        hist_card = Card(margins=(12, 12, 12, 12))
-        self._hist_hdr = SectionHeader(tr("automation.sched.history_title"))
-        hist_card.body.addWidget(self._hist_hdr)
+        col.addWidget(Divider())
+
+        hist_sec = Section(tr("automation.sched.history_title"), spacing=6)
+        self._hist_hdr = hist_sec.header
         self.history_view = QPlainTextEdit()
         self.history_view.setObjectName("ConsoleLog")
         self.history_view.setReadOnly(True)
-        self.history_view.setMaximumHeight(140)
-        hist_card.body.addWidget(self.history_view)
-        col.addWidget(hist_card)
+        self.history_view.setMaximumHeight(130)
+        hist_sec.body.addWidget(self.history_view)
+        col.addWidget(hist_sec)
         return page
 
     def _build_monitoring_tab(self) -> QWidget:
         page = QWidget()
         col = QVBoxLayout(page)
-        col.setContentsMargins(0, 8, 0, 0)
-        col.setSpacing(10)
+        col.setContentsMargins(0, 10, 0, 0)
+        col.setSpacing(12)
 
-        notice_card = Card()
         self._admin_notice_lbl = QLabel(tr("automation.mon.admin_notice"))
         self._admin_notice_lbl.setWordWrap(True)
         self._admin_notice_lbl.setObjectName("Hint")
-        notice_card.body.addWidget(self._admin_notice_lbl)
-        col.addWidget(notice_card)
+        col.addWidget(self._admin_notice_lbl)
+        col.addWidget(Divider())
 
         controls = QHBoxLayout()
         controls.setSpacing(6)
@@ -376,50 +373,50 @@ class AutomationPage(PageScaffold):
         controls.addWidget(self.audit_filter_input, 1)
         self.mon_refresh_btn = QPushButton(tr("automation.mon.refresh"))
         self.mon_refresh_btn.setObjectName("Ghost")
+        self.mon_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mon_refresh_btn.clicked.connect(self.refresh_monitoring)
         self.mon_export_btn = QPushButton(tr("automation.mon.export"))
         self.mon_export_btn.setObjectName("Accent")
+        self.mon_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mon_export_btn.clicked.connect(lambda: self.export_diagnostics())
         controls.addWidget(self.mon_refresh_btn)
         controls.addWidget(self.mon_export_btn)
         col.addLayout(controls)
 
-        snap_card = Card(margins=(12, 12, 12, 12))
-        self._snap_hdr = SectionHeader(tr("automation.mon.snapshot_title"))
-        snap_card.body.addWidget(self._snap_hdr)
+        snap_sec = Section(tr("automation.mon.snapshot_title"), spacing=6)
+        self._snap_hdr = snap_sec.header
         self.metrics_view = QPlainTextEdit()
         self.metrics_view.setObjectName("ConsoleLog")
         self.metrics_view.setReadOnly(True)
-        snap_card.body.addWidget(self.metrics_view, 1)
-        col.addWidget(snap_card, 1)
+        snap_sec.body.addWidget(self.metrics_view, 1)
+        col.addWidget(snap_sec, 1)
 
-        audit_card = Card(margins=(12, 12, 12, 12))
-        self._audit_hdr = SectionHeader(tr("automation.mon.audit_title"))
-        audit_card.body.addWidget(self._audit_hdr)
+        col.addWidget(Divider())
+
+        audit_sec = Section(tr("automation.mon.audit_title"), spacing=6)
+        self._audit_hdr = audit_sec.header
         self.audit_view = QPlainTextEdit()
         self.audit_view.setObjectName("ConsoleLog")
         self.audit_view.setReadOnly(True)
-        self.audit_view.setMaximumHeight(150)
-        audit_card.body.addWidget(self.audit_view)
-        col.addWidget(audit_card)
+        self.audit_view.setMaximumHeight(140)
+        audit_sec.body.addWidget(self.audit_view)
+        col.addWidget(audit_sec)
         return page
 
     def _build_playground_tab(self) -> QWidget:
         page = QWidget()
         col = QVBoxLayout(page)
-        col.setContentsMargins(0, 8, 0, 0)
-        col.setSpacing(10)
+        col.setContentsMargins(0, 10, 0, 0)
+        col.setSpacing(12)
 
-        warn_card = Card()
         self._live_warn_lbl = QLabel(tr("automation.playground.live_warning"))
         self._live_warn_lbl.setWordWrap(True)
         self._live_warn_lbl.setObjectName("Error")
-        warn_card.body.addWidget(self._live_warn_lbl)
-        col.addWidget(warn_card)
+        col.addWidget(self._live_warn_lbl)
+        col.addWidget(Divider())
 
-        form_card = Card(margins=(12, 12, 12, 12))
         row = QHBoxLayout()
-        row.setSpacing(8)
+        row.setSpacing(6)
         self.playground_profile = SafeComboBox()
         for prof in ("safe", "allowlist", "full"):
             self.playground_profile.addItem(prof, prof)
@@ -429,84 +426,89 @@ class AutomationPage(PageScaffold):
         self.playground_tool.currentIndexChanged.connect(self._update_playground_hint)
         self.playground_run_btn = QPushButton(tr("automation.playground.run"))
         self.playground_run_btn.setObjectName("Accent")
+        self.playground_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.playground_run_btn.clicked.connect(lambda: self.run_playground())
         row.addWidget(self.playground_profile)
         row.addWidget(self.playground_tool, 1)
         row.addWidget(self.playground_run_btn)
-        form_card.body.addLayout(row)
+        col.addLayout(row)
 
         self.playground_hint = QLabel()
         self.playground_hint.setObjectName("Hint")
         self.playground_hint.setWordWrap(True)
-        form_card.body.addWidget(self.playground_hint)
+        col.addWidget(self.playground_hint)
 
         self.playground_args = QPlainTextEdit("{}")
         self.playground_args.setObjectName("ConsoleLog")
-        self.playground_args.setMaximumHeight(90)
-        form_card.body.addWidget(self.playground_args)
-        col.addWidget(form_card)
+        self.playground_args.setMaximumHeight(86)
+        col.addWidget(self.playground_args)
 
-        out_card = Card(margins=(12, 12, 12, 12))
-        self._pg_out_hdr = SectionHeader(tr("automation.playground.output_title"))
-        out_card.body.addWidget(self._pg_out_hdr)
+        col.addWidget(Divider())
+
+        out_sec = Section(tr("automation.playground.output_title"), spacing=6)
+        self._pg_out_hdr = out_sec.header
         self.playground_output = QPlainTextEdit()
         self.playground_output.setObjectName("ConsoleLog")
         self.playground_output.setReadOnly(True)
-        out_card.body.addWidget(self.playground_output, 1)
-        col.addWidget(out_card, 1)
+        out_sec.body.addWidget(self.playground_output, 1)
+        col.addWidget(out_sec, 1)
         self._update_playground_hint()
         return page
 
     def _build_backup_tab(self) -> QWidget:
         page = QWidget()
         col = QVBoxLayout(page)
-        col.setContentsMargins(0, 8, 0, 0)
-        col.setSpacing(10)
+        col.setContentsMargins(0, 10, 0, 0)
+        col.setSpacing(14)
 
-        b_card = Card(margins=(14, 14, 14, 14))
-        self._backup_hdr = SectionHeader(
-            tr("automation.backup.title"), tr("automation.backup.dpapi_notice")
+        b_sec = Section(
+            tr("automation.backup.title"),
+            tr("automation.backup.dpapi_notice"),
+            spacing=8,
         )
-        b_card.body.addWidget(self._backup_hdr)
-        b_row = QHBoxLayout()
-        b_row.setSpacing(8)
+        self._backup_hdr = b_sec.header
+        b_row = FlowLayout(spacing=6)
         self.backup_create_btn = QPushButton(tr("automation.backup.create"))
         self.backup_create_btn.setObjectName("Accent")
+        self.backup_create_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backup_create_btn.clicked.connect(self._on_create_backup_clicked)
         self.backup_restore_btn = QPushButton(tr("automation.backup.restore"))
         self.backup_restore_btn.setObjectName("Ghost")
+        self.backup_restore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backup_restore_btn.clicked.connect(self._on_restore_backup_clicked)
         b_row.addWidget(self.backup_create_btn)
         b_row.addWidget(self.backup_restore_btn)
-        b_row.addStretch(1)
-        b_card.body.addLayout(b_row)
+        b_sec.body.addLayout(b_row)
         self.backup_status = QLabel("")
         self.backup_status.setObjectName("Hint")
         self.backup_status.setWordWrap(True)
-        b_card.body.addWidget(self.backup_status)
-        col.addWidget(b_card)
+        b_sec.body.addWidget(self.backup_status)
+        col.addWidget(b_sec)
 
-        u_card = Card(margins=(14, 14, 14, 14))
-        self._updater_hdr = SectionHeader(
+        col.addWidget(Divider())
+
+        u_sec = Section(
             tr("automation.updater.title"),
             tr("automation.updater.notice", version=__version__),
+            spacing=8,
         )
-        u_card.body.addWidget(self._updater_hdr)
+        self._updater_hdr = u_sec.header
         u_row = QHBoxLayout()
         u_row.setSpacing(8)
         self.updater_check_btn = QPushButton(tr("automation.updater.check"))
         self.updater_check_btn.setObjectName("Ghost")
+        self.updater_check_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.updater_check_btn.clicked.connect(self.check_for_updates)
         u_row.addWidget(self.updater_check_btn)
         u_row.addStretch(1)
-        u_card.body.addLayout(u_row)
+        u_sec.body.addLayout(u_row)
         self.updater_status = QLabel(
             tr("automation.updater.idle", auto_install="OFF")
         )
         self.updater_status.setObjectName("Hint")
         self.updater_status.setWordWrap(True)
-        u_card.body.addWidget(self.updater_status)
-        col.addWidget(u_card)
+        u_sec.body.addWidget(self.updater_status)
+        col.addWidget(u_sec)
         col.addStretch(1)
         return page
 

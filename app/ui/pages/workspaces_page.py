@@ -28,7 +28,7 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -314,22 +314,29 @@ class WorkspacesPage(PageScaffold):
         self.export_btn = self._make_btn(self.export_json)
         self.run_task_btn = self._make_btn(self.run_selected_task, obj="Accent")
         self.refresh_btn = self._make_btn(self.reload)
+        top_bar.addWidget(self.add_btn)
+        top_bar.addWidget(self.refresh_btn)
+        self.content.addLayout(top_bar)
+
+        action_flow = FlowLayout(spacing=6)
         for btn in (
-            self.add_btn,
             self.edit_btn,
             self.delete_btn,
             self.import_btn,
             self.export_btn,
             self.run_task_btn,
-            self.refresh_btn,
         ):
-            top_bar.addWidget(btn)
-        self.content.addLayout(top_bar)
+            action_flow.addWidget(btn)
+        self.content.addLayout(action_flow)
 
-        self.table_card = Card(margins=(12, 12, 12, 12))
+        self.table_card = QWidget()
+        table_lay = QVBoxLayout(self.table_card)
+        table_lay.setContentsMargins(0, 0, 0, 0)
+        table_lay.setSpacing(0)
         self.table = DataTable(["", "", "", "", "", ""])
+        self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._on_selected)
-        self.table_card.body.addWidget(self.table, 1)
+        table_lay.addWidget(self.table, 1)
         self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("workspaces")
@@ -337,28 +344,37 @@ class WorkspacesPage(PageScaffold):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        tree_card = Card(margins=(12, 12, 12, 12))
+        tree_pane = QWidget()
+        tree_lay = QVBoxLayout(tree_pane)
+        tree_lay.setContentsMargins(0, 4, 8, 0)
+        tree_lay.setSpacing(6)
         self.tree_header = SectionHeader()
-        tree_card.body.addWidget(self.tree_header)
+        tree_lay.addWidget(self.tree_header)
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
-        tree_card.body.addWidget(self.tree_widget, 1)
-        splitter.addWidget(tree_card)
+        tree_lay.addWidget(self.tree_widget, 1)
+        splitter.addWidget(tree_pane)
 
-        git_card = Card(margins=(12, 12, 12, 12))
+        git_pane = QWidget()
+        git_lay = QVBoxLayout(git_pane)
+        git_lay.setContentsMargins(8, 4, 0, 0)
+        git_lay.setSpacing(6)
         self.git_header = SectionHeader()
+        git_lay.addWidget(self.git_header)
+        git_tools = QHBoxLayout()
+        git_tools.setSpacing(6)
         self.file_search_edit = QLineEdit()
         self.file_search_edit.setObjectName("UiInput")
         self.file_search_btn = self._make_btn(self.search_in_selected_workspace)
         self.cmd_combo = SafeComboBox()
-        self.git_header.right_box.addWidget(self.file_search_edit)
-        self.git_header.right_box.addWidget(self.file_search_btn)
-        self.git_header.right_box.addWidget(self.cmd_combo)
-        git_card.body.addWidget(self.git_header)
+        git_tools.addWidget(self.file_search_edit, 1)
+        git_tools.addWidget(self.file_search_btn)
+        git_tools.addWidget(self.cmd_combo)
+        git_lay.addLayout(git_tools)
         self.details_view = QPlainTextEdit()
         self.details_view.setReadOnly(True)
-        git_card.body.addWidget(self.details_view, 1)
-        splitter.addWidget(git_card)
+        git_lay.addWidget(self.details_view, 1)
+        splitter.addWidget(git_pane)
 
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)

@@ -14,13 +14,14 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTableWidgetItem,
+    QVBoxLayout,
     QWidget,
 )
 
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable
@@ -66,7 +67,7 @@ class TasksPage(PageScaffold):
         self._records: dict[str, TaskRecord] = {}
         self._known_statuses: dict[str, str] = {}
 
-        # Filter & action bar
+        # Filter & action bars
         top_bar = QHBoxLayout()
         top_bar.setSpacing(6)
 
@@ -97,19 +98,25 @@ class TasksPage(PageScaffold):
         self.search_edit.setObjectName("UiInput")
         self.search_edit.textChanged.connect(lambda q: self.table.filter_rows(q))
         top_bar.addWidget(self.search_edit, 1)
+        self.content.addLayout(top_bar)
 
+        action_flow = FlowLayout(spacing=6)
         self.refresh_btn = self._make_action_btn(self.reload)
         self.cancel_btn = self._make_action_btn(self.cancel_selected, obj="Danger")
         self.restart_btn = self._make_action_btn(self.restart_selected, obj="Accent")
         self.export_btn = self._make_action_btn(self.export_selected_artifact)
         for btn in (self.refresh_btn, self.cancel_btn, self.restart_btn, self.export_btn):
-            top_bar.addWidget(btn)
-        self.content.addLayout(top_bar)
+            action_flow.addWidget(btn)
+        self.content.addLayout(action_flow)
 
-        self.table_card = Card(margins=(12, 12, 12, 12))
+        self.table_card = QWidget()
+        table_lay = QVBoxLayout(self.table_card)
+        table_lay.setContentsMargins(0, 0, 0, 0)
+        table_lay.setSpacing(0)
         self.table = DataTable(["", "", "", "", "", "", "", ""])
+        self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._on_selected)
-        self.table_card.body.addWidget(self.table, 1)
+        table_lay.addWidget(self.table, 1)
         self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("tasks")
@@ -118,29 +125,35 @@ class TasksPage(PageScaffold):
         # Bottom splitter: live redacted spool logs + artifact inspector
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        logs_card = Card(margins=(12, 12, 12, 12))
+        logs_pane = QWidget()
+        logs_lay = QVBoxLayout(logs_pane)
+        logs_lay.setContentsMargins(0, 4, 8, 0)
+        logs_lay.setSpacing(6)
         self.logs_header = SectionHeader()
         self.stream_combo = SafeComboBox()
         self.stream_combo.addItem("stdout", "stdout")
         self.stream_combo.addItem("stderr", "stderr")
         self.stream_combo.currentIndexChanged.connect(lambda *_: self._refresh_details())
         self.logs_header.right_box.addWidget(self.stream_combo)
-        logs_card.body.addWidget(self.logs_header)
+        logs_lay.addWidget(self.logs_header)
         self.logs_view = QPlainTextEdit()
         self.logs_view.setReadOnly(True)
-        logs_card.body.addWidget(self.logs_view, 1)
-        splitter.addWidget(logs_card)
+        logs_lay.addWidget(self.logs_view, 1)
+        splitter.addWidget(logs_pane)
 
-        art_card = Card(margins=(12, 12, 12, 12))
+        art_pane = QWidget()
+        art_lay = QVBoxLayout(art_pane)
+        art_lay.setContentsMargins(8, 4, 0, 0)
+        art_lay.setSpacing(6)
         self.art_header = SectionHeader()
         self.artifact_combo = SafeComboBox()
         self.artifact_combo.currentIndexChanged.connect(lambda *_: self._refresh_artifact_preview())
         self.art_header.right_box.addWidget(self.artifact_combo)
-        art_card.body.addWidget(self.art_header)
+        art_lay.addWidget(self.art_header)
         self.artifact_view = QPlainTextEdit()
         self.artifact_view.setReadOnly(True)
-        art_card.body.addWidget(self.artifact_view, 1)
-        splitter.addWidget(art_card)
+        art_lay.addWidget(self.artifact_view, 1)
+        splitter.addWidget(art_pane)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         self.content.addWidget(splitter, 1)

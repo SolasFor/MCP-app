@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -70,7 +70,7 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-class GatewayServerDialog(QDialog):
+class GatewayServerDialog(SilentDialog):
     """Create or edit an upstream MCP server profile without exposing stored secrets."""
 
     def __init__(
@@ -353,25 +353,28 @@ class GatewayPage(PageScaffold):
         self.import_btn = self._make_btn(self._open_import_flow)
         self.export_btn = self._make_btn(self._export_redacted)
         self.refresh_btn = self._make_btn(lambda: self.refresh_servers_sync())
-        for btn in (self.add_btn, self.solidworks_btn, self.import_btn, self.export_btn, self.refresh_btn):
-            toolbar.addWidget(btn)
+        toolbar.addWidget(self.add_btn)
+        toolbar.addWidget(self.refresh_btn)
         self.content.addLayout(toolbar)
 
-        action_bar = QHBoxLayout()
-        action_bar.setSpacing(6)
+        action_flow = FlowLayout(spacing=6)
         self.edit_btn = self._make_btn(self._open_edit_dialog)
         self.toggle_btn = self._make_btn(self._toggle_selected)
         self.delete_btn = self._make_btn(self._delete_selected, obj="Danger")
         for btn in (self.edit_btn, self.toggle_btn, self.delete_btn):
             btn.setEnabled(False)
-            action_bar.addWidget(btn)
-        action_bar.addStretch(1)
-        self.content.addLayout(action_bar)
+        for btn in (self.solidworks_btn, self.import_btn, self.export_btn, self.edit_btn, self.toggle_btn, self.delete_btn):
+            action_flow.addWidget(btn)
+        self.content.addLayout(action_flow)
 
-        self.table_card = Card(margins=(12, 12, 12, 12))
+        self.table_card = QWidget()
+        table_lay = QVBoxLayout(self.table_card)
+        table_lay.setContentsMargins(0, 0, 0, 0)
+        table_lay.setSpacing(0)
         self.server_table = DataTable(["", "", "", "", "", ""])
+        self.server_table.setMinimumHeight(130)
         self.server_table.itemSelectionChanged.connect(self._on_server_selected)
-        self.table_card.body.addWidget(self.server_table, 1)
+        table_lay.addWidget(self.server_table, 1)
         self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("gateway")
@@ -380,25 +383,31 @@ class GatewayPage(PageScaffold):
         # Details splitter: Tools/Schemas on left, Logs/Health on right
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        tools_card = Card(margins=(12, 12, 12, 12))
+        tools_pane = QWidget()
+        tools_lay = QVBoxLayout(tools_pane)
+        tools_lay.setContentsMargins(0, 4, 8, 0)
+        tools_lay.setSpacing(6)
         self.tools_header = SectionHeader()
-        tools_card.body.addWidget(self.tools_header)
+        tools_lay.addWidget(self.tools_header)
         self.tools_table = DataTable(["", "", ""])
         self.tools_table.itemSelectionChanged.connect(self._on_tool_selected)
-        tools_card.body.addWidget(self.tools_table, 1)
+        tools_lay.addWidget(self.tools_table, 1)
         self.schema_view = QPlainTextEdit()
         self.schema_view.setReadOnly(True)
         self.schema_view.setMaximumHeight(110)
-        tools_card.body.addWidget(self.schema_view)
-        splitter.addWidget(tools_card)
+        tools_lay.addWidget(self.schema_view)
+        splitter.addWidget(tools_pane)
 
-        logs_card = Card(margins=(12, 12, 12, 12))
+        logs_pane = QWidget()
+        logs_lay = QVBoxLayout(logs_pane)
+        logs_lay.setContentsMargins(8, 4, 0, 0)
+        logs_lay.setSpacing(6)
         self.logs_header = SectionHeader()
-        logs_card.body.addWidget(self.logs_header)
+        logs_lay.addWidget(self.logs_header)
         self.logs_view = QPlainTextEdit()
         self.logs_view.setReadOnly(True)
-        logs_card.body.addWidget(self.logs_view, 1)
-        splitter.addWidget(logs_card)
+        logs_lay.addWidget(self.logs_view, 1)
+        splitter.addWidget(logs_pane)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         self.content.addWidget(splitter, 1)

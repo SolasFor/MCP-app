@@ -27,8 +27,8 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import theme
-from app.ui.components.cards import Card, EmptyState, SectionHeader
-from app.ui.components.silent_dialog import SilentMessageBox
+from app.ui.components.cards import Divider, EmptyState, FlowLayout, SectionHeader
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -36,7 +36,7 @@ from backend.extensions.manager import ExtensionManager
 from backend.extensions.store import ExtensionStore
 
 
-class InstallZipDialog(QDialog):
+class InstallZipDialog(SilentDialog):
     """Prompt owner for ZIP archive path, optional expected SHA-256 pin, and explicit confirmation."""
 
     def __init__(self, *, parent: QWidget | None = None) -> None:
@@ -82,7 +82,7 @@ class InstallZipDialog(QDialog):
             self.path_edit.setText(chosen)
 
 
-class ExtensionPermissionsDialog(QDialog):
+class ExtensionPermissionsDialog(SilentDialog):
     """Edit granted permissions, allowed clients, and approved mutating tools for an extension."""
 
     def __init__(self, info: dict[str, Any], *, parent: QWidget | None = None) -> None:
@@ -154,12 +154,11 @@ class ExtensionsPage(PageScaffold):
 
         self.set_header(tr("extensions.title"), tr("extensions.lead"))
 
-        self._notice_card = Card()
         self._notice_lbl = QLabel(tr("extensions.isolation_notice"))
         self._notice_lbl.setWordWrap(True)
         self._notice_lbl.setObjectName("Hint")
-        self._notice_card.body.addWidget(self._notice_lbl)
-        self.content.addWidget(self._notice_card)
+        self.content.addWidget(self._notice_lbl)
+        self.content.addWidget(Divider())
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
@@ -204,15 +203,22 @@ class ExtensionsPage(PageScaffold):
             self.refresh_btn,
         ):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            toolbar.addWidget(btn)
+        toolbar.addWidget(self.install_zip_btn)
+        toolbar.addWidget(self.install_official_btn)
+        toolbar.addWidget(self.refresh_btn)
         self.content.addLayout(toolbar)
+
+        action_flow = FlowLayout(spacing=6)
+        for btn in (self.toggle_btn, self.perms_btn, self.update_btn, self.rollback_btn, self.uninstall_btn):
+            action_flow.addWidget(btn)
+        self.content.addLayout(action_flow)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         top_widget = QWidget()
         top_lay = QVBoxLayout(top_widget)
-        top_lay.setContentsMargins(0, 0, 0, 0)
-        top_lay.setSpacing(8)
+        top_lay.setContentsMargins(0, 0, 0, 6)
+        top_lay.setSpacing(6)
 
         self._installed_hdr = SectionHeader(tr("extensions.installed.title"))
         top_lay.addWidget(self._installed_hdr)
@@ -224,7 +230,7 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.trust"),
             tr("extensions.col.perms"),
         ])
-        self.installed_table.setMinimumHeight(130)
+        self.installed_table.setMinimumHeight(120)
         self.installed_table.itemSelectionChanged.connect(self._on_installed_selected)
         top_lay.addWidget(self.installed_table, 1)
 
@@ -240,27 +246,30 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.perms"),
             tr("extensions.col.desc"),
         ])
-        self.catalog_table.setMinimumHeight(120)
+        self.catalog_table.setMinimumHeight(110)
         top_lay.addWidget(self.catalog_table, 1)
         splitter.addWidget(top_widget)
 
-        bottom_card = Card(margins=(12, 12, 12, 12))
+        bottom_pane = QWidget()
+        bottom_lay = QVBoxLayout(bottom_pane)
+        bottom_lay.setContentsMargins(0, 6, 0, 0)
+        bottom_lay.setSpacing(6)
         self._ui_hdr = SectionHeader(tr("extensions.details.ui"))
-        bottom_card.body.addWidget(self._ui_hdr)
+        bottom_lay.addWidget(self._ui_hdr)
         self.ui_preview = QPlainTextEdit()
         self.ui_preview.setObjectName("ConsoleLog")
         self.ui_preview.setReadOnly(True)
-        self.ui_preview.setMaximumHeight(95)
-        bottom_card.body.addWidget(self.ui_preview)
+        self.ui_preview.setMaximumHeight(90)
+        bottom_lay.addWidget(self.ui_preview)
 
         self._logs_hdr = SectionHeader(tr("extensions.details.logs"))
-        bottom_card.body.addWidget(self._logs_hdr)
+        bottom_lay.addWidget(self._logs_hdr)
         self.logs_view = QPlainTextEdit()
         self.logs_view.setObjectName("ConsoleLog")
         self.logs_view.setReadOnly(True)
-        self.logs_view.setMinimumHeight(110)
-        bottom_card.body.addWidget(self.logs_view, 1)
-        splitter.addWidget(bottom_card)
+        self.logs_view.setMinimumHeight(96)
+        bottom_lay.addWidget(self.logs_view, 1)
+        splitter.addWidget(bottom_pane)
 
         self.content.addWidget(splitter, 1)
         self.refresh_all()

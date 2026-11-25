@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
-from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.cards import Divider, EmptyState, FlowLayout, SectionHeader
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -224,12 +224,11 @@ class DevicesPage(PageScaffold):
 
         self.set_header(tr("devices.title"), tr("devices.lead"))
 
-        self._notice_card = Card()
         self._notice_lbl = QLabel(tr("devices.security_notice"))
         self._notice_lbl.setWordWrap(True)
         self._notice_lbl.setObjectName("Hint")
-        self._notice_card.body.addWidget(self._notice_lbl)
-        self.content.addWidget(self._notice_card)
+        self.content.addWidget(self._notice_lbl)
+        self.content.addWidget(Divider())
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
@@ -266,13 +265,22 @@ class DevicesPage(PageScaffold):
             self.delete_btn,
         ):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            toolbar.addWidget(btn)
+        toolbar.addWidget(self.add_btn)
+        toolbar.addWidget(self.import_btn)
         self.content.addLayout(toolbar)
 
+        action_flow = FlowLayout(spacing=6)
+        for btn in (self.edit_btn, self.health_btn, self.metrics_btn, self.delete_btn):
+            action_flow.addWidget(btn)
+        self.content.addLayout(action_flow)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
-        top_card = Card(margins=(12, 12, 12, 12))
+        top_pane = QWidget()
+        top_lay = QVBoxLayout(top_pane)
+        top_lay.setContentsMargins(0, 0, 0, 6)
+        top_lay.setSpacing(6)
         self._table_hdr = SectionHeader(tr("devices.table.title"))
-        top_card.body.addWidget(self._table_hdr)
+        top_lay.addWidget(self._table_hdr)
         self.table = DataTable([
             tr("devices.col.id"),
             tr("devices.col.name"),
@@ -281,21 +289,24 @@ class DevicesPage(PageScaffold):
             tr("devices.col.auth"),
             tr("devices.col.perms"),
         ])
-        self.table.setMinimumHeight(140)
+        self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._refresh_details)
-        top_card.body.addWidget(self.table, 1)
+        top_lay.addWidget(self.table, 1)
         self.empty_state = EmptyState("devices", tr("devices.empty.title"), tr("devices.empty.desc"))
-        top_card.body.addWidget(self.empty_state)
-        splitter.addWidget(top_card)
+        top_lay.addWidget(self.empty_state)
+        splitter.addWidget(top_pane)
 
-        bottom_card = Card(margins=(12, 12, 12, 12))
+        bottom_pane = QWidget()
+        bottom_lay = QVBoxLayout(bottom_pane)
+        bottom_lay.setContentsMargins(0, 6, 0, 0)
+        bottom_lay.setSpacing(6)
         self._output_hdr = SectionHeader(tr("devices.details.output"))
-        bottom_card.body.addWidget(self._output_hdr)
+        bottom_lay.addWidget(self._output_hdr)
         self.output_view = QPlainTextEdit()
         self.output_view.setObjectName("ConsoleLog")
         self.output_view.setReadOnly(True)
-        bottom_card.body.addWidget(self.output_view, 1)
-        splitter.addWidget(bottom_card)
+        bottom_lay.addWidget(self.output_view, 1)
+        splitter.addWidget(bottom_pane)
 
         self.content.addWidget(splitter, 1)
         self.refresh_all()

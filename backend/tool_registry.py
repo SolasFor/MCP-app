@@ -90,9 +90,37 @@ GIT_TOOLS = frozenset({
     GIT_CHECKOUT,
     GIT_COMMIT,
 })
+DT_SCREENSHOT = "desktop_screenshot"
+DT_LIST_WINDOWS = "desktop_list_windows"
+DT_LIST_MONITORS = "desktop_list_monitors"
+DT_OPEN_APP = "desktop_open_app"
+DT_CLOSE_WINDOW = "desktop_close_window"
+DT_FOCUS_WINDOW = "desktop_focus_window"
+DT_GET_UI_TREE = "desktop_get_ui_tree"
+DT_CLICK = "desktop_click"
+DT_TYPE = "desktop_type"
+DT_KEYPRESS = "desktop_keypress"
+DT_SCROLL = "desktop_scroll"
+DT_DRAG = "desktop_drag"
+DT_WAIT_FOR_ELEMENT = "desktop_wait_for_element"
+DESKTOP_TOOLS = frozenset({
+    DT_SCREENSHOT,
+    DT_LIST_WINDOWS,
+    DT_LIST_MONITORS,
+    DT_OPEN_APP,
+    DT_CLOSE_WINDOW,
+    DT_FOCUS_WINDOW,
+    DT_GET_UI_TREE,
+    DT_CLICK,
+    DT_TYPE,
+    DT_KEYPRESS,
+    DT_SCROLL,
+    DT_DRAG,
+    DT_WAIT_FOR_ELEMENT,
+})
 BASIC_TOOLS = frozenset({"server_info"})
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS
+EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED}) | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS
+OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH} | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
@@ -139,6 +167,10 @@ class ToolRegistry:
         for git_tool in sorted(GIT_TOOLS):
             self.register(
                 ToolSpec(git_tool, "git", min_profile="allowlist", requires_execution=True)
+            )
+        for dt_tool in sorted(DESKTOP_TOOLS):
+            self.register(
+                ToolSpec(dt_tool, "desktop", min_profile="allowlist", requires_execution=True)
             )
 
     def register(self, spec: ToolSpec) -> None:

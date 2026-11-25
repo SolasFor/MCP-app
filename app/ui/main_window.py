@@ -170,7 +170,7 @@ class MainWindow(QMainWindow):
             history_dir=manager.workspaces_history_dir(),
             redactor=manager._redactor,
         )
-        self.security_page = SecurityPage()
+        self.security_page = SecurityPage(desktop_policy_path=manager.desktop_policy_path())
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
 
@@ -219,8 +219,14 @@ class MainWindow(QMainWindow):
         theme.manager().theme_changed.connect(lambda *_: self._apply_theme())
         i18n.language_changed.connect(lambda *_: self._retranslate_all())
 
+        self._desktop_poll = QTimer(self)
+        self._desktop_poll.setInterval(1000)
+        self._desktop_poll.timeout.connect(self._refresh_desktop_indicator)
+        self._desktop_poll.start()
+
         self.sidebar.set_collapsed(settings.sidebar_collapsed, emit=False)
         self._refresh_mode()
+        self._refresh_desktop_indicator()
         self._load_token_into_field()
         self._on_overall(manager.overall)
         self.show_page("home")
@@ -241,6 +247,13 @@ class MainWindow(QMainWindow):
 
         self._transport_badge = Badge("Quick Tunnel", variant="accent")
         row.addWidget(self._transport_badge)
+
+        self._desktop_indicator_btn = QPushButton("")
+        self._desktop_indicator_btn.setObjectName("Danger")
+        self._desktop_indicator_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._desktop_indicator_btn.clicked.connect(lambda: self.show_page("security"))
+        self._desktop_indicator_btn.hide()
+        row.addWidget(self._desktop_indicator_btn)
         row.addStretch(1)
 
         self._palette_top_btn = QPushButton(tr("topbar.palette"))
@@ -310,6 +323,7 @@ class MainWindow(QMainWindow):
         s.clients_requested.connect(lambda: self.show_page("clients"))
         s.diagnostics_requested.connect(self._open_connection_diagnostics)
         s.emergency_stop_requested.connect(self._on_emergency_stop)
+        s.desktop_policy_changed.connect(self._on_desktop_policy_changed)
 
         self.logs_page.viewer.copy_requested.connect(self._copy)
         self.logs_page.viewer.exported.connect(lambda msg: self.toasts.show_toast(msg, "ok"))
@@ -488,6 +502,7 @@ class MainWindow(QMainWindow):
             if hasattr(page, "retranslate"):
                 page.retranslate()  # type: ignore[attr-defined]
         self._refresh_mode()
+        self._refresh_desktop_indicator()
         self._on_overall(self.manager.overall)
 
     def _on_sidebar_collapsed(self, collapsed: bool) -> None:
@@ -904,11 +919,41 @@ class MainWindow(QMainWindow):
 
     def _on_emergency_stop(self) -> None:
         report = self.manager.emergency_stop()
+        self.security_page.reload_desktop_policy()
+        self._refresh_desktop_indicator()
         QMessageBox.warning(
             self,
             tr("home.btn.emergency"),
             f"{report['warning']}",
         )
+
+    def _on_desktop_policy_changed(self) -> None:
+        self._refresh_desktop_indicator()
+        self.toasts.show_toast(tr("security.desktop.saved"), "info")
+
+    def _refresh_desktop_indicator(self) -> None:
+        try:
+            pol = self.security_page._desktop_store.load()
+            act = self.security_page._desktop_store.read_activity()
+            if act.get("active"):
+                self._desktop_indicator_btn.setText(tr("topbar.desktop_active"))
+                self._desktop_indicator_btn.setObjectName("Danger")
+                repolish(self._desktop_indicator_btn)
+                self._desktop_indicator_btn.show()
+            elif pol.enabled and not pol.emergency_stop and pol.allow_input_control:
+                self._desktop_indicator_btn.setText(tr("topbar.desktop_control"))
+                self._desktop_indicator_btn.setObjectName("Danger")
+                repolish(self._desktop_indicator_btn)
+                self._desktop_indicator_btn.show()
+            elif pol.enabled and not pol.emergency_stop and pol.allow_screen_capture:
+                self._desktop_indicator_btn.setText(tr("topbar.desktop_view"))
+                self._desktop_indicator_btn.setObjectName("Secondary")
+                repolish(self._desktop_indicator_btn)
+                self._desktop_indicator_btn.show()
+            else:
+                self._desktop_indicator_btn.hide()
+        except Exception:
+            self._desktop_indicator_btn.hide()
 
     def _on_proxy_saved(self, settings: object) -> None:
         self.manager.apply_proxy_settings(settings)
@@ -1099,6 +1144,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._persist_geometry()
         if self._allow_close:
+            self._desktop_poll.stop()
             self.servers_page.shutdown()
             self.workspaces_page.shutdown()
             event.accept()

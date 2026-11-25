@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from backend.tool_registry import GIT_TOOLS, SERVER_TOOLS, TASK_TOOLS, WORKSPACE_TOOLS
+from backend.tool_registry import DESKTOP_TOOLS, GIT_TOOLS, SERVER_TOOLS, TASK_TOOLS, WORKSPACE_TOOLS
 
 ROOT = Path(__file__).resolve().parents[2]
 OWNER = "ci-owner-token-not-for-production"
@@ -272,7 +272,7 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(
             {t["name"] for t in json.loads(body)["result"]["tools"]},
             {"server_info", "oauth_windows_command", "oauth_ssh_command"}
-            | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS,
+            | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS,
         )
 
         # In allowlist mode the command runs IMMEDIATELY: no approval_id.

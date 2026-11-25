@@ -1,9 +1,12 @@
 import asyncio
+import base64
 import hmac
+import json
 import logging
 import os
 import secrets
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Literal
@@ -16,6 +19,7 @@ from mcp.server import MCPServer
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
@@ -38,7 +42,27 @@ if __package__:
         WorkspaceManager,
         WorkspaceStore,
     )
+    from .desktop import (
+        DesktopBackend,
+        DesktopManager,
+        DesktopPolicyStore,
+        UnavailableDesktopBackend,
+        Win32DesktopBackend,
+    )
     from .tool_registry import (
+        DT_CLICK,
+        DT_CLOSE_WINDOW,
+        DT_DRAG,
+        DT_FOCUS_WINDOW,
+        DT_GET_UI_TREE,
+        DT_KEYPRESS,
+        DT_LIST_MONITORS,
+        DT_LIST_WINDOWS,
+        DT_OPEN_APP,
+        DT_SCREENSHOT,
+        DT_SCROLL,
+        DT_TYPE,
+        DT_WAIT_FOR_ELEMENT,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -102,7 +126,27 @@ else:
         WorkspaceManager,
         WorkspaceStore,
     )
+    from desktop import (
+        DesktopBackend,
+        DesktopManager,
+        DesktopPolicyStore,
+        UnavailableDesktopBackend,
+        Win32DesktopBackend,
+    )
     from tool_registry import (
+        DT_CLICK,
+        DT_CLOSE_WINDOW,
+        DT_DRAG,
+        DT_FOCUS_WINDOW,
+        DT_GET_UI_TREE,
+        DT_KEYPRESS,
+        DT_LIST_MONITORS,
+        DT_LIST_WINDOWS,
+        DT_OPEN_APP,
+        DT_SCREENSHOT,
+        DT_SCROLL,
+        DT_TYPE,
+        DT_WAIT_FOR_ELEMENT,
         GIT_BRANCHES,
         GIT_CHECKOUT,
         GIT_COMMIT,
@@ -276,6 +320,21 @@ WORKSPACE_MANAGER = WorkspaceManager(
     runner=PROCESS_RUNNER,
     redactor=REDACTOR,
 )
+_DESKTOP_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "desktop"
+)
+DESKTOP_POLICY_STORE = DesktopPolicyStore(
+    Path(os.environ.get("MCP_DESKTOP_POLICY_PATH") or (_DESKTOP_DEFAULT_DIR / "policy.json"))
+)
+_DESKTOP_BACKEND: DesktopBackend = (
+    Win32DesktopBackend() if sys.platform == "win32" else UnavailableDesktopBackend()
+)
+DESKTOP_MANAGER = DesktopManager(
+    DESKTOP_POLICY_STORE,
+    _DESKTOP_BACKEND,
+    redactor=REDACTOR,
+)
 GATEWAY_ROUTER = GatewayRouter(
     GATEWAY_STORE,
     self_urls=(
@@ -445,6 +504,8 @@ oauth_provider = (
     if OAUTH_ENABLED else None
 )
 oauth_execution = ExecutionApprovals(oauth_provider.store) if oauth_provider is not None else None
+if oauth_execution is not None:
+    DESKTOP_MANAGER.emergency_stop_checker = oauth_execution.emergency_stopped
 
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
@@ -1570,6 +1631,356 @@ async def git_commit(workspace_id: str, message: str, paths: list[str] | None = 
         return res
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
         return _ws_call_error(exc)
+
+
+def _desktop_call_error(exc: Exception) -> dict:
+    if isinstance(exc, PermissionError):
+        return {"error": f"Computer Use denied: {exc}"}
+    return {"error": REDACTOR.redact_text(str(exc)) or type(exc).__name__}
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_screenshot(
+    monitor_index: int | None = None,
+    hwnd: int | None = None,
+    max_width: int | None = None,
+) -> CallToolResult:
+    """Capture a bounded in-memory PNG screenshot when screen access is opted in by owner."""
+    client_id = require_execution_permission(
+        DT_SCREENSHOT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        shot = await asyncio.to_thread(
+            DESKTOP_MANAGER.screenshot,
+            client_id=client_id,
+            client_profile=profile_mode,
+            monitor_index=monitor_index,
+            hwnd=hwnd,
+            max_width=max_width,
+        )
+        b64 = base64.b64encode(shot.png_bytes).decode("ascii")
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command="desktop:screenshot",
+        )
+        return CallToolResult(
+            content=[
+                TextContent(type="text", text=json.dumps(shot.metadata())),
+                ImageContent(type="image", data=b64, mimeType="image/png"),
+            ],
+            isError=False,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return CallToolResult(
+            content=[TextContent(type="text", text=json.dumps(_desktop_call_error(exc)))],
+            isError=True,
+        )
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_list_windows(include_minimized: bool = False) -> dict:
+    """List visible top-level windows (elevated/protected titles are masked)."""
+    client_id = require_execution_permission(
+        DT_LIST_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.list_windows,
+            client_id=client_id,
+            client_profile=profile_mode,
+            include_minimized=include_minimized,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_list_monitors() -> dict:
+    """List displays, virtual desktop bounds, and per-monitor DPI scale percentages."""
+    client_id = require_execution_permission(
+        DT_LIST_MONITORS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.list_monitors, client_id=client_id, client_profile=profile_mode
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_open_app(
+    executable: str, args: list[str] | None = None, cwd: str = ""
+) -> dict:
+    """Launch an approved interactive Windows executable without shell interpolation."""
+    client_id = require_execution_permission(
+        DT_OPEN_APP, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        res = await asyncio.to_thread(
+            DESKTOP_MANAGER.open_app,
+            executable,
+            args=tuple(args or ()),
+            cwd=cwd,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+        EXEC_AUDIT.record(
+            client_id=client_id, kind="windows", profile=profile_mode,
+            event="completed", command=f"desktop:open_app:{Path(executable).name}",
+        )
+        return res
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_close_window(hwnd: int) -> dict:
+    """Request window closure via WM_CLOSE (never touches elevated or credential windows)."""
+    client_id = require_execution_permission(
+        DT_CLOSE_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.close_window, hwnd, client_id=client_id, client_profile=profile_mode
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_focus_window(
+    hwnd: int,
+    x: int | None = None,
+    y: int | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> dict:
+    """Focus/restore an authorized window and optionally move/resize it."""
+    client_id = require_execution_permission(
+        DT_FOCUS_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.focus_window,
+            hwnd,
+            x=x,
+            y=y,
+            width=width,
+            height=height,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_get_ui_tree(
+    hwnd: int | None = None, max_depth: int = 4, max_nodes: int = 200
+) -> dict:
+    """Inspect bounded Windows UI Automation tree with password controls redacted."""
+    client_id = require_execution_permission(
+        DT_GET_UI_TREE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.get_ui_tree,
+            hwnd=hwnd,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_click(
+    hwnd: int | None = None,
+    name: str = "",
+    automation_id: str = "",
+    control_type: str = "",
+    x: int | None = None,
+    y: int | None = None,
+    button: Literal["left", "right", "middle"] = "left",
+    double: bool = False,
+) -> dict:
+    """Click a UI element (preferring UIA InvokePattern over raw coordinates)."""
+    client_id = require_execution_permission(
+        DT_CLICK, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.click,
+            hwnd=hwnd,
+            name=name,
+            automation_id=automation_id,
+            control_type=control_type,
+            x=x,
+            y=y,
+            button=button,
+            double=double,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, LookupError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_type(
+    text: str,
+    hwnd: int | None = None,
+    name: str = "",
+    automation_id: str = "",
+) -> dict:
+    """Type Unicode text into a UIA input or focused window (blocks password/secret inputs unless opted in)."""
+    client_id = require_execution_permission(
+        DT_TYPE, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.type_text,
+            text,
+            hwnd=hwnd,
+            name=name,
+            automation_id=automation_id,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, LookupError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_keypress(keys: str, hwnd: int | None = None) -> dict:
+    """Send a named key or key combo (e.g. 'Enter', 'Ctrl+S'; blocks SAS/Win+L)."""
+    client_id = require_execution_permission(
+        DT_KEYPRESS, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.keypress,
+            keys,
+            hwnd=hwnd,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_scroll(
+    delta: int,
+    x: int | None = None,
+    y: int | None = None,
+    horizontal: bool = False,
+    hwnd: int | None = None,
+) -> dict:
+    """Scroll vertically or horizontally via SendInput mouse wheel."""
+    client_id = require_execution_permission(
+        DT_SCROLL, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.scroll,
+            delta,
+            x=x,
+            y=y,
+            horizontal=horizontal,
+            hwnd=hwnd,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_drag(
+    start_x: int,
+    start_y: int,
+    end_x: int,
+    end_y: int,
+    button: Literal["left", "right"] = "left",
+    steps: int = 10,
+    hwnd: int | None = None,
+) -> dict:
+    """Drag pointer smoothly between virtual screen coordinates."""
+    client_id = require_execution_permission(
+        DT_DRAG, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.drag,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            button=button,
+            steps=steps,
+            hwnd=hwnd,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
+
+
+@_conditional_tool(OAUTH_ENABLED)
+async def desktop_wait_for_element(
+    hwnd: int | None = None,
+    name: str = "",
+    automation_id: str = "",
+    control_type: str = "",
+    timeout_seconds: float = 5.0,
+) -> dict:
+    """Poll boundedly until a matching UI Automation element appears."""
+    client_id = require_execution_permission(
+        DT_WAIT_FOR_ELEMENT, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    assert oauth_execution is not None
+    profile_mode = oauth_execution.profile_for(client_id)
+    try:
+        return await asyncio.to_thread(
+            DESKTOP_MANAGER.wait_for_element,
+            hwnd=hwnd,
+            name=name,
+            automation_id=automation_id,
+            control_type=control_type,
+            timeout_seconds=timeout_seconds,
+            client_id=client_id,
+            client_profile=profile_mode,
+        )
+    except (OSError, ValueError, PermissionError, RuntimeError) as exc:
+        return _desktop_call_error(exc)
 
 
 @_conditional_tool(OAUTH_ENABLED)

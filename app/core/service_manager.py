@@ -624,6 +624,7 @@ class ServiceManager(QObject):
             "MCP_MANAGED_SERVERS_PATH": str(self.managed_servers_path()),
             "MCP_WORKSPACES_CONFIG_PATH": str(self.workspaces_config_path()),
             "MCP_WORKSPACES_HISTORY_DIR": str(self.workspaces_history_dir()),
+            "MCP_DESKTOP_POLICY_PATH": str(self.desktop_policy_path()),
             "MCP_SECRETS_DIR": str(user_data_dir() / "secrets"),
             "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
             "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
@@ -640,6 +641,9 @@ class ServiceManager(QObject):
 
     def workspaces_history_dir(self) -> Path:
         return user_data_dir() / "workspaces" / "history"
+
+    def desktop_policy_path(self) -> Path:
+        return user_data_dir() / "desktop" / "policy.json"
 
     def managed_servers_path(self) -> Path:
         target = user_data_dir() / "servers" / "managed_servers.json"
@@ -1169,6 +1173,12 @@ class ServiceManager(QObject):
     def emergency_stop(self, reason: str = "Аварийная остановка владельцем") -> dict:
         """Немедленно заблокировать новые вызовы и остановить контролируемые процессы."""
         oauth_flagged = self._set_oauth_emergency_stop(True, reason=reason)
+        try:
+            from backend.desktop.models import DesktopPolicyStore
+
+            DesktopPolicyStore(self.desktop_policy_path()).set_emergency_stop(True, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
         self._restart_all_pending = False
         self._log(f"🛑 АВАРИЙНАЯ ОСТАНОВКА: {reason}")
         self.stop_all()

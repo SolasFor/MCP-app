@@ -99,6 +99,7 @@ def _check_backend() -> str:
         os.environ["MCP_MANAGED_SERVERS_PATH"] = str(Path(tmp) / "servers" / "managed_servers.json")
         os.environ["MCP_WORKSPACES_CONFIG_PATH"] = str(Path(tmp) / "workspaces" / "workspaces.json")
         os.environ["MCP_WORKSPACES_HISTORY_DIR"] = str(Path(tmp) / "workspaces" / "history")
+        os.environ["MCP_DESKTOP_POLICY_PATH"] = str(Path(tmp) / "desktop" / "policy.json")
         os.environ["MCP_SECRETS_DIR"] = str(Path(tmp) / "secrets")
         os.environ["MCP_TASKS_DB_PATH"] = str(Path(tmp) / "tasks" / "selftest_tasks.sqlite3")
         os.environ["MCP_TASKS_ARTIFACTS_DIR"] = str(Path(tmp) / "tasks" / "artifacts")

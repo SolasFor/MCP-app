@@ -122,31 +122,48 @@ def _start_mock_http_proxy(*, expected_auth: str = "") -> tuple[socket.socket, i
     return srv, srv.getsockname()[1]
 
 
-def _start_mock_socks5_proxy(*, expected_user: str = "", expected_pass: str = "") -> tuple[socket.socket, int, list[int]]:
+def _recv_exact(conn: socket.socket, size: int) -> bytes:
+    buf = b""
+    while len(buf) < size:
+        chunk = conn.recv(size - len(buf))
+        if not chunk:
+            raise OSError("unexpected EOF")
+        buf += chunk
+    return buf
+
+
+def _start_mock_socks5_proxy(
+    *,
+    expected_user: str = "",
+    expected_pass: str = "",
+    host_overrides: dict[str, str] | None = None,
+) -> tuple[socket.socket, int, list[int]]:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.bind(("127.0.0.1", 0))
     srv.listen(8)
     atyp_seen: list[int] = []
+    overrides = dict(host_overrides or {})
 
     def handle(conn: socket.socket) -> None:
         try:
-            greet = conn.recv(16)
-            if len(greet) < 3 or greet[0] != 5:
+            conn.settimeout(3.0)
+            hdr = _recv_exact(conn, 2)
+            if hdr[0] != 5:
                 return
-            methods = greet[2 : 2 + greet[1]]
+            methods = _recv_exact(conn, hdr[1])
             need_auth = bool(expected_user or expected_pass)
             if need_auth:
                 if 2 not in methods:
                     conn.sendall(b"\x05\xff")
                     return
                 conn.sendall(b"\x05\x02")
-                ver = conn.recv(1)
+                ver = _recv_exact(conn, 1)
                 if ver != b"\x01":
                     return
-                ulen = conn.recv(1)[0]
-                u = conn.recv(ulen).decode("utf-8")
-                plen = conn.recv(1)[0]
-                p = conn.recv(plen).decode("utf-8")
+                ulen = _recv_exact(conn, 1)[0]
+                u = _recv_exact(conn, ulen).decode("utf-8")
+                plen = _recv_exact(conn, 1)[0]
+                p = _recv_exact(conn, plen).decode("utf-8")
                 if u != expected_user or p != expected_pass:
                     conn.sendall(b"\x01\x01")
                     return
@@ -154,19 +171,20 @@ def _start_mock_socks5_proxy(*, expected_user: str = "", expected_pass: str = ""
             else:
                 conn.sendall(b"\x05\x00")
 
-            req = conn.recv(4)
+            req = _recv_exact(conn, 4)
             atyp = req[3]
             atyp_seen.append(atyp)
             if atyp == 1:
-                host = socket.inet_ntoa(conn.recv(4))
+                host = socket.inet_ntoa(_recv_exact(conn, 4))
             elif atyp == 3:
-                dlen = conn.recv(1)[0]
-                host = conn.recv(dlen).decode("utf-8")
+                dlen = _recv_exact(conn, 1)[0]
+                host = _recv_exact(conn, dlen).decode("utf-8")
             else:
                 conn.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
-            port = int.from_bytes(conn.recv(2), "big")
-            upstream = socket.create_connection((host, port), timeout=3.0)
+            port = int.from_bytes(_recv_exact(conn, 2), "big")
+            dial_host = overrides.get(host, "127.0.0.1" if host == "localhost" else host)
+            upstream = socket.create_connection((dial_host, port), timeout=3.0)
             conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
 
             def pipe(src: socket.socket, dst: socket.socket) -> None:
@@ -275,22 +293,40 @@ class ProxySystemTests(unittest.TestCase):
 
     def test_socks5_and_socks5h_auth_and_remote_dns(self) -> None:
         target, t_port, seen = _start_mock_target()
-        proxy_srv, p_port, atyp_seen = _start_mock_socks5_proxy(expected_user="bob", expected_pass="sec777")
+        proxy_srv, p_port, atyp_seen = _start_mock_socks5_proxy(
+            expected_user="bob",
+            expected_pass="sec777",
+            host_overrides={"mock-remote.invalid": "127.0.0.1"},
+        )
         try:
-            cfg = px.ProxySettings(
+            cfg_s5h = px.ProxySettings(
                 mode=px.PROXY_MODE_MANUAL,
                 scheme="socks5h",
                 host="127.0.0.1",
                 port=p_port,
                 username="bob",
                 password="sec777",
-                hosts=[f"localhost:{t_port}"],
+                hosts=[f"mock-remote.invalid:{t_port}"],
             )
-            with px.connect(cfg, "localhost", t_port, timeout=2.0) as sock:
+            with px.connect(cfg_s5h, "mock-remote.invalid", t_port, timeout=5.0) as sock:
                 sock.sendall(b"s5h")
                 self.assertEqual(sock.recv(2), b"OK")
             self.assertIn(3, atyp_seen)  # DOMAINNAME ATYP=3 confirms remote DNS for socks5h
-            self.assertEqual(seen, [b"s5h"])
+
+            cfg_s5 = px.ProxySettings(
+                mode=px.PROXY_MODE_MANUAL,
+                scheme="socks5",
+                host="127.0.0.1",
+                port=p_port,
+                username="bob",
+                password="sec777",
+                hosts=[f"127.0.0.1:{t_port}"],
+            )
+            with px.connect(cfg_s5, "127.0.0.1", t_port, timeout=5.0) as sock:
+                sock.sendall(b"s5")
+                self.assertEqual(sock.recv(2), b"OK")
+            self.assertIn(1, atyp_seen)  # IPv4 ATYP=1 confirms local resolution for socks5
+            self.assertEqual(seen, [b"s5h", b"s5"])
         finally:
             proxy_srv.close()
             target.close()

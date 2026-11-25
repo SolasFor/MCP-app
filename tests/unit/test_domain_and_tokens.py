@@ -3,6 +3,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import tempfile
 import unittest
 from pathlib import Path

@@ -25,6 +25,8 @@ if __package__:
     from .oauth_store import default_store_path
     from .oauth_execution import ExecutionApprovals
     from .execution_audit import ExecutionAudit, classify_command_output
+    from .gateway import GatewayConfigStore, GatewayRouter
+    from .gateway.security import check_loop_headers
     from .managed_servers import ManagedServers
     from .output_stream import decode_process_bytes
     from .process_runner import ProcessRunner
@@ -42,6 +44,8 @@ else:
     from oauth_store import default_store_path
     from oauth_execution import ExecutionApprovals
     from execution_audit import ExecutionAudit, classify_command_output
+    from gateway import GatewayConfigStore, GatewayRouter
+    from gateway.security import check_loop_headers
     from managed_servers import ManagedServers
     from output_stream import decode_process_bytes
     from process_runner import ProcessRunner
@@ -130,6 +134,23 @@ PROCESS_RUNNER = ProcessRunner(
 MANAGED_SERVERS = ManagedServers(Path(
     os.environ.get("MCP_MANAGED_SERVERS_PATH") or WORKSPACE_DIR / "managed_servers.json"
 ), runner=PROCESS_RUNNER)
+_GATEWAY_DEFAULT_PATH = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "gateway"
+    / "servers.json"
+)
+GATEWAY_STORE = GatewayConfigStore(
+    Path(os.environ.get("MCP_GATEWAY_CONFIG_PATH") or _GATEWAY_DEFAULT_PATH)
+)
+GATEWAY_ROUTER = GatewayRouter(
+    GATEWAY_STORE,
+    self_urls=(
+        PUBLIC_URL,
+        f"http://127.0.0.1:{PORT}{MCP_PATH}",
+        f"http://localhost:{PORT}{MCP_PATH}",
+    ),
+    redactor=REDACTOR,
+)
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
 OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
@@ -196,6 +217,14 @@ class HybridAuthMiddleware:
 
         client = scope.get("client") or ("?", 0)
         headers = Headers(scope=scope)
+        loop_error = check_loop_headers(dict(headers.items()), GATEWAY_ROUTER.instance_id)
+        if loop_error is not None:
+            logger.warning("Gateway loop blocked on %s: %s", path, loop_error)
+            await JSONResponse(
+                {"error": "gateway_loop_detected", "detail": loop_error},
+                status_code=400,
+            )(scope, receive, send)
+            return
         auth_header = headers.get("authorization", "")
 
         is_bearer = auth_header.lower().startswith("bearer ")
@@ -302,7 +331,13 @@ mcp = (
         SERVER_NAME,
         auth=auth_settings,
         auth_server_provider=oauth_provider,
-        middleware=[make_tool_middleware(oauth_provider.store, oauth_execution)],
+        middleware=[
+            make_tool_middleware(
+                oauth_provider.store,
+                oauth_execution,
+                gateway_router=GATEWAY_ROUTER,
+            )
+        ],
     )
     if oauth_provider is not None
     else MCPServer(SERVER_NAME, auth=auth_settings, token_verifier=SimpleTokenVerifier())
@@ -897,6 +932,10 @@ def main() -> None:
     try:
         uvicorn.run(build_app(), host=HOST, port=PORT)
     finally:
+        try:
+            asyncio.run(GATEWAY_ROUTER.close_all())
+        except Exception:
+            pass
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()
 

@@ -85,11 +85,13 @@ def make_tool_middleware(
     store: OAuthStore | None,
     execution: ExecutionApprovals | None = None,
     registry: ToolRegistry = DEFAULT_REGISTRY,
+    gateway_router: Any = None,
 ):
     async def restrict_tools(ctx, call_next):
         if ctx.method not in ("tools/list", "tools/call"):
             return await call_next(ctx)
-        allowed = allowed_tools(store, get_access_token(), execution, registry)
+        principal = get_access_token()
+        allowed = allowed_tools(store, principal, execution, registry)
         if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
@@ -97,23 +99,47 @@ def make_tool_middleware(
                 raise MCPError(
                     code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
                 )
+            if gateway_router is not None and isinstance(name, str):
+                await gateway_router.ensure_initialized()
+                await gateway_router.sync_dirty()
+                if gateway_router.is_gateway_tool(name):
+                    arguments = (
+                        params.get("arguments")
+                        if isinstance(params, dict)
+                        else getattr(params, "arguments", None)
+                    )
+                    try:
+                        return await gateway_router.call_authorized_tool(
+                            name, arguments, principal, execution
+                        )
+                    except PermissionError as exc:
+                        raise MCPError(code=FORBIDDEN_TOOL, message=str(exc)) from exc
+                    except Exception as exc:
+                        raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
             return await call_next(ctx)
         result = await call_next(ctx)
+        extra_tools = []
+        if gateway_router is not None:
+            await gateway_router.ensure_initialized()
+            await gateway_router.sync_dirty()
+            extra_tools = gateway_router.list_authorized_tools(principal, execution)
         if isinstance(result, ListToolsResult):
+            filtered = [tool for tool in result.tools if tool.name in allowed]
             return result.model_copy(
                 update={
-                    "tools": [tool for tool in result.tools if tool.name in allowed],
+                    "tools": [*filtered, *extra_tools],
                 }
             )
         if isinstance(result, dict) and isinstance(result.get("tools"), list):
+            filtered = [
+                tool
+                for tool in result["tools"]
+                if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None))
+                in allowed
+            ]
             return {
                 **result,
-                "tools": [
-                    tool
-                    for tool in result["tools"]
-                    if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None))
-                    in allowed
-                ],
+                "tools": [*filtered, *extra_tools],
             }
         raise MCPError(code=-32603, message="Unrecognized tools/list response type")
 

@@ -44,6 +44,7 @@ hiddenimports = [
     "app.core.reconnect",
     "app.core.network_watch",
     *collect_submodules("app.core.tunnels"),
+    *collect_submodules("backend.gateway"),
     *collect_submodules("app.ui"),
     *collect_submodules("uvicorn"),
     *collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli")),

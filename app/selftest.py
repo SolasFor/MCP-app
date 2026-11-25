@@ -63,6 +63,7 @@ def _check_qt() -> str:
     from app.ui.pages.servers_page import ServersPage  # noqa: F401
     from app.ui.pages.workspaces_page import WorkspacesPage  # noqa: F401
     from app.ui.pages.extensions_page import ExtensionsPage  # noqa: F401
+    from app.ui.pages.devices_page import DevicesPage  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR
 
@@ -102,6 +103,7 @@ def _check_backend() -> str:
         os.environ["MCP_WORKSPACES_HISTORY_DIR"] = str(Path(tmp) / "workspaces" / "history")
         os.environ["MCP_DESKTOP_POLICY_PATH"] = str(Path(tmp) / "desktop" / "policy.json")
         os.environ["MCP_EXTENSIONS_DIR"] = str(Path(tmp) / "extensions")
+        os.environ["MCP_DEVICES_CONFIG_PATH"] = str(Path(tmp) / "remote" / "devices.json")
         os.environ["MCP_SECRETS_DIR"] = str(Path(tmp) / "secrets")
         os.environ["MCP_TASKS_DB_PATH"] = str(Path(tmp) / "tasks" / "selftest_tasks.sqlite3")
         os.environ["MCP_TASKS_ARTIFACTS_DIR"] = str(Path(tmp) / "tasks" / "artifacts")

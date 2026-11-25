@@ -134,6 +134,32 @@ EXTENSION_TOOLS = frozenset({
 })
 EXTENSION_ALLOWLIST_TOOLS = frozenset({EXT_LIST, EXT_INFO, EXT_CALL_TOOL, EXT_LOGS})
 EXTENSION_FULL_TOOLS = frozenset({EXT_ENABLE, EXT_DISABLE})
+RM_DEVICE_LIST = "device_list"
+RM_DEVICE_INFO = "device_info"
+RM_DEVICE_HEALTH = "device_health"
+RM_SSH_EXECUTE = "ssh_execute"
+RM_SSH_TASK_START = "ssh_task_start"
+RM_SFTP_LIST = "sftp_list"
+RM_SFTP_DOWNLOAD = "sftp_download"
+RM_SFTP_UPLOAD = "sftp_upload"
+RM_SVC_LIST = "remote_service_list"
+RM_SVC_START = "remote_service_start"
+RM_SVC_STOP = "remote_service_stop"
+RM_METRICS = "remote_metrics"
+REMOTE_TOOLS = frozenset({
+    RM_DEVICE_LIST,
+    RM_DEVICE_INFO,
+    RM_DEVICE_HEALTH,
+    RM_SSH_EXECUTE,
+    RM_SSH_TASK_START,
+    RM_SFTP_LIST,
+    RM_SFTP_DOWNLOAD,
+    RM_SFTP_UPLOAD,
+    RM_SVC_LIST,
+    RM_SVC_START,
+    RM_SVC_STOP,
+    RM_METRICS,
+})
 BASIC_TOOLS = frozenset({"server_info"})
 EXEC_TOOLS = (
     frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
@@ -143,6 +169,7 @@ EXEC_TOOLS = (
     | GIT_TOOLS
     | DESKTOP_TOOLS
     | EXTENSION_TOOLS
+    | REMOTE_TOOLS
 )
 OAUTH_TOOLS = (
     BASIC_TOOLS
@@ -153,6 +180,7 @@ OAUTH_TOOLS = (
     | GIT_TOOLS
     | DESKTOP_TOOLS
     | EXTENSION_ALLOWLIST_TOOLS
+    | REMOTE_TOOLS
 )
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED} | EXTENSION_FULL_TOOLS
 
@@ -212,6 +240,10 @@ class ToolRegistry:
         for ext_full_tool in sorted(EXTENSION_FULL_TOOLS):
             self.register(
                 ToolSpec(ext_full_tool, "extensions", min_profile="full", requires_execution=True)
+            )
+        for remote_tool in sorted(REMOTE_TOOLS):
+            self.register(
+                ToolSpec(remote_tool, "remote", min_profile="allowlist", requires_execution=True)
             )
 
     def register(self, spec: ToolSpec) -> None:

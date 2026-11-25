@@ -24,6 +24,7 @@ from backend.tool_registry import (
     EXTENSION_ALLOWLIST_TOOLS,
     EXTENSION_FULL_TOOLS,
     GIT_TOOLS,
+    REMOTE_TOOLS,
     SERVER_TOOLS,
     TASK_TOOLS,
     WORKSPACE_TOOLS,
@@ -129,7 +130,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
                 "server_info", EXEC_WINDOWS, EXEC_SSH,
                 *sorted(TASK_TOOLS), *sorted(SERVER_TOOLS),
                 *sorted(WORKSPACE_TOOLS), *sorted(GIT_TOOLS), *sorted(DESKTOP_TOOLS),
-                *sorted(EXTENSION_ALLOWLIST_TOOLS), *sorted(EXTENSION_FULL_TOOLS), "shared_note_read",
+                *sorted(EXTENSION_ALLOWLIST_TOOLS), *sorted(EXTENSION_FULL_TOOLS), *sorted(REMOTE_TOOLS), "shared_note_read",
             )
         ]
         async def next_list(ctx):
@@ -155,6 +156,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
                 *({"name": n} for n in sorted(DESKTOP_TOOLS)),
                 *({"name": n} for n in sorted(EXTENSION_ALLOWLIST_TOOLS)),
                 *({"name": n} for n in sorted(EXTENSION_FULL_TOOLS)),
+                *({"name": n} for n in sorted(REMOTE_TOOLS)),
                 {"name": "shared_notes_list"},
             ]}
         ctx = SimpleNamespace(method="tools/list", params={})

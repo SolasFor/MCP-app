@@ -48,6 +48,7 @@ from app.ui.provider_wizards import ProviderConfigDialog
 from app.ui.pages import (
     ClientsPage,
     ConnectionsPage,
+    DevicesPage,
     ExtensionsPage,
     GatewayPage,
     HomePage,
@@ -75,10 +76,10 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("servers", "nav.servers", "servers", "primary", shortcut="Ctrl+6"),
     NavItemSpec("workspaces", "nav.workspaces", "workspaces", "primary", shortcut="Ctrl+7"),
     NavItemSpec("extensions", "nav.extensions", "extensions", "primary", shortcut=""),
+    NavItemSpec("devices", "nav.devices", "devices", "primary", shortcut=""),
     NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+8"),
     NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+9"),
     NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut=""),
-    NavItemSpec("devices", "nav.devices", "devices", "upcoming", tag="0.9.8"),
     NavItemSpec("automation", "nav.automation", "automation", "upcoming", tag="0.9.9"),
 )
 
@@ -96,6 +97,7 @@ PAGE_TASKS = PAGE_IDS.index("tasks")
 PAGE_SERVERS = PAGE_IDS.index("servers")
 PAGE_WORKSPACES = PAGE_IDS.index("workspaces")
 PAGE_EXTENSIONS = PAGE_IDS.index("extensions")
+PAGE_DEVICES = PAGE_IDS.index("devices")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
@@ -176,6 +178,10 @@ class MainWindow(QMainWindow):
             extensions_dir=manager.extensions_dir(),
             redactor=manager._redactor,
         )
+        self.devices_page = DevicesPage(
+            config_path=manager.devices_config_path(),
+            redactor=manager._redactor,
+        )
         self.security_page = SecurityPage(desktop_policy_path=manager.desktop_policy_path())
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
@@ -189,6 +195,7 @@ class MainWindow(QMainWindow):
             "servers": self.servers_page,
             "workspaces": self.workspaces_page,
             "extensions": self.extensions_page,
+            "devices": self.devices_page,
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
@@ -1155,6 +1162,7 @@ class MainWindow(QMainWindow):
             self.servers_page.shutdown()
             self.workspaces_page.shutdown()
             self.extensions_page.shutdown()
+            self.devices_page.shutdown()
             event.accept()
             return
         event.ignore()

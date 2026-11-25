@@ -25,6 +25,7 @@ from backend.tool_registry import (
     DESKTOP_TOOLS,
     EXTENSION_ALLOWLIST_TOOLS,
     GIT_TOOLS,
+    REMOTE_TOOLS,
     SERVER_TOOLS,
     TASK_TOOLS,
     WORKSPACE_TOOLS,
@@ -279,7 +280,7 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(
             {t["name"] for t in json.loads(body)["result"]["tools"]},
             {"server_info", "oauth_windows_command", "oauth_ssh_command"}
-            | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS | EXTENSION_ALLOWLIST_TOOLS,
+            | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | DESKTOP_TOOLS | EXTENSION_ALLOWLIST_TOOLS | REMOTE_TOOLS,
         )
 
         # In allowlist mode the command runs IMMEDIATELY: no approval_id.

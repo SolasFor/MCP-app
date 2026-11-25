@@ -11,7 +11,7 @@
 | 5. Task Manager | v0.9.3 | VERIFIED | [PR #24](https://github.com/SolasFor/MCP-app/pull/24), коммит `2ccd259`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45567201054), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45567201051) |
 | 6. Server Manager | v0.9.4 | VERIFIED | [PR #25](https://github.com/SolasFor/MCP-app/pull/25), коммит `f5c87b1`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45571994338), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45571994344) |
 | 7. Workspaces | v0.9.5 | VERIFIED | [PR #26](https://github.com/SolasFor/MCP-app/pull/26), коммит `d8f7f7a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45574728778), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45574728818) |
-| 8. Computer Use | v0.9.6 | TODO | — |
+| 8. Computer Use | v0.9.6 | VERIFIED | [PR #27](https://github.com/SolasFor/MCP-app/pull/27), коммит `e5837ef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45580710966), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45580711115) |
 | 9. Extensions | v0.9.7 | TODO | — |
 | 10. Remote Management | v0.9.8 | TODO | — |
 | 11. Automation & Monitoring | v0.9.9 | TODO | — |
@@ -20,10 +20,39 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/workspaces`, `d8f7f7a` (stacked на `feat/server-manager` / PR #25).
-- Статус Этапа 7 (`v0.9.5 — Workspaces`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#26 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/computer-use`, `e5837ef` (stacked на `feat/workspaces` / PR #26).
+- Статус Этапа 8 (`v0.9.6 — Computer Use`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#27 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/computer-use` от `feat/workspaces` и реализовать Этап 8 (`v0.9.6 — Computer Use`).
+- Следующее действие: отвести ветку `feat/extensions` от `feat/computer-use` и реализовать Этап 9 (`v0.9.7 — Extensions`).
+
+## Этап 8: v0.9.6 — Computer Use (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 8 / `v0.9.6` / `feat/computer-use` / `e5837ef`
+- Реализованные задачи:
+  - Реализован пакет `backend/desktop/` (`{__init__,models,backend_base,png_codec,win32_backend,manager}.py`):
+    - Нативный интерактивный бэкенд `Win32DesktopBackend` (изолированные 64-битные прототипы `WinDLL`, `SetProcessDpiAwarenessContext`, `EnumDisplayMonitors`/`GetDpiForMonitor` DPI, `EnumWindows`/`IsWindowElevated` через `OpenProcessToken`, проверка состояния сеанса `OpenInputDesktop`, захват окна/экрана `PrintWindow`/`GetWindowDC`/`BitBlt` → pure-Python BGRA→PNG `encode_bgra_to_png` в памяти с ограничением ширины/байт без записи на диск, нативный COM `UIAutomationCore.dll` через vtable-вызовы для UI-дерева, `InvokePattern` и `ValuePattern`, `SendInput` с UTF-16LE Unicode и виртуальными координатами нескольких мониторов, жёсткий отказ для `Ctrl+Alt+Del` и `Win+L`).
+    - Сериализованный fail-closed менеджер `DesktopManager` и `DesktopPolicyStore` (+ маяк активности `activity.json` для индикатора GUI): отдельные явные opt-in разрешения владельца (`enabled`, `allow_screen_capture`, `allow_input_control`, `allow_secret_typing`, `allowed_clients`), локальный `emergency_stop`, отказ при заблокированной сессии/UAC/secure desktop, отказ по UIPI повышенным окнам и полям пароля (`is_password=True`).
+  - Добавлены 13 OAuth-инструментов `desktop_*` в `backend/tool_registry.py` и `backend/server.py` (`desktop_screenshot` с возвратом `CallToolResult` — метаданные JSON + `ImageContent`, `list_windows`, `list_monitors`, `open_app`, `close_window`, `focus_window`, `get_ui_tree`, `click`, `type`, `keypress`, `scroll`, `drag`, `wait_for_element`), интеграция аварийной остановки в `ServiceManager.emergency_stop()`, изоляция `MCP_DESKTOP_POLICY_PATH` в `app/core/service_manager.py` и `app/selftest.py`.
+  - Обновлён GUI (`app/ui/pages/security_page.py`, `app/ui/main_window.py`, `app/ui/i18n.py`): переключатели политик Computer Use, список разрешённых клиентов, видимый индикатор состояния в верхней панели (`Просмотр` / `Контроль`) и кнопка экстренной остановки `Stop Computer Use` (полная RU/EN-локализация).
+  - Добавлена документация `docs/computer-use.md` и ссылка в `README.md`.
+- Оставшиеся задачи и зависимости: последовательный merge [PR #27](https://github.com/SolasFor/MCP-app/pull/27) после PR #20–#26.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.6`), `packaging/mcp_app.spec`, `app/core/service_manager.py`, `app/selftest.py`, `app/ui/{i18n,main_window}.py`, `app/ui/pages/security_page.py`, `backend/desktop/`, `backend/{tool_registry,server}.py`, `docs/computer-use.md`, `README.md`, `tests/unit/{test_desktop_security,test_tool_permissions}.py`, `tests/integration/{test_desktop_computer_use,test_tool_registry,test_oauth_http}.py`, `tools/live_desktop_smoke.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend tests tools main.py`, `mypy` (win32 + `--platform linux`): PASS (50 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (148/148 за 11.032s — fail-closed политики, lock/UAC/elevated/password/SAS защиты, cross-client allowlist, encoder PNG, нормализация координат нескольких мониторов)
+    - `tests/integration`: PASS (36/36 за 203.502s; всего 184/184 — mock `DesktopBackend` в headless CI для `desktop_*` инструментов и `ImageContent`, а также `SecurityPage` opt-in, видимого индикатора и `Stop Computer Use`)
+    - Live interactive Windows 11 smoke (`tools/live_desktop_smoke.py` с рабочим потоком и активным циклом Qt): **PASS** (`monitors=2`, `dpi_primary=100`, `screenshot_bytes=4158` `[440x280]`, `ui_nodes=11`, `click_method=uia_invoke`, ввод текста `hello-live-123`, отказ по полю пароля `password_blocked=True`, чистое закрытие окна).
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.6-portable.zip` 66.8 MB)
+  - GitHub Actions CI на `e5837ef`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`2m17s`) — https://github.com/SolasFor/MCP-app/actions/runs/45580710966/job/139089748783
+    - `Verify & Test (windows-latest)`: PASS (`5m33s`) — https://github.com/SolasFor/MCP-app/actions/runs/45580710966/job/139089748313
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m10s`) — https://github.com/SolasFor/MCP-app/actions/runs/45580711115/job/139089749566
+- Live tests отдельно от mocks: реальный интерактивный тест Windows 11 desktop (`tools/live_desktop_smoke.py`) — **PASS** (захват окна через `PrintWindow` при изолированном thread desktop `exebox-*` и `WinSta0\Default`, UIA COM + SendInput). В headless CI используются `_FakeBackend` и `QT_QPA_PLATFORM=offscreen`; они не подменяют живой тест. Опциональные сторонние CAD/Office-приложения (`SolidWorks`, `КОМПАС-3D`, `Mathcad`, `Office`, `VS Code`) в автотесты Computer Use не включались (`BLOCKED` / не проверялись вживую).
+- Риски / ограничения / блокеры: полноэкранный `BitBlt(GetDC(None))` между разными Win32 desktops (например, при запуске из изолированной среды `exebox-*` вместо `WinSta0\Default`) отклоняется ОС с `err=6`, тогда как `PrintWindow` для целевого `HWND` и обычный интерактивный запуск на `Default` desktop работают; сборка без Authenticode-сертификата.
+- PR / релиз: [PR #27](https://github.com/SolasFor/MCP-app/pull/27) (`feat/computer-use` → `feat/workspaces`).
+- Следующий точный шаг: Этап 9 (`v0.9.7 — Extensions`) на ветке `feat/extensions`.
+
 
 ## Этап 7: v0.9.5 — Workspaces (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 7 / `v0.9.5` / `feat/workspaces` / `d8f7f7a`

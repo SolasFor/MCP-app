@@ -54,6 +54,7 @@ hiddenimports = [
     *collect_submodules("backend.desktop"),
     *collect_submodules("backend.extensions"),
     *collect_submodules("backend.remote"),
+    *collect_submodules("backend.automation"),
     *collect_submodules("app.ui"),
     *collect_submodules("uvicorn"),
     *collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli")),

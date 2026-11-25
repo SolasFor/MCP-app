@@ -44,6 +44,7 @@ class Sidebar(QFrame):
         super().__init__(parent)
         self.setObjectName("Sidebar")
         self._specs = specs
+        self._has_upcoming = any(s.section == "upcoming" for s in specs)
         self._collapsed = False
         self._buttons: dict[str, NavButton] = {}
         self._order: list[str] = [s.page_id for s in specs]
@@ -105,6 +106,7 @@ class Sidebar(QFrame):
         nav_col.addSpacing(8)
         self._upcoming_lbl = QLabel()
         self._upcoming_lbl.setObjectName("SidebarSection")
+        self._upcoming_lbl.setVisible(self._has_upcoming)
         nav_col.addWidget(self._upcoming_lbl)
 
         for spec in specs:
@@ -170,7 +172,7 @@ class Sidebar(QFrame):
         self.setFixedWidth(self.COLLAPSED_WIDTH if collapsed else self.EXPANDED_WIDTH)
         self._wordmark.setVisible(not collapsed)
         self._primary_lbl.setVisible(not collapsed)
-        self._upcoming_lbl.setVisible(not collapsed)
+        self._upcoming_lbl.setVisible((not collapsed) and self._has_upcoming)
         self._chip_text.setVisible(not collapsed)
         self._chip_detail.setVisible(not collapsed)
         self._version_lbl.setVisible(not collapsed)

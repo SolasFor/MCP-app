@@ -58,22 +58,25 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_gui_opt_in_visible_topbar_indicator_and_stop_button(self) -> None:
+        from app.ui.components.toggle_switch import ToggleSwitch
+
         sec = self.window.security_page
         self.window.show_page("security")
-        self.assertFalse(sec.desktop_enabled_chk.isChecked())
+        self.assertIsInstance(sec.desktop_enabled_sw, ToggleSwitch)
+        self.assertFalse(hasattr(sec, "desktop_save_btn"))
+        self.assertFalse(sec.desktop_enabled_sw.isChecked())
         self.assertTrue(self.window._desktop_indicator_btn.isHidden())
 
-        # Enable view-only opt-in
-        sec.desktop_enabled_chk.setChecked(True)
-        sec.desktop_screen_chk.setChecked(True)
+        # Enable view-only opt-in via ToggleSwitch immediate auto-save (no Save button)
         sec.desktop_clients_edit.setText("c-view")
-        sec.save_desktop_policy()
+        sec.desktop_clients_edit.editingFinished.emit()
+        sec.desktop_enabled_sw.setChecked(True)
+        sec.desktop_screen_sw.setChecked(True)
         self.assertFalse(self.window._desktop_indicator_btn.isHidden())
         self.assertIn("Просмотр", self.window._desktop_indicator_btn.text())
 
-        # Enable input control -> indicator updates & retranslates EN/RU
-        sec.desktop_control_chk.setChecked(True)
-        sec.save_desktop_policy()
+        # Enable input control -> indicator updates immediately & retranslates EN/RU
+        sec.desktop_control_sw.setChecked(True)
         self.assertIn("Контроль", self.window._desktop_indicator_btn.text())
         self.window.set_language(LANG_EN)
         self.assertIn("Control", self.window._desktop_indicator_btn.text())
@@ -85,6 +88,7 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
         self.assertTrue(loaded.emergency_stop)
         self.assertFalse(loaded.enabled)
         self.assertTrue(self.window._desktop_indicator_btn.isHidden())
+        self.assertFalse(sec.desktop_clear_stop_btn.isHidden())
 
     def test_mcp_desktop_tools_pipeline_and_image_content(self) -> None:
         import asyncio

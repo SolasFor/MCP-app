@@ -17,8 +17,6 @@ import os
 import re
 import signal
 import sys
-import traceback
-from datetime import datetime
 from typing import Callable
 
 from PyQt6.QtCore import Qt, QTimer
@@ -29,8 +27,9 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
 from app.ui.components.silent_dialog import SilentMessageBox
 
 from app import APP_ID, APP_NAME, __version__, migrate
-from app.config import Settings
+from app.config import PROVIDER_NONE, Settings
 from app.core import autostart
+from app.core.logging_manager import LogConfig, configure_logging, default_logs_dir, get_logging_manager
 from app.core.service_manager import APP, ServiceManager
 from app.paths import user_data_dir
 from app.ui import icons, theme
@@ -111,31 +110,39 @@ def _create_installer_mutex() -> None:
 
 
 def _install_crash_handler() -> None:
-    """В оконном .exe нет консоли: необработанное исключение пишем в crash.log и показываем."""
+    """В оконном .exe нет консоли: необработанное исключение пишем в logs/crash.log и показываем."""
 
     def hook(exc_type, exc, tb) -> None:  # noqa: ANN001
-        text = "".join(traceback.format_exception(exc_type, exc, tb))
-        try:
-            with open(user_data_dir() / CRASH_LOG, "a", encoding="utf-8") as fh:
-                fh.write(f"\n=== {datetime.now():%Y-%m-%d %H:%M:%S} · {APP_NAME} {__version__} ===\n{text}")
-        except OSError:
-            pass
+        lm = get_logging_manager()
+        text = lm.log_crash(exc_type, exc, tb, context="gui_excepthook")
+        crash_path = lm.component_path("crash")
         if QApplication.instance() is not None:
             SilentMessageBox.critical(
                 None,
                 APP_NAME,
                 "Внутренняя ошибка. Приложение продолжит работу.",
-                informative_text=f"Подробности записаны в {user_data_dir() / CRASH_LOG}",
+                informative_text=f"Подробности записаны в {crash_path}",
                 detailed_text=text,
             )
 
     sys.excepthook = hook
+    import threading
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        tname = getattr(args.thread, "name", "thread")
+        get_logging_manager().log_crash(
+            args.exc_type, args.exc_value, args.exc_traceback, context=f"gui_thread:{tname}"
+        )
+
+    threading.excepthook = _thread_hook
 
 
 # ====================================================================== точка входа
 def run_gui(argv: list[str]) -> int:
     minimized = "--minimized" in argv[1:]
     _set_app_user_model_id()
+    lm = configure_logging(base_dir=default_logs_dir(), data_root=user_data_dir())
+    lm.info("app", f"Starting {APP_NAME} {__version__} (GUI)", event_code="gui_boot")
     _install_crash_handler()
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -149,12 +156,25 @@ def run_gui(argv: list[str]) -> int:
 
     key = _instance_key()
     if _notify_running_instance(key, show=not minimized):
+        lm.info("app", "Activated already-running instance", event_code="single_instance")
+        lm.shutdown(timeout=1.0)
         return 0
     _create_installer_mutex()
 
     migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 
     settings = Settings.load()
+    lm.update_config(
+        LogConfig(
+            enabled=settings.logging_enabled,
+            level=settings.logging_level,
+            max_file_mb=settings.logging_max_file_mb,
+            retention_days=settings.logging_retention_days,
+            max_total_mb=settings.logging_max_total_mb,
+            auto_rotate=settings.logging_auto_rotate,
+            archive_enabled=settings.logging_archive_enabled,
+        )
+    )
     i18n.set_language(settings.language)
     theme.apply(app, settings.theme_mode)
     app.setWindowIcon(icons.app_icon())
@@ -176,12 +196,6 @@ def run_gui(argv: list[str]) -> int:
         tray.show_requested.connect(window.show_and_raise)
         tray.quit_requested.connect(app.quit)
         window.task_notification.connect(tray.notify_task_event)
-        window.hidden_to_tray.connect(lambda: tray.show_silent_notification(
-            APP_NAME,
-            "Приложение продолжает работать в трее. Выход — правой кнопкой по значку.",
-            variant="info",
-            timeout_ms=4000,
-        ))
         tray.show()
 
     instance_server = _listen_for_instances(key, window.show_and_raise)
@@ -192,6 +206,8 @@ def run_gui(argv: list[str]) -> int:
             tray.hide()  # иначе в трее остаётся «призрак» до наведения мыши
         manager.shutdown()  # блокирующая остановка туннеля и сервера (до ~6 с)
         instance_server.close()
+        lm.info("app", "Application shutdown completed cleanly", event_code="gui_shutdown")
+        lm.shutdown(timeout=2.0)
 
     app.aboutToQuit.connect(on_about_to_quit)
 
@@ -205,7 +221,7 @@ def run_gui(argv: list[str]) -> int:
     if not (minimized and tray_available):
         window.show_and_raise()
     QTimer.singleShot(0, window.servers_page.start_autostart_servers)
-    if settings.start_services_on_launch:
+    if settings.start_services_on_launch and settings.active_provider != PROVIDER_NONE:
         QTimer.singleShot(0, manager.start_all)
 
     return app.exec()

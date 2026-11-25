@@ -4,12 +4,14 @@ This document summarizes the security architecture, trust boundaries, verified m
 
 ## 1. Trust Boundaries
 
-1. **External MCP Clients & Public Tunnels** (`Cloudflare Quick/Named`, `ngrok`, `Tailscale Funnel`, `Local only`):
+1. **External MCP Clients & Public Tunnels** (`Cloudflare Quick/Named`, `ngrok`, `Tailscale Funnel`):
    - Untrusted external requests arrive over TLS tunnels forwarding to `127.0.0.1:<port>`.
    - `HybridAuthMiddleware` strips legacy `?token=` from URLs (never logging tokens) and enforces DNS-rebinding allowlists (`TransportSecuritySettings`) plus Gateway loop header defense (`check_loop_headers`).
+   - Browser OAuth `/oauth/consent` enforces `Origin`, `Sec-Fetch-Site`, double-submit `csrf_token` cookie+form validation, and scopes CSP `form-action` strictly to `'self'` plus the single validated client `redirect_uri` origin/scheme (never `*`), blocking `javascript:`/`data:`/`vbscript:`/`blob:`/`file:` URIs.
    - Authentication is **never** disabled based on loopback source IP or tunnel trust; OAuth bearer tokens (`LocalConsentOAuthProvider`) validate `issuer`, `resource`, expiry, and live approval.
    - Rotating the owner token revokes all issued OAuth access/refresh tokens and resets `clients.approved_at` while keeping DCR `client_id` entries so authorized clients can reconnect and re-consent cleanly with the new owner token.
    - `issuer` transitions across incompatible providers prompt the owner before switching and never reuse tokens across issuers.
+   - Persistent logs in `%APPDATA%\MCPApp\logs\` and exported diagnostic ZIP bundles pass through `SecretRedactor` before writing (including at `DEBUG` level) and preserve protected security audits (`mcp_execution_audit.jsonl`, `desktop_policy_audit.jsonl`) against normal clearing or log rotation.
 
 2. **Three OAuth Execution Profiles (`safe`, `allowlist`, `full`)**:
    - **`safe`**: Fail-closed fallback for unapproved clients, corrupted encrypted policies, invalid configuration values, and active Emergency Stop; exposes only read-only `server_info`.

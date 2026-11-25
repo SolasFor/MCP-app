@@ -27,11 +27,13 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     TUNNEL_NAMED,
     Settings,
 )
 from app.core import autostart, token_store
+from app.core.logging_manager import LogConfig, get_logging_manager
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
 from app.paths import user_data_dir
@@ -113,7 +115,6 @@ _PAGE_NAV_KEY = {spec.page_id: spec.i18n_key for spec in NAV_SPECS}
 
 class MainWindow(QMainWindow):
     quit_requested = pyqtSignal()
-    hidden_to_tray = pyqtSignal()
     task_notification = pyqtSignal(str, str, str)
 
     def __init__(
@@ -128,7 +129,6 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self._tray_available = tray_available
         self._allow_close = False
-        self._tray_hint_shown = False
         self._unseen_errors = 0
         self._domain_guide: DomainGuideDialog | None = None
         self._domain_wizard: DomainWizard | None = None
@@ -360,6 +360,7 @@ class MainWindow(QMainWindow):
 
         self.logs_page.viewer.copy_requested.connect(self._copy)
         self.logs_page.viewer.exported.connect(lambda msg: self.toasts.show_toast(msg, "ok"))
+        self.logs_page.viewer.set_diagnostics_context_provider(self._diagnostics_export_context)
 
         st = self.settings_page
         st.theme_mode_selected.connect(self.set_theme_mode)
@@ -369,6 +370,7 @@ class MainWindow(QMainWindow):
         st.start_on_launch_toggled.connect(self._on_start_on_launch)
         st.minimize_toggled.connect(self._on_minimize_toggled)
         st.auto_restart_toggled.connect(self._on_auto_restart)
+        st.logging_settings_changed.connect(self._on_logging_settings_changed)
 
     def _connect_manager_signals(self) -> None:
         m = self.manager
@@ -412,6 +414,7 @@ class MainWindow(QMainWindow):
         if page_id == "logs":
             self._unseen_errors = 0
             self.sidebar.set_badge("logs", 0)
+            self.logs_page.viewer.reload_from_disk()
         elif page_id == "connections":
             self._refresh_services()
         elif page_id == "clients":
@@ -494,7 +497,6 @@ class MainWindow(QMainWindow):
     # ================================================================== theme & i18n
     def set_theme_mode(self, mode: str) -> None:
         normalized = mode if mode in theme.THEME_MODES else theme.THEME_DARK
-        prev_mode = self.settings.theme_mode
         self.settings.theme_mode = normalized
         chosen = theme.manager().set_mode(
             normalized,
@@ -503,8 +505,6 @@ class MainWindow(QMainWindow):
         self.settings.theme_mode = chosen
         self._save_settings()
         self._sync_theme_controls()
-        if chosen != prev_mode:
-            self.toasts.show_toast(tr("toast.theme_changed", theme=tr(f"settings.theme.{chosen}")), "info")
 
     def _on_theme_combo_changed(self, _index: int) -> None:
         mode = str(self._theme_combo.currentData() or theme.THEME_DARK)
@@ -662,10 +662,11 @@ class MainWindow(QMainWindow):
             PROVIDER_NGROK: "ngrok Agent",
             PROVIDER_TAILSCALE: "Tailscale Funnel",
             PROVIDER_LOCAL: "Local Loopback",
+            PROVIDER_NONE: tr("conn.provider.none"),
         }
         self.home_page.tunnel_row.set_title(tunnel_titles.get(pid, "Tunnel"))
-        if pid in (PROVIDER_LOCAL, PROVIDER_TAILSCALE):
-            if pid == PROVIDER_LOCAL:
+        if pid in (PROVIDER_LOCAL, PROVIDER_NONE, PROVIDER_TAILSCALE):
+            if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
                 self.home_page.tunnel_row.set_state(
                     tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
                     theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
@@ -685,8 +686,12 @@ class MainWindow(QMainWindow):
             )
         self.home_page.server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
-        if pid == PROVIDER_LOCAL:
-            detail = f"http://{s.local_host()}:{s.server_port}{s.mcp_path} (no tunnel)"
+        if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
+            detail = (
+                f"http://{s.local_host()}:{s.server_port}{s.mcp_path} (no tunnel)"
+                if pid == PROVIDER_LOCAL
+                else tr("conn.provider.none")
+            )
         else:
             detail = host or ("*.trycloudflare.com" if quick else "—")
             parts = [detail]
@@ -706,11 +711,12 @@ class MainWindow(QMainWindow):
             PROVIDER_NGROK: ("Transport: ngrok Agent v3", "ngrok"),
             PROVIDER_TAILSCALE: ("Transport: Tailscale Funnel (HTTPS)", "Tailscale Funnel"),
             PROVIDER_LOCAL: ("Transport: Local Only (127.0.0.1)", "Local Only"),
+            PROVIDER_NONE: (tr("conn.provider.none"), tr("conn.provider.none")),
         }
         caption, badge_text = provider_badges.get(pid, ("", pid))
         self.home_page.mode_caption.setText(caption)
         self._transport_badge.setText(badge_text)
-        self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else "accent")
+        self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else ("warn" if pid == PROVIDER_NONE else "accent"))
         try:
             statuses = m.connections.list_statuses(
                 local_host=s.local_host(),
@@ -726,9 +732,11 @@ class MainWindow(QMainWindow):
             statuses=statuses,
             has_domain=m.has_domain(),
         )
+        migrated_from = str(getattr(m, "migrated_from_provider", "") or getattr(self.settings, "migrated_from_provider", ""))
         self.connections_page.set_legacy_openai_migration(
-            migrated=bool(getattr(m, "migrated_from_openai_tunnel", False)),
+            migrated=bool(getattr(m, "migrated_from_openai_tunnel", False)) or migrated_from in ("openai_tunnel", "local_only"),
             has_secret=bool(m.has_legacy_openai_secret()) if hasattr(m, "has_legacy_openai_secret") else False,
+            migrated_from=migrated_from,
         )
 
     @staticmethod
@@ -873,8 +881,8 @@ class MainWindow(QMainWindow):
             hint = tr("home.mode.named_wizard_hint", host=wizard.hostname)
         elif pid == PROVIDER_CF_NAMED:
             hint = tr("home.mode.named_config_hint")
-        elif pid == PROVIDER_LOCAL:
-            hint = tr("conn.provider.local")
+        elif pid in (PROVIDER_LOCAL, PROVIDER_NONE):
+            hint = tr("conn.provider.none")
         else:
             hint = tr("conn.providers.note")
         h = self.home_page
@@ -907,6 +915,9 @@ class MainWindow(QMainWindow):
         elif ident.provider_id == PROVIDER_LOCAL:
             h.ov_url.setText(tr("home.url.local_only_value", local_url=ident.local_url))
             h.ov_url.setStyleSheet("")
+        elif ident.provider_id == PROVIDER_NONE:
+            h.ov_url.setText(tr("conn.provider.none"))
+            h.ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
         else:
             h.ov_url.setText(
                 tr("home.url.placeholder_quick" if self.settings.is_quick_tunnel else "home.url.placeholder_named")
@@ -1031,6 +1042,11 @@ class MainWindow(QMainWindow):
                 execution.set_profile(mode)
             else:
                 ExecutionApprovals.save_default_template(self._oauth_store_path(), profile=mode)
+            get_logging_manager().info(
+                "oauth",
+                f"Default OAuth access profile updated: {current_mode} -> {mode}",
+                event_code="oauth_default_profile_changed",
+            )
             self._refresh_access_profile()
         except (ValueError, OSError, RuntimeError) as exc:
             SilentMessageBox.warning(
@@ -1079,7 +1095,6 @@ class MainWindow(QMainWindow):
 
     def _on_desktop_policy_changed(self) -> None:
         self._refresh_desktop_indicator()
-        self.toasts.show_toast(tr("security.desktop.saved"), "info")
 
     def _refresh_desktop_indicator(self) -> None:
         try:
@@ -1194,6 +1209,36 @@ class MainWindow(QMainWindow):
     def _on_auto_restart(self, enabled: bool) -> None:
         self.settings.auto_restart = enabled
         self._save_settings()
+
+    def _on_logging_settings_changed(self, cfg_dict: dict) -> None:
+        s = self.settings
+        s.logging_enabled = bool(cfg_dict.get("logging_enabled", True))
+        s.logging_level = str(cfg_dict.get("logging_level", "INFO")).upper()
+        s.logging_max_file_mb = int(cfg_dict.get("logging_max_file_mb", 10))
+        s.logging_retention_days = int(cfg_dict.get("logging_retention_days", 30))
+        s.logging_max_total_mb = int(cfg_dict.get("logging_max_total_mb", 200))
+        s.logging_auto_rotate = bool(cfg_dict.get("logging_auto_rotate", True))
+        s.logging_archive_enabled = bool(cfg_dict.get("logging_archive_enabled", True))
+        self._save_settings()
+        get_logging_manager().update_config(
+            LogConfig(
+                enabled=s.logging_enabled,
+                level=s.logging_level,
+                max_file_mb=s.logging_max_file_mb,
+                retention_days=s.logging_retention_days,
+                max_total_mb=s.logging_max_total_mb,
+                auto_rotate=s.logging_auto_rotate,
+                archive_enabled=s.logging_archive_enabled,
+            )
+        )
+
+    def _diagnostics_export_context(self) -> dict[str, object]:
+        return {
+            "settings": self.settings,
+            "manager": self.manager,
+            "proxy_report": self.connections_page.proxy_page.diagnostics_snapshot(),
+            "redactor": getattr(self.manager, "_redactor", None),
+        }
 
     def _on_error_logged(self) -> None:
         if self._current_page_id != "logs" or not self.isVisible():
@@ -1315,9 +1360,6 @@ class MainWindow(QMainWindow):
         event.ignore()
         if self._tray_available and self.settings.minimize_to_tray_on_close:
             self.hide()
-            if not self._tray_hint_shown:
-                self._tray_hint_shown = True
-                self.hidden_to_tray.emit()
         else:
             self.quit_requested.emit()
 

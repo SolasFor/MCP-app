@@ -52,6 +52,7 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     REMOVED_PROVIDER_OPENAI,
     TUNNEL_MODES,
@@ -64,14 +65,17 @@ from app.core import domain_state, token_store
 from app.core import proxy as px
 from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
+from app.core.logging_manager import get_logging_manager, infer_level
 from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
 from app.core.network_watch import SystemResilienceMonitor
 from app.core.process import ManagedProcess, ProcState
 from app.core.reconnect import BackoffPolicy
 from app.core.redaction import SecretRedactor
+from app.core.secret_store import SecretStore
 from app.core.tunnel_log import classify_tunnel_error, classify_tunnel_event
 from app.core.tunnels import (
     ALL_PROVIDERS,
+    CloudflareNamedProvider,
     ConnectionIdentity,
     ConnectionManager,
     IssuerTransitionWarning,
@@ -213,12 +217,13 @@ class ServiceManager(QObject):
         self._server_restart_pending = False  # сервер останавливается, чтобы стартовать с новым адресом
         self._restart_all_pending = False     # после остановки всё запустить снова (новые настройки)
 
+        self._logging = get_logging_manager()
         self.connections = ConnectionManager(user_data_dir())
-        if self.connections.migrated_from_provider == REMOVED_PROVIDER_OPENAI:
-            self.settings.migrated_from_provider = REMOVED_PROVIDER_OPENAI
-            self.settings.active_provider = PROVIDER_LOCAL
+        if self.connections.migrated_from_provider in (REMOVED_PROVIDER_OPENAI, PROVIDER_LOCAL):
+            self.settings.migrated_from_provider = self.connections.migrated_from_provider
+            self.settings.active_provider = PROVIDER_NONE
             self._save_settings()
-        if settings.active_provider in ALL_PROVIDERS:
+        if settings.active_provider in ALL_PROVIDERS or settings.active_provider in (PROVIDER_LOCAL, PROVIDER_NONE):
             self.connections.set_active_provider(settings.active_provider)
         self._sync_named_provider_config()
 
@@ -262,16 +267,27 @@ class ServiceManager(QObject):
 
     @property
     def connection_identity(self) -> ConnectionIdentity:
-        prov = self.connections.get(self.active_provider)
-        runtime_url = (
-            self._quick_url
-            if self.active_provider == PROVIDER_CF_QUICK
-            else (
-                self.settings.public_url
-                if self.active_provider == PROVIDER_CF_NAMED
-                else self._runtime_provider_url
+        if self.active_provider == PROVIDER_NONE:
+            path = self.settings.mcp_path if self.settings.mcp_path.startswith("/") else f"/{self.settings.mcp_path}"
+            local_url = f"http://{self.settings.local_host()}:{self.settings.server_port}{path}"
+            return ConnectionIdentity(
+                provider_id=PROVIDER_NONE,
+                is_public_url=False,
+                public_url="",
+                local_url=local_url,
+                private_tunnel_id="",
+                oauth_issuer="",
+                oauth_resource_url="",
+                is_ephemeral=False,
+                supports_sse=False,
             )
-        )
+        prov = self.connections.get(self.active_provider)
+        if self.active_provider == PROVIDER_CF_QUICK:
+            runtime_url = self._quick_url
+        elif self.active_provider == PROVIDER_CF_NAMED:
+            runtime_url = self.settings.public_url or str(prov.export_config().get("public_url") or "")
+        else:
+            runtime_url = self._runtime_provider_url
         return prov.connection_identity(
             local_host=self.settings.local_host(),
             local_port=self.settings.server_port,
@@ -285,7 +301,7 @@ class ServiceManager(QObject):
 
     @property
     def public_url(self) -> str:
-        """Публичный HTTPS-адрес для клиентов ('' для local_only)."""
+        """Публичный HTTPS-адрес для клиентов ('' для local_only / none)."""
         return self.connection_identity.public_url
 
     @property
@@ -311,6 +327,13 @@ class ServiceManager(QObject):
             or self.connections.migrated_from_provider == REMOVED_PROVIDER_OPENAI
         )
 
+    @property
+    def migrated_from_local_only(self) -> bool:
+        return (
+            self.settings.migrated_from_provider == PROVIDER_LOCAL
+            or self.connections.migrated_from_provider == PROVIDER_LOCAL
+        )
+
     def has_legacy_openai_secret(self) -> bool:
         return self.connections.has_legacy_openai_secret()
 
@@ -318,12 +341,35 @@ class ServiceManager(QObject):
         return self.connections.purge_legacy_openai_secret()
 
     def _sync_named_provider_config(self) -> None:
-        self.connections.get(PROVIDER_CF_NAMED).load_config(
-            {
-                "public_url": self.settings.public_url,
-                "cloudflared_config": self.settings.cloudflared_config,
-            }
-        )
+        named = self.connections.get(PROVIDER_CF_NAMED)
+        if isinstance(named, CloudflareNamedProvider):
+            state = named.resolve_effective_state(mcp_path=self.settings.mcp_path)
+            merged_cfg = dict(named.export_config())
+            if state.hostname:
+                merged_cfg["hostname"] = state.hostname
+            if state.tunnel_id:
+                merged_cfg["tunnel_id"] = state.tunnel_id
+            if state.zone_name:
+                merged_cfg["zone_name"] = state.zone_name
+            if state.setup_mode:
+                merged_cfg["setup_mode"] = state.setup_mode
+            if state.public_url:
+                merged_cfg["public_url"] = state.public_url
+                if not self.settings.public_url:
+                    self.settings.public_url = state.public_url
+            elif self.settings.public_url:
+                merged_cfg["public_url"] = self.settings.public_url
+            merged_cfg["cloudflared_config"] = self.settings.cloudflared_config
+            if state.tunnel_token:
+                merged_cfg["tunnel_token_ref"] = SecretStore.secret_ref("tunnel", "cloudflare_named_token")
+            named.load_config(merged_cfg)
+        else:
+            named.load_config(
+                {
+                    "public_url": self.settings.public_url,
+                    "cloudflared_config": self.settings.cloudflared_config,
+                }
+            )
 
     @property
     def token(self) -> str:
@@ -338,14 +384,22 @@ class ServiceManager(QObject):
 
     # ------------------------------------------------------------------ свой домен
     def wizard_domain(self) -> domain_state.DomainState:
-        """Домен из мастера (пустой DomainState, если мастер не запускали)."""
-        return domain_state.load()
+        """Домен из мастера/ручного токена или сохранённой конфигурации cloudflare_named."""
+        state = domain_state.load()
+        if state.is_configured:
+            return state
+        named = self.connections.providers.get(PROVIDER_CF_NAMED)
+        if isinstance(named, CloudflareNamedProvider):
+            resolved = named.resolve_effective_state(mcp_path=self.settings.mcp_path)
+            if resolved.is_configured or resolved.hostname:
+                return resolved
+        return state
 
     def uses_wizard_domain(self) -> bool:
         return self.wizard_domain().is_configured
 
     def has_domain(self) -> bool:
-        """Свой домен настроен — мастером или вручную (config.yml). Тогда режим просто включается."""
+        """Свой домен настроен — мастером, токеном туннеля или вручную (config.yml)."""
         return self.uses_wizard_domain() or self.settings.has_named_tunnel_config()
 
     # ------------------------------------------------------------------ прокси
@@ -388,7 +442,13 @@ class ServiceManager(QObject):
         self._redactor.unregister(self._token)
         self._token = token
         self._redactor.register(token)
+        self._logging.register_secret(token)
         self._bind_oauth_owner_token(token)
+        self._logging.info(
+            "oauth",
+            f"Owner token updated ({token_store.mask(token)}); OAuth tokens invalidated",
+            event_code="owner_token_rotated",
+        )
         self._log(f"✔ Токен изменён ({token_store.mask(token)}). Обновите его в подключённых клиентах.")
         self.token_changed.emit()
         self._restart_server_only("новый токен")
@@ -443,21 +503,38 @@ class ServiceManager(QObject):
         return None
 
     def apply_domain(self, state: domain_state.DomainState) -> str | None:
-        """Мастер настроил домен: включить режим «Свой домен» с его адресом. Ошибка или None."""
+        """Мастер/ручной ввод настроил домен: сохранить независимо и включить «Свой домен»."""
         url = normalize_public_url(state.hostname, self.settings.mcp_path)
         if not url or not state.is_configured:
-            return "Мастер не вернул адрес или ключ туннеля."
+            return "Не указан домен или ключ Cloudflare Tunnel Token."
+        state.public_url = url
         self.settings.public_url = url
         self.settings.tunnel_mode = TUNNEL_NAMED
+        self.settings.active_provider = PROVIDER_CF_NAMED
+        named_cfg = {
+            "hostname": state.hostname,
+            "public_url": url,
+            "tunnel_id": state.tunnel_id,
+            "zone_name": state.zone_name,
+            "setup_mode": state.setup_mode or ("api" if state.zone_name else "token"),
+            "cloudflared_config": self.settings.cloudflared_config,
+            "tunnel_token_ref": SecretStore.secret_ref("tunnel", "cloudflare_named_token"),
+        }
+        self.connections.get(PROVIDER_CF_NAMED).load_config(named_cfg)
+        self.connections.set_active_provider(PROVIDER_CF_NAMED)
         if not self._save_settings():
             return "Не удалось сохранить настройки (см. журнал)."
         self._quick_url = ""
         self._runtime_provider_url = ""
         self._tailscale_active = False
+        self._redactor.register(state.tunnel_token)
+        self._logging.register_secret(state.tunnel_token)
+        self._logging.info(
+            "tunnel",
+            f"Configured Cloudflare Named Tunnel domain={state.hostname} mode={named_cfg['setup_mode']}",
+            event_code="named_domain_configured",
+        )
         self._log(f"✔ Свой домен настроен: {url}")
-        self.settings.active_provider = PROVIDER_CF_NAMED
-        self.connections.set_active_provider(PROVIDER_CF_NAMED)
-        self._sync_named_provider_config()
         self.settings_changed.emit()
         self.public_url_changed.emit(self.public_url)
         self._restart_if_running("свой домен настроен")  # ключ туннеля мог смениться
@@ -467,7 +544,18 @@ class ServiceManager(QObject):
         """Вкладка «Прокси» сохранила настройки: применить при следующем запуске туннеля."""
         self._bridge.settings = settings
         self._proxy_hint_shown = False
-        self._log("Прокси для хостов Cloudflare " + ("включён" if settings.enabled else "выключен"))
+        if settings.username:
+            self._redactor.register(settings.username)
+        if settings.password:
+            self._redactor.register(settings.password)
+        mode_labels = {
+            px.PROXY_MODE_NONE: "выключен (без прокси)",
+            px.PROXY_MODE_AUTO: "автоматическое определение",
+            px.PROXY_MODE_MANUAL: "ручная настройка",
+        }
+        label = mode_labels.get(settings.mode, settings.mode)
+        self._logging.info("proxy", f"Proxy mode applied: {settings.mode}", event_code="proxy_applied")
+        self._log(f"Прокси для хостов Cloudflare: {label}")
         self.settings_changed.emit()
         self._restart_if_running("новые настройки прокси")
 
@@ -487,23 +575,46 @@ class ServiceManager(QObject):
         )
 
     def set_active_provider(self, provider_id: str) -> None:
-        if provider_id not in ALL_PROVIDERS or provider_id == self.settings.active_provider:
+        if (
+            (provider_id not in ALL_PROVIDERS and provider_id != PROVIDER_LOCAL)
+            or provider_id == self.settings.active_provider
+        ):
             return
+        prev_provider = self.settings.active_provider
+        was_running = self._want_running
+        if was_running:
+            # Cleanly tear down previous transport before switching without touching persisted configs.
+            self._halt()
+            if prev_provider == PROVIDER_TAILSCALE and self._tailscale_active:
+                self.connections.get(PROVIDER_TAILSCALE).stop()
+                self._tailscale_active = False
+            self.tunnel.stop()
+            self.connections.ownership.clear_process(prev_provider)
+            self.server.stop()
+
         self.settings.active_provider = provider_id
         if provider_id == PROVIDER_CF_NAMED:
             self.settings.tunnel_mode = TUNNEL_NAMED
         elif provider_id == PROVIDER_CF_QUICK:
             self.settings.tunnel_mode = TUNNEL_QUICK
-        self.connections.set_active_provider(provider_id)
+        # Preserve each provider's persisted settings and restore named domain if switching back.
         self._sync_named_provider_config()
+        self.connections.set_active_provider(provider_id)
         self._save_settings()
         self._quick_url = ""
         self._runtime_provider_url = ""
         self._tailscale_active = False
+        self._logging.info(
+            "tunnel",
+            f"Switched active transport {prev_provider} -> {provider_id}",
+            event_code="provider_switched",
+        )
         self._log(f"Активный транспорт: {provider_id}")
         self.settings_changed.emit()
         self.public_url_changed.emit(self.public_url)
-        self._restart_if_running(f"смена транспорта ({provider_id})")
+        if was_running:
+            self._restart_all_pending = True
+            self._recompute()
 
     def set_allow_query_token(self, enabled: bool) -> None:
         if enabled == self.settings.allow_query_token:
@@ -595,23 +706,31 @@ class ServiceManager(QObject):
 
         self._sync_named_provider_config()
 
+        if pid == PROVIDER_NONE:
+            msg = (
+                "Транспортный провайдер не выбран. Откройте вкладку «Подключения» и выберите один из "
+                "четырёх транспортов (Cloudflare Quick, Cloudflare Named, ngrok или Tailscale Funnel)."
+            )
+            self._logging.warning("tunnel", msg, event_code="provider_none")
+            problems.append(msg)
+            return problems
+
         if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED):
             if self.cloudflared_path() is None:
-                problems.append(
-                    "cloudflared.exe не найден. Установите его (winget install --id Cloudflare.cloudflared) "
+                msg = (
+                    "cloudflared.exe не найден. Установите его: winget install --id Cloudflare.cloudflared "
+                    "(https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) "
                     "или укажите путь в настройках."
                 )
+                self._logging.error("tunnel", msg, event_code="agent_missing")
+                problems.append(msg)
             if pid == PROVIDER_CF_NAMED:
-                if not self.has_domain():
-                    problems.append(
-                        f"Свой домен ещё не настроен. {DOMAIN_GUIDE_HINT} "
-                        "Без домена выберите режим «Временный адрес»."
-                    )
-                elif not s.has_public_url:
-                    problems.append(
-                        "Не указан адрес своего домена. Введите его в «Подключение» → «Публичный адрес» "
-                        "(тот же hostname, что в config.yml)."
-                    )
+                named = self.connections.get(PROVIDER_CF_NAMED)
+                assert isinstance(named, CloudflareNamedProvider)
+                code, reason = named.diagnose_issue(mcp_path=s.mcp_path, check_binary=False)
+                if code:
+                    self._logging.error("tunnel", reason, event_code=code)
+                    problems.append(reason)
                 else:
                     self._warn_if_not_in_config()
             protocol = s.tunnel_protocol.strip().lower()
@@ -621,7 +740,9 @@ class ServiceManager(QObject):
             self._bridge.settings = px.load()
             if self._bridge.settings.enabled:
                 for error in self._bridge.settings.validate():
-                    problems.append(f"Прокси: {error}. Исправьте во вкладке «Прокси» или выключите прокси.")
+                    msg = f"Прокси: {error}. Исправьте во вкладке «Прокси» или переключите режим «Без прокси»."
+                    self._logging.error("proxy", msg, event_code="proxy_invalid")
+                    problems.append(msg)
 
             checks = ((s.local_host(), s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
             strays = _foreign_cloudflared()
@@ -631,8 +752,11 @@ class ServiceManager(QObject):
             prov = self.connections.get(pid)
             det = prov.detect()
             if not det.installed:
-                problems.append(det.detail or f"Клиент транспорта {pid} не установлен.")
+                msg = det.detail or f"Клиент транспорта {pid} не установлен."
+                self._logging.error("tunnel", msg, event_code="agent_missing")
+                problems.append(msg)
             for err in prov.validate_config():
+                self._logging.error("tunnel", err, event_code="provider_config_invalid")
                 problems.append(err)
             if pid == PROVIDER_LOCAL and s.server_host not in ("127.0.0.1", "localhost", "::1"):
                 problems.append("В режиме Local only адрес сервера должен быть loopback (127.0.0.1 / localhost / ::1).")
@@ -641,7 +765,9 @@ class ServiceManager(QObject):
         for host, port, what in checks:
             owner = _port_owner(host, port)
             if owner:
-                problems.append(f"Порт {port} ({what}) уже занят: {owner}. Закройте старое окно терминала.")
+                msg = f"Порт {port} ({what}) уже занят: {owner}. Закройте старое окно терминала."
+                self._logging.error("tunnel", msg, event_code="port_in_use")
+                problems.append(msg)
 
         return problems
 
@@ -674,6 +800,9 @@ class ServiceManager(QObject):
             "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
             "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
             "MCP_SPOOL_DIR": str(self.tasks_spool_dir()),
+            "MCP_LOGS_DIR": str(self._logging.base_dir),
+            "MCP_LOG_LEVEL": s.logging_level,
+            "MCP_TRANSPORT_PROVIDER": self.active_provider,
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
             "MCP_JSON_RESPONSE": "1" if not ident.supports_sse else "0",
         }
@@ -838,6 +967,14 @@ class ServiceManager(QObject):
             return
         if pid == PROVIDER_TAILSCALE:
             self.health.check_tunnel = False
+            proxy_cfg = px.load()
+            if proxy_cfg.enabled:
+                msg = (
+                    "Примечание о прокси: Tailscale Funnel использует системный сетевой сервис tailscaled "
+                    "и не маршрутизируется через прокси-мост Cloudflare в MCP-app."
+                )
+                self._logging.warning("proxy", msg, event_code="tailscale_proxy_unsupported")
+                self._log(f"ℹ {msg}")
             ts = self.connections.get(PROVIDER_TAILSCALE)
             assert isinstance(ts, TailscaleFunnelProvider)
             ok, msg = ts.start(
@@ -846,11 +983,13 @@ class ServiceManager(QObject):
                 mcp_path=self.settings.mcp_path,
             )
             if not ok:
+                self._logging.error("tunnel", f"Tailscale Funnel start failed: {msg}", event_code="tailscale_start_failed")
                 self._log(f"✖ Tailscale Funnel: {msg}")
                 self._fail()
                 return
             self._tailscale_active = True
             self._runtime_provider_url = msg
+            self._logging.info("tunnel", f"Tailscale Funnel active: {msg}", event_code="tailscale_active")
             self._log(f"✔ Tailscale Funnel активен: {msg}")
             self.public_url_changed.emit(self.public_url)
             if self.server.is_alive() and self._server_url != self.oauth_resource_url:
@@ -866,12 +1005,37 @@ class ServiceManager(QObject):
                 mcp_path=self.settings.mcp_path,
             )
             if spec is None:
+                self._logging.error("tunnel", "ngrok binary not found", event_code="agent_missing")
                 self._log(f"✖ Транспорт {pid}: не удалось подготовить команду запуска.")
                 self._fail()
                 return
+            proxy_cfg = px.load()
+            launch_env = dict(spec.env)
+            if proxy_cfg.enabled:
+                try:
+                    ep = proxy_cfg.resolve_active_endpoint()
+                except (ValueError, OSError) as exc:
+                    msg = f"Прокси для ngrok недоступен: {exc}"
+                    self._logging.error("proxy", msg, event_code="ngrok_proxy_failed")
+                    self._log(f"✖ {msg}")
+                    self._fail()
+                    return
+                if ep is not None:
+                    if ep.scheme == "http":
+                        launch_env["HTTP_PROXY"] = ep.url
+                        launch_env["HTTPS_PROXY"] = ep.url
+                        self._logging.info("proxy", f"ngrok HTTP_PROXY configured via {ep.redacted_url}", event_code="ngrok_proxy_http")
+                        self._log(f"ℹ ngrok использует HTTP-прокси {ep.redacted_url}")
+                    else:
+                        msg = (
+                            f"Выбран прокси {ep.scheme.upper()}, но ngrok Agent поддерживает только HTTP-прокси (proxy_url/HTTP_PROXY); "
+                            "SOCKS5 для ngrok в этом режиме не поддерживается."
+                        )
+                        self._logging.warning("proxy", msg, event_code="ngrok_socks_unsupported")
+                        self._log(f"⚠ {msg}")
             for secret in self.connections.collect_secret_values():
                 self._redactor.register(secret)
-            self.tunnel.start(spec.program, list(spec.args), workdir=spec.workdir or None, env=spec.env)
+            self.tunnel.start(spec.program, list(spec.args), workdir=spec.workdir or None, env=launch_env)
             self._external_poll.start()
             return
 
@@ -994,7 +1158,12 @@ class ServiceManager(QObject):
     def _forward_log(self, name: str, line: str) -> None:
         if name == SERVER and self._health_log_marker in line:
             return  # свои же проверки раз в 2 с не засоряют лог
-        self.log_line.emit(name, line)
+        safe_line = self.redact_text(line)
+        self.log_line.emit(name, safe_line)
+        if name == TUNNEL:
+            self._logging.log("tunnel", infer_level(safe_line), safe_line, event_code="tunnel_stdout")
+        elif name == SERVER and " | backend " not in safe_line:
+            self._logging.log("backend", infer_level(safe_line), safe_line, event_code="backend_stdout")
         if name != TUNNEL:
             return
         if self.active_provider == PROVIDER_NGROK:
@@ -1337,7 +1506,9 @@ class ServiceManager(QObject):
             QTimer.singleShot(0, self.start_all)
 
     def _log(self, text: str) -> None:
-        self.log_line.emit(APP, text)
+        safe = self.redact_text(text)
+        self._logging.log("app", infer_level(safe), safe, event_code="app_event")
+        self.log_line.emit(APP, safe)
 
 
 # ====================================================================== утилиты

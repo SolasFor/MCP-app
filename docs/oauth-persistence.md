@@ -28,6 +28,7 @@ OAuth-гранты, когда сервер запустится с новым �
 - `%APPDATA%\MCPApp\oauth\connections.key` — ключ шифрования Fernet.
 - `%APPDATA%\MCPApp\secrets\secrets.vault.enc` и `secrets.key` — единый `SecretStore` (DPAPI на Windows) для токена владельца, ключа туннеля и учётных данных прокси.
 - Доступен экспорт резервной копии метаданных клиентов без секретов и токенов (`export_redacted_backup`).
+- События регистрации, согласия, ошибок OAuth и смены прав/отзыва пишутся (без секретов, PKCE и кодов) в `%APPDATA%\MCPApp\logs\oauth.log` и `errors.log`.
 - **Windows:** ключ зашифрован DPAPI для текущего пользователя Windows.
   Регистрационные данные OAuth (в том числе client_secret) шифруются;
   токены доступа и обновления хранятся только как SHA-256 дайджесты

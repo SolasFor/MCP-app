@@ -1,13 +1,13 @@
-"""Connections & Transports page: all 5 providers, live detection, wizards, owner token, proxy."""
+"""Connections & Transports page: 4 UI transport providers, owner token editor, and proxy."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget
 
 from app.config import (
     PROVIDER_CF_NAMED,
     PROVIDER_CF_QUICK,
-    PROVIDER_LOCAL,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
 )
@@ -30,12 +30,11 @@ _PROVIDER_SPEC = (
     (PROVIDER_CF_NAMED, "cf_named"),
     (PROVIDER_NGROK, "ngrok"),
     (PROVIDER_TAILSCALE, "tailscale"),
-    (PROVIDER_LOCAL, "local"),
 )
 
 
 class ConnectionsPage(PageScaffold):
-    """Transport provider selector/diagnostics, owner Bearer token editor, and Cloudflare proxy."""
+    """Transport provider selector/diagnostics, owner Bearer token editor, and proxy settings."""
 
     domain_wizard_requested = pyqtSignal()
     domain_guide_requested = pyqtSignal()
@@ -50,6 +49,7 @@ class ConnectionsPage(PageScaffold):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=True, parent=parent)
+        self._migration_source = ""
 
         self.migration_banner = ErrorBanner()
         self.purge_openai_secret_btn = _button("", "Danger")
@@ -62,17 +62,17 @@ class ConnectionsPage(PageScaffold):
         self.providers_header = SectionHeader()
         self.providers_card.body.addWidget(self.providers_header)
 
-        # provider_id -> (key, name_label, detect_badge, state_badge, select_btn, config_btn, diag_btn)
+        # provider_id -> (key, name_label, active_badge, select_btn, config_btn, diag_btn)
         self.provider_rows: dict[
             str,
-            tuple[str, QLabel, Badge, Badge, QPushButton, QPushButton, QPushButton],
+            tuple[str, QLabel, Badge, QPushButton, QPushButton, QPushButton],
         ] = {}
         for pid, key in _PROVIDER_SPEC:
             row = QHBoxLayout()
             row.setSpacing(8)
             name = QLabel()
-            det_badge = Badge("", variant="neutral")
-            state_badge = Badge("", variant="neutral")
+            active_badge = Badge("", variant="ok")
+            active_badge.hide()
 
             select_btn = _button("")
             select_btn.clicked.connect(lambda _c=False, p=pid: self.provider_selected.emit(p))
@@ -82,13 +82,12 @@ class ConnectionsPage(PageScaffold):
             diag_btn.clicked.connect(lambda _c=False, p=pid: self.provider_diagnose_requested.emit(p))
 
             row.addWidget(name, 1)
-            row.addWidget(det_badge)
-            row.addWidget(state_badge)
+            row.addWidget(active_badge)
             row.addWidget(select_btn)
             row.addWidget(config_btn)
             row.addWidget(diag_btn)
             self.providers_card.body.addLayout(row)
-            self.provider_rows[pid] = (key, name, det_badge, state_badge, select_btn, config_btn, diag_btn)
+            self.provider_rows[pid] = (key, name, active_badge, select_btn, config_btn, diag_btn)
 
         self.providers_card.body.addWidget(Divider())
         transport_actions = QHBoxLayout()
@@ -103,7 +102,7 @@ class ConnectionsPage(PageScaffold):
         self.providers_card.body.addLayout(transport_actions)
         self.content.addWidget(self.providers_card)
 
-        # --- Owner Access Token Card
+        # --- Owner Access Token Card (MCP Server Owner Token)
         token_card = Card()
         self.token_header = SectionHeader()
         token_card.body.addWidget(self.token_header)
@@ -111,11 +110,14 @@ class ConnectionsPage(PageScaffold):
         t_row = QHBoxLayout()
         t_row.setSpacing(8)
         self.token_edit = QLineEdit()
+        self.token_edit.setObjectName("UiInput")
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.textEdited.connect(self.token_edited.emit)
         self.token_edit.returnPressed.connect(self.token_save_requested.emit)
         self.token_eye = _button("", "Ghost")
         self.token_eye.clicked.connect(self.toggle_token_visibility)
+        self.token_paste = _button("", "Ghost")
+        self.token_paste.clicked.connect(self._paste_token)
         self.token_save = _button("", "Accent")
         self.token_save.clicked.connect(self.token_save_requested.emit)
         self.token_save.hide()
@@ -123,7 +125,14 @@ class ConnectionsPage(PageScaffold):
         self.token_copy.clicked.connect(lambda: self.copy_requested.emit("token", self.token_copy))
         self.token_gen = _button("")
         self.token_gen.clicked.connect(self.token_generate_requested.emit)
-        for w in (self.token_edit, self.token_eye, self.token_save, self.token_copy, self.token_gen):
+        for w in (
+            self.token_edit,
+            self.token_eye,
+            self.token_paste,
+            self.token_save,
+            self.token_copy,
+            self.token_gen,
+        ):
             t_row.addWidget(w, 1 if w is self.token_edit else 0)
         token_card.body.addLayout(t_row)
 
@@ -134,7 +143,7 @@ class ConnectionsPage(PageScaffold):
         token_card.body.addWidget(self.token_error)
         self.content.addWidget(token_card)
 
-        # --- Cloudflare Proxy Card
+        # --- Proxy Card
         proxy_card = Card()
         self.proxy_title = QLabel()
         self.proxy_title.setObjectName("SectionTitle")
@@ -145,6 +154,14 @@ class ConnectionsPage(PageScaffold):
 
         self.content.addStretch(1)
         self.retranslate()
+
+    def _paste_token(self) -> None:
+        clip = QGuiApplication.clipboard()
+        raw = clip.text().strip() if clip is not None else ""
+        if not raw:
+            return
+        self.token_edit.setText(raw)
+        self.token_edited.emit(raw)
 
     def set_token_visible(self, visible: bool) -> None:
         self.token_edit.setEchoMode(
@@ -159,28 +176,16 @@ class ConnectionsPage(PageScaffold):
         self,
         *,
         active_provider: str,
-        statuses: dict[str, dict] | None = None,
+        statuses: dict[str, dict] | None = None,  # noqa: ARG002
         has_domain: bool = False,
     ) -> None:
-        for pid, (_key, _name, det_badge, state_badge, select_btn, _cfg, _diag) in self.provider_rows.items():
+        for pid, (_key, _name, active_badge, select_btn, _cfg, _diag) in self.provider_rows.items():
             is_active = pid == active_provider
-            state_badge.setText(tr("conn.badge.active" if is_active else "conn.badge.available"))
-            state_badge.set_variant("ok" if is_active else "accent")
+            active_badge.setVisible(is_active)
+            if is_active:
+                active_badge.setText(tr("conn.badge.active"))
+                active_badge.set_variant("ok")
             select_btn.setEnabled(not is_active)
-
-            info = (statuses or {}).get(pid, {})
-            det = info.get("detection", {})
-            installed = bool(det.get("installed", pid == PROVIDER_LOCAL))
-            if pid == PROVIDER_LOCAL:
-                det_badge.setText("Loopback")
-                det_badge.set_variant("accent")
-            elif installed:
-                ver = str(det.get("version") or "").strip()
-                det_badge.setText(tr("conn.badge.installed") + (f" · {ver[:18]}" if ver else ""))
-                det_badge.set_variant("ok")
-            else:
-                det_badge.setText(tr("conn.badge.missing"))
-                det_badge.set_variant("warn")
 
         self.wizard_btn.setText(tr("home.wizard.edit" if has_domain else "home.wizard.setup"))
 
@@ -190,24 +195,45 @@ class ConnectionsPage(PageScaffold):
             has_domain=has_domain,
         )
 
-    def set_legacy_openai_migration(self, *, migrated: bool, has_secret: bool) -> None:
-        self.migration_banner.setVisible(migrated or has_secret)
+    def set_legacy_openai_migration(
+        self,
+        *,
+        migrated: bool,
+        has_secret: bool,
+        migrated_from: str = "",
+    ) -> None:
+        self._migration_source = migrated_from or ("openai_tunnel" if (migrated or has_secret) else "")
+        self.migration_banner.setVisible(bool(migrated or has_secret or self._migration_source == "local_only"))
         self.purge_openai_secret_btn.setVisible(has_secret)
+        banner_key = (
+            "conn.local_removed.banner"
+            if self._migration_source == "local_only" and not has_secret
+            else "conn.openai_removed.banner"
+        )
+        self.migration_banner.message_label.setText(tr(banner_key))
 
     def retranslate(self) -> None:
         self.set_header(tr("conn.title"), tr("conn.lead"))
-        self.migration_banner.message_label.setText(tr("conn.openai_removed.banner"))
+        banner_key = (
+            "conn.local_removed.banner"
+            if self._migration_source == "local_only"
+            else "conn.openai_removed.banner"
+        )
+        self.migration_banner.message_label.setText(tr(banner_key))
         self.purge_openai_secret_btn.setText(tr("conn.openai_removed.purge_btn"))
         self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
-        for _pid, (key, name, _det_badge, _state_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
+        for _pid, (key, name, active_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
             name.setText(tr(f"conn.provider.{key}"))
+            active_badge.setText(tr("conn.badge.active"))
             select_btn.setText(tr("conn.btn.select"))
             config_btn.setText(tr("conn.btn.configure"))
             diag_btn.setText(tr("conn.btn.diagnose"))
         self.guide_btn.setText(tr("home.guide.open"))
         self.token_header.set_texts(tr("conn.token.title"), tr("conn.token.hint"))
+        self.token_edit.setPlaceholderText(tr("conn.token.placeholder"))
         visible = self.token_edit.echoMode() == QLineEdit.EchoMode.Normal
         self.token_eye.setText(tr("conn.token.hide" if visible else "conn.token.show"))
+        self.token_paste.setText(tr("conn.token.paste"))
         self.token_save.setText(tr("conn.token.save"))
         self.token_copy.setText(tr("conn.token.copy"))
         self.token_gen.setText(tr("conn.token.gen"))
@@ -216,6 +242,5 @@ class ConnectionsPage(PageScaffold):
 
     def apply_theme(self) -> None:
         self.migration_banner.apply_theme()
-        for _pid, (_k, _n, det_badge, state_badge, _s, _c, _d) in self.provider_rows.items():
-            det_badge.set_variant(str(det_badge.property("variant") or "neutral"))
-            state_badge.set_variant(str(state_badge.property("variant") or "neutral"))
+        for _pid, (_k, _n, active_badge, _s, _c, _d) in self.provider_rows.items():
+            active_badge.set_variant("ok")

@@ -19,21 +19,18 @@ PROVIDER_CF_NAMED = "cloudflare_named"
 PROVIDER_NGROK = "ngrok"
 PROVIDER_TAILSCALE = "tailscale_funnel"
 PROVIDER_LOCAL = "local_only"
+PROVIDER_NONE = "none"
 
-ALL_PROVIDERS: tuple[str, ...] = (
-    PROVIDER_CF_QUICK,
-    PROVIDER_CF_NAMED,
-    PROVIDER_NGROK,
-    PROVIDER_TAILSCALE,
-    PROVIDER_LOCAL,
-)
-
-EXTERNAL_PROVIDERS: tuple[str, ...] = (
+UI_PROVIDERS: tuple[str, ...] = (
     PROVIDER_CF_QUICK,
     PROVIDER_CF_NAMED,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
 )
+
+ALL_PROVIDERS: tuple[str, ...] = UI_PROVIDERS
+
+EXTERNAL_PROVIDERS: tuple[str, ...] = UI_PROVIDERS
 
 
 class ProviderState(str, Enum):

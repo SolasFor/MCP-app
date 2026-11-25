@@ -26,6 +26,8 @@ files = [
     "app/platform",
     "app/core/secret_store.py",
     "app/core/redaction.py",
+    "app/core/logging_manager.py",
+    "app/core/diagnostics_bundle.py",
     "app/core/reconnect.py",
     "app/core/tunnels",
     "app/ui/tokens.py",

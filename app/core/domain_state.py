@@ -25,6 +25,9 @@ class DomainState:
     tunnel_id: str = ""
     tunnel_token: str = ""
     zone_name: str = ""
+    setup_mode: str = ""
+    public_url: str = ""
+    decrypt_error: str = ""
 
     @property
     def is_configured(self) -> bool:
@@ -50,13 +53,23 @@ def load() -> DomainState:
         return DomainState()
 
     store = _store(target.parent)
+    hostname = str(raw.get("hostname") or "").strip().lower()
+    tunnel_id = str(raw.get("tunnel_id") or "").strip()
+    zone_name = str(raw.get("zone_name") or "").strip()
+    setup_mode = str(raw.get("setup_mode") or "").strip()
+    if not setup_mode and hostname:
+        setup_mode = "api" if (zone_name or tunnel_id) else "token"
+    public_url = str(raw.get("public_url") or "").strip()
+
     legacy_token = str(raw.get("tunnel_token") or "")
     if legacy_token:
         state = DomainState(
-            hostname=str(raw.get("hostname") or ""),
-            tunnel_id=str(raw.get("tunnel_id") or ""),
+            hostname=hostname,
+            tunnel_id=tunnel_id,
             tunnel_token=legacy_token,
-            zone_name=str(raw.get("zone_name") or ""),
+            zone_name=zone_name,
+            setup_mode=setup_mode,
+            public_url=public_url,
         )
         try:
             save(state)
@@ -65,23 +78,29 @@ def load() -> DomainState:
         return state
 
     token = ""
+    decrypt_error = ""
     ref = str(raw.get("tunnel_token_ref") or "")
     if ref:
         try:
             token = store.resolve_ref(ref) or ""
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError) as exc:
             token = ""
+            decrypt_error = f"{type(exc).__name__}: {exc}"
     else:
         try:
             token = store.get_secret(_SECRET_NS, _SECRET_KEY) or ""
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError) as exc:
             token = ""
+            decrypt_error = f"{type(exc).__name__}: {exc}"
 
     return DomainState(
-        hostname=str(raw.get("hostname") or ""),
-        tunnel_id=str(raw.get("tunnel_id") or ""),
+        hostname=hostname,
+        tunnel_id=tunnel_id,
         tunnel_token=token,
-        zone_name=str(raw.get("zone_name") or ""),
+        zone_name=zone_name,
+        setup_mode=setup_mode,
+        public_url=public_url,
+        decrypt_error=decrypt_error,
     )
 
 
@@ -95,10 +114,13 @@ def save(state: DomainState) -> None:
     else:
         store.delete_secret(_SECRET_NS, _SECRET_KEY)
 
+    mode = state.setup_mode.strip() or ("api" if (state.zone_name or state.tunnel_id) else ("token" if state.hostname else ""))
     payload = {
         "hostname": state.hostname,
         "tunnel_id": state.tunnel_id,
         "zone_name": state.zone_name,
+        "setup_mode": mode,
+        "public_url": state.public_url,
         "tunnel_token_ref": ref,
     }
     tmp = target.with_suffix(".tmp")

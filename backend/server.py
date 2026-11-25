@@ -26,11 +26,16 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
-    from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
+    from .oauth_provider import (
+        SECURITY_HEADERS,
+        LocalConsentOAuthProvider,
+        READ_SCOPE,
+        _render_error_html,
+    )
     from .oauth_store import canonical_oauth_urls, default_store_path
     from .oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
     from .execution_audit import ExecutionAudit, classify_command_output
@@ -147,7 +152,12 @@ if __package__:
     )
 else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
-    from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
+    from oauth_provider import (
+        SECURITY_HEADERS,
+        LocalConsentOAuthProvider,
+        READ_SCOPE,
+        _render_error_html,
+    )
     from oauth_store import canonical_oauth_urls, default_store_path
     from oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
     from execution_audit import ExecutionAudit, classify_command_output
@@ -263,6 +273,11 @@ else:
         parse_allowed_command, workspace_path,
     )
 
+from app.core.logging_manager import (
+    LogConfig,
+    configure_logging,
+    default_logs_dir,
+)
 from app.core.redaction import RedactingLogFilter, SecretRedactor
 
 # ==========================================
@@ -307,6 +322,23 @@ _REDACT_FILTER = RedactingLogFilter(REDACTOR)
 logger.addFilter(_REDACT_FILTER)
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(_REDACT_FILTER)
+
+_LOGGING_MGR = configure_logging(
+    base_dir=default_logs_dir(),
+    config=LogConfig(
+        enabled=_env_flag("MCP_LOGGING_ENABLED", True),
+        level=os.environ.get("MCP_LOG_LEVEL", "INFO"),
+    ),
+    redactor=REDACTOR,
+)
+_LOGGING_MGR.install_exception_hooks(chain_previous=False)
+_BACKEND_LOG_HANDLER = _LOGGING_MGR.std_logging_handler("backend", event_code="backend_log")
+_BACKEND_LOG_HANDLER.addFilter(_REDACT_FILTER)
+logger.addHandler(_BACKEND_LOG_HANDLER)
+for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _uv_logger = logging.getLogger(_uv_name)
+    _uv_logger.addFilter(_REDACT_FILTER)
+    _uv_logger.addHandler(_BACKEND_LOG_HANDLER)
 
 # The GUI passes the active Quick Tunnel URL and MCP path for each server start.
 MCP_PATH = validate_mcp_path(os.environ.get("MCP_PATH", "/mcp"))
@@ -534,21 +566,88 @@ class HybridAuthMiddleware:
             if query_token is not None:
                 logger.warning("Токен в ссылке запрещён ← %s %s", client[0], path)
 
+        is_oauth_path = path in ("/authorize", "/oauth/consent", "/token", "/register") or path.startswith("/.well-known/")
+        accept_hdr = (headers.get("accept") or "").lower()
+        intercept_authorize_html = (
+            path == "/authorize"
+            and scope.get("method") == "GET"
+            and "text/html" in accept_hdr
+        )
+        buffered_start = None
+        buffered_body = bytearray()
+
         async def observe_auth_result(message):
-            if message["type"] == "http.response.start" and path.rstrip("/") == MCP_PATH:
+            nonlocal buffered_start
+            if message["type"] == "http.response.start":
                 status = message["status"]
-                if status in (401, 403):
+                if path.rstrip("/") == MCP_PATH and status in (401, 403):
                     if is_bearer:
                         logger.warning(
                             "MCP авторизация отклонена HTTP %d ← %s %s %s",
                             status, client[0], scope.get("method"), path,
                         )
+                        _LOGGING_MGR.warning(
+                            "oauth",
+                            f"MCP Bearer rejected HTTP {status} method={scope.get('method')} path={path}",
+                            event_code="mcp_auth_rejected",
+                        )
                     elif scope.get("method") not in ("HEAD", "OPTIONS"):
-                        # Anonymous HEAD is a common OAuth discovery probe.
                         logger.info(
                             "MCP запрос без Bearer отклонён HTTP %d ← %s %s",
                             status, client[0], scope.get("method"),
                         )
+                elif is_oauth_path and status >= 400:
+                    lvl = "ERROR" if status >= 500 else "WARNING"
+                    _LOGGING_MGR.log(
+                        "oauth",
+                        lvl,
+                        f"OAuth endpoint HTTP {status} method={scope.get('method')} path={path}",
+                        event_code="oauth_http_error",
+                    )
+                if intercept_authorize_html and status >= 400:
+                    resp_headers = {
+                        k.decode("latin-1").lower(): v.decode("latin-1")
+                        for k, v in message.get("headers", [])
+                    }
+                    if "application/json" in resp_headers.get("content-type", "").lower():
+                        buffered_start = message
+                        return
+            elif message["type"] == "http.response.body" and buffered_start is not None:
+                buffered_body.extend(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                err_code = "invalid_request"
+                err_desc = "Invalid OAuth authorization request."
+                try:
+                    parsed = json.loads(buffered_body.decode("utf-8", errors="replace"))
+                    if isinstance(parsed, dict):
+                        err_code = str(parsed.get("error") or err_code)
+                        err_desc = REDACTOR.redact_text(str(parsed.get("error_description") or err_desc))
+                except Exception:  # noqa: BLE001
+                    pass
+                _LOGGING_MGR.warning(
+                    "oauth",
+                    f"Browser /authorize error {buffered_start['status']} ({err_code}): {err_desc}",
+                    event_code="oauth_authorize_browser_error",
+                )
+                hint = (
+                    "This usually means the MCP server restarted or switched URL/provider after the client registered. "
+                    "Return to your AI client and click Reconnect to register and authorize cleanly."
+                    if "not found" in err_desc.lower() or "client" in err_desc.lower()
+                    else "Verify the server public URL and restart authorization from your AI client."
+                )
+                html_resp = HTMLResponse(
+                    _render_error_html(
+                        "Authorization failed",
+                        f"Authorization failed ({err_code})",
+                        err_desc,
+                        hint=hint,
+                    ),
+                    status_code=buffered_start["status"],
+                    headers=SECURITY_HEADERS,
+                )
+                await html_resp(scope, receive, send)
+                return
             await send(message)
 
         await self.app(scope, receive, observe_auth_result)
@@ -3294,6 +3393,23 @@ def main() -> None:
             "OAuth authorization server: enabled (local owner consent required; "
             "client-specific Windows/SSH access profiles)"
         )
+        _LOGGING_MGR.info(
+            "oauth",
+            f"OAuth server initialized issuer={BASE_URL} default_profile={oauth_execution.profile()}",
+            event_code="oauth_init",
+        )
+        _LOGGING_MGR.info("gateway", f"Gateway initialized profiles={len(GATEWAY_STORE.list_profiles())}", event_code="gateway_init")
+        _LOGGING_MGR.info("tasks", "TaskManager initialized", event_code="tasks_init")
+        _LOGGING_MGR.info("servers", "ManagedServers initialized", event_code="servers_init")
+        _LOGGING_MGR.info("workspaces", "WorkspaceManager initialized", event_code="workspaces_init")
+        _LOGGING_MGR.info("extensions", "ExtensionManager initialized", event_code="extensions_init")
+        _LOGGING_MGR.info("ssh", "RemoteManager initialized", event_code="ssh_init")
+        _LOGGING_MGR.info("automation", "Automation subsystem initialized", event_code="automation_init")
+        _LOGGING_MGR.info(
+            "computer_use",
+            f"DesktopManager initialized enabled={DESKTOP_POLICY_STORE.load().enabled}",
+            event_code="computer_use_init",
+        )
         logger.info(
             "OAuth command policies: global_default=%s; registered_clients=%d; "
             "Windows allowlist=%d; SSH hosts=%d; SSH commands=%d; "
@@ -3336,6 +3452,7 @@ def main() -> None:
         EXTENSION_MANAGER.shutdown_all()
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()
+        _LOGGING_MGR.shutdown(timeout=1.5)
 
 
 if __name__ == "__main__":

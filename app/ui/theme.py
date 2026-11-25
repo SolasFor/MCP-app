@@ -124,9 +124,22 @@ def _sync_globals(active: tok.ThemeTokens) -> None:
         "failed": (tr("status.service.failed"), ERR),
     }
     LOG_SOURCES = {
-        "server": ("server", LINK),
+        "server": ("backend", LINK),
+        "backend": ("backend", LINK),
         "tunnel": ("tunnel", OK),
         "app": ("app", TEXT_MUTED),
+        "oauth": ("oauth", ACCENT_TEXT),
+        "proxy": ("proxy", LINK),
+        "computer_use": ("desktop", WARN),
+        "gateway": ("gateway", LINK),
+        "tasks": ("tasks", TEXT),
+        "servers": ("servers", TEXT),
+        "workspaces": ("work", TEXT),
+        "extensions": ("ext", ACCENT_TEXT),
+        "ssh": ("ssh", WARN),
+        "automation": ("auto", OK),
+        "errors": ("errors", ERR),
+        "crash": ("crash", ERR),
     }
 
 

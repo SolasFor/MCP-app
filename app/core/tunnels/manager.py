@@ -13,6 +13,7 @@ from app.core.tunnels.base import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     ConnectionIdentity,
     DiagnosticCheck,
@@ -36,7 +37,7 @@ _DETECT_CACHE_TTL_S = 60.0
 
 
 class ConnectionManager:
-    """Manages all 5 MCP-app transport providers and non-secret connection persistence."""
+    """Manages transport providers (4 UI providers + internal loopback fallback) and non-secret config."""
 
     def __init__(self, data_dir: Path, secret_store: SecretStore | None = None) -> None:
         self._data_dir = Path(data_dir)
@@ -70,12 +71,12 @@ class ConnectionManager:
             return
         active = str(raw.get("active_provider") or PROVIDER_CF_QUICK)
         needs_save = False
-        if active == _REMOVED_PROVIDER_OPENAI:
-            # Safely migrate removed OpenAI Tunnel to Local only; never auto-publish a public tunnel.
-            self._active_provider_id = PROVIDER_LOCAL
-            self.migrated_from_provider = _REMOVED_PROVIDER_OPENAI
+        if active in (_REMOVED_PROVIDER_OPENAI, PROVIDER_LOCAL):
+            # Safely migrate removed OpenAI Tunnel or legacy UI Local Only -> no active external transport.
+            self._active_provider_id = PROVIDER_NONE
+            self.migrated_from_provider = active
             needs_save = True
-        elif active in ALL_PROVIDERS:
+        elif active in ALL_PROVIDERS or active == PROVIDER_NONE:
             self._active_provider_id = active
         configs = raw.get("providers")
         if isinstance(configs, dict):
@@ -131,18 +132,22 @@ class ConnectionManager:
         return self._active_provider_id
 
     def get(self, provider_id: str) -> TunnelProvider:
+        if provider_id == PROVIDER_NONE:
+            # Safe fallback object when legacy local_only/openai_tunnel was migrated with no active transport.
+            return self.providers[PROVIDER_LOCAL]
         if provider_id not in self.providers:
             raise KeyError(f"Unknown transport provider: {provider_id!r}")
         return self.providers[provider_id]
 
     @property
     def active_provider(self) -> TunnelProvider:
-        return self.providers[self._active_provider_id]
+        return self.get(self._active_provider_id)
 
     def set_active_provider(self, provider_id: str) -> str:
-        if provider_id not in self.providers:
+        if provider_id not in ALL_PROVIDERS and provider_id not in (PROVIDER_LOCAL, PROVIDER_NONE):
             raise ValueError(f"Unsupported provider: {provider_id!r}")
-        # Single external provider policy: selecting one replaces previous active provider.
+        # Single external provider policy: selecting one replaces previous active provider
+        # without ever erasing another provider's persisted configuration or tokens.
         self._active_provider_id = provider_id
         self.save()
         return provider_id
@@ -239,7 +244,8 @@ class ConnectionManager:
         refresh_detection: bool = False,
     ) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
-        for pid, provider in self.providers.items():
+        for pid in ALL_PROVIDERS:
+            provider = self.providers[pid]
             is_this_active = pid == self._active_provider_id
             det = self._cached_detection(pid, provider, refresh=refresh_detection)
             result[pid] = provider.summary_dict(

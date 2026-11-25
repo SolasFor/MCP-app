@@ -107,7 +107,10 @@ class NgrokProvider(TunnelProvider):
                 except OSError:
                     version = ""
                 return ProviderDetection(installed=True, executable=exe, version=version)
-        return ProviderDetection(installed=False, detail="ngrok CLI not found in PATH or LOCALAPPDATA")
+        return ProviderDetection(
+            installed=False,
+            detail="ngrok CLI не найден. Установите: winget install --id Ngrok.Ngrok (https://ngrok.com/download).",
+        )
 
     def validate_config(self, config: dict[str, Any] | None = None) -> list[str]:
         cfg = config if config is not None else self._config

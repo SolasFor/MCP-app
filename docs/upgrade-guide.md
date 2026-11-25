@@ -6,6 +6,9 @@
 2. **`settings.json` Hardening**:
    - Legacy `allow_query_token: true` is automatically overridden/ignored (`ALLOW_QUERY_TOKEN = False` in backend and sanitized on load). Query-string credentials (`?token=`) are strictly rejected; clients must use OAuth 2.1 or `Authorization: Bearer ...`.
    - Legacy `tunnel_mode` (`"quick"` / `"named"`) maps cleanly to `active_provider` (`"cloudflare_quick"` / `"cloudflare_named"`) while preserving existing domain settings and UI defaults (`Dark`, `RU`, window geometry).
+   - Legacy `active_provider` values `openai_tunnel` or `local_only` migrate safely to `none` (`PROVIDER_NONE`, no transport auto-started) and display a clear migration notice on the Connections page.
+   - Legacy disabled `proxy.json` entries pointing to hardcoded `127.0.0.1:1080` migrate cleanly to `mode = "none"`.
+   - Legacy `crash.log` and `server/mcp_audit.log` histories are non-destructively copied into `%APPDATA%\MCPApp\logs\archive\` during initial `LoggingManager` startup while keeping protected security audit files intact.
 3. **`managed_servers.json` Schema Migration (v1 → v2)**:
    - Existing `v1` server definitions migrate automatically to `v2` (`ServerConfigStore.migrate_legacy_file`), creating a backup copy before writing and moving plain env secrets into DPAPI `SecretStore` where applicable.
 4. **OAuth SQLite Migration (v1 → v2)**:

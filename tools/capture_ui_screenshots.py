@@ -127,6 +127,24 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             win.grab().save(str(p4))
             saved.append(p4)
 
+            # 5. Security Dark (RU) - Computer Use ToggleSwitches & auto-save
+            win.set_theme_mode(theme.THEME_DARK)
+            win.set_language(LANG_RU)
+            win.show_page("security")
+            win.toasts.clear_all()
+            app.processEvents()
+            p5 = out_dir / "security-dark.png"
+            win.grab().save(str(p5))
+            saved.append(p5)
+
+            # 6. Settings Dark (RU) - Persistent Logging & Appearance
+            win.show_page("settings")
+            win.toasts.clear_all()
+            app.processEvents()
+            p6 = out_dir / "settings-dark.png"
+            win.grab().save(str(p6))
+            saved.append(p6)
+
             win.allow_close()
             win.close()
     return saved

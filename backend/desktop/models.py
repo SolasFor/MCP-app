@@ -6,7 +6,8 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -283,6 +284,14 @@ class DesktopPolicyStore:
             os.replace(tmp, self.path)
             self._platform.restrict_path_acl(self.path, is_dir=False)
 
+    def update(self, **changes: Any) -> DesktopPolicy:
+        """Atomically update selected fields while preserving min_profile, lists, and emergency_stop."""
+        with self._lock:
+            cur = self.load()
+            updated = replace(cur, **changes)
+            self.save(updated)
+            return updated
+
     def set_emergency_stop(self, active: bool, reason: str = "") -> DesktopPolicy:
         with self._lock:
             cur = self.load()
@@ -339,6 +348,43 @@ class DesktopPolicyStore:
                 }
             except (OSError, ValueError):
                 return {"active": False, "client_id": "", "tool": "", "updated_at": 0.0}
+
+
+def record_desktop_policy_audit(
+    audit_path: Path,
+    old_policy: DesktopPolicy,
+    new_policy: DesktopPolicy,
+    *,
+    actor: str = "owner",
+) -> None:
+    """Append a tamper-resistant protected JSONL audit entry for Computer Use policy edits."""
+    changed = {
+        field_name: {"old": getattr(old_policy, field_name), "new": getattr(new_policy, field_name)}
+        for field_name in (
+            "enabled",
+            "allow_screen_capture",
+            "allow_input_control",
+            "allow_secret_typing",
+            "allowed_clients",
+            "allowed_apps",
+            "min_profile",
+            "emergency_stop",
+        )
+        if getattr(old_policy, field_name) != getattr(new_policy, field_name)
+    }
+    if not changed:
+        return
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor,
+        "changes": changed,
+    }
+    target = Path(audit_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    get_platform().restrict_path_acl(target.parent, is_dir=True)
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    get_platform().restrict_path_acl(target, is_dir=False)
 
 
 def desktop_tool_permissions(

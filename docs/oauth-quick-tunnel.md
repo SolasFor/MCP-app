@@ -44,9 +44,13 @@ redirect URL**, and the consent page does not set authentication cookies.
 - `/revoke`
 - `/mcp` (protected MCP endpoint)
 
-`/oauth/consent` requires a **same-origin POST** and the owner's token.
+`/oauth/consent` requires a **same-origin POST** (`Origin`, `Sec-Fetch-Site`, and double-submit `csrf_token` cookie+form check) and the owner's token.
 Pending requests expire after five minutes and wrong-owner-token attempts
-are limited to five per request. Form responses forbid caching and framing.
+are limited to five per request (showing an inline retry form for attempts 1–4).
+Consent responses forbid caching and framing (`Cache-Control: no-store`, `X-Frame-Options: DENY`)
+and dynamically scope CSP `form-action 'self' <validated client callback origin>` only for the
+approved/pending client's redirect target so Chromium browsers (Chrome, Edge) cleanly complete
+cross-origin 303 redirects after form POST.
 
 ## Supported grant behavior
 

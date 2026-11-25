@@ -278,11 +278,15 @@ class AcceptanceGuiFixesTests(unittest.TestCase):
         self.assertEqual(self.window.logs_page.property("_mcp_theme_version"), theme.manager().version)
 
     def test_task7_openai_removed_and_legacy_config_migrated(self) -> None:
-        self.assertEqual(len(ALL_PROVIDERS), 5)
-        self.assertNotIn("openai_tunnel", ALL_PROVIDERS)
-        self.assertNotIn("openai_tunnel", self.window.connections_page.provider_rows)
+        from app.config import PROVIDER_NONE
 
-        # Write legacy openai_tunnel settings + secrets -> loads safely as local_only
+        self.assertEqual(len(ALL_PROVIDERS), 4)
+        self.assertNotIn("openai_tunnel", ALL_PROVIDERS)
+        self.assertNotIn(PROVIDER_LOCAL, ALL_PROVIDERS)
+        self.assertNotIn("openai_tunnel", self.window.connections_page.provider_rows)
+        self.assertNotIn(PROVIDER_LOCAL, self.window.connections_page.provider_rows)
+
+        # Write legacy openai_tunnel settings + secrets -> loads safely as none
         self.settings_path.write_text(
             json.dumps({"active_provider": "openai_tunnel", "default_access_profile": "allowlist"}),
             encoding="utf-8",
@@ -292,7 +296,7 @@ class AcceptanceGuiFixesTests(unittest.TestCase):
         secrets.set_secret("tunnel", "ngrok_authtoken", "keep-ngrok-key")
 
         migrated_settings = Settings.load()
-        self.assertEqual(migrated_settings.active_provider, PROVIDER_LOCAL)
+        self.assertEqual(migrated_settings.active_provider, PROVIDER_NONE)
         self.assertEqual(migrated_settings.migrated_from_provider, "openai_tunnel")
 
         mgr2 = ServiceManager(migrated_settings)

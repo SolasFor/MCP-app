@@ -1,8 +1,9 @@
-"""Setup & diagnostics dialogs for ngrok, Tailscale Funnel, and Local Only."""
+"""Setup & diagnostics dialogs for ngrok and Tailscale Funnel."""
 from __future__ import annotations
 
 from typing import Any
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
@@ -15,7 +16,6 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.tunnels import (
-    PROVIDER_LOCAL,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
     ConnectionManager,
@@ -24,6 +24,7 @@ from app.core.tunnels.ngrok import DEFAULT_NGROK_API_URL
 from app.core.tunnels.tailscale import ALLOWED_FUNNEL_PORTS
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
+from app.ui.i18n import tr
 
 
 class ProviderConfigDialog(SilentDialog):
@@ -67,36 +68,49 @@ class ProviderConfigDialog(SilentDialog):
         self.fields: dict[str, Any] = {}
         if provider_id == PROVIDER_NGROK:
             notice = QLabel(
-                "Токен ngrok сохраняется только в защищённом SecretStore (DPAPI) и передаётся "
-                "процессу через NGROK_AUTHTOKEN. Для стабильного OAuth используйте закреплённый домен; "
-                "бесплатные домены *.ngrok-free.* могут показывать warning interstitial в браузере."
+                "Токен ngrok (ngrok Authtoken — отдельно от MCP Owner Token) сохраняется в SecretStore (DPAPI) "
+                "и передаётся процессу через NGROK_AUTHTOKEN. ngrok CLI поддерживает только HTTP/HTTPS-прокси "
+                "(SOCKS5 не поддерживается). Для стабильного OAuth рекомендуется закреплённый домен."
             )
             notice.setObjectName("Hint")
             notice.setWordWrap(True)
             root.addWidget(notice)
 
+            tok_row = QHBoxLayout()
+            tok_row.setSpacing(6)
             self.authtoken_edit = QLineEdit()
+            self.authtoken_edit.setObjectName("UiInput")
             self.authtoken_edit.setEchoMode(QLineEdit.EchoMode.Password)
             self.authtoken_edit.setPlaceholderText(
                 "Уже сохранён в SecretStore (оставьте пустым, чтобы не менять)"
                 if self.provider.has_authtoken()  # type: ignore[attr-defined]
-                else "Вставьте authtoken с dashboard.ngrok.com"
+                else "Вставьте ngrok Authtoken с dashboard.ngrok.com"
             )
+            self.authtoken_eye = QPushButton(tr("conn.token.show"))
+            self.authtoken_eye.setObjectName("Ghost")
+            self.authtoken_eye.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.authtoken_eye.clicked.connect(self._toggle_ngrok_eye)
+            tok_row.addWidget(self.authtoken_edit, 1)
+            tok_row.addWidget(self.authtoken_eye)
+
             self.domain_edit = QLineEdit(str(cfg.get("reserved_domain") or ""))
+            self.domain_edit.setObjectName("UiInput")
             self.domain_edit.setPlaceholderText("mcp-example.ngrok-free.app или свой домен")
             self.api_edit = QLineEdit(str(cfg.get("local_api_url") or DEFAULT_NGROK_API_URL))
+            self.api_edit.setObjectName("UiInput")
             self.bin_edit = QLineEdit(str(cfg.get("binary_path") or ""))
+            self.bin_edit.setObjectName("UiInput")
             self.bin_edit.setPlaceholderText("Автопоиск ngrok.exe в PATH / LOCALAPPDATA")
-            form.addRow("Authtoken (DPAPI)", self.authtoken_edit)
+            form.addRow("ngrok Authtoken (DPAPI)", tok_row)
             form.addRow("Домен (--url)", self.domain_edit)
             form.addRow("Local API URL", self.api_edit)
             form.addRow("Путь к ngrok", self.bin_edit)
 
         elif provider_id == PROVIDER_TAILSCALE:
             notice = QLabel(
-                "Tailscale Funnel публикует выбранный путь в публичный интернет по HTTPS через MagicDNS "
-                "(в отличие от приватного Tailscale Serve). Разрешённые порты: 443, 8443, 10000. "
-                "При остановке снимается только маршрут MCP-app (без tailscale funnel reset)."
+                "Tailscale Funnel публикует выбранный путь в публичный интернет по HTTPS через MagicDNS. "
+                "Разрешённые порты: 443, 8443, 10000. Системный демон Tailscale управляет собственным транспортом "
+                "и не использует прокси-мост MCP-app. При остановке снимается только маршрут MCP-app."
             )
             notice.setObjectName("Hint")
             notice.setWordWrap(True)
@@ -109,28 +123,14 @@ class ProviderConfigDialog(SilentDialog):
             self.port_combo.setCurrentIndex(max(0, self.port_combo.findData(cur_port)))
 
             self.host_edit = QLineEdit(str(cfg.get("hostname_override") or ""))
+            self.host_edit.setObjectName("UiInput")
             self.host_edit.setPlaceholderText("Автоопределение через tailscale status --json")
             self.bin_edit = QLineEdit(str(cfg.get("binary_path") or ""))
+            self.bin_edit.setObjectName("UiInput")
             self.bin_edit.setPlaceholderText("Автопоиск tailscale.exe")
             form.addRow("Публичный порт HTTPS", self.port_combo)
             form.addRow("DNS-имя (опционально)", self.host_edit)
             form.addRow("Путь к tailscale", self.bin_edit)
-
-        elif provider_id == PROVIDER_LOCAL:
-            notice = QLabel(
-                "Режим «Только локально»: сервер работает строго на loopback (127.0.0.1 / localhost / ::1) "
-                "без внешних туннелей. Авторизация OAuth / Bearer сохраняется полностью."
-            )
-            notice.setObjectName("Hint")
-            notice.setWordWrap(True)
-            root.addWidget(notice)
-
-            self.bind_combo = SafeComboBox()
-            for host in ("127.0.0.1", "localhost", "::1"):
-                self.bind_combo.addItem(host, host)
-            cur_host = str(cfg.get("bind_host") or "127.0.0.1")
-            self.bind_combo.setCurrentIndex(max(0, self.bind_combo.findData(cur_host)))
-            form.addRow("Loopback адрес", self.bind_combo)
 
         root.addLayout(form)
 
@@ -142,18 +142,29 @@ class ProviderConfigDialog(SilentDialog):
 
         buttons = QHBoxLayout()
         self.diag_btn = QPushButton("Проверить")
+        self.diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diag_btn.clicked.connect(self._run_diagnose)
         buttons.addWidget(self.diag_btn)
 
         buttons.addStretch(1)
         cancel_btn = QPushButton("Отмена")
+        cancel_btn.setObjectName("Ghost")
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.clicked.connect(self.reject)
         self.save_btn = QPushButton("Сохранить")
         self.save_btn.setObjectName("Accent")
+        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self._save)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(self.save_btn)
         root.addLayout(buttons)
+
+    def _toggle_ngrok_eye(self) -> None:
+        if not hasattr(self, "authtoken_edit"):
+            return
+        vis = self.authtoken_edit.echoMode() == QLineEdit.EchoMode.Password
+        self.authtoken_edit.setEchoMode(QLineEdit.EchoMode.Normal if vis else QLineEdit.EchoMode.Password)
+        self.authtoken_eye.setText(tr("conn.token.hide" if vis else "conn.token.show"))
 
     def _collect(self) -> tuple[dict[str, Any], dict[str, str] | None]:
         if self.provider_id == PROVIDER_NGROK:
@@ -172,8 +183,6 @@ class ProviderConfigDialog(SilentDialog):
                 "binary_path": self.bin_edit.text().strip(),
             }
             return cfg, None
-        if self.provider_id == PROVIDER_LOCAL:
-            return {"bind_host": str(self.bind_combo.currentData())}, None
         return {}, None
 
     def _apply_current(self) -> bool:

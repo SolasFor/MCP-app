@@ -15,6 +15,7 @@ from app.core.tunnels import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     ConnectionManager,
     TailscaleFunnelProvider,
@@ -49,14 +50,16 @@ class ConnectionManagerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_all_five_providers_registered_and_single_active_policy(self) -> None:
-        self.assertEqual(len(ALL_PROVIDERS), 5)
-        self.assertEqual(set(self.mgr.providers.keys()), set(ALL_PROVIDERS))
+    def test_all_four_ui_providers_registered_and_single_active_policy(self) -> None:
+        self.assertEqual(len(ALL_PROVIDERS), 4)
+        self.assertNotIn(PROVIDER_LOCAL, ALL_PROVIDERS)
+        self.assertTrue(set(ALL_PROVIDERS).issubset(set(self.mgr.providers.keys())))
+        self.assertEqual(set(self.mgr.list_statuses(local_host="127.0.0.1", local_port=8000, mcp_path="/mcp", runtime_url="", running=False).keys()), set(ALL_PROVIDERS))
         self.assertEqual(self.mgr.active_provider_id, PROVIDER_CF_QUICK)
         self.mgr.set_active_provider(PROVIDER_NGROK)
         self.assertEqual(self.mgr.active_provider_id, PROVIDER_NGROK)
-        self.mgr.set_active_provider(PROVIDER_LOCAL)
-        self.assertEqual(self.mgr.active_provider_id, PROVIDER_LOCAL)
+        self.mgr.set_active_provider(PROVIDER_NONE)
+        self.assertEqual(self.mgr.active_provider_id, PROVIDER_NONE)
 
     def test_local_only_enforces_loopback_and_no_public_url(self) -> None:
         local = self.mgr.get(PROVIDER_LOCAL)
@@ -191,7 +194,7 @@ class ConnectionManagerTests(unittest.TestCase):
 
         migrated_mgr = ConnectionManager(self.data_dir, secret_store=self.secrets)
         self.assertEqual(migrated_mgr.migrated_from_provider, "openai_tunnel")
-        self.assertEqual(migrated_mgr.active_provider_id, PROVIDER_LOCAL)
+        self.assertEqual(migrated_mgr.active_provider_id, PROVIDER_NONE)
         self.assertIsNone(migrated_mgr.providers.get("openai_tunnel"))
 
         saved_raw = (tunnels_dir / "connections.json").read_text(encoding="utf-8")

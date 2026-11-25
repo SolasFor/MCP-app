@@ -1,6 +1,6 @@
 # MCP app
 
-Десктопное приложение для Windows 10/11: одной кнопкой поднимает **MCP-сервер** (`backend/server.py`) и открывает к нему доступ через **Cloudflare Tunnel (Quick / Named)**, **ngrok**, **Tailscale Funnel** или **только локально (`127.0.0.1`)**. Работает из трея с бесшумными диалогами и уведомлениями, сам перезапускает упавшие части и не оставляет процессов-сирот.
+Десктопное приложение для Windows 10/11: одной кнопкой поднимает **MCP-сервер** (`backend/server.py`) и открывает к нему доступ через **Cloudflare Tunnel (Quick / Named)**, **ngrok** или **Tailscale Funnel** (внутренний loopback сохранён для headless/Admin/тестов). Работает из трея без навязчивых уведомлений и звуков, с централизованной системой постоянных журналов (`%APPDATA%\MCPApp\logs\`), сам перезапускает упавшие части и не оставляет процессов-сирот.
 
 - **Временный адрес** `*.trycloudflare.com`: без домена и без аккаунта Cloudflare, работает сразу после установки.
 - **Свой домен**: постоянный адрес через именованный туннель (`~/.cloudflared/config.yml`).
@@ -77,7 +77,10 @@ Python и cloudflared ставить не нужно: оба внутри сбо
 [менеджер серверов v0.9.4](docs/server-manager.md),
 [диспетчер задач v0.9.3](docs/task-manager.md),
 [универсальный MCP Gateway v0.9.2](docs/mcp-gateway.md),
-[менеджер подключений и 6 транспортов v0.9.1](docs/connection-manager.md),
+[менеджер подключений и 4 UI-транспорта](docs/connection-manager.md),
+[свой домен Cloudflare Named](docs/custom-domain.md),
+[система прокси](docs/proxy.md),
+[постоянное логирование и диагностический ZIP](docs/logging.md),
 [дизайн-система UI v0.9.0](docs/ui-design-system.md),
 [сценарии Windows/SSH](docs/oauth-fixed-windows-ssh.md),
 [стабильность и безопасность v0.8.6](docs/stability-security.md),

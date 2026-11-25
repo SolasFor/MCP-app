@@ -209,6 +209,16 @@ class ClientsPage(PageScaffold):
                     combo.blockSignals(False)
                     return
             self._execution.set_client_profile(client_id, selected)
+            try:
+                from app.core.logging_manager import get_logging_manager
+
+                get_logging_manager().info(
+                    "oauth",
+                    f"Client execution profile updated: client_id={client_id} {previous} -> {selected}",
+                    event_code="oauth_client_profile_changed",
+                )
+            except Exception:  # noqa: BLE001
+                pass
             self.clients_updated.emit(self.client_summaries())
             self.status_message.emit(
                 tr("clients.role_saved", role=tr(f"clients.role.{selected}")),
@@ -244,6 +254,16 @@ class ClientsPage(PageScaffold):
         ):
             return
         self._store.revoke_client(client_id)
+        try:
+            from app.core.logging_manager import get_logging_manager
+
+            get_logging_manager().warning(
+                "oauth",
+                f"OAuth client revoked by owner: client_id={client_id}",
+                event_code="oauth_client_revoked",
+            )
+        except Exception:  # noqa: BLE001
+            pass
         self.reload()
 
     def retranslate(self) -> None:

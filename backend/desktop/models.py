@@ -56,6 +56,23 @@ class DesktopPolicy:
     emergency_stop: bool = False
     emergency_reason: str = ""
 
+    @property
+    def effective_screen_capture(self) -> bool:
+        return bool(self.enabled and not self.emergency_stop and self.allow_screen_capture)
+
+    @property
+    def effective_input_control(self) -> bool:
+        return bool(self.enabled and not self.emergency_stop and self.allow_input_control)
+
+    @property
+    def effective_secret_typing(self) -> bool:
+        return bool(
+            self.enabled
+            and not self.emergency_stop
+            and self.allow_input_control
+            and self.allow_secret_typing
+        )
+
     def validate(self) -> None:
         if self.min_profile not in DESKTOP_MIN_PROFILES:
             raise ValueError(f"Invalid min_profile: {self.min_profile!r}")

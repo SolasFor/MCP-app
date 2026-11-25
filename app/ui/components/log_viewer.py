@@ -4,7 +4,6 @@ from __future__ import annotations
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
@@ -18,7 +17,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.core.diagnostics_bundle import export_diagnostics_zip
 from app.core.logging_manager import LOG_COMPONENTS, LOG_LEVELS, get_logging_manager
 from app.paths import user_data_dir
 from app.ui.components.cards import Badge
@@ -29,7 +27,7 @@ from app.ui.widgets import LogView
 
 
 class LogViewerWidget(QWidget):
-    """Structured log viewer with component/level selectors, paging, folder open, and diagnostic ZIP export."""
+    """Structured log viewer with component/level selectors, paging, folder open, and log export."""
 
     copy_requested = pyqtSignal(str, object)
     exported = pyqtSignal(str)
@@ -37,7 +35,6 @@ class LogViewerWidget(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._diagnostics_context_fn: Callable[[], dict] | None = None
         self._load_token = 0
         self._next_offset = 0
         self._has_more = False
@@ -72,7 +69,7 @@ class LogViewerWidget(QWidget):
             lambda: self.copy_requested.emit(self.log_view.plain_text(), self.copy_btn)
         )
         self.export_btn = QPushButton()
-        self.export_btn.setObjectName("Accent")
+        self.export_btn.setObjectName("Ghost")
         self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.clicked.connect(self.export_log)
 
@@ -126,9 +123,6 @@ class LogViewerWidget(QWidget):
         self._page_loaded.connect(self._apply_loaded_page)
         self.retranslate()
         self._update_count(0, 0)
-
-    def set_diagnostics_context_provider(self, fn: Callable[[], dict]) -> None:
-        self._diagnostics_context_fn = fn
 
     def log_view_auto_scroll(self, enabled: bool) -> None:
         self.log_view.set_auto_scroll(enabled)
@@ -206,31 +200,20 @@ class LogViewerWidget(QWidget):
         self.log_view.clear_log()
 
     def export_log(self) -> None:
+        comp = str(self.component_combo.currentData() or "all")
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = str(user_data_dir() / f"mcp-app-diagnostics-{stamp}.zip")
+        default_name = f"mcp-app-{comp if comp != 'all' else 'logs'}-{stamp}.log"
+        default_path = str(user_data_dir() / default_name)
         dest, _ = QFileDialog.getSaveFileName(
             self,
             tr("logs.export"),
             default_path,
-            "Diagnostics Archive (*.zip);;Log (*.log *.txt)",
+            "Log (*.log *.txt);;All Files (*)",
         )
         if not dest:
             return
-        dest_path = Path(dest)
-        if dest_path.suffix.lower() in (".log", ".txt"):
-            dest_path.write_text(self.log_view.plain_text(), encoding="utf-8")
-            self.exported.emit(tr("toast.exported"))
-            return
-        ctx = self._diagnostics_context_fn() if self._diagnostics_context_fn is not None else {}
         try:
-            export_diagnostics_zip(
-                dest_path,
-                settings=ctx.get("settings"),
-                manager=ctx.get("manager"),
-                proxy_report=ctx.get("proxy_report"),
-                network_report=ctx.get("network_report"),
-                redactor=ctx.get("redactor"),
-            )
+            Path(dest).write_text(self.log_view.plain_text(), encoding="utf-8")
         except OSError as exc:
             SilentMessageBox.warning(self, tr("logs.export"), f"{type(exc).__name__}: {exc}")
             return

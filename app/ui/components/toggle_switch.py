@@ -1,7 +1,7 @@
 """Theme-aware ToggleSwitch widget in Linear + Docker Desktop style."""
 from __future__ import annotations
 
-from PyQt6.QtCore import QRectF, QSize, Qt, QVariantAnimation
+from PyQt6.QtCore import QEvent, QRectF, QSize, Qt, QVariantAnimation
 from PyQt6.QtGui import QColor, QFontMetrics, QPainter, QPaintEvent, QPen
 from PyQt6.QtWidgets import QAbstractButton, QApplication, QSizePolicy, QWidget
 
@@ -56,6 +56,14 @@ class ToggleSwitch(QAbstractButton):
     def apply_theme(self) -> None:
         self.update()
 
+    def changeEvent(self, event: QEvent) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.EnabledChange:
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor if self.isEnabled() else Qt.CursorShape.ArrowCursor
+            )
+            self.update()
+
     def sizeHint(self) -> QSize:  # noqa: N802
         fm = QFontMetrics(self.font())
         label = self.text()
@@ -72,29 +80,32 @@ class ToggleSwitch(QAbstractButton):
 
         enabled = self.isEnabled()
         checked = self.isChecked()
-        t = self._thumb_pos if enabled or checked else (1.0 if checked else 0.0)
-        if self._anim.state() != QVariantAnimation.State.Running:
-            t = 1.0 if checked else 0.0
+        t = self._thumb_pos if self._anim.state() == QVariantAnimation.State.Running else (1.0 if checked else 0.0)
 
         y = (self.height() - _TRACK_H) / 2.0
         track_rect = QRectF(0.0, y, float(_TRACK_W), float(_TRACK_H))
-
-        off_color = QColor(theme.BORDER_STRONG)
-        on_color = QColor(theme.ACCENT_STRONG)
-        track_color = QColor(
-            round(off_color.red() + (on_color.red() - off_color.red()) * t),
-            round(off_color.green() + (on_color.green() - off_color.green()) * t),
-            round(off_color.blue() + (on_color.blue() - off_color.blue()) * t),
-        )
-        if not enabled:
-            track_color.setAlphaF(0.45)
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(track_color)
         radius = _TRACK_H / 2.0
-        painter.drawRoundedRect(track_rect, radius, radius)
 
-        if self.hasFocus():
+        if enabled:
+            off_color = QColor(theme.BORDER_STRONG)
+            on_color = QColor(theme.ACCENT_STRONG)
+            track_color = QColor(
+                round(off_color.red() + (on_color.red() - off_color.red()) * t),
+                round(off_color.green() + (on_color.green() - off_color.green()) * t),
+                round(off_color.blue() + (on_color.blue() - off_color.blue()) * t),
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(track_color)
+            painter.drawRoundedRect(track_rect, radius, radius)
+        else:
+            # Neutral greyed-out pill so disabled dependent toggles never look clickable or active.
+            track_color = QColor(theme.BORDER_STRONG)
+            track_color.setAlphaF(0.55)
+            painter.setPen(QPen(QColor(theme.BORDER), 1.0))
+            painter.setBrush(track_color)
+            painter.drawRoundedRect(track_rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+
+        if enabled and self.hasFocus():
             painter.setPen(QPen(QColor(theme.ACCENT), 1.5))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRoundedRect(track_rect.adjusted(-1.0, -1.0, 1.0, 1.0), radius + 1.0, radius + 1.0)
@@ -103,7 +114,14 @@ class ToggleSwitch(QAbstractButton):
         knob_x = 2.0 + (_TRACK_W - knob - 4.0) * t
         knob_y = y + 2.0
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#FFFFFF" if checked else theme.ELEVATED))
+        if enabled:
+            knob_color = QColor("#FFFFFF" if checked else theme.ELEVATED)
+        elif checked:
+            knob_color = QColor(theme.TEXT_FAINT)
+        else:
+            knob_color = QColor(theme.ELEVATED)
+            knob_color.setAlphaF(0.8)
+        painter.setBrush(knob_color)
         painter.drawEllipse(QRectF(knob_x, knob_y, knob, knob))
 
         label = self.text()

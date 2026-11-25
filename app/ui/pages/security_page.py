@@ -1,4 +1,4 @@
-"""Security & Boundaries page: access policy, SecretStore, Computer Use toggle auto-save, emergency stop."""
+"""Security & Boundaries page: access policy, SecretStore, and auto-saved Computer Use toggles."""
 from __future__ import annotations
 
 import sys
@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushBu
 from app.core.logging_manager import get_logging_manager
 from app.paths import user_data_dir
 from app.ui.components.cards import Badge, Card, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.toggle_switch import ToggleSwitch
 from app.ui.i18n import tr
@@ -28,6 +29,7 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
 class SecurityPage(PageScaffold):
     """Central view of access profiles, DPAPI secret storage, and auto-saved Computer Use toggles."""
 
+    access_profile_changed = pyqtSignal(int)
     allowlist_requested = pyqtSignal()
     clients_requested = pyqtSignal()
     desktop_policy_changed = pyqtSignal()
@@ -54,6 +56,23 @@ class SecurityPage(PageScaffold):
         self.mode_badge = Badge("safe", variant="ok")
         self.policy_header.right_box.addWidget(self.mode_badge)
         policy_card.body.addWidget(self.policy_header)
+
+        self.access_label = QLabel()
+        self.access_label.setObjectName("FieldLabel")
+        policy_card.body.addWidget(self.access_label)
+
+        self.access_profile = SafeComboBox()
+        self.access_profile.addItem("", "safe")
+        self.access_profile.addItem("", "allowlist")
+        self.access_profile.addItem("", "full")
+        self.access_profile.setCurrentIndex(1)
+        self.access_profile.currentIndexChanged.connect(self.access_profile_changed.emit)
+        policy_card.body.addWidget(self.access_profile)
+
+        self.access_profile_hint = QLabel()
+        self.access_profile_hint.setObjectName("Hint")
+        self.access_profile_hint.setWordWrap(True)
+        policy_card.body.addWidget(self.access_profile_hint)
 
         p_row = QHBoxLayout()
         p_row.setSpacing(8)
@@ -107,17 +126,10 @@ class SecurityPage(PageScaffold):
         self._desktop_apps_lbl = d_form.labelForField(self.desktop_apps_edit)
         desktop_card.body.addLayout(d_form)
 
-        d_row = QHBoxLayout()
-        d_row.setSpacing(8)
-        self.desktop_stop_btn = _button("", "Danger")
-        self.desktop_stop_btn.clicked.connect(self.stop_computer_use)
         self.desktop_clear_stop_btn = _button("", "Secondary")
         self.desktop_clear_stop_btn.clicked.connect(self.clear_emergency_stop)
         self.desktop_clear_stop_btn.hide()
-        d_row.addWidget(self.desktop_stop_btn)
-        d_row.addWidget(self.desktop_clear_stop_btn)
-        d_row.addStretch(1)
-        desktop_card.body.addLayout(d_row)
+        desktop_card.body.addWidget(self.desktop_clear_stop_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.desktop_refresh_hint = QLabel()
         self.desktop_refresh_hint.setObjectName("Hint")
@@ -163,8 +175,17 @@ class SecurityPage(PageScaffold):
             for w in widgets:
                 w.blockSignals(False)
             self._loading_desktop = False
+        self._sync_desktop_toggle_states()
         self._refresh_desktop_badge(pol)
         return pol
+
+    def _sync_desktop_toggle_states(self) -> None:
+        """Disable dependent Computer Use switches visually without erasing saved values."""
+        master_on = self.desktop_enabled_sw.isChecked()
+        control_on = master_on and self.desktop_control_sw.isChecked()
+        self.desktop_screen_sw.setEnabled(master_on)
+        self.desktop_control_sw.setEnabled(master_on)
+        self.desktop_secrets_sw.setEnabled(control_on)
 
     def _refresh_desktop_badge(self, pol: DesktopPolicy) -> None:
         self.desktop_clear_stop_btn.setVisible(pol.emergency_stop)
@@ -219,24 +240,7 @@ class SecurityPage(PageScaffold):
             self.reload_desktop_policy()
             SilentMessageBox.warning(self, tr("security.desktop.title"), str(exc))
             return
-        self._refresh_desktop_badge(pol)
-        self.desktop_policy_changed.emit()
-
-    def stop_computer_use(self) -> None:
-        prev = self._desktop_store.load()
-        pol = self._desktop_store.set_emergency_stop(True, "Owner stopped Computer Use")
-        record_desktop_policy_audit(
-            self._desktop_store.path.with_name("desktop_policy_audit.jsonl"),
-            prev,
-            pol,
-            actor="owner",
-        )
-        get_logging_manager().warning(
-            "computer_use",
-            "Computer Use emergency stop activated by owner",
-            event_code="computer_use_emergency_stop",
-        )
-        self.reload_desktop_policy()
+        self._sync_desktop_toggle_states()
         self._refresh_desktop_badge(pol)
         self.desktop_policy_changed.emit()
 
@@ -263,10 +267,16 @@ class SecurityPage(PageScaffold):
         variant = {"safe": "ok", "allowlist": "warn", "full": "err"}[self._active_mode]
         self.mode_badge.setText(tr(f"clients.role.{self._active_mode}"))
         self.mode_badge.set_variant(variant)
+        self.access_profile_hint.setText(tr(f"home.access.hint.{self._active_mode}"))
 
     def retranslate(self) -> None:
         self.set_header(tr("security.title"), tr("security.lead"))
         self.policy_header.set_texts(tr("security.policy.title"), tr("home.access.desc"))
+        self.access_label.setText(tr("home.access.label"))
+        self.access_profile.blockSignals(True)
+        for idx, key in enumerate(("safe", "allowlist", "full")):
+            self.access_profile.setItemText(idx, tr(f"home.access.{key}"))
+        self.access_profile.blockSignals(False)
         self.set_access_mode(self._active_mode)
         self.allowlist_btn.setText(tr("home.access.allowlist_btn"))
         self.clients_btn.setText(tr("home.access.clients_btn"))
@@ -280,7 +290,6 @@ class SecurityPage(PageScaffold):
             self._desktop_clients_lbl.setText(tr("security.desktop.clients"))
         if isinstance(self._desktop_apps_lbl, QLabel):
             self._desktop_apps_lbl.setText(tr("security.desktop.apps"))
-        self.desktop_stop_btn.setText(tr("security.desktop.stop"))
         self.desktop_clear_stop_btn.setText(tr("security.desktop.clear_stop"))
         self.desktop_refresh_hint.setText(tr("security.desktop.autosave_hint"))
 

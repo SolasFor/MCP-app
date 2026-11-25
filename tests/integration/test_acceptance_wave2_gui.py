@@ -128,25 +128,118 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         self.assertFalse(c.token_save.isHidden())
 
     def test_security_page_toggle_switches_autosave_and_rollback(self) -> None:
+        from app.ui.i18n import LANG_EN, tr
+        from backend.desktop.models import DesktopPolicyStore
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_store import OAuthStore
+        from backend.tool_registry import DEFAULT_REGISTRY, DESKTOP_TOOLS
+        from mcp.shared.auth import OAuthClientInformationFull
+
         sec = self.window.security_page
         self.window.show_page("security")
         self.assertFalse(hasattr(sec, "desktop_save_btn"))
+        self.assertFalse(hasattr(sec, "desktop_stop_btn"))
+        self.assertFalse(hasattr(sec, "stop_computer_use"))
         for attr in ("desktop_enabled_sw", "desktop_screen_sw", "desktop_control_sw", "desktop_secrets_sw"):
             self.assertIsInstance(getattr(sec, attr), ToggleSwitch)
 
-        with patch.object(self.window.toasts, "show_toast") as toast_mock:
+        # Master OFF -> all dependent switches are disabled while unchecked initially
+        self.assertFalse(sec.desktop_screen_sw.isEnabled())
+        self.assertFalse(sec.desktop_control_sw.isEnabled())
+        self.assertFalse(sec.desktop_secrets_sw.isEnabled())
+
+        with patch.object(self.window.toasts, "show_toast") as toast_mock, patch(
+            "app.ui.pages.security_page.SilentMessageBox.warning"
+        ) as dlg_mock:
             sec.desktop_enabled_sw.click()
             sec.desktop_screen_sw.click()
+            sec.desktop_control_sw.click()
+            sec.desktop_secrets_sw.click()
             self.app.processEvents()
             toast_mock.assert_not_called()
+            dlg_mock.assert_not_called()
 
         loaded = sec._desktop_store.load()
         self.assertTrue(loaded.enabled)
         self.assertTrue(loaded.allow_screen_capture)
+        self.assertTrue(loaded.allow_input_control)
+        self.assertTrue(loaded.allow_secret_typing)
+
+        # Register an approved allowlist client and verify Computer Use tools are live-enabled then live-disabled
+        oauth_store = OAuthStore(self.oauth_path, "https://cu.example", "https://cu.example/mcp")
+        oauth_store.save_client(
+            OAuthClientInformationFull(
+                client_id="client-a",
+                client_name="Client A",
+                redirect_uris=["http://127.0.0.1:19991/cb"],
+                token_endpoint_auth_method="none",
+            )
+        )
+        oauth_store.mark_approved("client-a")
+        exec_app = ExecutionApprovals(oauth_store, default_profile="allowlist")
+        principal = type("Principal", (), {"client_id": "client-a", "scopes": ["mcp:read"]})()
+        live_store = DesktopPolicyStore(self.policy_path)
 
         sec.desktop_clients_edit.setText("client-a, client-b, client-a")
         sec.desktop_clients_edit.editingFinished.emit()
         self.assertEqual(sec._desktop_store.load().allowed_clients, ("client-a", "client-b"))
+
+        tools_on = DEFAULT_REGISTRY.allowed_tools(
+            oauth_store, principal, exec_app, desktop_policy_store=live_store
+        )
+        self.assertTrue(DESKTOP_TOOLS.issubset(tools_on))
+
+        # Disable master switch -> tools immediately disappear from ToolRegistry & authorize_call raises,
+        # while dependent switches remain greyed out AND keep their stored True choices.
+        with patch.object(self.window.toasts, "show_toast") as toast_mock:
+            sec.desktop_enabled_sw.click()
+            self.app.processEvents()
+            toast_mock.assert_not_called()
+        self.assertFalse(sec.desktop_screen_sw.isEnabled())
+        self.assertFalse(sec.desktop_control_sw.isEnabled())
+        self.assertFalse(sec.desktop_secrets_sw.isEnabled())
+        self.assertTrue(sec.desktop_screen_sw.isChecked())
+        self.assertTrue(sec.desktop_control_sw.isChecked())
+        self.assertTrue(sec.desktop_secrets_sw.isChecked())
+
+        tools_off = DEFAULT_REGISTRY.allowed_tools(
+            oauth_store, principal, exec_app, desktop_policy_store=live_store
+        )
+        self.assertFalse(tools_off & DESKTOP_TOOLS)
+        with self.assertRaises(PermissionError):
+            DEFAULT_REGISTRY.authorize_call(
+                "desktop_screenshot", oauth_store, principal, exec_app, desktop_policy_store=live_store
+            )
+
+        # Simulate app restart -> master stays OFF, dependent toggles stay disabled with saved checks
+        sec2 = self.window.security_page.__class__(desktop_policy_path=self.policy_path)
+        self.assertFalse(sec2.desktop_enabled_sw.isChecked())
+        self.assertFalse(sec2.desktop_screen_sw.isEnabled())
+        self.assertFalse(sec2.desktop_control_sw.isEnabled())
+        self.assertFalse(sec2.desktop_secrets_sw.isEnabled())
+        self.assertTrue(sec2.desktop_screen_sw.isChecked())
+        self.assertTrue(sec2.desktop_control_sw.isChecked())
+        self.assertTrue(sec2.desktop_secrets_sw.isChecked())
+        sec2.close()
+
+        # Re-enable master -> dependent toggles unlock with preserved settings and tools return
+        sec.desktop_enabled_sw.click()
+        self.assertTrue(sec.desktop_screen_sw.isEnabled())
+        self.assertTrue(sec.desktop_control_sw.isEnabled())
+        self.assertTrue(sec.desktop_secrets_sw.isEnabled())
+        self.assertTrue(
+            DESKTOP_TOOLS.issubset(
+                DEFAULT_REGISTRY.allowed_tools(oauth_store, principal, exec_app, desktop_policy_store=live_store)
+            )
+        )
+
+        # Themes + RU/EN translations on SecurityPage
+        for mode in (theme.THEME_LIGHT, theme.THEME_DARK, theme.THEME_SYSTEM):
+            self.window.set_theme_mode(mode)
+            self.app.processEvents()
+        self.window.set_language(LANG_EN)
+        self.assertEqual(sec.access_label.text(), tr("home.access.label"))
+        self.window.set_language(LANG_RU)
 
         audit_jsonl = self.policy_path.with_name("desktop_policy_audit.jsonl")
         self.assertTrue(audit_jsonl.is_file())
@@ -158,9 +251,12 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         ) as warn_mock:
             sec.desktop_control_sw.click()
             self.assertTrue(warn_mock.called)
-        self.assertFalse(sec.desktop_control_sw.isChecked())
+        self.assertTrue(sec.desktop_control_sw.isChecked())
 
-    def test_settings_and_logs_page_persistent_logs_and_zip_export(self) -> None:
+    def test_settings_and_logs_page_persistent_logs_and_plain_export(self) -> None:
+        from app.core.diagnostics_bundle import export_diagnostics_zip
+        from app.ui.i18n import LANG_EN, _STRINGS, keys_for
+
         st = self.window.settings_page
         idx = st.logging_level_combo.findData("DEBUG")
         self.assertGreaterEqual(idx, 0)
@@ -170,6 +266,14 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         self.assertEqual(self.settings.logging_max_file_mb, 25)
         self.assertEqual(self.lm.config.level, "DEBUG")
 
+        # Subtitle "logs.lead" removed from LogsPage and i18n in both RU and EN
+        self.assertNotIn("logs.lead", keys_for(LANG_RU))
+        self.assertNotIn("logs.lead", keys_for(LANG_EN))
+        self.assertNotIn("Экспорт диагностики", _STRINGS[LANG_RU]["logs.export"])
+        self.assertNotIn("Export Diagnostics", _STRINGS[LANG_EN]["logs.export"])
+        self.assertEqual(self.window.logs_page.lead_label.text(), "")
+        self.assertTrue(self.window.logs_page.lead_label.isHidden())
+
         # Protected security audit must survive log clearing
         audit_file = self.logs_dir / "mcp_execution_audit.jsonl"
         audit_file.write_text('{"event":"keep_me"}\n', encoding="utf-8")
@@ -177,14 +281,23 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
 
         viewer = self.window.logs_page.viewer
         self.assertEqual(viewer.component_combo.count(), 1 + len(LOG_COMPONENTS))
+        viewer.log_view.append_line("oauth", "Redacted sample Bearer another-secret-abc")
+        viewer.log_view.flush_now()
 
-        zip_out = self.root / "bundle.zip"
-        with patch("app.ui.components.log_viewer.QFileDialog.getSaveFileName", return_value=(str(zip_out), "")):
+        # Plain log export from UI (no diagnostic ZIP export in Logs tab)
+        log_out = self.root / "exported.log"
+        with patch("app.ui.components.log_viewer.QFileDialog.getSaveFileName", return_value=(str(log_out), "")):
             viewer.export_log()
+        self.assertTrue(log_out.is_file())
+        exported_txt = log_out.read_text(encoding="utf-8")
+        self.assertNotIn("another-secret-abc", exported_txt)
+
+        # Internal diagnostics bundle remains functional for programmatic callers
+        zip_out = self.root / "internal_diag.zip"
+        export_diagnostics_zip(zip_out, logging_manager=self.lm)
         self.assertTrue(zip_out.is_file())
         with zipfile.ZipFile(zip_out, "r") as zf:
-            raw_oauth = zf.read("logs/oauth.log").decode("utf-8")
-            self.assertNotIn("super-secret-xyz", raw_oauth)
+            self.assertNotIn("super-secret-xyz", zf.read("logs/oauth.log").decode("utf-8"))
 
         viewer.clear_logs()
         self.assertEqual(audit_file.read_text(encoding="utf-8"), '{"event":"keep_me"}\n')

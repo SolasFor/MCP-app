@@ -275,13 +275,13 @@ class DesktopManager:
             pol = self._authorize(client_id, client_profile, require_control=True, target_hwnd=hwnd)
             if not isinstance(text, str) or not text or "\x00" in text:
                 raise ValueError("Non-empty text without NUL bytes is required")
-            if not pol.allow_secret_typing and self.redactor.redact_text(text) != text:
+            if not pol.effective_secret_typing and self.redactor.redact_text(text) != text:
                 raise PermissionError("Typing registered secret values is blocked unless allow_secret_typing=True")
             if automation_id or name:
                 elem = self.backend.find_element(hwnd=hwnd, name=name, automation_id=automation_id)
                 if elem is None:
                     raise LookupError("Target UIA input element was not found")
-                if elem.get("is_password") and not pol.allow_secret_typing:
+                if elem.get("is_password") and not pol.effective_secret_typing:
                     raise PermissionError("Typing into password fields is blocked unless allow_secret_typing=True")
                 ok, used = self.backend.set_element_value(
                     text=text, hwnd=hwnd, name=name, automation_id=automation_id

@@ -307,18 +307,41 @@ class AcceptanceGuiFixesTests(unittest.TestCase):
         self.assertEqual(secrets.get_secret("tunnel", "ngrok_authtoken"), "keep-ngrok-key")
 
     def test_task11_and_task12_removed_ui_blocks(self) -> None:
-        for attr in ("clients_summary_lbl", "clients_table", "clients_empty_lbl", "set_clients_summary"):
+        from app.ui.components.cards import Card
+        from app.ui.components.safe_combo import SafeComboBox
+
+        for attr in (
+            "clients_summary_lbl",
+            "clients_table",
+            "clients_empty_lbl",
+            "set_clients_summary",
+            "access_header",
+            "access_label",
+            "access_profile",
+            "access_profile_hint",
+            "allowlist_btn",
+            "clients_btn",
+            "diag_btn",
+            "access_profile_changed",
+            "allowlist_requested",
+            "diagnostics_requested",
+        ):
             self.assertFalse(hasattr(self.window.home_page, attr), f"HomePage still has {attr}")
+        self.assertEqual(len(self.window.home_page.findChildren(Card)), 2)
+
         for attr in (
             "action_title",
             "emergency_btn",
             "diag_btn",
             "diagnostics_requested",
             "emergency_stop_requested",
+            "desktop_stop_btn",
+            "stop_computer_use",
         ):
             self.assertFalse(hasattr(self.window.security_page, attr), f"SecurityPage still has {attr}")
+        self.assertIsInstance(self.window.security_page.access_profile, SafeComboBox)
+        self.assertIs(self.window._access_profile, self.window.security_page.access_profile)
         self.assertTrue(hasattr(self.window.home_page, "emergency_btn"))
-        self.assertTrue(hasattr(self.window.home_page, "diag_btn"))
 
         # Language switch still translates clean pages
         self.window.set_language(LANG_EN)

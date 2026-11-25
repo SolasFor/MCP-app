@@ -44,7 +44,6 @@ from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.sidebar import NavItemSpec, Sidebar
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.toast import ToastManager
-from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
 from app.ui.i18n import LANG_EN, LANG_RU, i18n, tr
@@ -236,7 +235,7 @@ class MainWindow(QMainWindow):
         self._emergency_btn = self.home_page.emergency_btn
         self._mode_buttons = self.home_page.mode_buttons
         self._url_copy = self.home_page.url_copy
-        self._access_profile = self.home_page.access_profile
+        self._access_profile = self.security_page.access_profile
         self._log_view = self.logs_page.viewer.log_view
         self._proxy_page = self.connections_page.proxy_page
 
@@ -314,9 +313,6 @@ class MainWindow(QMainWindow):
         h.url_edited.connect(self._on_url_edited)
         h.url_save_requested.connect(self._save_url)
         h.copy_requested.connect(self._handle_copy_request)
-        h.access_profile_changed.connect(self._on_access_profile_changed)
-        h.allowlist_requested.connect(self._open_allowlist)
-        h.diagnostics_requested.connect(self._open_connection_diagnostics)
 
         c = self.connections_page
         c.domain_wizard_requested.connect(self.show_domain_wizard)
@@ -354,13 +350,13 @@ class MainWindow(QMainWindow):
         self.automation_page.status_message.connect(self.toasts.show_toast)
 
         s = self.security_page
+        s.access_profile_changed.connect(self._on_access_profile_changed)
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
         s.desktop_policy_changed.connect(self._on_desktop_policy_changed)
 
         self.logs_page.viewer.copy_requested.connect(self._copy)
         self.logs_page.viewer.exported.connect(lambda msg: self.toasts.show_toast(msg, "ok"))
-        self.logs_page.viewer.set_diagnostics_context_provider(self._diagnostics_export_context)
 
         st = self.settings_page
         st.theme_mode_selected.connect(self.set_theme_mode)
@@ -1002,7 +998,6 @@ class MainWindow(QMainWindow):
             self._access_profile.blockSignals(True)
             self._access_profile.setCurrentIndex(max(index, 0))
             self._access_profile.blockSignals(False)
-            self.home_page.access_profile_hint.setText(tr(f"home.access.hint.{mode}"))
             self.security_page.set_access_mode(mode)
             oauth_url = self._effective_oauth_url()
             self.clients_page.set_public_url(oauth_url if execution else "")
@@ -1011,7 +1006,7 @@ class MainWindow(QMainWindow):
             self._access_profile.blockSignals(True)
             self._access_profile.setCurrentIndex(max(self._access_profile.findData("safe"), 0))
             self._access_profile.blockSignals(False)
-            self.home_page.access_profile_hint.setText(f"{type(exc).__name__}")
+            self.security_page.access_profile_hint.setText(f"{type(exc).__name__}")
 
     def _on_access_profile_changed(self, _index: int) -> None:
         mode = str(self._access_profile.currentData() or "safe")
@@ -1065,23 +1060,6 @@ class MainWindow(QMainWindow):
             ExecutionPolicyDialog(execution, self).exec()
         except (ValueError, OSError, RuntimeError) as exc:
             SilentMessageBox.warning(self, "Белый список", f"Не удалось открыть: {type(exc).__name__}")
-
-    def _open_connection_diagnostics(self) -> None:
-        public_url = self._effective_oauth_url() or self.manager.public_url
-        if not public_url:
-            SilentMessageBox.information(self, "Диагностика", tr("home.access.need_server"))
-            return
-        dialog = ConnectionDiagnosticsDialog(
-            public_url,
-            self.settings.server_port,
-            self.settings.server_health_path,
-            self.manager.token,
-            self,
-            tunnel_mode=self.settings.tunnel_mode,
-            tunnel_protocol=self.manager.tunnel_protocol,
-            recent_logs=tuple(self._log_view.plain_text().splitlines()[-200:]),
-        )
-        dialog.exec()
 
     def _on_emergency_stop(self) -> None:
         report = self.manager.emergency_stop()
@@ -1231,14 +1209,6 @@ class MainWindow(QMainWindow):
                 archive_enabled=s.logging_archive_enabled,
             )
         )
-
-    def _diagnostics_export_context(self) -> dict[str, object]:
-        return {
-            "settings": self.settings,
-            "manager": self.manager,
-            "proxy_report": self.connections_page.proxy_page.diagnostics_snapshot(),
-            "redactor": getattr(self.manager, "_redactor", None),
-        }
 
     def _on_error_logged(self) -> None:
         if self._current_page_id != "logs" or not self.isVisible():

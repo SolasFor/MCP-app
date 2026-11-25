@@ -257,6 +257,12 @@ class HomePage(PageScaffold):
             self.clients_table.setItem(idx, 1, QTableWidgetItem(status))
             self.clients_table.setItem(idx, 2, QTableWidgetItem(mode))
 
+    def set_mode_highlight(self, mode: str | None) -> None:
+        self.mode_group.setExclusive(False)
+        for key, btn in self.mode_buttons.items():
+            btn.setChecked(mode == key)
+        self.mode_group.setExclusive(True)
+
     def retranslate(self) -> None:
         self.services_title.setText(tr("home.services"))
         self.emergency_btn.setText(tr("home.btn.emergency"))

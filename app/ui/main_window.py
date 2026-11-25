@@ -21,7 +21,16 @@ from PyQt6.QtWidgets import (
 )
 
 from app import APP_NAME
-from app.config import TUNNEL_NAMED, Settings
+from app.config import (
+    PROVIDER_CF_NAMED,
+    PROVIDER_CF_QUICK,
+    PROVIDER_LOCAL,
+    PROVIDER_NGROK,
+    PROVIDER_OPENAI,
+    PROVIDER_TAILSCALE,
+    TUNNEL_NAMED,
+    Settings,
+)
 from app.core import autostart, token_store
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
@@ -35,6 +44,7 @@ from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
 from app.ui.i18n import LANG_EN, LANG_RU, i18n, tr
 from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
+from app.ui.provider_wizards import ProviderConfigDialog
 from app.ui.pages import (
     ClientsPage,
     ConnectionsPage,
@@ -236,6 +246,9 @@ class MainWindow(QMainWindow):
         c = self.connections_page
         c.domain_wizard_requested.connect(self.show_domain_wizard)
         c.domain_guide_requested.connect(self.show_domain_guide)
+        c.provider_selected.connect(self._on_provider_selected)
+        c.provider_configure_requested.connect(self._open_provider_config)
+        c.provider_diagnose_requested.connect(self._open_provider_diagnose)
         c.token_edited.connect(self._on_token_edited)
         c.token_save_requested.connect(self._save_token)
         c.token_generate_requested.connect(self._generate_token)
@@ -301,7 +314,7 @@ class MainWindow(QMainWindow):
             self._unseen_errors = 0
             self.sidebar.set_badge("logs", 0)
         elif page_id == "clients":
-            self.clients_page.set_public_url(self.manager.public_url)
+            self.clients_page.set_public_url(self._effective_oauth_url())
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []
@@ -453,42 +466,89 @@ class MainWindow(QMainWindow):
 
     def _refresh_services(self) -> None:
         m, s = self.manager, self.settings
-        quick = s.is_quick_tunnel
+        pid = m.active_provider
+        quick = m.is_quick
         self._apply_row(
             self.home_page.server_row,
             m.server.state,
             waiting=m.is_active and quick and m.server.state == ProcState.STOPPED,
             waiting_text=tr("status.waiting_url"),
         )
-        self._apply_row(
-            self.home_page.tunnel_row,
-            m.tunnel.state,
-            waiting=m.is_active and not quick and m.tunnel.state == ProcState.STOPPED,
-            waiting_text=tr("status.waiting_server"),
-        )
+        tunnel_titles = {
+            PROVIDER_CF_QUICK: "Cloudflare Tunnel",
+            PROVIDER_CF_NAMED: "Cloudflare Tunnel",
+            PROVIDER_NGROK: "ngrok Agent",
+            PROVIDER_TAILSCALE: "Tailscale Funnel",
+            PROVIDER_OPENAI: "OpenAI Secure Tunnel",
+            PROVIDER_LOCAL: "Local Loopback",
+        }
+        self.home_page.tunnel_row.set_title(tunnel_titles.get(pid, "Tunnel"))
+        if pid in (PROVIDER_LOCAL, PROVIDER_TAILSCALE):
+            if pid == PROVIDER_LOCAL:
+                self.home_page.tunnel_row.set_state(
+                    tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
+                    theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
+                )
+            else:
+                ts_on = m._tailscale_active
+                self.home_page.tunnel_row.set_state(
+                    tr("status.service.running") if ts_on else tr("status.service.stopped"),
+                    theme.OK if ts_on else theme.IDLE,
+                )
+        else:
+            self._apply_row(
+                self.home_page.tunnel_row,
+                m.tunnel.state,
+                waiting=m.is_active and not quick and m.tunnel.state == ProcState.STOPPED,
+                waiting_text=tr("status.waiting_server"),
+            )
         self.home_page.server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
-        detail = host or ("*.trycloudflare.com" if quick else "—")
-        parts = [detail]
-        if m.tunnel_protocol:
-            parts.append(m.tunnel_protocol)
-        if m.proxy_enabled:
-            parts.append(tr("common.via_proxy"))
-        self.home_page.tunnel_row.set_detail("  ·  ".join(parts))
-
-        if quick:
-            caption = tr("home.mode.quick_caption")
-            badge_text = "Cloudflare Quick"
-        elif m.uses_wizard_domain():
-            caption = tr("home.mode.named_wizard_caption")
-            badge_text = "Cloudflare Named"
+        if pid == PROVIDER_LOCAL:
+            detail = f"http://{s.local_host()}:{s.server_port}{s.mcp_path} (no tunnel)"
+        elif pid == PROVIDER_OPENAI:
+            tid = m.private_tunnel_id or "not set"
+            detail = f"tunnel_id: {tid}"
         else:
-            caption = tr("home.mode.named_config_caption")
-            badge_text = "Cloudflare Named"
+            detail = host or ("*.trycloudflare.com" if quick else "—")
+            parts = [detail]
+            if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED) and m.tunnel_protocol:
+                parts.append(m.tunnel_protocol)
+            if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED) and m.proxy_enabled:
+                parts.append(tr("common.via_proxy"))
+            detail = "  ·  ".join(parts)
+        self.home_page.tunnel_row.set_detail(detail)
+
+        provider_badges = {
+            PROVIDER_CF_QUICK: (tr("home.mode.quick_caption"), "Cloudflare Quick"),
+            PROVIDER_CF_NAMED: (
+                tr("home.mode.named_wizard_caption" if m.uses_wizard_domain() else "home.mode.named_config_caption"),
+                "Cloudflare Named",
+            ),
+            PROVIDER_NGROK: ("Transport: ngrok Agent v3", "ngrok"),
+            PROVIDER_TAILSCALE: ("Transport: Tailscale Funnel (HTTPS)", "Tailscale Funnel"),
+            PROVIDER_OPENAI: ("Transport: OpenAI Secure MCP Tunnel (outbound)", "OpenAI Tunnel"),
+            PROVIDER_LOCAL: ("Transport: Local Only (127.0.0.1)", "Local Only"),
+        }
+        caption, badge_text = provider_badges.get(pid, ("", pid))
         self.home_page.mode_caption.setText(caption)
         self._transport_badge.setText(badge_text)
         self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else "accent")
-        self.connections_page.refresh_transport_status(is_quick=quick, has_domain=m.has_domain())
+        try:
+            statuses = m.connections.list_statuses(
+                local_host=s.local_host(),
+                local_port=s.server_port,
+                mcp_path=s.mcp_path,
+                runtime_url=m.public_url,
+                running=m.overall == Overall.RUNNING,
+            )
+        except Exception:
+            statuses = {}
+        self.connections_page.refresh_providers(
+            active_provider=pid,
+            statuses=statuses,
+            has_domain=m.has_domain(),
+        )
 
     @staticmethod
     def _apply_row(row: StatusRow, state: ProcState, waiting: bool, waiting_text: str) -> None:
@@ -531,38 +591,95 @@ class MainWindow(QMainWindow):
         self.show_page("home")
 
     def _on_mode_clicked(self, mode: str) -> None:
-        if mode == self.settings.tunnel_mode:
+        target_provider = PROVIDER_CF_NAMED if mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
+        if target_provider == self.manager.active_provider:
             return
-        if mode == TUNNEL_NAMED and not self.manager.has_domain():
+        self._on_provider_selected(target_provider)
+
+    def _on_provider_selected(self, provider_id: str) -> None:
+        if provider_id == self.manager.active_provider:
+            return
+        if provider_id == PROVIDER_CF_NAMED and not self.manager.has_domain():
             self._refresh_mode()
             self.manager.log_line.emit(APP, "Свой домен ещё не настроен — открыл мастер настройки.")
             self.show_domain_wizard()
             return
-        if self.manager.is_active and not self._confirm(
-            "Сменить режим туннеля?",
+        warning = self.manager.check_issuer_transition(provider_id)
+        if warning.issuer_changed:
+            msg = tr(
+                "conn.issuer_change.body",
+                prev=warning.previous_issuer or "—",
+                next=warning.next_issuer or "—",
+                note=warning.message,
+            )
+            if not self._confirm(tr("conn.issuer_change.title"), msg):
+                self._refresh_mode()
+                return
+        elif self.manager.is_active and not self._confirm(
+            "Сменить транспорт?",
             "Сервисы перезапустятся, а клиентам понадобится новый адрес.",
         ):
             self._refresh_mode()
             return
-        self.manager.set_tunnel_mode(mode)
+        self.manager.set_active_provider(provider_id)
+
+    def _open_provider_config(self, provider_id: str) -> None:
+        if provider_id == PROVIDER_CF_NAMED:
+            self.show_domain_wizard()
+            return
+        if provider_id == PROVIDER_CF_QUICK:
+            self.show_domain_guide()
+            return
+        dlg = ProviderConfigDialog(
+            self.manager.connections,
+            provider_id,
+            local_host=self.settings.local_host(),
+            local_port=self.settings.server_port,
+            mcp_path=self.settings.mcp_path,
+            parent=self,
+        )
+        if dlg.exec():
+            for secret in self.manager.connections.collect_secret_values():
+                self.manager._redactor.register(secret)
+            self._refresh_mode()
+
+    def _open_provider_diagnose(self, provider_id: str) -> None:
+        checks = self.manager.connections.diagnose_provider(
+            provider_id,
+            local_host=self.settings.local_host(),
+            local_port=self.settings.server_port,
+            mcp_path=self.settings.mcp_path,
+        )
+        lines = [f"{'✓' if c.ok else '✕'} {c.label}: {c.detail}" for c in checks]
+        QMessageBox.information(self, f"{APP_NAME} — {provider_id}", "\n".join(lines))
 
     def _refresh_mode(self) -> None:
         s, m = self.settings, self.manager
-        quick = s.is_quick_tunnel
+        pid = m.active_provider
+        quick = m.is_quick
         wizard = m.wizard_domain()
-        self._mode_buttons[s.tunnel_mode].setChecked(True)
-        if quick:
+        if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED):
+            self.home_page.set_mode_highlight(s.tunnel_mode)
+        else:
+            self.home_page.set_mode_highlight(None)
+        if pid == PROVIDER_CF_QUICK:
             hint = tr("home.mode.quick_hint")
             if not m.has_domain():
                 hint += "\n" + tr("home.mode.no_domain_hint")
-        elif wizard.is_configured:
+        elif pid == PROVIDER_CF_NAMED and wizard.is_configured:
             hint = tr("home.mode.named_wizard_hint", host=wizard.hostname)
-        else:
+        elif pid == PROVIDER_CF_NAMED:
             hint = tr("home.mode.named_config_hint")
+        elif pid == PROVIDER_LOCAL:
+            hint = tr("conn.provider.local")
+        elif pid == PROVIDER_OPENAI:
+            hint = tr("conn.provider.openai")
+        else:
+            hint = tr("conn.providers.note")
         h = self.home_page
         h.mode_hint.setText(hint)
         h.wizard_link.setText(tr("home.wizard.edit" if wizard.is_configured else "home.wizard.setup"))
-        h.url_edit.setReadOnly(quick)
+        h.url_edit.setReadOnly(pid != PROVIDER_CF_NAMED)
         h.url_edit.setPlaceholderText(tr("home.url.placeholder_quick") if quick else "mcp.example.com")
         h.url_edit.setText(self.manager.public_url)
         h.url_save.hide()
@@ -572,7 +689,7 @@ class MainWindow(QMainWindow):
         self._refresh_services()
 
     def _on_public_url(self, url: str) -> None:
-        if self.settings.is_quick_tunnel or not self.home_page.url_save.isVisible():
+        if self.manager.active_provider != PROVIDER_CF_NAMED or not self.home_page.url_save.isVisible():
             self.home_page.url_edit.setText(url)
         self._refresh_address()
         self._refresh_access_profile()
@@ -580,10 +697,23 @@ class MainWindow(QMainWindow):
         self._on_overall(self.manager.overall)
 
     def _refresh_address(self) -> None:
+        ident = self.manager.connection_identity
         url = self.manager.public_url
         h = self.home_page
         if url:
             h.ov_url.setText(url)
+            h.ov_url.setStyleSheet("")
+        elif ident.provider_id == PROVIDER_LOCAL:
+            h.ov_url.setText(tr("home.url.local_only_value", local_url=ident.local_url))
+            h.ov_url.setStyleSheet("")
+        elif ident.provider_id == PROVIDER_OPENAI:
+            h.ov_url.setText(
+                tr(
+                    "home.url.openai_tunnel_value",
+                    tunnel_id=ident.private_tunnel_id or "—",
+                    local_url=ident.local_url,
+                )
+            )
             h.ov_url.setStyleSheet("")
         else:
             h.ov_url.setText(
@@ -620,8 +750,15 @@ class MainWindow(QMainWindow):
         self._flash(h.url_copy, tr("home.url.copied"))
 
     # ================================================================== OAuth & security
+    def _effective_oauth_url(self) -> str:
+        if self.manager.public_url:
+            return self.manager.public_url
+        if self.manager.is_active and self.manager.active_provider in (PROVIDER_LOCAL, PROVIDER_OPENAI):
+            return self.manager.oauth_resource_url
+        return ""
+
     def _execution_store(self) -> ExecutionApprovals | None:
-        url = self.manager.public_url
+        url = self._effective_oauth_url()
         if not url:
             return None
         parts = urlsplit(url)
@@ -643,7 +780,8 @@ class MainWindow(QMainWindow):
                 tr(f"home.access.hint.{mode}") if execution else tr("home.access.need_server")
             )
             self.security_page.set_access_mode(mode)
-            self.clients_page.set_public_url(self.manager.public_url if execution else "")
+            oauth_url = self._effective_oauth_url()
+            self.clients_page.set_public_url(oauth_url if execution else "")
             self.home_page.set_clients_summary(self.clients_page.client_summaries())
         except Exception as exc:
             self._access_profile.setEnabled(False)
@@ -689,7 +827,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Белый список", f"Не удалось открыть: {type(exc).__name__}")
 
     def _open_connection_diagnostics(self) -> None:
-        public_url = self.manager.public_url
+        public_url = self._effective_oauth_url() or self.manager.public_url
         if not public_url:
             QMessageBox.information(self, "Диагностика", tr("home.access.need_server"))
             return

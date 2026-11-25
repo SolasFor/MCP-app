@@ -21,11 +21,26 @@ from app.paths import user_data_dir
 
 SETTINGS_FILE = "settings.json"
 
-# Режимы туннеля
+# Режимы туннеля и провайдеры (v0.9.1)
 TUNNEL_NAMED = "named"   # свой домен: config.yml + `cloudflared tunnel run`
 TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `cloudflared tunnel --url …`
 TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
 DEFAULT_TUNNEL_MODE = TUNNEL_QUICK
+
+PROVIDER_CF_QUICK = "cloudflare_quick"
+PROVIDER_CF_NAMED = "cloudflare_named"
+PROVIDER_NGROK = "ngrok"
+PROVIDER_TAILSCALE = "tailscale_funnel"
+PROVIDER_OPENAI = "openai_tunnel"
+PROVIDER_LOCAL = "local_only"
+ACTIVE_PROVIDERS = (
+    PROVIDER_CF_QUICK,
+    PROVIDER_CF_NAMED,
+    PROVIDER_NGROK,
+    PROVIDER_TAILSCALE,
+    PROVIDER_OPENAI,
+    PROVIDER_LOCAL,
+)
 
 DEFAULT_MCP_PATH = "/mcp"
 DEFAULT_PUBLIC_URL = ""  # своего домена по умолчанию нет
@@ -84,8 +99,9 @@ class Settings:
     server_health_path: str = "/health"  # server.py отвечает тут без токена и без записи в лог
     metrics_port: int = 20241        # cloudflared --metrics -> /ready для индикатора
 
-    # Cloudflare Tunnel
-    tunnel_mode: str = DEFAULT_TUNNEL_MODE  # quick | named
+    # Cloudflare Tunnel и активный транспорт (v0.9.1)
+    active_provider: str = PROVIDER_CF_QUICK
+    tunnel_mode: str = DEFAULT_TUNNEL_MODE  # quick | named (совместимость с v0.8.5–v0.9.0)
     cloudflared_path: str = ""       # пусто = автопоиск (встроенный в сборку, Program Files, PATH)
     cloudflared_config: str = DEFAULT_CLOUDFLARED_CONFIG  # только для named
     # Протокол связи с Cloudflare: "http2" (TCP) | "quic" (UDP 7844) | "auto".
@@ -122,7 +138,7 @@ class Settings:
     # ------------------------------------------------------------------ свойства
     @property
     def is_quick_tunnel(self) -> bool:
-        return self.tunnel_mode == TUNNEL_QUICK
+        return self.active_provider == PROVIDER_CF_QUICK
 
     @property
     def has_public_url(self) -> bool:
@@ -157,6 +173,10 @@ class Settings:
             settings = cls(**{k: v for k, v in data.items() if k in known})
         except TypeError:
             return cls()
+        if "active_provider" not in data:
+            settings.active_provider = (
+                PROVIDER_CF_NAMED if settings.tunnel_mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
+            )
         settings.sanitize()
         return settings
 
@@ -187,6 +207,14 @@ class Settings:
             self.enable_execution_tools = False
         if self.tunnel_mode not in TUNNEL_MODES:
             self.tunnel_mode = DEFAULT_TUNNEL_MODE
+        if self.active_provider not in ACTIVE_PROVIDERS:
+            self.active_provider = (
+                PROVIDER_CF_NAMED if self.tunnel_mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
+            )
+        elif self.active_provider == PROVIDER_CF_NAMED:
+            self.tunnel_mode = TUNNEL_NAMED
+        elif self.active_provider == PROVIDER_CF_QUICK:
+            self.tunnel_mode = TUNNEL_QUICK
         self.mcp_path = normalize_mcp_path(self.mcp_path)
         self.server_health_path = normalize_mcp_path(self.server_health_path)
         url = normalize_public_url(self.public_url, self.mcp_path)
@@ -195,9 +223,15 @@ class Settings:
         if url in _LEGACY_DEFAULT_PUBLIC_URLS and not self.has_named_tunnel_config():
             url = ""
         self.public_url = url
-        if not self.public_url and self.tunnel_mode == TUNNEL_NAMED and not self.has_named_tunnel_config():
+        if (
+            self.active_provider == PROVIDER_CF_NAMED
+            and not self.public_url
+            and self.tunnel_mode == TUNNEL_NAMED
+            and not self.has_named_tunnel_config()
+        ):
             # Домен не настроен вообще — «Свой домен» не запустится, остаётся временный.
             self.tunnel_mode = TUNNEL_QUICK
+            self.active_provider = PROVIDER_CF_QUICK
         if self.theme_mode not in ("dark", "light", "system"):
             self.theme_mode = "dark"
         if self.language not in ("ru", "en"):

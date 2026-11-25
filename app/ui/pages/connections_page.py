@@ -1,9 +1,17 @@
-"""Connections & Transports page: Cloudflare active mode, roadmap transports, owner token, proxy."""
+"""Connections & Transports page: all 6 providers, live detection, wizards, owner token, proxy."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget
 
+from app.config import (
+    PROVIDER_CF_NAMED,
+    PROVIDER_CF_QUICK,
+    PROVIDER_LOCAL,
+    PROVIDER_NGROK,
+    PROVIDER_OPENAI,
+    PROVIDER_TAILSCALE,
+)
 from app.ui.components.cards import Badge, Card, Divider, SectionHeader
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -18,11 +26,24 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
     return btn
 
 
+_PROVIDER_SPEC = (
+    (PROVIDER_CF_QUICK, "cf_quick"),
+    (PROVIDER_CF_NAMED, "cf_named"),
+    (PROVIDER_NGROK, "ngrok"),
+    (PROVIDER_TAILSCALE, "tailscale"),
+    (PROVIDER_OPENAI, "openai"),
+    (PROVIDER_LOCAL, "local"),
+)
+
+
 class ConnectionsPage(PageScaffold):
-    """Advanced transport settings, owner Bearer token editor, and Cloudflare proxy routing."""
+    """Transport provider selector/diagnostics, owner Bearer token editor, and Cloudflare proxy."""
 
     domain_wizard_requested = pyqtSignal()
     domain_guide_requested = pyqtSignal()
+    provider_selected = pyqtSignal(str)
+    provider_configure_requested = pyqtSignal(str)
+    provider_diagnose_requested = pyqtSignal(str)
     token_edited = pyqtSignal(str)
     token_save_requested = pyqtSignal()
     token_generate_requested = pyqtSignal()
@@ -31,28 +52,37 @@ class ConnectionsPage(PageScaffold):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=True, parent=parent)
 
-        # --- Transport Providers Registry (honest active vs v0.9.1 planned)
         self.providers_card = Card()
         self.providers_header = SectionHeader()
         self.providers_card.body.addWidget(self.providers_header)
-        self._provider_rows: list[tuple[str, QLabel, Badge]] = []
-        providers = (
-            ("cf_quick", "ok"),
-            ("cf_named", "accent"),
-            ("ngrok", "neutral"),
-            ("tailscale", "neutral"),
-            ("openai", "neutral"),
-            ("local", "neutral"),
-        )
-        for key, variant in providers:
+
+        # provider_id -> (key, name_label, detect_badge, state_badge, select_btn, config_btn, diag_btn)
+        self.provider_rows: dict[
+            str,
+            tuple[str, QLabel, Badge, Badge, QPushButton, QPushButton, QPushButton],
+        ] = {}
+        for pid, key in _PROVIDER_SPEC:
             row = QHBoxLayout()
-            row.setSpacing(10)
+            row.setSpacing(8)
             name = QLabel()
-            badge = Badge("", variant=variant)
+            det_badge = Badge("", variant="neutral")
+            state_badge = Badge("", variant="neutral")
+
+            select_btn = _button("")
+            select_btn.clicked.connect(lambda _c=False, p=pid: self.provider_selected.emit(p))
+            config_btn = _button("", "Ghost")
+            config_btn.clicked.connect(lambda _c=False, p=pid: self.provider_configure_requested.emit(p))
+            diag_btn = _button("", "Ghost")
+            diag_btn.clicked.connect(lambda _c=False, p=pid: self.provider_diagnose_requested.emit(p))
+
             row.addWidget(name, 1)
-            row.addWidget(badge)
+            row.addWidget(det_badge)
+            row.addWidget(state_badge)
+            row.addWidget(select_btn)
+            row.addWidget(config_btn)
+            row.addWidget(diag_btn)
             self.providers_card.body.addLayout(row)
-            self._provider_rows.append((key, name, badge))
+            self.provider_rows[pid] = (key, name, det_badge, state_badge, select_btn, config_btn, diag_btn)
 
         self.providers_card.body.addWidget(Divider())
         transport_actions = QHBoxLayout()
@@ -119,27 +149,49 @@ class ConnectionsPage(PageScaffold):
     def toggle_token_visibility(self) -> None:
         self.set_token_visible(self.token_edit.echoMode() == QLineEdit.EchoMode.Password)
 
-    def refresh_transport_status(self, *, is_quick: bool, has_domain: bool) -> None:
-        for key, _name, badge in self._provider_rows:
-            if key == "cf_quick":
-                badge.setText(tr("conn.badge.active" if is_quick else "conn.badge.available"))
-                badge.set_variant("ok" if is_quick else "accent")
-            elif key == "cf_named":
-                active_named = (not is_quick) and has_domain
-                badge.setText(tr("conn.badge.active" if active_named else "conn.badge.available"))
-                badge.set_variant("ok" if active_named else "accent")
+    def refresh_providers(
+        self,
+        *,
+        active_provider: str,
+        statuses: dict[str, dict] | None = None,
+        has_domain: bool = False,
+    ) -> None:
+        for pid, (_key, _name, det_badge, state_badge, select_btn, _cfg, _diag) in self.provider_rows.items():
+            is_active = pid == active_provider
+            state_badge.setText(tr("conn.badge.active" if is_active else "conn.badge.available"))
+            state_badge.set_variant("ok" if is_active else "accent")
+            select_btn.setEnabled(not is_active)
+
+            info = (statuses or {}).get(pid, {})
+            det = info.get("detection", {})
+            installed = bool(det.get("installed", pid == PROVIDER_LOCAL))
+            if pid == PROVIDER_LOCAL:
+                det_badge.setText("Loopback")
+                det_badge.set_variant("accent")
+            elif installed:
+                ver = str(det.get("version") or "").strip()
+                det_badge.setText(tr("conn.badge.installed") + (f" · {ver[:18]}" if ver else ""))
+                det_badge.set_variant("ok")
             else:
-                badge.setText(tr("conn.badge.planned"))
-                badge.set_variant("neutral")
+                det_badge.setText(tr("conn.badge.missing"))
+                det_badge.set_variant("warn")
+
         self.wizard_btn.setText(tr("home.wizard.edit" if has_domain else "home.wizard.setup"))
+
+    def refresh_transport_status(self, *, is_quick: bool, has_domain: bool) -> None:
+        self.refresh_providers(
+            active_provider=PROVIDER_CF_QUICK if is_quick else PROVIDER_CF_NAMED,
+            has_domain=has_domain,
+        )
 
     def retranslate(self) -> None:
         self.set_header(tr("conn.title"), tr("conn.lead"))
         self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
-        for key, name, badge in self._provider_rows:
+        for _pid, (key, name, _det_badge, _state_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
             name.setText(tr(f"conn.provider.{key}"))
-            if key not in ("cf_quick", "cf_named"):
-                badge.setText(tr("conn.badge.planned"))
+            select_btn.setText(tr("conn.btn.select"))
+            config_btn.setText(tr("conn.btn.configure"))
+            diag_btn.setText(tr("conn.btn.diagnose"))
         self.guide_btn.setText(tr("home.guide.open"))
         self.token_header.set_texts(tr("conn.token.title"), tr("conn.token.hint"))
         visible = self.token_edit.echoMode() == QLineEdit.EchoMode.Normal
@@ -151,5 +203,6 @@ class ConnectionsPage(PageScaffold):
         self.proxy_page.retranslate()
 
     def apply_theme(self) -> None:
-        for _k, _n, badge in self._provider_rows:
-            badge.set_variant(str(badge.property("variant") or "neutral"))
+        for _pid, (_k, _n, det_badge, state_badge, _s, _c, _d) in self.provider_rows.items():
+            det_badge.set_variant(str(det_badge.property("variant") or "neutral"))
+            state_badge.set_variant(str(state_badge.property("variant") or "neutral"))

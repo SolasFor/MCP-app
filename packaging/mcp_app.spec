@@ -30,6 +30,7 @@ if (ROOT / "assets").is_dir():
 # часть модулей через importlib — PyInstaller их не видит без подсказки.
 hiddenimports = [
     "backend.server",
+    "backend.managed_servers",
     "backend.process_runner",
     "backend.output_stream",
     "backend.tool_registry",
@@ -46,6 +47,7 @@ hiddenimports = [
     *collect_submodules("app.core.tunnels"),
     *collect_submodules("backend.gateway"),
     *collect_submodules("backend.tasks"),
+    *collect_submodules("backend.servers"),
     *collect_submodules("app.ui"),
     *collect_submodules("uvicorn"),
     *collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli")),

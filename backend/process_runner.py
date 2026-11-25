@@ -507,7 +507,36 @@ class ProcessRunner:
             hide_console=(lifecycle == "controlled"),
             breakaway_from_job=(lifecycle == "independent"),
         )
-        try:
+        if os.name == "nt":
+            try:
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=str(cwd),
+                    env=child_env,
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=flags,
+                )
+            except PermissionError:
+                if lifecycle != "independent":
+                    raise
+                # Parent host job (e.g. CI runner) may forbid CREATE_BREAKAWAY_FROM_JOB.
+                fallback_flags = self.platform.subprocess_creation_flags(
+                    detached=True, hide_console=False, breakaway_from_job=False
+                )
+                proc = subprocess.Popen(
+                    argv,
+                    cwd=str(cwd),
+                    env=child_env,
+                    shell=False,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=fallback_flags,
+                )
+        else:
             proc = subprocess.Popen(
                 argv,
                 cwd=str(cwd),
@@ -516,24 +545,7 @@ class ProcessRunner:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=flags,
-            )
-        except PermissionError:
-            if lifecycle != "independent":
-                raise
-            # Parent host job (e.g. CI runner) may forbid CREATE_BREAKAWAY_FROM_JOB.
-            fallback_flags = self.platform.subprocess_creation_flags(
-                detached=True, hide_console=False, breakaway_from_job=False
-            )
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(cwd),
-                env=child_env,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=fallback_flags,
+                start_new_session=True,
             )
         identity = self.platform.capture_process_identity(proc.pid)
         job: ProcessJobHandle | None = None
@@ -549,13 +561,14 @@ class ProcessRunner:
         def pump(pipe, buf: BoundedOutputBuffer) -> None:
             if pipe is None:
                 return
+            read_fn = getattr(pipe, "read1", pipe.read)
             try:
                 while True:
-                    chunk = pipe.read(16384)
+                    chunk = read_fn(16384)
                     if not chunk:
                         break
                     buf.append(chunk)
-            except OSError:
+            except (OSError, ValueError):
                 pass
             finally:
                 try:
@@ -609,6 +622,8 @@ class ProcessRunner:
                 if handle.process.poll() is None:
                     handle.process.kill()
                     handle.process.wait(timeout=2)
+            for thread in handle._reader_threads:
+                thread.join(timeout=0.5)
             return True
         finally:
             if handle.job is not None:

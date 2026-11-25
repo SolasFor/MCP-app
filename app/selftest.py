@@ -60,6 +60,7 @@ def _check_qt() -> str:
     from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
     from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog  # noqa: F401
     from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
+    from app.ui.pages.servers_page import ServersPage  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR
 
@@ -94,6 +95,8 @@ def _check_backend() -> str:
         # Never touch a real user's encrypted OAuth/Gateway/Tasks state during selftest.
         os.environ["MCP_OAUTH_STORE_PATH"] = str(Path(tmp) / "oauth" / "selftest.sqlite3")
         os.environ["MCP_GATEWAY_CONFIG_PATH"] = str(Path(tmp) / "gateway" / "servers.json")
+        os.environ["MCP_MANAGED_SERVERS_PATH"] = str(Path(tmp) / "servers" / "managed_servers.json")
+        os.environ["MCP_SECRETS_DIR"] = str(Path(tmp) / "secrets")
         os.environ["MCP_TASKS_DB_PATH"] = str(Path(tmp) / "tasks" / "selftest_tasks.sqlite3")
         os.environ["MCP_TASKS_ARTIFACTS_DIR"] = str(Path(tmp) / "tasks" / "artifacts")
         os.environ["MCP_SPOOL_DIR"] = str(Path(tmp) / "tasks" / "spool")

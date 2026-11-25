@@ -53,6 +53,7 @@ from app.ui.pages import (
     LogsPage,
     PlannedPage,
     SecurityPage,
+    ServersPage,
     SettingsPage,
     TasksPage,
 )
@@ -69,10 +70,10 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("clients", "nav.clients", "clients", "primary", shortcut="Ctrl+3"),
     NavItemSpec("gateway", "nav.gateway", "gateway", "primary", shortcut="Ctrl+4"),
     NavItemSpec("tasks", "nav.tasks", "tasks", "primary", shortcut="Ctrl+5"),
-    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+6"),
-    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+7"),
-    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+8"),
-    NavItemSpec("servers", "nav.servers", "servers", "upcoming", tag="0.9.4"),
+    NavItemSpec("servers", "nav.servers", "servers", "primary", shortcut="Ctrl+6"),
+    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+7"),
+    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+8"),
+    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+9"),
     NavItemSpec("workspaces", "nav.workspaces", "workspaces", "upcoming", tag="0.9.5"),
     NavItemSpec("devices", "nav.devices", "devices", "upcoming", tag="0.9.8"),
     NavItemSpec("extensions", "nav.extensions", "extensions", "upcoming", tag="0.9.7"),
@@ -90,6 +91,7 @@ PAGE_CONNECTIONS = PAGE_IDS.index("connections")
 PAGE_CLIENTS = PAGE_IDS.index("clients")
 PAGE_GATEWAY = PAGE_IDS.index("gateway")
 PAGE_TASKS = PAGE_IDS.index("tasks")
+PAGE_SERVERS = PAGE_IDS.index("servers")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
@@ -156,6 +158,11 @@ class MainWindow(QMainWindow):
             artifacts_dir=manager.tasks_artifacts_dir(),
             redactor=manager._redactor,
         )
+        self.servers_page = ServersPage(
+            config_path=manager.managed_servers_path(),
+            tasks_db_path=manager.tasks_db_path(),
+            redactor=manager._redactor,
+        )
         self.security_page = SecurityPage()
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
@@ -166,6 +173,7 @@ class MainWindow(QMainWindow):
             "clients": self.clients_page,
             "gateway": self.gateway_page,
             "tasks": self.tasks_page,
+            "servers": self.servers_page,
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
@@ -281,6 +289,10 @@ class MainWindow(QMainWindow):
         tsk.status_message.connect(self.toasts.show_toast)
         tsk.task_finished.connect(self.task_notification.emit)
 
+        srv = self.servers_page
+        srv.config_changed.connect(self.manager.refresh_server_secrets)
+        srv.status_message.connect(self.toasts.show_toast)
+
         s = self.security_page
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
@@ -341,6 +353,8 @@ class MainWindow(QMainWindow):
             self.gateway_page.reload()
         elif page_id == "tasks":
             self.tasks_page.reload()
+        elif page_id == "servers":
+            self.servers_page.reload()
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []
@@ -1066,6 +1080,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._persist_geometry()
         if self._allow_close:
+            self.servers_page.shutdown()
             event.accept()
             return
         event.ignore()

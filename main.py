@@ -3,6 +3,7 @@
     python main.py                    -> GUI (окно + трей)
     python main.py --minimized        -> GUI сразу в трее (так стартует автозапуск)
     python main.py --backend          -> MCP-сервер (backend/server.py)
+    python main.py --headless         -> MCP-сервер без GUI (для службы/контейнера)
     python main.py --selftest <файл>  -> самопроверка сборки (пишет отчёт в файл)
     python main.py --run-extension <путь> -> изолированный процесс расширения
 
@@ -27,7 +28,7 @@ def main() -> int:
 
         return run_extension_entrypoint(args[idx + 1])
 
-    if "--backend" in args:
+    if "--backend" in args or "--headless" in args:
         from app.backend_entry import run_backend
 
         run_backend()

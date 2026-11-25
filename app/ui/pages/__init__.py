@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "AutomationPage",
     "ClientsPage",
     "ConnectionsPage",
     "DevicesPage",
@@ -18,6 +19,7 @@ __all__ = [
     "WorkspacesPage",
 ]
 
+from app.ui.pages.automation_page import AutomationPage
 from app.ui.pages.base import PageScaffold
 from app.ui.pages.clients_page import ClientsPage
 from app.ui.pages.connections_page import ConnectionsPage

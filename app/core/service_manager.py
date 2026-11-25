@@ -627,6 +627,7 @@ class ServiceManager(QObject):
             "MCP_DESKTOP_POLICY_PATH": str(self.desktop_policy_path()),
             "MCP_EXTENSIONS_DIR": str(self.extensions_dir()),
             "MCP_DEVICES_CONFIG_PATH": str(self.devices_config_path()),
+            "MCP_AUTOMATION_DIR": str(self.automation_dir()),
             "MCP_SECRETS_DIR": str(user_data_dir() / "secrets"),
             "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
             "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
@@ -652,6 +653,9 @@ class ServiceManager(QObject):
 
     def devices_config_path(self) -> Path:
         return user_data_dir() / "remote" / "devices.json"
+
+    def automation_dir(self) -> Path:
+        return user_data_dir() / "automation"
 
     def managed_servers_path(self) -> Path:
         target = user_data_dir() / "servers" / "managed_servers.json"

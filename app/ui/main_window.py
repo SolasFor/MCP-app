@@ -34,6 +34,7 @@ from app.config import (
 from app.core import autostart, token_store
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
+from app.paths import user_data_dir
 from app.ui import icons, theme
 from app.ui.components.cards import Badge
 from app.ui.components.command_palette import CommandPaletteDialog, PaletteAction
@@ -46,6 +47,7 @@ from app.ui.i18n import LANG_EN, LANG_RU, i18n, tr
 from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog
 from app.ui.provider_wizards import ProviderConfigDialog
 from app.ui.pages import (
+    AutomationPage,
     ClientsPage,
     ConnectionsPage,
     DevicesPage,
@@ -80,7 +82,7 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+8"),
     NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+9"),
     NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut=""),
-    NavItemSpec("automation", "nav.automation", "automation", "upcoming", tag="0.9.9"),
+    NavItemSpec("automation", "nav.automation", "automation", "primary", shortcut=""),
 )
 
 PAGE_IDS: tuple[str, ...] = tuple(spec.page_id for spec in NAV_SPECS)
@@ -101,6 +103,7 @@ PAGE_DEVICES = PAGE_IDS.index("devices")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
+PAGE_AUTOMATION = PAGE_IDS.index("automation")
 
 _PAGE_NAV_KEY = {spec.page_id: spec.i18n_key for spec in NAV_SPECS}
 
@@ -185,6 +188,11 @@ class MainWindow(QMainWindow):
         self.security_page = SecurityPage(desktop_policy_path=manager.desktop_policy_path())
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
+        self.automation_page = AutomationPage(
+            automation_dir=manager.automation_dir(),
+            config_root=user_data_dir(),
+            redactor=manager._redactor,
+        )
 
         self._pages_by_id: dict[str, QWidget] = {
             "home": self.home_page,
@@ -199,6 +207,7 @@ class MainWindow(QMainWindow):
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
+            "automation": self.automation_page,
         }
         self._planned_pages: dict[str, PlannedPage] = {}
         for spec in NAV_SPECS:
@@ -230,8 +239,8 @@ class MainWindow(QMainWindow):
         self._connect_manager_signals()
         self._install_shortcuts()
 
-        theme.manager().theme_changed.connect(lambda *_: self._apply_theme())
-        i18n.language_changed.connect(lambda *_: self._retranslate_all())
+        theme.manager().theme_changed.connect(self._on_theme_changed)
+        i18n.language_changed.connect(self._on_language_changed)
 
         self._desktop_poll = QTimer(self)
         self._desktop_poll.setInterval(1000)
@@ -332,6 +341,8 @@ class MainWindow(QMainWindow):
         ws.config_changed.connect(self.manager.refresh_workspace_secrets)
         ws.status_message.connect(self.toasts.show_toast)
 
+        self.automation_page.status_message.connect(self.toasts.show_toast)
+
         s = self.security_page
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
@@ -402,6 +413,8 @@ class MainWindow(QMainWindow):
             self.servers_page.reload()
         elif page_id == "workspaces":
             self.workspaces_page.reload()
+        elif page_id == "automation":
+            self.automation_page.reload()
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []
@@ -489,6 +502,12 @@ class MainWindow(QMainWindow):
             self.settings.theme_mode, self.settings.language, self.sidebar.is_collapsed
         )
         self.toasts.show_toast(tr("toast.lang_changed"), "info")
+
+    def _on_theme_changed(self, *_args: object) -> None:
+        self._apply_theme()
+
+    def _on_language_changed(self, *_args: object) -> None:
+        self._retranslate_all()
 
     def _apply_theme(self) -> None:
         theme.apply_window_titlebar(self)
@@ -1158,11 +1177,20 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._persist_geometry()
         if self._allow_close:
+            for sig, slot in (
+                (theme.manager().theme_changed, self._on_theme_changed),
+                (i18n.language_changed, self._on_language_changed),
+            ):
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
             self._desktop_poll.stop()
             self.servers_page.shutdown()
             self.workspaces_page.shutdown()
             self.extensions_page.shutdown()
             self.devices_page.shutdown()
+            self.automation_page.shutdown()
             event.accept()
             return
         event.ignore()

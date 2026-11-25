@@ -917,9 +917,11 @@ class ThemeManager(QObject):
         self._tokens = active
         _sync_globals(active)
 
-        fusion = QStyleFactory.create("Fusion")
-        if fusion is not None:
-            app.setStyle(fusion)
+        cur_style = app.style()
+        if cur_style is None or cur_style.objectName().lower() != "fusion":
+            fusion = QStyleFactory.create("Fusion")
+            if fusion is not None:
+                app.setStyle(fusion)
         app.setPalette(_palette(active))
         font = QFont()
         font.setFamilies(list(tok.SANS_FAMILIES))

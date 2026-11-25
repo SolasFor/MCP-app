@@ -61,9 +61,15 @@ class TrayIcon(QSystemTrayIcon):
         self.messageClicked.connect(lambda: self.show_requested.emit())
         manager.overall_state_changed.connect(self._on_overall)
         manager.public_url_changed.connect(self._on_public_url)
-        theme.manager().theme_changed.connect(lambda *_: self._update(self.manager.overall))
-        i18n.language_changed.connect(lambda *_: self.retranslate())
+        theme.manager().theme_changed.connect(self._on_theme_changed)
+        i18n.language_changed.connect(self._on_language_changed)
         self._update(manager.overall)
+
+    def _on_theme_changed(self, *_args: object) -> None:
+        self._update(self.manager.overall)
+
+    def _on_language_changed(self, *_args: object) -> None:
+        self.retranslate()
 
     def retranslate(self) -> None:
         self._act_open.setText(tr("tray.open"))

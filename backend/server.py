@@ -9,16 +9,18 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Literal
+from typing import Any, Literal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import paramiko
 from pydantic import AnyHttpUrl
 from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_context_var
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.auth import OAuthClientInformationFull
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
@@ -51,7 +53,16 @@ if __package__:
     )
     from .extensions import ExtensionManager, ExtensionStore
     from .remote import DeviceStore, RemoteManager, SSHConnectionError
+    from .automation import (
+        AutomationScheduler,
+        MetricsRegistry,
+        ScheduleSpec,
+        build_admin_app,
+        collect_system_snapshot,
+        export_redacted_diagnostics,
+    )
     from .tool_registry import (
+        DEFAULT_REGISTRY,
         DT_CLICK,
         DT_CLOSE_WINDOW,
         DT_DRAG,
@@ -155,7 +166,16 @@ else:
     )
     from extensions import ExtensionManager, ExtensionStore
     from remote import DeviceStore, RemoteManager, SSHConnectionError
+    from automation import (
+        AutomationScheduler,
+        MetricsRegistry,
+        ScheduleSpec,
+        build_admin_app,
+        collect_system_snapshot,
+        export_redacted_diagnostics,
+    )
     from tool_registry import (
+        DEFAULT_REGISTRY,
         DT_CLICK,
         DT_CLOSE_WINDOW,
         DT_DRAG,
@@ -408,6 +428,14 @@ GATEWAY_ROUTER = GatewayRouter(
     ),
     redactor=REDACTOR,
 )
+METRICS_REGISTRY = MetricsRegistry()
+_AUTOMATION_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "automation"
+)
+AUTOMATION_DIR = Path(os.environ.get("MCP_AUTOMATION_DIR") or _AUTOMATION_DEFAULT_DIR)
+ADMIN_TOKEN = (os.environ.get("MCP_ADMIN_TOKEN") or "").strip() or secrets.token_urlsafe(24)
+REDACTOR.register(ADMIN_TOKEN)
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
 OAUTH_ENABLED = _env_flag("MCP_ENABLE_OAUTH", True)
@@ -571,6 +599,34 @@ oauth_execution = ExecutionApprovals(oauth_provider.store) if oauth_provider is 
 if oauth_execution is not None:
     DESKTOP_MANAGER.emergency_stop_checker = oauth_execution.emergency_stopped
 
+
+def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
+    if oauth_execution is not None and oauth_execution.emergency_stopped():
+        return (False, "Emergency stop is active")
+    if spec.client_id == "owner":
+        return (True, "")
+    if oauth_provider is None or oauth_execution is None:
+        return (False, "OAuth store unavailable")
+    tok = AccessToken(
+        token="sched-check",
+        client_id=spec.client_id,
+        scopes=[READ_SCOPE],
+        resource=RESOURCE_URL,
+    )
+    if not oauth_execution.client_approved(spec.client_id):
+        return (False, f"Client {spec.client_id!r} is not approved")
+    allowed = DEFAULT_REGISTRY.allowed_tools(oauth_provider.store, tok, oauth_execution)
+    if spec.tool_name not in allowed:
+        return (False, f"Client {spec.client_id!r} is not authorized for {spec.tool_name}")
+    return (True, "")
+
+
+AUTOMATION_SCHEDULER = AutomationScheduler(
+    AUTOMATION_DIR,
+    permission_checker=_scheduler_permission_check,
+    redactor=REDACTOR,
+)
+
 # The SDK's localhost-only defaults reject public Cloudflare Host headers
 # with HTTP 421. Keep DNS-rebinding defense enabled and allow only the current
 # tunnel hostname (never a wildcard for trycloudflare.com).
@@ -595,6 +651,7 @@ mcp = (
                 oauth_provider.store,
                 oauth_execution,
                 gateway_router=GATEWAY_ROUTER,
+                metrics_registry=METRICS_REGISTRY,
             )
         ],
     )
@@ -2857,6 +2914,164 @@ def build_app():
     # появляется до того, как SDK проверит авторизацию.
     app.add_middleware(HybridAuthMiddleware)
     return app
+
+
+def build_local_admin_app(*, read_only_token: str = ""):
+    """Strictly separate localhost-only Admin REST API (never mounted on public tunnels)."""
+    tokens: dict[str, frozenset[str]] = {ADMIN_TOKEN: frozenset({"admin:read", "admin:write"})}
+    if read_only_token.strip():
+        tokens[read_only_token.strip()] = frozenset({"admin:read"})
+
+    def _snapshot() -> dict[str, Any]:
+        clients = oauth_provider.store.list_clients() if oauth_provider is not None else []
+        return collect_system_snapshot(
+            METRICS_REGISTRY,
+            clients=clients,
+            tunnel_status={"public_url": PUBLIC_URL, "json_response": JSON_RESPONSE},
+            gateway_status={"servers": len(GATEWAY_STORE.list_profiles())},
+            scheduler_stats={"schedules": len(AUTOMATION_SCHEDULER.list_schedules())},
+        )
+
+    def _export_diag() -> str:
+        log_path = Path(AUDIT_LOG)
+        lines: list[str] = []
+        if log_path.is_file():
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+            except OSError:
+                lines = []
+        return export_redacted_diagnostics(_snapshot(), audit_lines=lines, redactor=REDACTOR)
+
+    return build_admin_app(
+        admin_tokens=tokens,
+        snapshot_provider=_snapshot,
+        scheduler_list_provider=AUTOMATION_SCHEDULER.list_schedules,
+        scheduler_trigger_fn=lambda sid: AUTOMATION_SCHEDULER.trigger_now(sid, trigger="admin_api"),
+        diagnostics_export_fn=_export_diag,
+    )
+
+
+async def invoke_playground_tool(
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    profile: str = "safe",
+    client_id: str = "playground-ephemeral",
+) -> dict[str, Any]:
+    """Execute a real MCP tool in Playground with explicit profile gating and metrics tracking."""
+    t0 = time.monotonic()
+    ranks = {"safe": 0, "allowlist": 1, "full": 2}
+    if profile not in ranks:
+        METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        return {
+            "allowed": False,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "error": f"Unknown profile: {profile!r}",
+        }
+    spec = DEFAULT_REGISTRY._specs.get(tool_name)
+    if spec is None:
+        METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        return {
+            "allowed": False,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "error": f"Unknown tool: {tool_name}",
+        }
+    if tool_name != "server_info" and oauth_execution is not None and oauth_execution.emergency_stopped():
+        METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        return {
+            "allowed": False,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "error": "Denied: Emergency stop is active",
+        }
+    if ranks[profile] < ranks.get(spec.min_profile, 99):
+        METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        return {
+            "allowed": False,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "error": (
+                f"Denied: tool '{tool_name}' requires profile '{spec.min_profile}' "
+                f"(selected: '{profile}')"
+            ),
+        }
+
+    ephemeral_id = f"{client_id}-{secrets.token_hex(4)}"
+    created_ephemeral = False
+    if tool_name != "server_info" and oauth_provider is not None and oauth_execution is not None:
+        client_info = OAuthClientInformationFull(
+            client_id=ephemeral_id,
+            client_name="MCP Playground (ephemeral)",
+            redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
+        )
+        oauth_provider.store.save_client(client_info)
+        oauth_provider.store.mark_approved(ephemeral_id)
+        oauth_execution.set_client_profile(ephemeral_id, profile)
+        created_ephemeral = True
+
+    tok = AccessToken(
+        token="playground-token",
+        client_id=ephemeral_id if created_ephemeral else client_id,
+        scopes=[READ_SCOPE],
+        resource=RESOURCE_URL,
+    )
+    auth_token = auth_context_var.set(AuthenticatedUser(tok))
+    try:
+        res = await mcp.call_tool(tool_name, dict(arguments or {}))
+        elapsed = (time.monotonic() - t0) * 1000.0
+        is_err = bool(getattr(res, "isError", False))
+        METRICS_REGISTRY.record_call(tool_name, elapsed, error=is_err)
+        raw_items = getattr(res, "content", None)
+        if raw_items is None and isinstance(res, list):
+            raw_items = res
+        items_out: list[dict[str, Any]] = []
+        for item in raw_items or ():
+            if isinstance(item, TextContent) or hasattr(item, "text"):
+                items_out.append({"type": "text", "text": REDACTOR.redact_text(str(getattr(item, "text", "")))})
+            elif isinstance(item, ImageContent) or hasattr(item, "mimeType"):
+                data_val = str(getattr(item, "data", ""))
+                items_out.append({
+                    "type": "image",
+                    "mimeType": str(getattr(item, "mimeType", "image/png")),
+                    "bytes": len(data_val),
+                })
+            else:
+                items_out.append({"type": "raw", "value": REDACTOR.redact_text(str(item))})
+        structured = getattr(res, "structuredContent", None)
+        if structured is None and isinstance(res, dict):
+            structured = res
+        return {
+            "allowed": True,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "is_error": is_err,
+            "content": items_out,
+            "structured": structured,
+        }
+    except Exception as exc:  # noqa: BLE001
+        METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        return {
+            "allowed": True,
+            "live_execution": True,
+            "profile": profile,
+            "tool_name": tool_name,
+            "is_error": True,
+            "error": REDACTOR.redact_text(str(exc)) or type(exc).__name__,
+        }
+    finally:
+        auth_context_var.reset(auth_token)
+        if created_ephemeral and oauth_provider is not None:
+            try:
+                oauth_provider.store.revoke_client(ephemeral_id)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def main() -> None:

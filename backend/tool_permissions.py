@@ -5,6 +5,7 @@ Each OAuth client can have an owner-selected profile overriding the global defau
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from mcp.server.auth.middleware.auth_context import get_access_token
@@ -86,6 +87,7 @@ def make_tool_middleware(
     execution: ExecutionApprovals | None = None,
     registry: ToolRegistry = DEFAULT_REGISTRY,
     gateway_router: Any = None,
+    metrics_registry: Any = None,
 ):
     async def restrict_tools(ctx, call_next):
         if ctx.method not in ("tools/list", "tools/call"):
@@ -95,28 +97,50 @@ def make_tool_middleware(
         if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
-            if name in EXEC_TOOLS and name not in allowed:
-                raise MCPError(
-                    code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
-                )
-            if gateway_router is not None and isinstance(name, str):
-                await gateway_router.ensure_initialized()
-                await gateway_router.sync_dirty()
-                if gateway_router.is_gateway_tool(name):
-                    arguments = (
-                        params.get("arguments")
-                        if isinstance(params, dict)
-                        else getattr(params, "arguments", None)
+            t0 = time.monotonic()
+            try:
+                if name in EXEC_TOOLS and name not in allowed:
+                    raise MCPError(
+                        code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
                     )
-                    try:
-                        return await gateway_router.call_authorized_tool(
-                            name, arguments, principal, execution
+                if gateway_router is not None and isinstance(name, str):
+                    await gateway_router.ensure_initialized()
+                    await gateway_router.sync_dirty()
+                    if gateway_router.is_gateway_tool(name):
+                        arguments = (
+                            params.get("arguments")
+                            if isinstance(params, dict)
+                            else getattr(params, "arguments", None)
                         )
-                    except PermissionError as exc:
-                        raise MCPError(code=FORBIDDEN_TOOL, message=str(exc)) from exc
-                    except Exception as exc:
-                        raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
-            return await call_next(ctx)
+                        try:
+                            res = await gateway_router.call_authorized_tool(
+                                name, arguments, principal, execution
+                            )
+                        except PermissionError as exc:
+                            raise MCPError(code=FORBIDDEN_TOOL, message=str(exc)) from exc
+                        except Exception as exc:
+                            raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
+                        if metrics_registry is not None:
+                            is_err = bool(getattr(res, "isError", False)) or (
+                                isinstance(res, dict) and bool(res.get("isError"))
+                            )
+                            metrics_registry.record_call(name, (time.monotonic() - t0) * 1000.0, error=is_err)
+                        return res
+                res = await call_next(ctx)
+            except Exception:
+                if metrics_registry is not None:
+                    metrics_registry.record_call(
+                        str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=True
+                    )
+                raise
+            if metrics_registry is not None:
+                is_err = bool(getattr(res, "isError", False)) or (
+                    isinstance(res, dict) and bool(res.get("isError"))
+                )
+                metrics_registry.record_call(
+                    str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=is_err
+                )
+            return res
         result = await call_next(ctx)
         extra_tools = []
         if gateway_router is not None:

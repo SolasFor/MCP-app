@@ -53,6 +53,7 @@ class ProxyPage(QWidget):
         hint = QLabel(HINT)
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
+        self._hint_label = hint
 
         self.enabled = QCheckBox("Пускать хосты Cloudflare через прокси")
         self.enabled.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -62,10 +63,12 @@ class ProxyPage(QWidget):
         self.hosts.setPlaceholderText("Один хост на строку: host или host:port (по умолчанию 443)")
         self.hosts.setMinimumHeight(110)
 
+        self._url_label = QLabel("Адрес прокси")
+        self._hosts_label = QLabel("Хосты")
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
-        form.addRow("Адрес прокси", self.url)
-        form.addRow("Хосты", self.hosts)
+        form.addRow(self._url_label, self.url)
+        form.addRow(self._hosts_label, self.hosts)
 
         self.save_btn = _button("Сохранить", "Accent")
         self.check_btn = _button("Проверить")
@@ -110,6 +113,36 @@ class ProxyPage(QWidget):
         self._check_finished.connect(self._on_check_finished)
 
         self.load(px.load())
+
+    def retranslate(self) -> None:
+        """Preserve localized proxy controls across live language switches."""
+        from app.ui.i18n import LANG_EN, i18n
+
+        if i18n.language == LANG_EN:
+            self._hint_label.setText(
+                "If some Cloudflare hosts are blocked in your network, route only those hosts "
+                "through a local SOCKS5 or HTTP proxy. Tunnel traffic uses HTTP/2 (TCP)."
+            )
+            self.enabled.setText("Route Cloudflare hosts through proxy")
+            self._url_label.setText("Proxy URL")
+            self._hosts_label.setText("Hosts")
+            self.url.setPlaceholderText("socks5://127.0.0.1:1080 or http://user:pass@host:port")
+            self.hosts.setPlaceholderText("One host per line: host or host:port (default 443)")
+            self.save_btn.setText("Save")
+            self.check_btn.setText("Check")
+            self.reset_btn.setText("Default Hosts")
+            self.table.setHorizontalHeaderLabels(["Host", "Direct", "Via Proxy"])
+        else:
+            self._hint_label.setText(HINT)
+            self.enabled.setText("Пускать хосты Cloudflare через прокси")
+            self._url_label.setText("Адрес прокси")
+            self._hosts_label.setText("Хосты")
+            self.url.setPlaceholderText("socks5://127.0.0.1:1080  или  http://логин:пароль@host:port")
+            self.hosts.setPlaceholderText("Один хост на строку: host или host:port (по умолчанию 443)")
+            self.save_btn.setText("Сохранить")
+            self.check_btn.setText("Проверить")
+            self.reset_btn.setText("Список по умолчанию")
+            self.table.setHorizontalHeaderLabels(["Хост", "Напрямую", "Через прокси"])
 
     # ------------------------------------------------------------ данные
     def load(self, settings: px.ProxySettings) -> None:

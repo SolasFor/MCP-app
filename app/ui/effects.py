@@ -49,8 +49,8 @@ class SpotlightFrame(QFrame):
     виджетами ловим фильтром событий — иначе свет «залипал» бы на кнопках.
     """
 
-    def __init__(self, object_name: str = "Elevated", corner_radius: int = 16,
-                 light_radius: int = 300, strength: float = 0.07,
+    def __init__(self, object_name: str = "Elevated", corner_radius: int = 10,
+                 light_radius: int = 260, strength: float = 0.04,
                  parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName(object_name)

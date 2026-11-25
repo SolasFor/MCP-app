@@ -109,6 +109,16 @@ class Settings:
     minimize_to_tray_on_close: bool = True
     auto_restart: bool = True
 
+    # Интерфейс и окно (v0.9.0)
+    theme_mode: str = "dark"         # dark | light | system
+    language: str = "ru"             # ru | en
+    sidebar_collapsed: bool = False
+    window_width: int = 1120
+    window_height: int = 760
+    window_x: int | None = None
+    window_y: int | None = None
+    window_maximized: bool = False
+
     # ------------------------------------------------------------------ свойства
     @property
     def is_quick_tunnel(self) -> bool:
@@ -188,6 +198,25 @@ class Settings:
         if not self.public_url and self.tunnel_mode == TUNNEL_NAMED and not self.has_named_tunnel_config():
             # Домен не настроен вообще — «Свой домен» не запустится, остаётся временный.
             self.tunnel_mode = TUNNEL_QUICK
+        if self.theme_mode not in ("dark", "light", "system"):
+            self.theme_mode = "dark"
+        if self.language not in ("ru", "en"):
+            self.language = "ru"
+        if not isinstance(self.sidebar_collapsed, bool):
+            self.sidebar_collapsed = False
+        if not isinstance(self.window_maximized, bool):
+            self.window_maximized = False
+        for attr, default, minimum, maximum in (
+            ("window_width", 1120, 860, 4096),
+            ("window_height", 760, 600, 4096),
+        ):
+            val = getattr(self, attr)
+            if not isinstance(val, int) or isinstance(val, bool) or val < minimum or val > maximum:
+                setattr(self, attr, default)
+        for coord in ("window_x", "window_y"):
+            val = getattr(self, coord)
+            if val is not None and (not isinstance(val, int) or isinstance(val, bool)):
+                setattr(self, coord, None)
 
     def save(self) -> None:
         target = self.path()

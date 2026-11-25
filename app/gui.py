@@ -21,7 +21,8 @@ import traceback
 from datetime import datetime
 from typing import Callable
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
@@ -31,6 +32,7 @@ from app.core import autostart
 from app.core.service_manager import APP, ServiceManager
 from app.paths import user_data_dir
 from app.ui import icons, theme
+from app.ui.i18n import i18n
 from app.ui.main_window import MainWindow
 from app.ui.tray import TrayIcon
 
@@ -131,6 +133,9 @@ def run_gui(argv: list[str]) -> int:
     minimized = "--minimized" in argv[1:]
     _set_app_user_model_id()
     _install_crash_handler()
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
 
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
@@ -145,10 +150,10 @@ def run_gui(argv: list[str]) -> int:
 
     migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 
-    theme.apply(app)
-    app.setWindowIcon(icons.app_icon())
-
     settings = Settings.load()
+    i18n.set_language(settings.language)
+    theme.apply(app, settings.theme_mode)
+    app.setWindowIcon(icons.app_icon())
     try:
         autostart.refresh_if_moved()  # .exe перенесли — поправить путь в реестре
     except OSError:

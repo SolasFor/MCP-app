@@ -14,16 +14,45 @@
 | 8. Computer Use | v0.9.6 | VERIFIED | [PR #27](https://github.com/SolasFor/MCP-app/pull/27), коммит `e5837ef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45580710966), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45580711115) |
 | 9. Extensions | v0.9.7 | VERIFIED | [PR #28](https://github.com/SolasFor/MCP-app/pull/28), коммит `62c6708`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45588509164), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45588509142) |
 | 10. Remote Management | v0.9.8 | VERIFIED | [PR #29](https://github.com/SolasFor/MCP-app/pull/29), коммит `72f98de`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45595306144), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45595303716) |
-| 11. Automation & Monitoring | v0.9.9 | VERIFIED | [PR #30](https://github.com/SolasFor/MCP-app/pull/30), коммит `a7827cc`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45612560560), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45612560580) |
-| 12. Stable Release | v1.0.0 | IN_PROGRESS | Ветка `release/v1.0.0` |
+| 11. Automation & Monitoring | v0.9.9 | VERIFIED | [PR #30](https://github.com/SolasFor/MCP-app/pull/30), коммит `3b325f3`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45612560560), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45612560580) |
+| 12. Stable Release | v1.0.0 | BLOCKED (engineering/CI VERIFIED; owner release blockers remain) | [PR #31](https://github.com/SolasFor/MCP-app/pull/31), коммит `e6bc844`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45616799590), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45616799698) |
 
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/automation-monitoring`, `a7827cc` (stacked на `feat/remote-management` / PR #29).
-- Статус Этапа 11 (`v0.9.9 — Automation & Monitoring`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#30 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `release/v1.0.0`, `e6bc844` (stacked на `feat/automation-monitoring` / PR #30).
+- Статус Этапа 12 (`v1.0.0 — Stable Release`): инженерные проверки и Windows CI **VERIFIED**; публичный релиз **BLOCKED** (нет доверенного Authenticode `.pfx`, 72-часовой soak-тест `NOT_RUN`, внешние live-клиенты/провайдеры без учётных данных владельца, merge PR #20–#31 в `main` и публикация релиза требуют явного одобрения владельца).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `release/v1.0.0` от `feat/automation-monitoring` и выполнить Этап 12 (`v1.0.0 — Stable Release`).
+- Следующее действие: проверка и согласование владельцем стека PR #20–#31 для последовательного merge в `main`, принятие решения по Authenticode-подписи/72h-тесту и публикация релиза `v1.0.0`.
+
+## Этап 12: v1.0.0 — Stable Release (BLOCKED: engineering/CI VERIFIED; owner gates remain)
+- Этап / версия / ветка / HEAD: Этап 12 / `v1.0.0` / `release/v1.0.0` / `e6bc844`
+- Реализованные задачи:
+  - Обновлена версия `1.0.0` в `app/__init__.py` и `pyproject.toml`.
+  - Финализирован комплект релизной документации: `docs/threat-model-v1.md`, `docs/compatibility-matrix.md` (честное разделение `VERIFIED` / `NOT_APPLICABLE` / `BLOCKED`), `docs/upgrade-guide.md`, `docs/tool-reference.md`, `CHANGELOG.md` (`v0.8.5`–`v1.0.0`), `docs/releases/v1.0.0.md` и обновлённый `README.md` (FAQ, известные ограничения и не-гарантии полной песочницы).
+  - Добавлен E2E-набор `tests/integration/test_release_1_0_0.py`: миграции `v0.8.5 → v1.0.0` (принудительный сброс `allow_query_token=False`, перенос `managed_servers.json` v1→v2 с резервной копией, сохранность OAuth-клиентов), восстановление при битых конфигах (`fail-closed`) + `BackupManager` roundtrip, параллельные клиенты + отзыв OAuth в полёте с автопаузой расписаний, усечение флуда вывода (40+ KiB) и редактирование секретов, проверка версии и скан секретов по `git ls-files`.
+- Оставшиеся задачи и зависимости (блокеры владельца):
+  - Доверенный Authenticode-сертификат `.pfx` для подписи EXE/Setup (сборки неподписанные, `StagedUpdater.auto_install_enabled = False`).
+  - Непрерывный 72-часовой soak-тест (`NOT_RUN`).
+  - Внешняя live-матрица транспорт/клиент, требующая учётных данных/доменов/планов/лицензии владельца (Cloudflare Named domain, ngrok, Tailscale Funnel ACL, OpenAI Tunnel, ChatGPT/Claude/Gemini/Notion, live `SLDWORKS.exe` COM).
+  - Последовательный merge PR #20–#31 в `main` и публикация официального GitHub Release `v1.0.0` (по правилам `AGENTS.md` требуют одобрения владельца).
+- Изменённые файлы / миграции: `app/__init__.py`, `pyproject.toml`, `README.md`, `CHANGELOG.md`, `docs/{threat-model-v1,compatibility-matrix,upgrade-guide,tool-reference}.md`, `docs/releases/v1.0.0.md`, `tests/integration/test_release_1_0_0.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `i18n` parity: PASS (616 ключей RU/EN)
+    - `compileall`, `ruff check app backend tests tools`, `mypy` (win32 + `--platform linux`): PASS (67 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (163/163); `tests/integration`: PASS (52/52; всего 215/215)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-1.0.0-portable.zip` 67.0 MB SHA-256 `502a38cf5df0b94d33229f704db16a1064fae658b7b4d43e02fbc74316d280ff`, `SBOM.cdx.json` SHA-256 `dac7d88db12c62532de4594117953b5a6abd78ca393493764dfcd0941e502c0c`, `SHA256SUMS.txt`, frozen `MCPApp.exe --headless` `/health` 200 OK, frozen `MCPApp.exe --run-extension` worker OK).
+  - GitHub Actions CI на `e6bc844`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`2m20s`) — https://github.com/SolasFor/MCP-app/actions/runs/45616799590/job/139214170785
+    - `Verify & Test (windows-latest)`: PASS (`5m35s`) — https://github.com/SolasFor/MCP-app/actions/runs/45616799590/job/139214171445
+    - `windows-package` (`RC Windows installer (no publish)` с `MCPApp-Setup-1.0.0.exe`): PASS (`2m14s`) — https://github.com/SolasFor/MCP-app/actions/runs/45616799698/job/139214171074
+- Live tests отдельно от mocks: `local_only`, `MCPApp.exe --selftest`, frozen `--headless`, frozen `--run-extension`, `LocalSSHServer`, `stdio`/`Streamable HTTP`/`SSE` Gateway upstreams и Win32 interactive Computer Use smoke (`v0.9.6`) — **PASS**; внешние облачные клиенты/туннели, live COM `SLDWORKS.exe` и 72h soak — **BLOCKED / NOT_RUN**.
+- Риски / ограничения / блокеры: см. выше (unsigned EXE, `auto_install_enabled=False`, 72h soak `NOT_RUN`, внешняя матрица без ключей/лицензий).
+- PR / релиз: [PR #31](https://github.com/SolasFor/MCP-app/pull/31) (`release/v1.0.0` → `feat/automation-monitoring`), в очереди стека PR #20–#31.
+- Следующий точный шаг: владелец просматривает PR #20–#31, принимает решение по неподписанному релизу/Authenticode и при одобрении разрешает последовательный merge в `main` и публикацию `v1.0.0`.
+
 
 ## Этап 11: v0.9.9 — Automation & Monitoring (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 11 / `v0.9.9` / `feat/automation-monitoring` / `a7827cc`

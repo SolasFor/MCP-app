@@ -8,7 +8,7 @@
 | 2. UI Redesign | v0.9.0 | VERIFIED | [PR #21](https://github.com/SolasFor/MCP-app/pull/21), коммит `2ab3ddd`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45518398422), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45518398349) |
 | 3. Connection Manager | v0.9.1 | VERIFIED | [PR #22](https://github.com/SolasFor/MCP-app/pull/22), коммит `424481a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45522273057), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45522273017) |
 | 4. MCP Gateway | v0.9.2 | VERIFIED | [PR #23](https://github.com/SolasFor/MCP-app/pull/23), коммит `87e7fef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45563300320), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45563300338) |
-| 5. Task Manager | v0.9.3 | TODO | — |
+| 5. Task Manager | v0.9.3 | VERIFIED | [PR #24](https://github.com/SolasFor/MCP-app/pull/24), коммит `2ccd259`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45567201054), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45567201051) |
 | 6. Server Manager | v0.9.4 | TODO | — |
 | 7. Workspaces | v0.9.5 | TODO | — |
 | 8. Computer Use | v0.9.6 | TODO | — |
@@ -20,10 +20,35 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/mcp-gateway`, `87e7fef` (stacked на `feat/connection-manager` / PR #22).
-- Статус Этапа 4 (`v0.9.2 — MCP Gateway`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#23; живой SolidWorks COM smoke и внешняя цепочка MCP Inspector / ChatGPT через публичный туннель отмечены как `BLOCKED`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/task-manager`, `2ccd259` (stacked на `feat/mcp-gateway` / PR #23).
+- Статус Этапа 5 (`v0.9.3 — Task Manager`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#24 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/task-manager` от `feat/mcp-gateway` и реализовать Этап 5 (`v0.9.3 — Task Manager`).
+- Следующее действие: отвести ветку `feat/server-manager` от `feat/task-manager` и реализовать Этап 6 (`v0.9.4 — Server Manager`).
+
+## Этап 5: v0.9.3 — Task Manager (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 5 / `v0.9.3` / `feat/task-manager` / `2ccd259`
+- Реализованные задачи:
+  - Реализован пакет `backend/tasks/` (`{__init__,models,store,manager}.py`): долговечный реестр `tasks.sqlite3` (WAL + `schema_migrations` v1 + пользовательские ACL) с шифрованием спецификаций команд DPAPI (Windows) / POSIX `0600` ключом, атомарной идемпотентностью `(owner_client_id, idempotency_key)`, приоритетной очередью `priority DESC, created_at ASC`, глобальными и per-client квотами параллельности (`max_global=4`, `max_per_client=2`, `max_queued_per_client=20`), восстановлением незавершённых задач при перезапуске (`recover_interrupted()` → `interrupted`, без автоповтора неидемпотентных команд), явным рестартом (`parent_task_id`) и квотами удержания/очистки спула и артефактов (`enforce_retention`), а также маппингом статусов `to_mcp_task_dict()` под схему MCP `Task` без требования клиентской поддержки `tasks/*`.
+  - В `backend/process_runner.py` добавлены `run_id`, `on_started`, `cancel_run()` (завершение всего дерева процессов через Job Object на Windows или `terminate_process_tree` + POSIX `start_new_session=True`), сохранено отсечение секретов и скрытые консольные окна.
+  - В `backend/tool_registry.py`, `backend/server.py` и `app/core/service_manager.py` добавлены 8 OAuth-инструментов (`task_start`, `task_status`, `task_list`, `task_output`, `task_result`, `task_cancel`, `task_restart`, `task_artifacts`) с сохранением синхронных `oauth_windows_command` и `oauth_ssh_command`, перепроверкой прав и аварийной остановки перед запуском и строгой кросс-клиентской изоляцией владельца.
+  - Создана страница `app/ui/pages/tasks_page.py` (`TasksPage`: фильтры `All`/`Active`/`History` и статусов, поиск, прогресс `—` когда неизвестен без выдуманных процентов, живой redacted вывод `stdout`/`stderr`, просмотр и экспорт `result.json` артефактов, кнопки Отмена/Перезапуск) + уведомления в трее (`TrayIcon.notify_task_event` в `app/ui/tray.py`, интеграция в `app/ui/main_window.py` `Ctrl+5`, `app/gui.py`, RU/EN `app/ui/i18n.py`, `docs/task-manager.md`, `README.md`).
+- Оставшиеся задачи и зависимости: последовательный merge [PR #24](https://github.com/SolasFor/MCP-app/pull/24) после PR #20–#23; задачи честно завершаются статусом `interrupted` при выключении ОС/бэкенда и не обещают продолжения после выключения компьютера.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.3`), `packaging/mcp_app.spec`, `backend/tasks/`, `backend/{process_runner,tool_registry,server}.py`, `app/core/service_manager.py`, `app/{gui,selftest}.py`, `app/ui/{i18n,main_window,tray}.py`, `app/ui/pages/{__init__,tasks_page}.py`, `tests/unit/{test_task_manager,test_tool_permissions}.py`, `tests/integration/{test_task_manager_integration,test_tool_registry,test_oauth_http,test_ui_redesign_gui,test_unified_home_gui}.py`, `docs/task-manager.md`, `README.md`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend tests`, `mypy` (win32 + `--platform linux`): PASS (30 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (135/135 за 9.591s — включая зашифрованное хранение, квоты, приоритеты, `recover_interrupted`, убийство дочернего дерева процессов при отмене, отзыв прав в очереди, кросс-клиентский отказ и ротацию)
+    - `tests/integration`: PASS (25/25 за 94.214s; всего 160/160 — включая продолжение фоновой задачи после отключения клиента, пагинированный `stdout`/redacted `stderr`, `result.json`, явный рестарт и headless `TasksPage` GUI + `TrayIcon.notify_task_event`)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.3-portable.zip` 66.6 MB)
+  - GitHub Actions CI на `2ccd259`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`1m30s`) — https://github.com/SolasFor/MCP-app/actions/runs/45567201054/job/139044801433
+    - `Verify & Test (windows-latest)`: PASS (`3m20s`) — https://github.com/SolasFor/MCP-app/actions/runs/45567201054/job/139044800971
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m48s`) — https://github.com/SolasFor/MCP-app/actions/runs/45567201051/job/139044801573
+- Live tests отдельно от mocks: реальные дочерние процессы и дерево процессов, SQLite WAL persistence/recovery, disk spool pagination и Qt `TasksPage` — **PASS**; реальное выключение ПК не моделируется ОС (честно зафиксирован recovery-статус `interrupted`).
+- Риски / ограничения / блокеры: сборка без Authenticode-сертификата; продолжение задач после полного выключения ПК невозможно (документировано в `docs/task-manager.md`).
+- PR / релиз: [PR #24](https://github.com/SolasFor/MCP-app/pull/24) (`feat/task-manager` → `feat/mcp-gateway`).
+- Следующий точный шаг: Этап 6 (`v0.9.4 — Server Manager`) на ветке `feat/server-manager`.
 
 ## Этап 4: v0.9.2 — MCP Gateway (VERIFIED; live SolidWorks COM / external tunnel smoke: BLOCKED)
 - Этап / версия / ветка / HEAD: Этап 4 / `v0.9.2` / `feat/mcp-gateway` / `87e7fef`

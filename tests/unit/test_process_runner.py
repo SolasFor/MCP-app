@@ -146,16 +146,18 @@ class ProcessRunnerTests(unittest.TestCase):
         try:
             res = asyncio.run(
                 self.runner.run_command(
-                    [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+                    [sys.executable, "-c", "import json, os; print(json.dumps(sorted(os.environ.keys())))"],
                     cwd=self.tmp.name,
                     timeout=10,
+                    output_limit=65536,
+                    max_memory_bytes=256 * 1024,
                 )
             )
             self.assertEqual(res.exit_code, 0)
-            child_env = json.loads(res.stdout)
-            self.assertNotIn("MCP_SECRET_TOKEN", child_env)
-            self.assertNotIn("TUNNEL_TOKEN", child_env)
-            self.assertNotIn("MCP_CUSTOM_SECRET", child_env)
+            child_keys = set(json.loads(res.stdout))
+            self.assertNotIn("MCP_SECRET_TOKEN", child_keys)
+            self.assertNotIn("TUNNEL_TOKEN", child_keys)
+            self.assertNotIn("MCP_CUSTOM_SECRET", child_keys)
         finally:
             for k, v in old_env.items():
                 if v is None:

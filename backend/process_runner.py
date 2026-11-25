@@ -323,15 +323,32 @@ class ProcessRunner:
                 breakaway_from_job=(lifecycle == "independent"),
             )
             launcher = spawn_fn or asyncio.create_subprocess_exec
-            process = await launcher(
-                *argv,
-                cwd=str(cwd),
-                env=child_env,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=flags,
-            )
+            try:
+                process = await launcher(
+                    *argv,
+                    cwd=str(cwd),
+                    env=child_env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=flags,
+                )
+            except PermissionError:
+                if lifecycle != "independent":
+                    raise
+                # Parent host job (e.g. CI runner) may forbid CREATE_BREAKAWAY_FROM_JOB.
+                fallback_flags = self.platform.subprocess_creation_flags(
+                    detached=True, hide_console=False, breakaway_from_job=False
+                )
+                process = await launcher(
+                    *argv,
+                    cwd=str(cwd),
+                    env=child_env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=fallback_flags,
+                )
 
             pid = getattr(process, "pid", None)
             if isinstance(pid, int) and pid > 0:
@@ -469,16 +486,34 @@ class ProcessRunner:
             hide_console=(lifecycle == "controlled"),
             breakaway_from_job=(lifecycle == "independent"),
         )
-        proc = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            env=child_env,
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=flags,
-        )
+        try:
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=child_env,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=flags,
+            )
+        except PermissionError:
+            if lifecycle != "independent":
+                raise
+            # Parent host job (e.g. CI runner) may forbid CREATE_BREAKAWAY_FROM_JOB.
+            fallback_flags = self.platform.subprocess_creation_flags(
+                detached=True, hide_console=False, breakaway_from_job=False
+            )
+            proc = subprocess.Popen(
+                argv,
+                cwd=str(cwd),
+                env=child_env,
+                shell=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=fallback_flags,
+            )
         identity = self.platform.capture_process_identity(proc.pid)
         job: ProcessJobHandle | None = None
         if lifecycle == "controlled":

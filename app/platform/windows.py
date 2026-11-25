@@ -4,9 +4,11 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+import sys
 import time
 from ctypes import wintypes
 from pathlib import Path
+from typing import Any
 
 import psutil
 
@@ -91,13 +93,25 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+def _windll() -> Any:
+    if sys.platform != "win32":
+        raise OSError("Windows API is unavailable on this platform")
+    return ctypes.windll
+
+
+def _win_error() -> OSError:
+    if sys.platform != "win32":
+        return OSError("Windows API is unavailable on this platform")
+    return ctypes.WinError()
+
+
 class WindowsPlatformAdapter(PlatformAdapter):
     """Windows 10/11 implementation using Win32 APIs and psutil."""
 
     def create_job(
         self, name: str = "", kill_on_close: bool = True, allow_breakaway: bool = False
     ) -> ProcessJobHandle | None:
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _windll().kernel32
         kernel32.CreateJobObjectW.restype = wintypes.HANDLE
         handle = kernel32.CreateJobObjectW(None, name or None)
         if not handle:
@@ -126,7 +140,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
     ) -> bool:
         if not job.active or not job.handle or pid <= 0:
             return False
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _windll().kernel32
         opened = None
         target_handle = process_handle
         if target_handle is None:
@@ -151,14 +165,14 @@ class WindowsPlatformAdapter(PlatformAdapter):
     def terminate_job(self, job: ProcessJobHandle, exit_code: int = 1) -> bool:
         if not job.active or not job.handle:
             return False
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = _windll().kernel32
         ok = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job.handle), wintypes.UINT(exit_code)))
         return ok
 
     def close_job(self, job: ProcessJobHandle) -> None:
         if not job.active or not job.handle:
             return
-        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(job.handle))
+        _windll().kernel32.CloseHandle(wintypes.HANDLE(job.handle))
         job.active = False
         job.handle = None
 
@@ -286,7 +300,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
         buf = ctypes.create_string_buffer(data)
         source = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
         output = _DataBlob()
-        ok = ctypes.windll.crypt32.CryptProtectData(
+        ok = _windll().crypt32.CryptProtectData(
             ctypes.byref(source),
             description,
             None,
@@ -296,17 +310,17 @@ class WindowsPlatformAdapter(PlatformAdapter):
             ctypes.byref(output),
         )
         if not ok:
-            raise ctypes.WinError()
+            raise _win_error()
         try:
             return ctypes.string_at(output.pbData, output.cbData)
         finally:
-            ctypes.windll.kernel32.LocalFree(output.pbData)
+            _windll().kernel32.LocalFree(output.pbData)
 
     def dpapi_unprotect(self, blob: bytes) -> bytes:
         buf = ctypes.create_string_buffer(blob)
         source = _DataBlob(len(blob), ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte)))
         output = _DataBlob()
-        ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ok = _windll().crypt32.CryptUnprotectData(
             ctypes.byref(source),
             None,
             None,
@@ -316,16 +330,16 @@ class WindowsPlatformAdapter(PlatformAdapter):
             ctypes.byref(output),
         )
         if not ok:
-            raise ctypes.WinError()
+            raise _win_error()
         try:
             return ctypes.string_at(output.pbData, output.cbData)
         finally:
-            ctypes.windll.kernel32.LocalFree(output.pbData)
+            _windll().kernel32.LocalFree(output.pbData)
 
     def credman_write(self, target: str, secret: bytes, username: str = "MCPApp") -> bool:
         if not target or len(secret) > _CRED_MAX_BLOB_BYTES:
             return False
-        advapi32 = ctypes.windll.advapi32
+        advapi32 = _windll().advapi32
         buf = ctypes.create_string_buffer(secret)
         cred = _CredentialW()
         cred.Flags = 0
@@ -344,7 +358,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
     def credman_read(self, target: str) -> bytes | None:
         if not target:
             return None
-        advapi32 = ctypes.windll.advapi32
+        advapi32 = _windll().advapi32
         p_cred = ctypes.POINTER(_CredentialW)()
         ok = advapi32.CredReadW(target, _CRED_TYPE_GENERIC, 0, ctypes.byref(p_cred))
         if not ok or not p_cred:
@@ -360,7 +374,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
     def credman_delete(self, target: str) -> bool:
         if not target:
             return False
-        return bool(ctypes.windll.advapi32.CredDeleteW(target, _CRED_TYPE_GENERIC, 0))
+        return bool(_windll().advapi32.CredDeleteW(target, _CRED_TYPE_GENERIC, 0))
 
     def restrict_path_acl(self, path: Path, is_dir: bool = False) -> bool:
         user = os.environ.get("USERNAME")
@@ -381,7 +395,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
     def default_oem_encoding(self) -> str:
         try:
-            cp = int(ctypes.windll.kernel32.GetOEMCP())
+            cp = int(_windll().kernel32.GetOEMCP())
             if cp > 0:
                 return f"cp{cp}"
         except (AttributeError, OSError):
@@ -390,7 +404,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
 
     def default_ansi_encoding(self) -> str:
         try:
-            cp = int(ctypes.windll.kernel32.GetACP())
+            cp = int(_windll().kernel32.GetACP())
             if cp > 0:
                 return f"cp{cp}"
         except (AttributeError, OSError):

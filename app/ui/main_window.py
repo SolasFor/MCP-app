@@ -48,6 +48,7 @@ from app.ui.provider_wizards import ProviderConfigDialog
 from app.ui.pages import (
     ClientsPage,
     ConnectionsPage,
+    GatewayPage,
     HomePage,
     LogsPage,
     PlannedPage,
@@ -65,10 +66,10 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("home", "nav.home", "home", "primary", shortcut="Ctrl+1"),
     NavItemSpec("connections", "nav.connections", "connections", "primary", shortcut="Ctrl+2"),
     NavItemSpec("clients", "nav.clients", "clients", "primary", shortcut="Ctrl+3"),
-    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+4"),
-    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+5"),
-    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+6"),
-    NavItemSpec("gateway", "nav.gateway", "gateway", "upcoming", tag="0.9.2"),
+    NavItemSpec("gateway", "nav.gateway", "gateway", "primary", shortcut="Ctrl+4"),
+    NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+5"),
+    NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+6"),
+    NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut="Ctrl+7"),
     NavItemSpec("tasks", "nav.tasks", "tasks", "upcoming", tag="0.9.3"),
     NavItemSpec("servers", "nav.servers", "servers", "upcoming", tag="0.9.4"),
     NavItemSpec("workspaces", "nav.workspaces", "workspaces", "upcoming", tag="0.9.5"),
@@ -86,6 +87,7 @@ PAGE_OVERVIEW = 0
 PAGE_CONNECTION = PAGE_OVERVIEW
 PAGE_CONNECTIONS = PAGE_IDS.index("connections")
 PAGE_CLIENTS = PAGE_IDS.index("clients")
+PAGE_GATEWAY = PAGE_IDS.index("gateway")
 PAGE_SECURITY = PAGE_IDS.index("security")
 PAGE_LOGS = PAGE_IDS.index("logs")
 PAGE_SETTINGS = PAGE_IDS.index("settings")
@@ -144,6 +146,7 @@ class MainWindow(QMainWindow):
         self.home_page = HomePage()
         self.connections_page = ConnectionsPage()
         self.clients_page = ClientsPage()
+        self.gateway_page = GatewayPage(config_path=manager.gateway_config_path())
         self.security_page = SecurityPage()
         self.logs_page = LogsPage()
         self.settings_page = SettingsPage(settings, manager.cloudflared_path(), tray_available)
@@ -152,6 +155,7 @@ class MainWindow(QMainWindow):
             "home": self.home_page,
             "connections": self.connections_page,
             "clients": self.clients_page,
+            "gateway": self.gateway_page,
             "security": self.security_page,
             "logs": self.logs_page,
             "settings": self.settings_page,
@@ -259,6 +263,10 @@ class MainWindow(QMainWindow):
         cl.allowlist_requested.connect(self._open_allowlist)
         cl.clients_updated.connect(h.set_clients_summary)
 
+        gw = self.gateway_page
+        gw.config_changed.connect(self.manager.refresh_gateway_secrets)
+        gw.status_message.connect(self.toasts.show_toast)
+
         s = self.security_page
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
@@ -315,6 +323,8 @@ class MainWindow(QMainWindow):
             self.sidebar.set_badge("logs", 0)
         elif page_id == "clients":
             self.clients_page.set_public_url(self._effective_oauth_url())
+        elif page_id == "gateway":
+            self.gateway_page.reload()
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []

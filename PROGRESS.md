@@ -7,7 +7,7 @@
 | 1. Stability & Security | v0.8.6 | VERIFIED | [PR #20](https://github.com/SolasFor/MCP-app/pull/20), коммит `f6c0dd7`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45514910047), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45514910385) |
 | 2. UI Redesign | v0.9.0 | VERIFIED | [PR #21](https://github.com/SolasFor/MCP-app/pull/21), коммит `2ab3ddd`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45518398422), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45518398349) |
 | 3. Connection Manager | v0.9.1 | VERIFIED | [PR #22](https://github.com/SolasFor/MCP-app/pull/22), коммит `424481a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45522273057), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45522273017) |
-| 4. MCP Gateway | v0.9.2 | TODO | — |
+| 4. MCP Gateway | v0.9.2 | VERIFIED | [PR #23](https://github.com/SolasFor/MCP-app/pull/23), коммит `87e7fef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45563300320), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45563300338) |
 | 5. Task Manager | v0.9.3 | TODO | — |
 | 6. Server Manager | v0.9.4 | TODO | — |
 | 7. Workspaces | v0.9.5 | TODO | — |
@@ -20,10 +20,34 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/connection-manager`, `424481a` (stacked на `feat/ui-redesign` / PR #21).
-- Статус Этапа 3 (`v0.9.1 — Connection Manager`): `VERIFIED` (ожидает одобрения владельца для последовательного merge [PR #22](https://github.com/SolasFor/MCP-app/pull/22); внешние публичные live-проверки Cloudflare/ngrok/Tailscale/OpenAI отмечены как `BLOCKED` без разрешения/учётных данных владельца).
-- Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/mcp-gateway` от `feat/connection-manager` и реализовать Этап 4 (`v0.9.2 — MCP Gateway`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/mcp-gateway`, `87e7fef` (stacked на `feat/connection-manager` / PR #22).
+- Статус Этапа 4 (`v0.9.2 — MCP Gateway`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#23; живой SolidWorks COM smoke и внешняя цепочка MCP Inspector / ChatGPT через публичный туннель отмечены как `BLOCKED`).
+- Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
+- Следующее действие: отвести ветку `feat/task-manager` от `feat/mcp-gateway` и реализовать Этап 5 (`v0.9.3 — Task Manager`).
+
+## Этап 4: v0.9.2 — MCP Gateway (VERIFIED; live SolidWorks COM / external tunnel smoke: BLOCKED)
+- Этап / версия / ветка / HEAD: Этап 4 / `v0.9.2` / `feat/mcp-gateway` / `87e7fef`
+- Реализованные задачи:
+  - Реализован пакет `backend/gateway/` (`{__init__,models,security,store,upstream_client,router}.py`): профили `UpstreamServerProfile`, локальный `stdio`, удалённый `Streamable HTTP` и опциональный legacy `SSE` на базе `mcp==2.3.0`; выделенная задача жизненного цикла (`_lifecycle_task`) на каждое upstream-соединение с обработкой `BaseException`/`CancelledError` при отказе на старте (`DEAD_PORT_ISOLATION_OK`), ограниченной пагинацией `tools/list`, строгими таймаутами без автоповтора неидемпотентных вызовов и обработкой `notifications/tools/list_changed` с привязкой к `client_id`.
+  - Безопасность и изоляция: детерминированные namespaces `<server_id>__<tool>` (`<=64` символов с хеш-разрешением коллизий), SSRF/cloud-metadata/embedded-credentials/self-recursion валидация (`validate_upstream_url`), защита от маршрутных циклов (`X-MCP-Gateway-Id`, `X-MCP-Gateway-Hop` в `HybridAuthMiddleware` → HTTP `400 gateway_loop_detected`), отсечение downstream `Authorization`/cookie, хранение env-секретов, bearer-токенов и заголовков в DPAPI `SecretStore`, импорт стандартного `mcpServers` JSON только после подтверждения владельца с предупреждением о динамических лаунчерах (`npx`/`uvx`/скрипты), экспорт без секретов, изоляция сессий `per_client` / `shared_service`, редактирование секретов в `TextContent`, `structuredContent` и логах, ограничение `max_response_bytes`.
+  - Интеграция в сервер и UI: `backend/tool_permissions.py` (`make_tool_middleware(..., gateway_router=...)`), `backend/server.py` (`GATEWAY_STORE`, `GATEWAY_ROUTER`, `REDACTOR`, закрытие при остановке), `app/core/service_manager.py` (`MCP_GATEWAY_CONFIG_PATH`, `refresh_gateway_secrets()`), новая страница `app/ui/pages/gateway_page.py` (`GatewayPage`, `GatewayServerDialog`, `GatewayImportPreviewDialog`, шаблон `solidworks_mcp_template` с `approved_by_owner=False`, инспектор схем, redacted логи), переключение в активный раздел бокового меню `Ctrl+4` (`app/ui/main_window.py`, RU/EN `app/ui/i18n.py`), `docs/mcp-gateway.md`, `README.md`, `packaging/mcp_app.spec`, `.github/workflows/transport-checks.yml` (`timeout-minutes: 15`, `QT_QPA_PLATFORM: offscreen`).
+- Оставшиеся задачи и зависимости: последовательный merge [PR #23](https://github.com/SolasFor/MCP-app/pull/23) после PR #20–#22; live CAD smoke (при наличии установленного SolidWorks) и внешняя проверка MCP Inspector / ChatGPT через публичный туннель владельца.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.2`), `packaging/mcp_app.spec`, `backend/gateway/`, `backend/{server,tool_permissions}.py`, `app/core/service_manager.py`, `app/ui/{main_window,i18n}.py`, `app/ui/pages/{__init__,gateway_page}.py`, `tests/fixtures/gateway_stdio_server.py`, `tests/unit/test_gateway_security.py`, `tests/integration/{test_mcp_gateway,test_ui_redesign_gui,test_unified_home_gui}.py`, `docs/mcp-gateway.md`, `README.md`, `.github/workflows/transport-checks.yml`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend tests`, `mypy` (win32 + `--platform linux`): PASS (26 файлов, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (132/132 за 8.672s)
+    - `tests/integration`: PASS (24/24 за 85.635s; всего 156/156, включая реальные `stdio`, `Streamable HTTP`, `SSE`, недоступный 4-й сервер, коллизии имён, динамические tools + `tools/list_changed`, `ImageContent` + `structured_content` + redaction, per-client isolation, fail-closed OAuth/emergency stop, ASGI HTTP `400` loop guard и headless `GatewayPage` GUI)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.2-portable.zip` 66.6 MB)
+  - GitHub Actions CI на `87e7fef`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`1m17s`) — https://github.com/SolasFor/MCP-app/actions/runs/45563300320/job/139031944058
+    - `Verify & Test (windows-latest)`: PASS (`3m16s`) — https://github.com/SolasFor/MCP-app/actions/runs/45563300320/job/139031944826
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m38s`) — https://github.com/SolasFor/MCP-app/actions/runs/45563300338/job/139031944669
+- Live tests отдельно от mocks: реальные локальные процессы/серверы `stdio` + `Streamable HTTP` + `SSE` + недоступный 4-й сервер и headless Qt `GatewayPage` — **PASS**; живой SolidWorks COM smoke (`SLDWORKS.exe`, создание тестовой `SLDPRT`) и внешняя цепочка `MCP Inspector / ChatGPT -> Tunnel -> Gateway` — **BLOCKED** (на сборочной машине нет установленного SolidWorks и лицензии; нет внешней учётной записи/туннеля для удалённого публичного прогона).
+- Риски / ограничения / блокеры: отсутствие `SLDWORKS.exe` для физического COM CAD smoke; внешний клиент через публичный туннель зависит от Этапа 3 (разрешение/учётные данные владельца); сборка без Authenticode-сертификата.
+- PR / релиз: [PR #23](https://github.com/SolasFor/MCP-app/pull/23) (`feat/mcp-gateway` → `feat/connection-manager`).
+- Следующий точный шаг: Этап 5 (`v0.9.3 — Task Manager`) на ветке `feat/task-manager`.
 
 ## Этап 3: v0.9.1 — Connection Manager (VERIFIED; external live smoke: BLOCKED)
 - Этап / версия / ветка / HEAD: Этап 3 / `v0.9.1` / `feat/connection-manager` / `424481a`

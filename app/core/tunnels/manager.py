@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,27 +13,30 @@ from app.core.tunnels.base import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
     ConnectionIdentity,
     DiagnosticCheck,
     IssuerTransitionWarning,
+    ProviderDetection,
     RouteOwnershipStore,
     TunnelProvider,
 )
 from app.core.tunnels.cloudflare import CloudflareNamedProvider, CloudflareQuickProvider
 from app.core.tunnels.local_only import LocalOnlyProvider
 from app.core.tunnels.ngrok import NgrokProvider
-from app.core.tunnels.openai_tunnel import OpenAISecureTunnelProvider
 from app.core.tunnels.tailscale import TailscaleFunnelProvider
 from app.platform import get_platform
 
 CONNECTIONS_FILE = "connections.json"
 ROUTES_FILE = "routes.json"
+_REMOVED_PROVIDER_OPENAI = "openai_tunnel"
+_LEGACY_OPENAI_SECRET_NS = "tunnel"
+_LEGACY_OPENAI_SECRET_KEY = "openai_tunnel_api_key"
+_DETECT_CACHE_TTL_S = 60.0
 
 
 class ConnectionManager:
-    """Manages all 6 MCP-app transport providers and non-secret connection persistence."""
+    """Manages all 5 MCP-app transport providers and non-secret connection persistence."""
 
     def __init__(self, data_dir: Path, secret_store: SecretStore | None = None) -> None:
         self._data_dir = Path(data_dir)
@@ -50,10 +54,11 @@ class ConnectionManager:
             PROVIDER_CF_NAMED: CloudflareNamedProvider(self.secrets, self.ownership),
             PROVIDER_NGROK: NgrokProvider(self.secrets, self.ownership),
             PROVIDER_TAILSCALE: TailscaleFunnelProvider(self.secrets, self.ownership),
-            PROVIDER_OPENAI: OpenAISecureTunnelProvider(self.secrets, self.ownership),
             PROVIDER_LOCAL: LocalOnlyProvider(self.secrets, self.ownership),
         }
         self._active_provider_id = PROVIDER_CF_QUICK
+        self.migrated_from_provider: str = ""
+        self._detect_cache: dict[str, tuple[float, ProviderDetection]] = {}
         self._load()
 
     def _load(self) -> None:
@@ -64,10 +69,18 @@ class ConnectionManager:
         if not isinstance(raw, dict):
             return
         active = str(raw.get("active_provider") or PROVIDER_CF_QUICK)
-        if active in ALL_PROVIDERS:
+        needs_save = False
+        if active == _REMOVED_PROVIDER_OPENAI:
+            # Safely migrate removed OpenAI Tunnel to Local only; never auto-publish a public tunnel.
+            self._active_provider_id = PROVIDER_LOCAL
+            self.migrated_from_provider = _REMOVED_PROVIDER_OPENAI
+            needs_save = True
+        elif active in ALL_PROVIDERS:
             self._active_provider_id = active
         configs = raw.get("providers")
         if isinstance(configs, dict):
+            if _REMOVED_PROVIDER_OPENAI in configs:
+                needs_save = True
             for pid, cfg in configs.items():
                 if pid in self.providers and isinstance(cfg, dict):
                     # Strip any accidentally injected raw secret fields from JSON on disk.
@@ -77,6 +90,24 @@ class ConnectionManager:
                         if k not in ("authtoken", "api_key", "tunnel_token", "token")
                     }
                     self.providers[pid].load_config(clean_cfg)
+        if needs_save:
+            try:
+                self.save()
+            except OSError:
+                pass
+
+    def has_legacy_openai_secret(self) -> bool:
+        try:
+            return bool(self.secrets.get_secret(_LEGACY_OPENAI_SECRET_NS, _LEGACY_OPENAI_SECRET_KEY))
+        except (OSError, ValueError, RuntimeError):
+            return False
+
+    def purge_legacy_openai_secret(self) -> bool:
+        """Delete ONLY the leftover OpenAI Secure MCP Tunnel API key on owner confirmation."""
+        try:
+            return self.secrets.delete_secret(_LEGACY_OPENAI_SECRET_NS, _LEGACY_OPENAI_SECRET_KEY)
+        except (OSError, ValueError, RuntimeError):
+            return False
 
     def save(self) -> None:
         payload = {
@@ -176,6 +207,27 @@ class ConnectionManager:
             mcp_path=mcp_path,
         )
 
+    def refresh_detections(self) -> dict[str, ProviderDetection]:
+        now = time.monotonic()
+        out: dict[str, ProviderDetection] = {}
+        for pid, provider in self.providers.items():
+            det = provider.detect()
+            self._detect_cache[pid] = (now, det)
+            out[pid] = det
+        return out
+
+    def _cached_detection(self, pid: str, provider: TunnelProvider, *, refresh: bool) -> ProviderDetection:
+        now = time.monotonic()
+        cached = self._detect_cache.get(pid)
+        if not refresh and cached is not None and (now - cached[0]) < _DETECT_CACHE_TTL_S:
+            return cached[1]
+        if not refresh and cached is None:
+            # Fast non-blocking placeholder for background/theme refreshes until ConnectionsPage probes.
+            return ProviderDetection(installed=pid == PROVIDER_LOCAL)
+        det = provider.detect()
+        self._detect_cache[pid] = (now, det)
+        return det
+
     def list_statuses(
         self,
         *,
@@ -184,16 +236,19 @@ class ConnectionManager:
         mcp_path: str,
         runtime_url: str = "",
         running: bool = False,
+        refresh_detection: bool = False,
     ) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
         for pid, provider in self.providers.items():
             is_this_active = pid == self._active_provider_id
+            det = self._cached_detection(pid, provider, refresh=refresh_detection)
             result[pid] = provider.summary_dict(
                 local_host=local_host,
                 local_port=local_port,
                 mcp_path=mcp_path,
                 runtime_url=runtime_url if is_this_active else "",
                 running=running and is_this_active,
+                detection=det,
             )
         return result
 

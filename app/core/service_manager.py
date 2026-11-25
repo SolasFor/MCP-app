@@ -52,8 +52,8 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
+    REMOVED_PROVIDER_OPENAI,
     TUNNEL_MODES,
     TUNNEL_NAMED,
     TUNNEL_QUICK,
@@ -76,7 +76,6 @@ from app.core.tunnels import (
     ConnectionManager,
     IssuerTransitionWarning,
     NgrokProvider,
-    OpenAISecureTunnelProvider,
     TailscaleFunnelProvider,
 )
 from app.core.tunnels.ngrok import parse_ngrok_log_line
@@ -215,6 +214,10 @@ class ServiceManager(QObject):
         self._restart_all_pending = False     # после остановки всё запустить снова (новые настройки)
 
         self.connections = ConnectionManager(user_data_dir())
+        if self.connections.migrated_from_provider == REMOVED_PROVIDER_OPENAI:
+            self.settings.migrated_from_provider = REMOVED_PROVIDER_OPENAI
+            self.settings.active_provider = PROVIDER_LOCAL
+            self._save_settings()
         if settings.active_provider in ALL_PROVIDERS:
             self.connections.set_active_provider(settings.active_provider)
         self._sync_named_provider_config()
@@ -282,13 +285,37 @@ class ServiceManager(QObject):
 
     @property
     def public_url(self) -> str:
-        """Публичный HTTPS-адрес для клиентов ('' для local_only и openai_tunnel)."""
+        """Публичный HTTPS-адрес для клиентов ('' для local_only)."""
         return self.connection_identity.public_url
 
     @property
     def oauth_resource_url(self) -> str:
-        """Resource URL для локального OAuth-провайдера (включая local_only и openai_tunnel)."""
+        """Resource URL для локального OAuth-провайдера (включая local_only)."""
         return self.public_url or self.connection_identity.oauth_resource_url
+
+    @property
+    def active_server_oauth_url(self) -> str:
+        """OAuth resource URL of the currently running backend, or configured provider URL."""
+        if self.server.is_alive() and self._server_url:
+            return self._server_url
+        return self.oauth_resource_url
+
+    @property
+    def oauth_store_path(self) -> Path:
+        return user_data_dir() / "oauth" / "connections.sqlite3"
+
+    @property
+    def migrated_from_openai_tunnel(self) -> bool:
+        return (
+            self.settings.migrated_from_provider == REMOVED_PROVIDER_OPENAI
+            or self.connections.migrated_from_provider == REMOVED_PROVIDER_OPENAI
+        )
+
+    def has_legacy_openai_secret(self) -> bool:
+        return self.connections.has_legacy_openai_secret()
+
+    def purge_legacy_openai_secret(self) -> bool:
+        return self.connections.purge_legacy_openai_secret()
 
     def _sync_named_provider_config(self) -> None:
         self.connections.get(PROVIDER_CF_NAMED).load_config(
@@ -361,10 +388,26 @@ class ServiceManager(QObject):
         self._redactor.unregister(self._token)
         self._token = token
         self._redactor.register(token)
+        self._bind_oauth_owner_token(token)
         self._log(f"✔ Токен изменён ({token_store.mask(token)}). Обновите его в подключённых клиентах.")
         self.token_changed.emit()
-        self._restart_if_running("новый токен")
+        self._restart_server_only("новый токен")
         return None
+
+    def _bind_oauth_owner_token(self, token: str) -> None:
+        url = self.active_server_oauth_url
+        if not url:
+            return
+        try:
+            from backend.oauth_store import OAuthStore, canonical_oauth_urls
+
+            issuer, canonical_res = canonical_oauth_urls(url)
+            if not issuer:
+                return
+            store = OAuthStore(self.oauth_store_path, issuer, canonical_res)
+            store.bind_owner(token)
+        except Exception:  # noqa: BLE001
+            pass
 
     def generate_token(self) -> str | None:
         return self.set_token(token_store.generate())
@@ -591,8 +634,6 @@ class ServiceManager(QObject):
                 problems.append(det.detail or f"Клиент транспорта {pid} не установлен.")
             for err in prov.validate_config():
                 problems.append(err)
-            if pid == PROVIDER_OPENAI and not str(prov.export_config().get("tunnel_id") or "").strip():
-                problems.append("Укажите OpenAI Tunnel ID в настройках подключения OpenAI Secure MCP Tunnel.")
             if pid == PROVIDER_LOCAL and s.server_host not in ("127.0.0.1", "localhost", "::1"):
                 problems.append("В режиме Local only адрес сервера должен быть loopback (127.0.0.1 / localhost / ::1).")
             checks = ((s.local_host(), s.server_port, "MCP-сервера"),)
@@ -619,6 +660,7 @@ class ServiceManager(QObject):
             "MCP_ENABLE_ADVANCED": "1" if s.enable_advanced_tools else "0",
             "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
             "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
+            "MCP_DEFAULT_ACCESS_PROFILE": s.default_access_profile,
             "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
             "MCP_GATEWAY_CONFIG_PATH": str(self.gateway_config_path()),
             "MCP_MANAGED_SERVERS_PATH": str(self.managed_servers_path()),
@@ -811,9 +853,11 @@ class ServiceManager(QObject):
             self._runtime_provider_url = msg
             self._log(f"✔ Tailscale Funnel активен: {msg}")
             self.public_url_changed.emit(self.public_url)
+            if self.server.is_alive() and self._server_url != self.oauth_resource_url:
+                self._restart_server_only("обновлён публичный адрес Tailscale")
             self._recompute()
             return
-        if pid in (PROVIDER_NGROK, PROVIDER_OPENAI):
+        if pid == PROVIDER_NGROK:
             self.health.check_tunnel = False
             prov = self.connections.get(pid)
             spec = prov.build_launch_spec(
@@ -873,13 +917,9 @@ class ServiceManager(QObject):
                     for warn in warnings:
                         self._log(f"⚠ {warn}")
                     self.public_url_changed.emit(self.public_url)
+                    if self.server.is_alive() and self._server_url != self.oauth_resource_url:
+                        self._restart_server_only("обновлён публичный адрес ngrok")
                     self._recompute()
-        elif pid == PROVIDER_OPENAI:
-            oai = self.connections.get(PROVIDER_OPENAI)
-            assert isinstance(oai, OpenAISecureTunnelProvider)
-            if oai.check_observability_ready():
-                self.tunnel.mark_health(True)
-                self._recompute()
 
     def _restart(self, name: str) -> None:
         if not self._want_running:
@@ -890,6 +930,19 @@ class ServiceManager(QObject):
         else:
             self._start_tunnel()
         self._recompute()
+
+    def _restart_server_only(self, reason: str) -> None:
+        """Перезапустить только MCP-сервер, сохраняя активный туннель и публичный адрес."""
+        if not self._want_running:
+            return
+        if not self.server.is_alive():
+            if not self._restart_timers[SERVER].isActive():
+                self._start_server()
+            return
+        self._log(f"↻ Перезапуск MCP-сервера: {reason}")
+        self._server_restart_pending = True
+        self._server_wait.stop()
+        self.server.stop()
 
     def _restart_if_running(self, reason: str) -> None:
         """Новые настройки применяются только при старте: остановить и запустить снова."""
@@ -948,8 +1001,6 @@ class ServiceManager(QObject):
             ngrok_err = parse_ngrok_log_line(line)
             if ngrok_err:
                 self._log(f"✖ ngrok: {ngrok_err}")
-            return
-        if self.active_provider == PROVIDER_OPENAI:
             return
         low = line.lower()
         # Preserve raw cloudflared error lines. Provide one contextual hint
@@ -1249,7 +1300,7 @@ class ServiceManager(QObject):
 
     def _recompute(self) -> None:
         pid = self.active_provider
-        daemon_tunnel = pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED, PROVIDER_NGROK, PROVIDER_OPENAI)
+        daemon_tunnel = pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED, PROVIDER_NGROK)
         if self._want_running:
             if pid == PROVIDER_LOCAL:
                 if self.server.state == ProcState.RUNNING:

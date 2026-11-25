@@ -1,16 +1,13 @@
-"""Setup & diagnostics dialogs for ngrok, Tailscale Funnel, OpenAI Secure Tunnel, and Local Only."""
+"""Setup & diagnostics dialogs for ngrok, Tailscale Funnel, and Local Only."""
 from __future__ import annotations
 
 from typing import Any
 
 from PyQt6.QtWidgets import (
-    QComboBox,
-    QDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -20,17 +17,16 @@ from PyQt6.QtWidgets import (
 from app.core.tunnels import (
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
     ConnectionManager,
-    OpenAISecureTunnelProvider,
 )
 from app.core.tunnels.ngrok import DEFAULT_NGROK_API_URL
-from app.core.tunnels.openai_tunnel import DEFAULT_OBSERVABILITY_URL, DEFAULT_PROFILE_NAME
 from app.core.tunnels.tailscale import ALLOWED_FUNNEL_PORTS
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 
 
-class ProviderConfigDialog(QDialog):
+class ProviderConfigDialog(SilentDialog):
     """Per-provider setup wizard & live diagnostic inspector backed by ConnectionManager."""
 
     def __init__(
@@ -106,7 +102,7 @@ class ProviderConfigDialog(QDialog):
             notice.setWordWrap(True)
             root.addWidget(notice)
 
-            self.port_combo = QComboBox()
+            self.port_combo = SafeComboBox()
             for port in ALLOWED_FUNNEL_PORTS:
                 self.port_combo.addItem(str(port), port)
             cur_port = int(cfg.get("https_port") or 443)
@@ -120,36 +116,6 @@ class ProviderConfigDialog(QDialog):
             form.addRow("DNS-имя (опционально)", self.host_edit)
             form.addRow("Путь к tailscale", self.bin_edit)
 
-        elif provider_id == PROVIDER_OPENAI:
-            notice = QLabel(
-                "OpenAI Secure MCP Tunnel (openai/tunnel-client) — исходящее приватное подключение. "
-                "Он НЕ создаёт публичный HTTPS URL и не гарантирует работу на любом тарифе ChatGPT "
-                "(требуется доступ workspace/организации в OpenAI Platform). "
-                "Локальная проверка OAuth / Bearer остаётся включённой."
-            )
-            notice.setObjectName("Hint")
-            notice.setWordWrap(True)
-            root.addWidget(notice)
-
-            self.tunnel_id_edit = QLineEdit(str(cfg.get("tunnel_id") or ""))
-            self.tunnel_id_edit.setPlaceholderText("tunnel_0123456789abcdef...")
-            self.profile_edit = QLineEdit(str(cfg.get("profile_name") or DEFAULT_PROFILE_NAME))
-            self.api_key_edit = QLineEdit()
-            self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-            self.api_key_edit.setPlaceholderText(
-                "Ключ уже в SecretStore (оставьте пустым, чтобы не менять)"
-                if self.provider.has_api_key()  # type: ignore[attr-defined]
-                else "Runtime API Key (Tunnels Read + Use)"
-            )
-            self.obs_edit = QLineEdit(str(cfg.get("observability_url") or DEFAULT_OBSERVABILITY_URL))
-            self.bin_edit = QLineEdit(str(cfg.get("binary_path") or ""))
-            self.bin_edit.setPlaceholderText("Автопоиск tunnel-client.exe")
-            form.addRow("Tunnel ID", self.tunnel_id_edit)
-            form.addRow("Профиль tunnel-client", self.profile_edit)
-            form.addRow("API Key (DPAPI)", self.api_key_edit)
-            form.addRow("Observability URL", self.obs_edit)
-            form.addRow("Путь к tunnel-client", self.bin_edit)
-
         elif provider_id == PROVIDER_LOCAL:
             notice = QLabel(
                 "Режим «Только локально»: сервер работает строго на loopback (127.0.0.1 / localhost / ::1) "
@@ -159,7 +125,7 @@ class ProviderConfigDialog(QDialog):
             notice.setWordWrap(True)
             root.addWidget(notice)
 
-            self.bind_combo = QComboBox()
+            self.bind_combo = SafeComboBox()
             for host in ("127.0.0.1", "localhost", "::1"):
                 self.bind_combo.addItem(host, host)
             cur_host = str(cfg.get("bind_host") or "127.0.0.1")
@@ -178,11 +144,6 @@ class ProviderConfigDialog(QDialog):
         self.diag_btn = QPushButton("Проверить")
         self.diag_btn.clicked.connect(self._run_diagnose)
         buttons.addWidget(self.diag_btn)
-
-        if provider_id == PROVIDER_OPENAI:
-            self.init_btn = QPushButton("Init Profile")
-            self.init_btn.clicked.connect(self._run_openai_init)
-            buttons.addWidget(self.init_btn)
 
         buttons.addStretch(1)
         cancel_btn = QPushButton("Отмена")
@@ -211,16 +172,6 @@ class ProviderConfigDialog(QDialog):
                 "binary_path": self.bin_edit.text().strip(),
             }
             return cfg, None
-        if self.provider_id == PROVIDER_OPENAI:
-            cfg = {
-                "tunnel_id": self.tunnel_id_edit.text().strip(),
-                "profile_name": self.profile_edit.text().strip() or DEFAULT_PROFILE_NAME,
-                "observability_url": self.obs_edit.text().strip() or DEFAULT_OBSERVABILITY_URL,
-                "binary_path": self.bin_edit.text().strip(),
-            }
-            key = self.api_key_edit.text().strip()
-            secrets = {"api_key": key} if key else None
-            return cfg, secrets
         if self.provider_id == PROVIDER_LOCAL:
             return {"bind_host": str(self.bind_combo.currentData())}, None
         return {}, None
@@ -229,7 +180,7 @@ class ProviderConfigDialog(QDialog):
         cfg, secrets = self._collect()
         errors = self.connections.configure_provider(self.provider_id, cfg, secrets=secrets)
         if errors:
-            QMessageBox.warning(self, "Ошибка параметров", "\n".join(errors))
+            SilentMessageBox.warning(self, "Ошибка параметров", "\n".join(errors))
             return False
         return True
 
@@ -246,18 +197,6 @@ class ProviderConfigDialog(QDialog):
         for item in checks:
             mark = "✓" if item.ok else "✕"
             self.diag_output.append(f"{mark} {item.label}: {item.detail}")
-
-    def _run_openai_init(self) -> None:
-        if not self._apply_current():
-            return
-        prov = self.provider
-        assert isinstance(prov, OpenAISecureTunnelProvider)
-        ok, msg = prov.initialize_profile(
-            local_host=self._local_host,
-            local_port=self._local_port,
-            mcp_path=self._mcp_path,
-        )
-        self.diag_output.append(f"{'✓' if ok else '✕'} tunnel-client init: {msg}")
 
     def _save(self) -> None:
         if not self._apply_current():

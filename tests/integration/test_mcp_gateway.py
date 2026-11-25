@@ -23,11 +23,12 @@ from mcp.server.auth.provider import AccessToken
 from mcp.shared.auth import OAuthClientInformationFull
 from mcp.types import ImageContent, TextContent
 from pydantic import AnyUrl
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication
 from starlette.responses import JSONResponse
 
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.i18n import LANG_RU, i18n
 from app.ui.pages.gateway_page import GatewayPage
 from backend.gateway.models import (
@@ -456,7 +457,7 @@ class GatewayIntegrationTests(unittest.TestCase):
             # Toggle & delete with confirmation
             page._toggle_selected()
             self.assertFalse(page.store.get("stdio_gui").enabled)  # type: ignore[union-attr]
-            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            with patch.object(SilentMessageBox, "question", return_value=SilentMessageBox.StandardButton.Yes):
                 page._delete_selected()
             self.assertIsNone(page.store.get("stdio_gui"))
 

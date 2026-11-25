@@ -19,7 +19,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from cryptography.fernet import Fernet
 from mcp.server.auth.provider import AccessToken, RefreshToken
@@ -28,12 +28,39 @@ from mcp.shared.auth import OAuthClientInformationFull
 from app.core.redaction import SecretRedactor
 from app.platform import get_platform
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _KEY_PREFIX_WIN = b"DPAPI1:"
 _KEY_PREFIX_POSIX = b"POSIX1:"
 
 
+def canonical_oauth_urls(url: str) -> tuple[str, str]:
+    """Return canonical ``(issuer, resource_url)`` shared between GUI and backend."""
+    raw = (url or "").strip()
+    if not raw:
+        return "", ""
+    parts = urlsplit(raw)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if scheme not in ("http", "https") or not host:
+        cleaned = raw.rstrip("/")
+        return cleaned, cleaned
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    default_port = 80 if scheme == "http" else 443
+    host_fmt = f"[{host}]" if ":" in host else host
+    netloc = host_fmt if (port is None or port == default_port) else f"{host_fmt}:{port}"
+    issuer = urlunsplit((scheme, netloc, "", "", ""))
+    path = parts.path.rstrip("/")
+    resource_url = f"{issuer}{path}" if path else issuer
+    return issuer, resource_url
+
+
 def default_store_path() -> Path:
+    env_override = os.environ.get("MCP_OAUTH_STORE_PATH", "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
     from app.paths import user_data_dir
 
     return user_data_dir() / "oauth" / "connections.sqlite3"
@@ -90,8 +117,13 @@ def _digest(raw: str) -> str:
 class OAuthStore:
     def __init__(self, path: str | Path, issuer: str, resource_url: str) -> None:
         self.path = Path(path).expanduser().resolve()
-        self.issuer = issuer.rstrip("/")
-        self.resource_url = resource_url.rstrip("/")
+        canon_issuer, canon_resource = canonical_oauth_urls(resource_url or issuer)
+        if canon_issuer and (not issuer or canonical_oauth_urls(issuer)[0] == canon_issuer):
+            self.issuer = canon_issuer
+            self.resource_url = canon_resource
+        else:
+            self.issuer = issuer.rstrip("/")
+            self.resource_url = resource_url.rstrip("/")
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _user_private(self.path.parent, directory=True)
         self._cipher = Fernet(_load_or_create_key(self.path))
@@ -163,6 +195,14 @@ class OAuthStore:
                 db.execute(
                     "INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
                     (2, int(time.time()), "Per-client allowlists, temporary grants, emergency stop"),
+                )
+            if 3 not in applied:
+                cols = {row[1] for row in db.execute("PRAGMA table_info(meta)").fetchall()}
+                if "resource_url" not in cols:
+                    db.execute("ALTER TABLE meta ADD COLUMN resource_url TEXT NOT NULL DEFAULT ''")
+                db.execute(
+                    "INSERT OR IGNORE INTO schema_migrations VALUES (?,?,?)",
+                    (3, int(time.time()), "Separate owner rotation from resource URL changes"),
                 )
 
     def schema_version(self) -> int:
@@ -237,18 +277,58 @@ class OAuthStore:
         return {"active": bool(row[0]), "reason": row[1], "updated_at": row[2]}
 
     def bind_owner(self, secret: str) -> None:
-        """Changing the owner token invalidates all OAuth grants for this issuer."""
-        fingerprint = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.resource_url)
+        """Rotate owner token or detect resource URL change with explicit revocation semantics.
+
+        Policy:
+        - Owner token rotation (same issuer & resource_url): immediately revokes all
+          issued OAuth access/refresh tokens and resets client ``approved_at=NULL``
+          plus execution overrides, while preserving DCR client registrations so
+          external AI clients can reconnect cleanly via ``/authorize`` + ``/oauth/consent``.
+        - Resource URL change on the same issuer: wipes tokens, client registrations,
+          and execution records completely.
+        """
+        v2_fp = _digest("MCPApp/OAuth/owner/v2\0" + secret)
+        v1_fp = _digest("MCPApp/OAuth/owner/v1\0" + secret + "\0" + self.resource_url)
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
-                "SELECT owner_fingerprint FROM meta WHERE issuer=?", (self.issuer,)
+                "SELECT owner_fingerprint, resource_url FROM meta WHERE issuer=?", (self.issuer,)
             ).fetchone()
-            if existing and existing[0] != fingerprint:
+            if existing:
+                existing_fp = str(existing[0] or "")
+                existing_res = str(existing[1] or "")
+                if existing_fp == v2_fp and existing_res == self.resource_url:
+                    return
+                if existing_fp in (v2_fp, v1_fp) and (not existing_res or existing_res == self.resource_url):
+                    db.execute(
+                        "INSERT OR REPLACE INTO meta(issuer, owner_fingerprint, resource_url) VALUES (?, ?, ?)",
+                        (self.issuer, v2_fp, self.resource_url),
+                    )
+                    return
+                resource_changed = bool(existing_res and existing_res != self.resource_url)
+                if not existing_res and not resource_changed:
+                    # Legacy v1 row without resource_url column: detect resource mismatch from stored tokens.
+                    for (enc,) in db.execute(
+                        "SELECT encrypted FROM tokens WHERE issuer=?", (self.issuer,)
+                    ).fetchall():
+                        try:
+                            tok_res = str(self._decrypt(enc).get("resource") or "").rstrip("/")
+                            if tok_res and tok_res != self.resource_url:
+                                resource_changed = True
+                                break
+                        except Exception:  # noqa: BLE001
+                            resource_changed = True
+                            break
                 db.execute("DELETE FROM tokens WHERE issuer=?", (self.issuer,))
-                db.execute("DELETE FROM clients WHERE issuer=?", (self.issuer,))
+                if resource_changed:
+                    db.execute("DELETE FROM clients WHERE issuer=?", (self.issuer,))
+                else:
+                    db.execute("UPDATE clients SET approved_at=NULL WHERE issuer=?", (self.issuer,))
                 self._clear_exec_records(db, self.issuer)
-            db.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (self.issuer, fingerprint))
+            db.execute(
+                "INSERT OR REPLACE INTO meta(issuer, owner_fingerprint, resource_url) VALUES (?, ?, ?)",
+                (self.issuer, v2_fp, self.resource_url),
+            )
 
     def remove_old_quick_tunnels(self) -> None:
         hostname = (urlsplit(self.issuer).hostname or "").lower()

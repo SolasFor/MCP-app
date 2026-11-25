@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication
 from app.config import Settings
 from app.core.service_manager import ServiceManager
 from app.ui import theme
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.i18n import LANG_RU, i18n
 from app.ui.main_window import MainWindow, NAV_TITLES, PAGE_IDS
 from backend.oauth_store import OAuthStore
@@ -70,7 +71,9 @@ class UnifiedHomeTests(unittest.TestCase):
         self.assertTrue(hasattr(self.window, "_mode_buttons"))
         self.assertTrue(hasattr(self.window, "_url_copy"))
         self.assertTrue(hasattr(self.window, "_access_profile"))
-        self.assertFalse(self.window._access_profile.isEnabled())
+        self.assertTrue(self.window._access_profile.isEnabled())
+        self.assertEqual(self.window._access_profile.currentData(), "allowlist")
+        self.assertFalse(hasattr(self.window.home_page, "clients_table"))
         self.assertFalse(hasattr(self.window, "_query_check"))
         self.assertFalse(hasattr(self.window, "_ov_copy_full"))
 
@@ -78,20 +81,24 @@ class UnifiedHomeTests(unittest.TestCase):
         self.manager._quick_url = URL
         self.window._refresh_access_profile()
         self.assertTrue(self.window._access_profile.isEnabled())
-        self.assertEqual(self.window._access_profile.currentData(), "safe")
+        self.assertEqual(self.window._access_profile.currentData(), "allowlist")
         backend = ExecutionApprovals(OAuthStore(self.path, ISSUER, URL))
+        self.assertEqual(backend.profile(), "allowlist")
+
+        self.window._access_profile.setCurrentIndex(self.window._access_profile.findData("safe"))
+        self.assertEqual(backend.profile(), "safe")
 
         index = self.window._access_profile.findData("allowlist")
         self.window._access_profile.setCurrentIndex(index)
         self.assertEqual(backend.profile(), "allowlist")
 
         index = self.window._access_profile.findData("full")
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.No):
+        with patch.object(SilentMessageBox, "warning", return_value=SilentMessageBox.StandardButton.No):
             self.window._access_profile.setCurrentIndex(index)
         self.assertEqual(backend.profile(), "allowlist")
         self.assertEqual(self.window._access_profile.currentData(), "allowlist")
 
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes):
+        with patch.object(SilentMessageBox, "warning", return_value=SilentMessageBox.StandardButton.Yes):
             self.window._access_profile.setCurrentIndex(index)
         self.assertEqual(backend.profile(), "full")
         self.window._access_profile.setCurrentIndex(self.window._access_profile.findData("safe"))

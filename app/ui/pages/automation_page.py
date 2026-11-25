@@ -9,8 +9,6 @@ from typing import Any, Callable
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QComboBox,
-    QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
@@ -30,6 +28,8 @@ from app import __version__
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -164,7 +164,7 @@ def run_local_playground_call(
     }
 
 
-class ScheduleDialog(QDialog):
+class ScheduleDialog(SilentDialog):
     """Modal editor for creating a ScheduleSpec."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -182,7 +182,7 @@ class ScheduleDialog(QDialog):
         self.id_edit.setPlaceholderText("daily-health")
         self.name_edit = QLineEdit()
         self.name_edit.setObjectName("UiInput")
-        self.trigger_combo = QComboBox()
+        self.trigger_combo = SafeComboBox()
         for kind in ("cron", "interval", "startup", "event"):
             self.trigger_combo.addItem(kind, kind)
         self.cron_edit = QLineEdit("*/5 * * * *")
@@ -195,15 +195,15 @@ class ScheduleDialog(QDialog):
         self.event_edit.setPlaceholderText("tunnel.started")
         self.tz_edit = QLineEdit("UTC")
         self.tz_edit.setObjectName("UiInput")
-        self.tool_combo = QComboBox()
+        self.tool_combo = SafeComboBox()
         for tname in sorted(DEFAULT_REGISTRY.registered_names()):
             self.tool_combo.addItem(tname, tname)
         self.args_edit = QLineEdit("{}")
         self.args_edit.setObjectName("UiInput")
-        self.misfire_combo = QComboBox()
+        self.misfire_combo = SafeComboBox()
         for pol in ("skip", "coalesce", "run_once"):
             self.misfire_combo.addItem(pol, pol)
-        self.conc_combo = QComboBox()
+        self.conc_combo = SafeComboBox()
         for pol in ("forbid", "allow"):
             self.conc_combo.addItem(pol, pol)
         self.safe_retry_chk = QCheckBox(tr("automation.dlg.safe_retry"))
@@ -420,10 +420,10 @@ class AutomationPage(PageScaffold):
         form_card = Card(margins=(12, 12, 12, 12))
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.playground_profile = QComboBox()
+        self.playground_profile = SafeComboBox()
         for prof in ("safe", "allowlist", "full"):
             self.playground_profile.addItem(prof, prof)
-        self.playground_tool = QComboBox()
+        self.playground_tool = SafeComboBox()
         for tname in sorted(DEFAULT_REGISTRY.registered_names()):
             self.playground_tool.addItem(tname, tname)
         self.playground_tool.currentIndexChanged.connect(self._update_playground_hint)
@@ -560,7 +560,7 @@ class AutomationPage(PageScaffold):
 
     def open_add_schedule_dialog(self) -> None:
         dlg = ScheduleDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_spec is not None:
+        if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.saved_spec is not None:
             self.create_schedule(dlg.saved_spec)
 
     def _selected_schedule_id(self) -> str | None:

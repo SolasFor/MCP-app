@@ -60,6 +60,8 @@ def _check_qt() -> str:
     from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
     from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog  # noqa: F401
     from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
+    from app.ui.components.safe_combo import SafeComboBox  # noqa: F401
+    from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox  # noqa: F401
     from app.ui.pages.servers_page import ServersPage  # noqa: F401
     from app.ui.pages.workspaces_page import WorkspacesPage  # noqa: F401
     from app.ui.pages.extensions_page import ExtensionsPage  # noqa: F401
@@ -122,7 +124,7 @@ def _check_backend() -> str:
                 raise RuntimeError("OAuth execution approvals are missing")
             import asyncio
             registered = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
-            expected = set(_tr.FULL_TOOLS)
+            expected = set(_tr.ALL_REGISTERED_OAUTH_TOOLS)
             if registered != expected:
                 raise RuntimeError(f"OAuth tool registry mismatch: {registered}")
             return type(app).__name__

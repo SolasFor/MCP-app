@@ -9,8 +9,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication
 
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.oauth_clients_dialog import OAuthClientsDialog
 from backend.oauth_store import OAuthStore
 from mcp.shared.auth import OAuthClientInformationFull
@@ -60,25 +61,26 @@ class OAuthGuiTests(unittest.TestCase):
             [select.itemData(i) for i in range(select.count())],
             ["safe", "allowlist", "full"],
         )
-        self.assertEqual(select.currentData(), "safe")
-        select.setCurrentIndex(select.findData("allowlist"))
+        self.assertEqual(select.currentData(), "allowlist")
+        select.setCurrentIndex(select.findData("safe"))
         state = ExecutionApprovals(self.store)
-        self.assertEqual(state.profile_for("gui-client-1"), "allowlist")
-        self.assertEqual(state.profile(), "safe")
+        self.assertEqual(state.profile_for("gui-client-1"), "safe")
+        self.assertEqual(state.profile(), "allowlist")
         dialog.reload()
-        self.assertEqual(dialog.table.cellWidget(0, 2).currentData(), "allowlist")
+        self.assertEqual(dialog.table.cellWidget(0, 2).currentData(), "safe")
         dialog.close()
 
     def test_full_access_requires_explicit_confirmation_and_can_be_revoked(self):
         from backend.oauth_execution import ExecutionApprovals
         dialog = OAuthClientsDialog(RESOURCE)
         combo = dialog.table.cellWidget(0, 2)
+        combo.setCurrentIndex(combo.findData("safe"))
         full = combo.findData("full")
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.No):
+        with patch.object(SilentMessageBox, "warning", return_value=SilentMessageBox.StandardButton.No):
             combo.setCurrentIndex(full)
         self.assertEqual(combo.currentData(), "safe")
         self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "safe")
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes):
+        with patch.object(SilentMessageBox, "warning", return_value=SilentMessageBox.StandardButton.Yes):
             combo.setCurrentIndex(full)
         self.assertEqual(ExecutionApprovals(self.store).profile_for("gui-client-1"), "full")
         combo.setCurrentIndex(combo.findData("safe"))
@@ -106,7 +108,7 @@ class OAuthGuiTests(unittest.TestCase):
     def test_revoke_button_revokes_in_live_backend_store(self):
         dialog = OAuthClientsDialog(RESOURCE)
         dialog.table.selectRow(0)
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+        with patch.object(SilentMessageBox, "question", return_value=SilentMessageBox.StandardButton.Yes):
             dialog.revoke_selected()
         self.assertEqual(dialog.table.rowCount(), 0)
         self.assertIsNone(self.store.get_client("gui-client-1"))

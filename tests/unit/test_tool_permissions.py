@@ -60,6 +60,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_three_profiles_change_tool_visibility_without_restart(self):
+        self.exec.set_profile("safe")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
         self.assertFalse(self.exec.can_request("alpha", "windows", command="whoami"))
         self.exec.set_profile("allowlist")

@@ -5,9 +5,11 @@ from dataclasses import dataclass
 from typing import Any
 
 if __package__:
+    from .desktop.models import DesktopPolicyStore, desktop_tool_permissions
     from .oauth_execution import ExecutionApprovals
     from .oauth_store import OAuthStore
 else:
+    from desktop.models import DesktopPolicyStore, desktop_tool_permissions  # type: ignore[no-redef]
     from oauth_execution import ExecutionApprovals  # type: ignore[no-redef]
     from oauth_store import OAuthStore  # type: ignore[no-redef]
 
@@ -103,21 +105,24 @@ DT_KEYPRESS = "desktop_keypress"
 DT_SCROLL = "desktop_scroll"
 DT_DRAG = "desktop_drag"
 DT_WAIT_FOR_ELEMENT = "desktop_wait_for_element"
-DESKTOP_TOOLS = frozenset({
+DESKTOP_VIEW_TOOLS = frozenset({
     DT_SCREENSHOT,
     DT_LIST_WINDOWS,
     DT_LIST_MONITORS,
+    DT_GET_UI_TREE,
+    DT_WAIT_FOR_ELEMENT,
+})
+DESKTOP_CONTROL_TOOLS = frozenset({
     DT_OPEN_APP,
     DT_CLOSE_WINDOW,
     DT_FOCUS_WINDOW,
-    DT_GET_UI_TREE,
     DT_CLICK,
     DT_TYPE,
     DT_KEYPRESS,
     DT_SCROLL,
     DT_DRAG,
-    DT_WAIT_FOR_ELEMENT,
 })
+DESKTOP_TOOLS = DESKTOP_VIEW_TOOLS | DESKTOP_CONTROL_TOOLS
 EXT_LIST = "extension_list"
 EXT_INFO = "extension_info"
 EXT_CALL_TOOL = "extension_call_tool"
@@ -178,11 +183,11 @@ OAUTH_TOOLS = (
     | SERVER_TOOLS
     | WORKSPACE_TOOLS
     | GIT_TOOLS
-    | DESKTOP_TOOLS
     | EXTENSION_ALLOWLIST_TOOLS
     | REMOTE_TOOLS
 )
 FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED} | EXTENSION_FULL_TOOLS
+ALL_REGISTERED_OAUTH_TOOLS = FULL_TOOLS | DESKTOP_TOOLS
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
@@ -259,6 +264,8 @@ class ToolRegistry:
         store: OAuthStore | None,
         principal: Any,
         execution: ExecutionApprovals | None = None,
+        *,
+        desktop_policy_store: DesktopPolicyStore | None = None,
     ) -> frozenset[str]:
         if store is None or execution is None or principal is None:
             return BASIC_TOOLS
@@ -276,11 +283,20 @@ class ToolRegistry:
         allowed = {
             name
             for name, spec in self._specs.items()
-            if _PROFILE_RANK.get(spec.min_profile, 99) <= rank
+            if spec.category != "desktop" and _PROFILE_RANK.get(spec.min_profile, 99) <= rank
         }
+        if desktop_policy_store is not None:
+            policy = desktop_policy_store.load()
+            allow_view, allow_control = desktop_tool_permissions(
+                policy, client_id, profile, emergency_stopped=False
+            )
+            if allow_view:
+                allowed.update(DESKTOP_VIEW_TOOLS)
+            if allow_control:
+                allowed.update(DESKTOP_CONTROL_TOOLS)
         for grant in execution.active_temporary_grants(client_id):
             for tool_name in grant.get("tool_names", ()):
-                if tool_name in self._specs:
+                if tool_name in self._specs and self._specs[tool_name].category != "desktop":
                     allowed.add(tool_name)
         return frozenset(allowed)
 
@@ -290,11 +306,15 @@ class ToolRegistry:
         store: OAuthStore | None,
         principal: Any,
         execution: ExecutionApprovals | None,
+        *,
+        desktop_policy_store: DesktopPolicyStore | None = None,
     ) -> str:
         """Verify live authorization at call time or post-queue dispatch."""
         if execution is not None and execution.emergency_stopped():
             raise PermissionError("Emergency stop is active")
-        allowed = self.allowed_tools(store, principal, execution)
+        allowed = self.allowed_tools(
+            store, principal, execution, desktop_policy_store=desktop_policy_store
+        )
         if tool_name not in self._specs or tool_name not in allowed:
             raise PermissionError("OAuth client is not authorized to request execution")
         client_id = getattr(principal, "client_id", None)

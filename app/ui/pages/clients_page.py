@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QTableWidgetItem
+from PyQt6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QTableWidgetItem
 
 from app.ui.components.cards import Card, EmptyState
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from backend.oauth_execution import ExecutionApprovals
-from backend.oauth_store import OAuthStore, default_store_path
+from backend.oauth_store import OAuthStore, canonical_oauth_urls, default_store_path
 
 
 class ClientsPage(PageScaffold):
@@ -20,10 +24,17 @@ class ClientsPage(PageScaffold):
 
     allowlist_requested = pyqtSignal()
     clients_updated = pyqtSignal(list)
+    status_message = pyqtSignal(str, str)
 
-    def __init__(self, parent=None) -> None:  # noqa: ANN001
+    def __init__(
+        self,
+        parent=None,  # noqa: ANN001
+        *,
+        store_path_fn: Callable[[], Path] | None = None,
+    ) -> None:
         super().__init__(scroll=False, parent=parent)
         self._public_url = ""
+        self._store_path_fn = store_path_fn or default_store_path
         self._store: OAuthStore | None = None
         self._execution: ExecutionApprovals | None = None
 
@@ -58,6 +69,11 @@ class ClientsPage(PageScaffold):
 
         self.empty_state = EmptyState("clients")
         self.content.addWidget(self.empty_state, 1)
+
+        self.refresh_hint = QLabel()
+        self.refresh_hint.setObjectName("Hint")
+        self.refresh_hint.setWordWrap(True)
+        self.content.addWidget(self.refresh_hint)
 
         self.retranslate()
         self.reload()
@@ -107,9 +123,9 @@ class ClientsPage(PageScaffold):
             self.clients_updated.emit([])
             return
 
-        issuer = f"{parts.scheme}://{parts.netloc}"
+        issuer, resource_url = canonical_oauth_urls(self._public_url)
         try:
-            self._store = OAuthStore(default_store_path(), issuer, self._public_url)
+            self._store = OAuthStore(self._store_path_fn(), issuer, resource_url)
             self._execution = ExecutionApprovals(self._store)
             clients = self._store.list_clients()
         except Exception:
@@ -152,7 +168,7 @@ class ClientsPage(PageScaffold):
                 QTableWidgetItem(tr("clients.status.approved" if approved else "clients.status.registered")),
             )
             if approved and self._execution is not None:
-                selector = QComboBox(self.table)
+                selector = SafeComboBox(self.table)
                 selector.setMinimumWidth(190)
                 for key in ("safe", "allowlist", "full"):
                     selector.addItem(tr(f"clients.role.{key}"), key)
@@ -171,7 +187,7 @@ class ClientsPage(PageScaffold):
         self._selection_changed()
         self.clients_updated.emit(self.client_summaries())
 
-    def _change_client_profile(self, client_id: str, combo: QComboBox) -> None:
+    def _change_client_profile(self, client_id: str, combo: SafeComboBox) -> None:
         if self._execution is None:
             return
         try:
@@ -180,25 +196,29 @@ class ClientsPage(PageScaffold):
             if selected == previous:
                 return
             if selected == "full":
-                answer = QMessageBox.warning(
+                answer = SilentMessageBox.warning(
                     self,
                     tr("clients.role.full"),
                     tr("home.access.hint.full"),
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.No,
                 )
-                if answer != QMessageBox.StandardButton.Yes:
+                if answer != SilentMessageBox.StandardButton.Yes:
                     combo.blockSignals(True)
                     combo.setCurrentIndex(combo.findData(previous))
                     combo.blockSignals(False)
                     return
             self._execution.set_client_profile(client_id, selected)
             self.clients_updated.emit(self.client_summaries())
+            self.status_message.emit(
+                tr("clients.role_saved", role=tr(f"clients.role.{selected}")),
+                "ok",
+            )
         except (ValueError, OSError, RuntimeError) as exc:
             combo.blockSignals(True)
             combo.setCurrentIndex(max(combo.findData(self._execution.profile_for(client_id)), 0))
             combo.blockSignals(False)
-            QMessageBox.warning(self, tr("clients.title"), str(type(exc).__name__))
+            SilentMessageBox.warning(self, tr("clients.title"), str(type(exc).__name__))
 
     def _selection_changed(self) -> None:
         row = self.table.currentRow()
@@ -213,14 +233,14 @@ class ClientsPage(PageScaffold):
             return
         client_id = item.data(Qt.ItemDataRole.UserRole)
         if (
-            QMessageBox.question(
+            SilentMessageBox.question(
                 self,
                 tr("clients.revoke"),
                 f"{item.text()}?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                SilentMessageBox.StandardButton.No,
             )
-            != QMessageBox.StandardButton.Yes
+            != SilentMessageBox.StandardButton.Yes
         ):
             return
         self._store.revoke_client(client_id)
@@ -232,6 +252,7 @@ class ClientsPage(PageScaffold):
         self.refresh_button.setText(tr("clients.refresh"))
         self.allowlist_button.setText(tr("home.access.allowlist_btn"))
         self.revoke_button.setText(tr("clients.revoke"))
+        self.refresh_hint.setText(tr("clients.tools_refresh_hint"))
         self.table.setHorizontalHeaderLabels(
             [
                 tr("clients.col.name"),

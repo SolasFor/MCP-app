@@ -1,6 +1,14 @@
 # Changelog
 
-## [1.0.0] - 2026-11-25 (Stage 12: Stable Release Prep)
+## [1.0.0] - 2026-11-25 (Stage 12: Stable Release Prep & Acceptance Fixes)
+- **Release Acceptance Fixes**:
+  - Set `allowlist` as first-launch default access profile (configurable before server start, persisted across restarts, inherited by new OAuth contexts/clients while preserving individual profiles and fail-closed `safe` fallbacks).
+  - Replaced `QComboBox` with wheel-safe `SafeComboBox` across all pages/dialogs and replaced topbar cycling theme button with a Light/Dark/System `SafeComboBox` synced with `SettingsPage`.
+  - Replaced all `QMessageBox` / audible `QSystemTrayIcon.showMessage` calls with silent `SilentDialog` / `SilentMessageBox` / `SilentNotificationPopup` (zero alert sounds without muting Windows).
+  - Eliminated ~1s theme-switch freeze (<200ms visible update) via cached toggle PNGs/QSS/palette, one-time style/font init, lazy hidden-page theming, and removing blocking CLI probes from theme updates.
+  - Fixed OAuth client reconnect after owner-token rotation (preserve DCR client registration with `approved_at=NULL`, revoke issued tokens and overrides, restart backend without tearing down active tunnel).
+  - Completely removed OpenAI Secure MCP Tunnel (`openai_tunnel`) with safe migration to `local_only` and optional owner cleanup of `tunnel/openai_tunnel_api_key` (5 transports remain).
+  - Fixed live per-client permissions & live Computer Use `desktop_*` gating (`tools.listChanged=True` + `notifications/tools/list_changed`), enriched `server_info` (`profile`, `computer_use`, `server_mode`), and cleaned Home/Security cards.
 - Completed final security review and documented full threat model (`docs/threat-model-v1.md`), honest transport/client compatibility matrix (`docs/compatibility-matrix.md`), upgrade guide (`docs/upgrade-guide.md`), complete MCP tool reference (`docs/tool-reference.md`), and release notes (`docs/releases/v1.0.0.md`).
 - Added E2E `v0.8.5 -> v1.0.0` upgrade migration, resilience, mid-flight OAuth revoke, output flood, and tracked-file secret scan tests (`tests/integration/test_release_1_0_0.py`).
 

@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.platform import get_platform
 
@@ -20,6 +20,7 @@ MAX_UI_TREE_NODES = 250
 MAX_WAIT_TIMEOUT_S = 30.0
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 DESKTOP_MIN_PROFILES = ("allowlist", "full")
+_PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
 SENSITIVE_TITLE_KEYWORDS = (
     "1password",
@@ -338,3 +339,41 @@ class DesktopPolicyStore:
                 }
             except (OSError, ValueError):
                 return {"active": False, "client_id": "", "tool": "", "updated_at": 0.0}
+
+
+def desktop_tool_permissions(
+    policy: DesktopPolicy | None,
+    client_id: str | None,
+    client_profile: str,
+    *,
+    emergency_stopped: bool = False,
+) -> tuple[bool, bool]:
+    """Return ``(allow_view, allow_control)`` for an OAuth client under live Computer Use policy."""
+    if emergency_stopped or policy is None or policy.emergency_stop or not policy.enabled:
+        return (False, False)
+    if client_id not in (None, "", "owner"):
+        if client_id == "mcp-app-user" or client_profile == "safe":
+            return (False, False)
+        if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(policy.min_profile, 1):
+            return (False, False)
+        if policy.allowed_clients and client_id not in policy.allowed_clients:
+            return (False, False)
+    return (bool(policy.allow_screen_capture), bool(policy.allow_input_control))
+
+
+def effective_desktop_access(
+    policy: DesktopPolicy | None,
+    client_id: str | None,
+    client_profile: str,
+    *,
+    emergency_stopped: bool = False,
+) -> Literal["disabled", "view", "control"]:
+    """Return effective Computer Use capability level (``disabled``, ``view``, or ``control``)."""
+    allow_view, allow_control = desktop_tool_permissions(
+        policy, client_id, client_profile, emergency_stopped=emergency_stopped
+    )
+    if allow_control:
+        return "control"
+    if allow_view:
+        return "view"
+    return "disabled"

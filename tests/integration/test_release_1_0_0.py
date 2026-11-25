@@ -90,7 +90,7 @@ class Release100E2ETests(unittest.TestCase):
             store1.mark_approved("v085-client")
 
             store2 = OAuthStore(oauth_db, issuer, res_url)
-            self.assertEqual(store2.schema_version(), 2)
+            self.assertEqual(store2.schema_version(), 3)
             self.assertEqual([c["client_id"] for c in store2.list_clients()], ["v085-client"])
 
     def test_broken_config_fail_closed_and_backup_roundtrip(self) -> None:

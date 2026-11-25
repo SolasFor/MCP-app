@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QCheckBox, QFormLayout, QHBoxLayout, QLabel, QLineEd
 
 from app.paths import user_data_dir
 from app.ui.components.cards import Badge, Card, SectionHeader
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from backend.desktop.models import DesktopPolicy, DesktopPolicyStore
@@ -23,12 +24,10 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
 
 
 class SecurityPage(PageScaffold):
-    """Central view of access profiles, DPAPI secret storage, Computer Use opt-in, and emergency controls."""
+    """Central view of access profiles, DPAPI secret storage, and Computer Use opt-in."""
 
     allowlist_requested = pyqtSignal()
     clients_requested = pyqtSignal()
-    diagnostics_requested = pyqtSignal()
-    emergency_stop_requested = pyqtSignal()
     desktop_policy_changed = pyqtSignal()
 
     def __init__(
@@ -41,7 +40,7 @@ class SecurityPage(PageScaffold):
         self._backend_name = (
             "Windows DPAPI + Credential Manager" if sys.platform == "win32" else "POSIX 0600 Fernet"
         )
-        self._active_mode = "safe"
+        self._active_mode = "allowlist"
         self._desktop_store = DesktopPolicyStore(
             desktop_policy_path or (user_data_dir() / "desktop" / "policy.json")
         )
@@ -106,6 +105,10 @@ class SecurityPage(PageScaffold):
         d_row.addWidget(self.desktop_stop_btn)
         d_row.addStretch(1)
         desktop_card.body.addLayout(d_row)
+        self.desktop_refresh_hint = QLabel()
+        self.desktop_refresh_hint.setObjectName("Hint")
+        self.desktop_refresh_hint.setWordWrap(True)
+        desktop_card.body.addWidget(self.desktop_refresh_hint)
         self.content.addWidget(desktop_card)
 
         # --- Secret Storage & Honest Sandbox Notice Card
@@ -117,24 +120,6 @@ class SecurityPage(PageScaffold):
         self.secret_desc.setWordWrap(True)
         secret_card.body.addWidget(self.secret_desc)
         self.content.addWidget(secret_card)
-
-        # --- Emergency Stop & Diagnostics Card
-        action_card = Card()
-        self.action_title = QLabel()
-        self.action_title.setObjectName("SectionTitle")
-        action_card.body.addWidget(self.action_title)
-
-        a_row = QHBoxLayout()
-        a_row.setSpacing(8)
-        self.emergency_btn = _button("", "Danger")
-        self.emergency_btn.clicked.connect(self.emergency_stop_requested.emit)
-        self.diag_btn = _button("")
-        self.diag_btn.clicked.connect(self.diagnostics_requested.emit)
-        a_row.addWidget(self.emergency_btn)
-        a_row.addWidget(self.diag_btn)
-        a_row.addStretch(1)
-        action_card.body.addLayout(a_row)
-        self.content.addWidget(action_card)
 
         self.content.addStretch(1)
         self.reload_desktop_policy()
@@ -171,16 +156,25 @@ class SecurityPage(PageScaffold):
     def save_desktop_policy(self) -> None:
         clients = tuple(c.strip() for c in self.desktop_clients_edit.text().split(",") if c.strip())
         apps = tuple(a.strip() for a in self.desktop_apps_edit.text().split(",") if a.strip())
-        pol = DesktopPolicy(
-            enabled=self.desktop_enabled_chk.isChecked(),
-            allow_screen_capture=self.desktop_screen_chk.isChecked(),
-            allow_input_control=self.desktop_control_chk.isChecked(),
-            allow_secret_typing=self.desktop_secrets_chk.isChecked(),
-            allowed_clients=clients,
-            allowed_apps=apps,
-            emergency_stop=False,
-        )
-        self._desktop_store.save(pol)
+        try:
+            current = self._desktop_store.load()
+            pol = DesktopPolicy(
+                enabled=self.desktop_enabled_chk.isChecked(),
+                allow_screen_capture=self.desktop_screen_chk.isChecked(),
+                allow_input_control=self.desktop_control_chk.isChecked(),
+                allow_secret_typing=self.desktop_secrets_chk.isChecked(),
+                allowed_clients=clients,
+                min_profile=current.min_profile,
+                allowed_apps=apps,
+                blocked_title_patterns=current.blocked_title_patterns,
+                max_image_width=current.max_image_width,
+                max_image_bytes=current.max_image_bytes,
+                emergency_stop=False,
+            )
+            self._desktop_store.save(pol)
+        except Exception as exc:  # noqa: BLE001
+            SilentMessageBox.warning(self, tr("security.desktop.title"), str(exc))
+            return
         self._refresh_desktop_badge(pol)
         self.desktop_policy_changed.emit()
 
@@ -214,13 +208,11 @@ class SecurityPage(PageScaffold):
             self._desktop_apps_lbl.setText(tr("security.desktop.apps"))
         self.desktop_save_btn.setText(tr("security.desktop.save"))
         self.desktop_stop_btn.setText(tr("security.desktop.stop"))
+        self.desktop_refresh_hint.setText(tr("security.desktop.refresh_hint"))
         self._refresh_desktop_badge(self._desktop_store.load())
 
         self.secret_header.set_texts(tr("security.secrets.title"))
         self.secret_desc.setText(tr("security.secrets.desc", backend=self._backend_name))
-        self.action_title.setText(tr("security.actions.title"))
-        self.emergency_btn.setText(tr("home.btn.emergency"))
-        self.diag_btn.setText(tr("home.access.diag_btn"))
 
     def apply_theme(self) -> None:
         self.mode_badge.set_variant(str(self.mode_badge.property("variant") or "ok"))

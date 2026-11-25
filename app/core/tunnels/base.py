@@ -18,7 +18,6 @@ PROVIDER_CF_QUICK = "cloudflare_quick"
 PROVIDER_CF_NAMED = "cloudflare_named"
 PROVIDER_NGROK = "ngrok"
 PROVIDER_TAILSCALE = "tailscale_funnel"
-PROVIDER_OPENAI = "openai_tunnel"
 PROVIDER_LOCAL = "local_only"
 
 ALL_PROVIDERS: tuple[str, ...] = (
@@ -26,7 +25,6 @@ ALL_PROVIDERS: tuple[str, ...] = (
     PROVIDER_CF_NAMED,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
-    PROVIDER_OPENAI,
     PROVIDER_LOCAL,
 )
 
@@ -35,7 +33,6 @@ EXTERNAL_PROVIDERS: tuple[str, ...] = (
     PROVIDER_CF_NAMED,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
-    PROVIDER_OPENAI,
 )
 
 
@@ -310,8 +307,9 @@ class TunnelProvider(ABC):
         mcp_path: str,
         runtime_url: str = "",
         running: bool = False,
+        detection: ProviderDetection | None = None,
     ) -> dict[str, Any]:
-        det = self.detect()
+        det = detection if detection is not None else self.detect()
         st = self.status(
             local_host=local_host,
             local_port=local_port,

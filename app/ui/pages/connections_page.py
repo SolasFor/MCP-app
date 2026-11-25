@@ -1,4 +1,4 @@
-"""Connections & Transports page: all 6 providers, live detection, wizards, owner token, proxy."""
+"""Connections & Transports page: all 5 providers, live detection, wizards, owner token, proxy."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -9,10 +9,9 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
 )
-from app.ui.components.cards import Badge, Card, Divider, SectionHeader
+from app.ui.components.cards import Badge, Card, Divider, ErrorBanner, SectionHeader
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from app.ui.proxy_page import ProxyPage
@@ -31,7 +30,6 @@ _PROVIDER_SPEC = (
     (PROVIDER_CF_NAMED, "cf_named"),
     (PROVIDER_NGROK, "ngrok"),
     (PROVIDER_TAILSCALE, "tailscale"),
-    (PROVIDER_OPENAI, "openai"),
     (PROVIDER_LOCAL, "local"),
 )
 
@@ -44,6 +42,7 @@ class ConnectionsPage(PageScaffold):
     provider_selected = pyqtSignal(str)
     provider_configure_requested = pyqtSignal(str)
     provider_diagnose_requested = pyqtSignal(str)
+    purge_openai_secret_requested = pyqtSignal()
     token_edited = pyqtSignal(str)
     token_save_requested = pyqtSignal()
     token_generate_requested = pyqtSignal()
@@ -51,6 +50,13 @@ class ConnectionsPage(PageScaffold):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=True, parent=parent)
+
+        self.migration_banner = ErrorBanner()
+        self.purge_openai_secret_btn = _button("", "Danger")
+        self.purge_openai_secret_btn.clicked.connect(self.purge_openai_secret_requested.emit)
+        self.migration_banner.actions_layout.addWidget(self.purge_openai_secret_btn)
+        self.migration_banner.hide()
+        self.content.addWidget(self.migration_banner)
 
         self.providers_card = Card()
         self.providers_header = SectionHeader()
@@ -184,8 +190,14 @@ class ConnectionsPage(PageScaffold):
             has_domain=has_domain,
         )
 
+    def set_legacy_openai_migration(self, *, migrated: bool, has_secret: bool) -> None:
+        self.migration_banner.setVisible(migrated or has_secret)
+        self.purge_openai_secret_btn.setVisible(has_secret)
+
     def retranslate(self) -> None:
         self.set_header(tr("conn.title"), tr("conn.lead"))
+        self.migration_banner.message_label.setText(tr("conn.openai_removed.banner"))
+        self.purge_openai_secret_btn.setText(tr("conn.openai_removed.purge_btn"))
         self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
         for _pid, (key, name, _det_badge, _state_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
             name.setText(tr(f"conn.provider.{key}"))
@@ -203,6 +215,7 @@ class ConnectionsPage(PageScaffold):
         self.proxy_page.retranslate()
 
     def apply_theme(self) -> None:
+        self.migration_banner.apply_theme()
         for _pid, (_k, _n, det_badge, state_badge, _s, _c, _d) in self.provider_rows.items():
             det_badge.set_variant(str(det_badge.property("variant") or "neutral"))
             state_badge.set_variant(str(state_badge.property("variant") or "neutral"))

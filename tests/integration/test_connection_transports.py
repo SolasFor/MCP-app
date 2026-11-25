@@ -26,7 +26,6 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
     Settings,
 )
@@ -327,15 +326,16 @@ class ConnectionManagerGuiTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
-    def test_connections_page_lists_all_six_providers_and_switches_with_issuer_guard(self) -> None:
+    def test_connections_page_lists_all_five_providers_and_switches_with_issuer_guard(self) -> None:
+        self.assertEqual(len(ALL_PROVIDERS), 5)
         self.assertEqual(set(self.window.connections_page.provider_rows.keys()), set(ALL_PROVIDERS))
         self.assertEqual(self.manager.active_provider, PROVIDER_CF_QUICK)
 
-        # Configure OpenAI tunnel via dialog
-        dlg = ProviderConfigDialog(self.manager.connections, PROVIDER_OPENAI, parent=self.window)
-        dlg.tunnel_id_edit.setText("tunnel_abc123456789")
-        dlg.api_key_edit.setText("sk-openai-secret-999")
-        dlg.accept() if dlg._apply_current() else self.fail("Expected valid OpenAI config")
+        # Configure ngrok via dialog
+        dlg = ProviderConfigDialog(self.manager.connections, PROVIDER_NGROK, parent=self.window)
+        dlg.domain_edit.setText("demo-mcp.ngrok-free.app")
+        dlg.authtoken_edit.setText("ng_secret_999")
+        dlg.accept() if dlg._apply_current() else self.fail("Expected valid ngrok config")
 
         # Switching to Local Only while running prompts/warns on issuer transition
         self.manager._quick_url = "https://old-quick.trycloudflare.com/mcp"

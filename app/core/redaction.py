@@ -16,7 +16,6 @@ INTERNAL_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "CF_API_TOKEN",
     "NGROK_AUTHTOKEN",
     "OPENAI_API_KEY",
-    "OPENAI_TUNNEL_TOKEN",
 })
 
 _SECRET_FIELD_NAMES = frozenset({
@@ -46,7 +45,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"(?i)((?:MCP_SECRET_TOKEN|TUNNEL_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN|"
-            r"NGROK_AUTHTOKEN|OPENAI_API_KEY|OPENAI_TUNNEL_TOKEN)\s*=\s*)[^\s\"']+"
+            r"NGROK_AUTHTOKEN|OPENAI_API_KEY)\s*=\s*)[^\s\"']+"
         ),
         r"\1[REDACTED]",
     ),

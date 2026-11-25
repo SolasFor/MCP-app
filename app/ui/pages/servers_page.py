@@ -10,15 +10,12 @@ from typing import Any
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QComboBox,
-    QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -33,6 +30,8 @@ from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -68,7 +67,7 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-class ServerProfileDialog(QDialog):
+class ServerProfileDialog(SilentDialog):
     """Create or edit a managed ServerProfile without revealing saved SecretStore values."""
 
     def __init__(
@@ -101,7 +100,7 @@ class ServerProfileDialog(QDialog):
         self.display_edit.setObjectName("UiInput")
         form.addRow(tr("servers.dlg.display_name"), self.display_edit)
 
-        self.template_combo = QComboBox()
+        self.template_combo = SafeComboBox()
         for tid in TEMPLATES:
             self.template_combo.addItem(tid, tid)
         self.template_combo.setCurrentIndex(max(self.template_combo.findData(self._base.template), 0))
@@ -145,14 +144,14 @@ class ServerProfileDialog(QDialog):
         self.expose_check.setChecked(self._base.expose_externally)
         form.addRow("", self.expose_check)
 
-        self.lifecycle_combo = QComboBox()
+        self.lifecycle_combo = SafeComboBox()
         for lc in LIFECYCLES:
             self.lifecycle_combo.addItem(lc, lc)
         self.lifecycle_combo.setCurrentIndex(max(self.lifecycle_combo.findData(self._base.lifecycle), 0))
         form.addRow(tr("servers.dlg.lifecycle"), self.lifecycle_combo)
 
         probe_row = QHBoxLayout()
-        self.readiness_combo = QComboBox()
+        self.readiness_combo = SafeComboBox()
         for rk in READINESS_KINDS:
             self.readiness_combo.addItem(rk, rk)
         self.readiness_combo.setCurrentIndex(
@@ -169,7 +168,7 @@ class ServerProfileDialog(QDialog):
         form.addRow(tr("servers.dlg.readiness_kind"), probe_row)
 
         restart_row = QHBoxLayout()
-        self.restart_combo = QComboBox()
+        self.restart_combo = SafeComboBox()
         for rp in RESTART_POLICIES:
             self.restart_combo.addItem(rp, rp)
         self.restart_combo.setCurrentIndex(max(self.restart_combo.findData(self._base.restart.policy), 0))
@@ -188,7 +187,7 @@ class ServerProfileDialog(QDialog):
         self.deps_edit.setObjectName("UiInput")
         form.addRow(tr("servers.dlg.deps"), self.deps_edit)
 
-        self.min_profile_combo = QComboBox()
+        self.min_profile_combo = SafeComboBox()
         for mp in SERVER_MIN_PROFILES:
             self.min_profile_combo.addItem(mp, mp)
         self.min_profile_combo.setCurrentIndex(
@@ -304,13 +303,13 @@ class ServerProfileDialog(QDialog):
             profiles[profile.name] = profile
             validate_dependencies(profiles)
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), str(exc))
+            SilentMessageBox.warning(self, tr("servers.title"), str(exc))
             return
         self.saved_profile = profile
         self.accept()
 
 
-class TemplateWizardDialog(QDialog):
+class TemplateWizardDialog(SilentDialog):
     """Create a validated ServerProfile from one of the safe built-in templates."""
 
     def __init__(self, store: ServerConfigStore, parent: QWidget | None = None) -> None:
@@ -330,7 +329,7 @@ class TemplateWizardDialog(QDialog):
         self.name_edit.setObjectName("UiInput")
         form.addRow(tr("servers.dlg.name"), self.name_edit)
 
-        self.template_combo = QComboBox()
+        self.template_combo = SafeComboBox()
         for tid, meta in self._templates.items():
             self.template_combo.addItem(str(meta["title"]), tid)
         self.template_combo.currentIndexChanged.connect(self._on_template_changed)
@@ -427,7 +426,7 @@ class TemplateWizardDialog(QDialog):
             profiles[prof.name] = prof
             validate_dependencies(profiles)
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.tpl.title"), str(exc))
+            SilentMessageBox.warning(self, tr("servers.tpl.title"), str(exc))
             return
         self.saved_profile = prof
         self.accept()
@@ -508,7 +507,7 @@ class ServersPage(PageScaffold):
 
         logs_card = Card(margins=(12, 12, 12, 12))
         self.logs_header = SectionHeader()
-        self.stream_combo = QComboBox()
+        self.stream_combo = SafeComboBox()
         self.stream_combo.addItem("stdout", "stdout")
         self.stream_combo.addItem("stderr", "stderr")
         self.stream_combo.currentIndexChanged.connect(lambda *_: self._refresh_details())
@@ -703,14 +702,14 @@ class ServersPage(PageScaffold):
         name = self._selected_name()
         if not name:
             return
-        answer = QMessageBox.question(
+        answer = SilentMessageBox.question(
             self,
             tr("servers.title"),
             tr("servers.delete.confirm", name=name),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if answer != SilentMessageBox.StandardButton.Yes:
             return
         try:
             self.store.delete_profile(name)
@@ -718,7 +717,7 @@ class ServersPage(PageScaffold):
             self.status_message.emit(tr("servers.toast.deleted", name=name), "info")
             self.reload()
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), str(exc))
+            SilentMessageBox.warning(self, tr("servers.title"), str(exc))
 
     def import_legacy_json(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -734,7 +733,7 @@ class ServersPage(PageScaffold):
             )
             self.reload()
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), str(exc))
+            SilentMessageBox.warning(self, tr("servers.title"), str(exc))
 
     def start_selected(self) -> None:
         name = self._selected_name()
@@ -744,7 +743,7 @@ class ServersPage(PageScaffold):
             self.server_manager.start_server(name, client_id="owner", wait_readiness=True)
             self.status_message.emit(tr("servers.toast.started", name=name), "ok")
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
+            SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
     def stop_selected(self) -> None:
@@ -758,7 +757,7 @@ class ServersPage(PageScaffold):
             else:
                 self.status_message.emit(tr("servers.toast.stopped", name=name), "info")
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
+            SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
     def restart_selected(self) -> None:
@@ -769,7 +768,7 @@ class ServersPage(PageScaffold):
             self.server_manager.restart_server(name, client_id="owner", wait_readiness=True)
             self.status_message.emit(tr("servers.toast.restarted", name=name), "ok")
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
+            SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
     def check_health_selected(self) -> None:
@@ -781,7 +780,7 @@ class ServersPage(PageScaffold):
             lvl = "ok" if res.get("healthy") else "warn"
             self.status_message.emit(f"{name}: {res.get('detail', res.get('status'))}", lvl)
         except Exception as exc:
-            QMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
+            SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
     def start_autostart_servers(self) -> None:

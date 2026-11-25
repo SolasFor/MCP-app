@@ -19,9 +19,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from .oauth_store import OAuthStore
+    from .oauth_store import OAuthStore, canonical_oauth_urls
 except ImportError:
-    from oauth_store import OAuthStore
+    from oauth_store import OAuthStore, canonical_oauth_urls
 from urllib.parse import urlencode
 
 from mcp.server.auth.provider import (
@@ -83,10 +83,17 @@ class LocalConsentOAuthProvider(
     def __init__(
         self, issuer: str, resource_url: str, owner_secret: str,
         store_path: str | Path | None = None,
+        default_profile: str | None = None,
     ) -> None:
-        self.issuer = issuer.rstrip("/")
-        self.resource_url = resource_url.rstrip("/")
+        canon_issuer, canon_resource = canonical_oauth_urls(resource_url or issuer)
+        if canon_issuer and (not issuer or canonical_oauth_urls(issuer)[0] == canon_issuer):
+            self.issuer = canon_issuer
+            self.resource_url = canon_resource
+        else:
+            self.issuer = issuer.rstrip("/")
+            self.resource_url = resource_url.rstrip("/")
         self._owner_secret = owner_secret
+        self._default_profile = default_profile
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.pending: dict[str, PendingConsent] = {}
         self.codes: dict[str, AuthorizationCode] = {}
@@ -171,7 +178,15 @@ class LocalConsentOAuthProvider(
             pending = self.pending.get(token_digest(ticket))
             self._cleanup()
             if not pending or pending.expires_at < time.time():
-                return HTMLResponse("Authorization request expired.", status_code=410, headers=SECURITY_HEADERS)
+                expired_html = (
+                    "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+                    "<title>Authorization expired</title></head><body><main>"
+                    "<h1>Authorization request expired</h1>"
+                    "<p>This authorization link has expired or the server restarted. "
+                    "Please click Reconnect in your AI client to start a fresh authorization.</p>"
+                    "</main></body></html>"
+                )
+                return HTMLResponse(expired_html, status_code=410, headers=SECURITY_HEADERS)
             display_name = html.escape(pending.client.client_name or pending.client.client_id or "Unknown client")
             display_uri = html.escape(str(pending.params.redirect_uri))
             safe_ticket = html.escape(ticket, quote=True)
@@ -183,7 +198,7 @@ class LocalConsentOAuthProvider(
                     from .oauth_execution import ExecutionApprovals
                 except ImportError:
                     from oauth_execution import ExecutionApprovals
-                profiles = ExecutionApprovals(self.store)
+                profiles = ExecutionApprovals(self.store, default_profile=self._default_profile)
                 mode = (profiles.profile_for(pending.client.client_id)
                         if profiles.client_approved(pending.client.client_id)
                         else profiles.profile())

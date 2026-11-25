@@ -24,7 +24,9 @@ from typing import Callable
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from PyQt6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+from PyQt6.QtWidgets import QApplication, QSystemTrayIcon
+
+from app.ui.components.silent_dialog import SilentMessageBox
 
 from app import APP_ID, APP_NAME, __version__, migrate
 from app.config import Settings
@@ -119,11 +121,13 @@ def _install_crash_handler() -> None:
         except OSError:
             pass
         if QApplication.instance() is not None:
-            box = QMessageBox(QMessageBox.Icon.Critical, APP_NAME,
-                              "Внутренняя ошибка. Приложение продолжит работу.")
-            box.setInformativeText(f"Подробности записаны в {user_data_dir() / CRASH_LOG}")
-            box.setDetailedText(text)
-            box.exec()
+            SilentMessageBox.critical(
+                None,
+                APP_NAME,
+                "Внутренняя ошибка. Приложение продолжит работу.",
+                informative_text=f"Подробности записаны в {user_data_dir() / CRASH_LOG}",
+                detailed_text=text,
+            )
 
     sys.excepthook = hook
 
@@ -172,11 +176,11 @@ def run_gui(argv: list[str]) -> int:
         tray.show_requested.connect(window.show_and_raise)
         tray.quit_requested.connect(app.quit)
         window.task_notification.connect(tray.notify_task_event)
-        window.hidden_to_tray.connect(lambda: tray.showMessage(
+        window.hidden_to_tray.connect(lambda: tray.show_silent_notification(
             APP_NAME,
             "Приложение продолжает работать в трее. Выход — правой кнопкой по значку.",
-            QSystemTrayIcon.MessageIcon.Information,
-            4000,
+            variant="info",
+            timeout_ms=4000,
         ))
         tray.show()
 

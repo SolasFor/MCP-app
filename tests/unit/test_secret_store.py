@@ -141,7 +141,7 @@ class SecretStoreTests(unittest.TestCase):
                 conn.close()
 
             migrated = OAuthStore(db_path, issuer, resource)
-            self.assertEqual(migrated.schema_version(), 2)
+            self.assertEqual(migrated.schema_version(), 3)
             self.assertEqual(migrated.get_client("c1").client_name, "Client One")
             self.assertEqual(migrated.get_token("raw-access-token-value", "access").client_id, "c1")
 

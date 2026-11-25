@@ -6,9 +6,9 @@ import sys
 from pathlib import Path
 from string import Template
 
-from PyQt6.QtCore import QObject, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPalette, QPen
-from PyQt6.QtWidgets import QApplication, QStyleFactory, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QMenu, QStyleFactory, QWidget
 
 from app.ui import tokens as tok
 from app.ui.i18n import tr
@@ -679,6 +679,20 @@ QMenu::item { padding: 6px 20px 6px 12px; border-radius: 6px; }
 QMenu::item:selected { background: $ACTIVE; color: $TEXT_STRONG; }
 QMenu::item:disabled { color: $TEXT_FAINT; }
 QMenu::separator { height: 1px; background: $BORDER; margin: 4px 6px; }
+QComboBox#ThemeCombo {
+    background: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 7px;
+    padding: 4px 28px 4px 10px;
+    min-height: 18px;
+    font-weight: 500;
+    color: $TEXT_STRONG;
+}
+QComboBox#ThemeCombo:hover {
+    background: $CONTROL_HOVER;
+    border-color: $BORDER_STRONG;
+}
+QComboBox#ThemeCombo::drop-down { width: 22px; }
 QMessageBox { background: $SURFACE; }
 QMessageBox QLabel { color: $TEXT; }
 """)
@@ -722,13 +736,23 @@ def _draw_chevron(scale: int, color: str) -> QImage:
     return image
 
 
+_TOGGLE_CACHE: dict[tuple[str, str], dict[str, str]] = {}
+_QSS_CACHE: dict[tuple[str, str], str] = {}
+_PALETTE_CACHE: dict[str, QPalette] = {}
+
+
 def _toggle_images(active: tok.ThemeTokens) -> dict[str, str]:
     from app.paths import user_data_dir
 
     folder = user_data_dir() / "ui"
+    suffix = active.name
+    cache_key = (str(folder), suffix)
+    cached = _TOGGLE_CACHE.get(cache_key)
+    if cached is not None and all(Path(p).exists() for p in cached.values()):
+        return cached
+
     folder.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
-    suffix = active.name
     for key, on, disabled in (
         ("TOGGLE_OFF", False, False),
         ("TOGGLE_ON", True, False),
@@ -736,19 +760,31 @@ def _toggle_images(active: tok.ThemeTokens) -> dict[str, str]:
         ("TOGGLE_ON_DISABLED", True, True),
     ):
         base = folder / f"{key.lower()}_{suffix}.png"
-        _draw_toggle(on, 1, disabled, active).save(str(base))
-        _draw_toggle(on, 2, disabled, active).save(str(base.with_name(base.stem + "@2x.png")))
+        base_2x = base.with_name(base.stem + "@2x.png")
+        if not base.exists():
+            _draw_toggle(on, 1, disabled, active).save(str(base))
+        if not base_2x.exists():
+            _draw_toggle(on, 2, disabled, active).save(str(base_2x))
         paths[key] = Path(base).as_posix()
 
     chevron = folder / f"chevron_down_{suffix}.png"
-    _draw_chevron(1, active.text_muted).save(str(chevron))
-    _draw_chevron(2, active.text_muted).save(str(chevron.with_name(chevron.stem + "@2x.png")))
+    chevron_2x = chevron.with_name(chevron.stem + "@2x.png")
+    if not chevron.exists():
+        _draw_chevron(1, active.text_muted).save(str(chevron))
+    if not chevron_2x.exists():
+        _draw_chevron(2, active.text_muted).save(str(chevron_2x))
     paths["CHEVRON_DOWN"] = Path(chevron).as_posix()
+    _TOGGLE_CACHE[cache_key] = paths
     return paths
 
 
 def stylesheet(active: tok.ThemeTokens | None = None) -> str:
     current = active or manager().tokens
+    toggle_paths = _toggle_images(current)
+    cache_key = (toggle_paths["TOGGLE_OFF"], current.name)
+    cached_qss = _QSS_CACHE.get(cache_key)
+    if cached_qss is not None:
+        return cached_qss
     values = {
         "BG": current.bg,
         "SIDEBAR": current.sidebar,
@@ -786,11 +822,16 @@ def stylesheet(active: tok.ThemeTokens | None = None) -> str:
         "FONT_UI": FONT_UI,
         "FONT_MONO": FONT_MONO,
     }
-    values.update(_toggle_images(current))
-    return _QSS_TMPL.substitute(values)
+    values.update(toggle_paths)
+    rendered = _QSS_TMPL.substitute(values)
+    _QSS_CACHE[cache_key] = rendered
+    return rendered
 
 
 def _palette(active: tok.ThemeTokens) -> QPalette:
+    cached = _PALETTE_CACHE.get(active.name)
+    if cached is not None:
+        return cached
     pal = QPalette()
     roles = {
         QPalette.ColorRole.Window: active.bg,
@@ -853,6 +894,28 @@ def apply_window_titlebar(widget: QWidget, resolved: str | None = None) -> None:
         pass
 
 
+class _PopupThemeFilter(QObject):
+    """Applies the cached QSS lazily to newly opened dialogs and context menus."""
+
+    def __init__(self, theme_mgr: ThemeManager, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._mgr = theme_mgr
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802
+        if (
+            event is not None
+            and event.type() == QEvent.Type.Show
+            and isinstance(obj, QWidget)
+            and obj.isWindow()
+            and isinstance(obj, (QDialog, QMenu))
+            and obj.objectName() != "MainWindow"
+        ):
+            self._mgr.apply_to_widget(obj)
+            if isinstance(obj, QDialog):
+                apply_window_titlebar(obj)
+        return False
+
+
 class ThemeManager(QObject):
     theme_changed = pyqtSignal(str, object)
 
@@ -861,7 +924,13 @@ class ThemeManager(QObject):
         self._mode = THEME_DARK
         self._resolved = THEME_DARK
         self._tokens = tok.DARK_TOKENS
+        self._version = 1
         self._system_hooked = False
+        self._style_initialized = False
+        self._font_initialized = False
+        self._applied_mode: str | None = None
+        self._applied_resolved: str | None = None
+        self._popup_filter: _PopupThemeFilter | None = None
 
     @property
     def mode(self) -> str:
@@ -875,7 +944,28 @@ class ThemeManager(QObject):
     def tokens(self) -> tok.ThemeTokens:
         return self._tokens
 
+    @property
+    def version(self) -> int:
+        return self._version
+
+    @property
+    def current_stylesheet(self) -> str:
+        return stylesheet(self._tokens)
+
+    def apply_to_widget(self, widget: QWidget, active: tok.ThemeTokens | None = None) -> bool:
+        """Apply active QSS to a widget subtree only when theme version changed."""
+        target_version = self._version if active is None else None
+        if target_version is not None and widget.property("_mcp_theme_version") == target_version:
+            return False
+        widget.setStyleSheet(stylesheet(active or self._tokens))
+        if target_version is not None:
+            widget.setProperty("_mcp_theme_version", target_version)
+        return True
+
     def _hook_system_changes(self, app: QApplication) -> None:
+        if self._popup_filter is None:
+            self._popup_filter = _PopupThemeFilter(self, app)
+            app.installEventFilter(self._popup_filter)
         if self._system_hooked:
             return
         self._system_hooked = True
@@ -898,9 +988,14 @@ class ThemeManager(QObject):
             self.apply(target_app, normalized)
         else:
             resolved, active = resolve_tokens(normalized)
+            if self._applied_mode == normalized and self._applied_resolved == resolved:
+                return self._mode
             self._mode = normalized
             self._resolved = resolved
             self._tokens = active
+            self._applied_mode = normalized
+            self._applied_resolved = resolved
+            self._version += 1
             _sync_globals(active)
             self.theme_changed.emit(resolved, active)
         return self._mode
@@ -913,21 +1008,41 @@ class ThemeManager(QObject):
             self._mode = mode if mode in THEME_MODES else THEME_DARK
         self._hook_system_changes(app)
         resolved, active = resolve_tokens(self._mode)
+        if (
+            self._style_initialized
+            and self._applied_mode == self._mode
+            and self._applied_resolved == resolved
+        ):
+            return
         self._resolved = resolved
         self._tokens = active
+        self._applied_mode = self._mode
+        self._applied_resolved = resolved
+        self._version += 1
         _sync_globals(active)
 
-        cur_style = app.style()
-        if cur_style is None or cur_style.objectName().lower() != "fusion":
-            fusion = QStyleFactory.create("Fusion")
-            if fusion is not None:
-                app.setStyle(fusion)
+        if not self._style_initialized:
+            cur_style = app.style()
+            if cur_style is None or cur_style.objectName().lower() != "fusion":
+                fusion = QStyleFactory.create("Fusion")
+                if fusion is not None:
+                    app.setStyle(fusion)
+            self._style_initialized = True
+        if not self._font_initialized:
+            font = QFont()
+            font.setFamilies(list(tok.SANS_FAMILIES))
+            font.setPixelSize(13)
+            app.setFont(font)
+            self._font_initialized = True
+
         app.setPalette(_palette(active))
-        font = QFont()
-        font.setFamilies(list(tok.SANS_FAMILIES))
-        font.setPixelSize(13)
-        app.setFont(font)
-        app.setStyleSheet(stylesheet(active))
+        if app.styleSheet():
+            app.setStyleSheet("")
+        for top in app.topLevelWidgets():
+            if top.isVisible() and isinstance(top, (QDialog, QMenu)) and top.objectName() != "MainWindow":
+                self.apply_to_widget(top, active)
+                if isinstance(top, QDialog):
+                    apply_window_titlebar(top)
         self.theme_changed.emit(resolved, active)
 
 
@@ -942,3 +1057,8 @@ def manager() -> ThemeManager:
 def apply(app: QApplication, mode: str | None = None) -> None:
     """Apply active theme (or `mode`) to `QApplication`."""
     _MANAGER.apply(app, mode=mode)
+
+
+def apply_to_widget(widget: QWidget, active: tok.ThemeTokens | None = None) -> bool:
+    """Apply active QSS to a widget subtree only when theme version changed."""
+    return _MANAGER.apply_to_widget(widget, active=active)

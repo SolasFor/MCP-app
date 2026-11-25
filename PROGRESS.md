@@ -13,17 +13,46 @@
 | 7. Workspaces | v0.9.5 | VERIFIED | [PR #26](https://github.com/SolasFor/MCP-app/pull/26), коммит `d8f7f7a`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45574728778), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45574728818) |
 | 8. Computer Use | v0.9.6 | VERIFIED | [PR #27](https://github.com/SolasFor/MCP-app/pull/27), коммит `e5837ef`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45580710966), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45580711115) |
 | 9. Extensions | v0.9.7 | VERIFIED | [PR #28](https://github.com/SolasFor/MCP-app/pull/28), коммит `62c6708`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45588509164), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45588509142) |
-| 10. Remote Management | v0.9.8 | TODO | — |
+| 10. Remote Management | v0.9.8 | VERIFIED | [PR #29](https://github.com/SolasFor/MCP-app/pull/29), коммит `72f98de`, [Transport CI](https://github.com/SolasFor/MCP-app/actions/runs/45595306144), [RC Windows](https://github.com/SolasFor/MCP-app/actions/runs/45595303716) |
 | 11. Automation & Monitoring | v0.9.9 | TODO | — |
 | 12. Stable Release | v1.0.0 | TODO | — |
 
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, HEAD: 2026-11-25, ветка `feat/extensions`, `62c6708` (stacked на `feat/computer-use` / PR #27).
-- Статус Этапа 9 (`v0.9.7 — Extensions`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#28 в `main`).
+- Дата, ветка, HEAD: 2026-11-25, ветка `feat/remote-management`, `72f98de` (stacked на `feat/extensions` / PR #28).
+- Статус Этапа 10 (`v0.9.8 — Remote Management`): `VERIFIED` (ожидает одобрения владельца для последовательного merge PR #20–#29 в `main`).
 - Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `cloudflared 2026.11.2`, `tailscale 1.104.2`, SolidWorks (`SLDWORKS.exe`), `ngrok` и `openai/tunnel-client` локально не установлены, `gh` авторизован (`SolasFor`), `iscc` в GitHub Actions `windows-latest`.
-- Следующее действие: отвести ветку `feat/remote-management` от `feat/extensions` и реализовать Этап 10 (`v0.9.8 — Remote Management`).
+- Следующее действие: отвести ветку `feat/automation-monitoring` от `feat/remote-management` и реализовать Этап 11 (`v0.9.9 — Automation & Monitoring`).
+
+## Этап 10: v0.9.8 — Remote Management (VERIFIED)
+- Этап / версия / ветка / HEAD: Этап 10 / `v0.9.8` / `feat/remote-management` / `72f98de`
+- Реализованные задачи:
+  - Реализован пакет `backend/remote/` (`{__init__,models,store,ssh_client,manager}.py`):
+    - Реестр устройств `devices.json` с атомарной записью и ACL, пароли и парольные фразы только в `SecretStore("ssh")` (`secret://ssh/<device>__password` / `passphrase`), безопасный экспорт без секретов и импорт `~/.ssh/config` (`import_ssh_config` с пропуском wildcard `Host *` / `Match` и игнорированием `ProxyCommand`, дефолтными правами `False`).
+    - Жёсткая проверка ключей хостов в `SSHConnectionManager` (`paramiko.RejectPolicy()`, неизменяемый `strict_host_key=True`, обязательная проверка по `known_hosts` с немедленным отказом `PermissionError` при неизвестном или изменившемся ключе), честная обработка обрыва соединения (`exit_code < 0` → `SSHConnectionError` / статус задачи `disconnected` с `disconnect_note` без блокировки Engine и без ложного обещания остановки/возобновления удалённого процесса).
+    - Защищённый SFTP (`sftp_list`, `sftp_download`, `sftp_upload`): канонические POSIX-пути, проверка корней `allowed_sftp_roots`, серверный `sftp.normalize(...)` против symlink-побегов, отказ при symlink на чтение/перезапись и квота `sftp_max_bytes`.
+    - Гранулярные права устройства (`execute`, `sftp_read`, `sftp_write`, `service_control`, `metrics`, `docker_read`), раздельный режим `allowlist` (запрет shell-метасимволов, точные `allowed_commands` и `allowed_services`) и `full`, отсутствие автоматического `sudo`.
+  - Добавлены 12 OAuth-инструментов в `backend/tool_registry.py` и `backend/server.py` (`device_list`, `device_info`, `device_health`, `ssh_execute`, `ssh_task_start`, `sftp_list`, `sftp_download`, `sftp_upload`, `remote_service_list`, `remote_service_start`, `remote_service_stop`, `remote_metrics`) при полном сохранении совместимого `oauth_ssh_command`; добавлена изоляция `MCP_DEVICES_CONFIG_PATH` в `ServiceManager` и `app/selftest.py`.
+  - Создана страница `app/ui/pages/devices_page.py` (`DevicesPage`, `DeviceProfileDialog`, импорт `~/.ssh/config`, health/metrics, журналы), раздел «Устройства» переведён в активное меню (`app/ui/main_window.py`, RU/EN `app/ui/i18n.py`), добавлена документация `docs/remote-management.md` и ссылка в `README.md`.
+- Оставшиеся задачи и зависимости: последовательный merge [PR #29](https://github.com/SolasFor/MCP-app/pull/29) после PR #20–#28.
+- Изменённые файлы / миграции: `app/__init__.py` & `pyproject.toml` (`0.9.8`), `packaging/mcp_app.spec`, `app/core/service_manager.py`, `app/selftest.py`, `app/ui/{i18n,main_window}.py`, `app/ui/pages/{__init__,devices_page}.py`, `backend/remote/`, `backend/{tool_registry,server}.py`, `docs/remote-management.md`, `README.md`, `tests/fixtures/local_ssh_server.py`, `tests/unit/{test_remote_security,test_tool_permissions}.py`, `tests/integration/{test_remote_management,test_tool_registry,test_oauth_http,test_ui_redesign_gui,test_unified_home_gui}.py`.
+- Проверки:
+  - Локально (Windows 11, `.venv`, Python 3.13.15):
+    - `compileall`, `ruff check app backend extensions_official tests tools main.py`, `mypy` (win32 + `--platform linux`): PASS (62 файла, 0 ошибок)
+    - `tools/check_licenses.py`: PASS (38/38); `tools/generate_sbom.py`: PASS (38 компонентов); `pip-audit`: PASS (0 уязвимостей)
+    - `tests/unit`: PASS (156/156 за 13.156s — запрет отключения `strict_host_key`, фильтрация `~/.ssh/config`, SFTP path/service валидаторы, редактирование секретов, кросс-клиентская изоляция)
+    - `tests/integration`: PASS (43/43; всего 199/199 — локальный Paramiko `LocalSSHServer` SSH+SFTP, проверка `known_hosts` и отказ при ротации ключа хоста, SFTP upload/list/download/квота/symlink/canonical escape, метрики/сервисы, async job и обрыв соединения `disconnected`, OAuth cross-client deny и headless `DevicesPage` GUI)
+    - `packaging/build.ps1 -Python "py -3.13" -SkipInstaller`: PASS (`MCPApp.exe --selftest` → `RESULT OK`, `MCPApp-0.9.8-portable.zip` 70.2 MB / 70,230,362 байт)
+  - GitHub Actions CI на `72f98de`:
+    - `Verify & Test (ubuntu-latest)`: PASS (`2m49s`) — https://github.com/SolasFor/MCP-app/actions/runs/45595306144/job/139139683666
+    - `Verify & Test (windows-latest)`: PASS (`4m13s`) — https://github.com/SolasFor/MCP-app/actions/runs/45595306144/job/139139683237
+    - `RC Windows installer (no publish)` (`windows-package`): PASS (`2m10s`) — https://github.com/SolasFor/MCP-app/actions/runs/45595303716/job/139139677684
+- Live tests отдельно от mocks: реальные локальные SSH/SFTP соединения и ротация ключей против localhost `LocalSSHServer` — **PASS**; внешний физический/облачный SSH-сервер за пределами localhost не подключался; `DevicesPage` проверялся через `QT_QPA_PLATFORM=offscreen`.
+- Риски / ограничения / блокеры: без подтверждённого удалённого агента при потере SSH-соединения невозможно гарантировать остановку или возобновление запущенного процесса на удалённой машине (задача честно переходит в `disconnected`). Сборка без Authenticode-сертификата.
+- PR / релиз: [PR #29](https://github.com/SolasFor/MCP-app/pull/29) (`feat/remote-management` → `feat/extensions`).
+- Следующий точный шаг: Этап 11 (`v0.9.9 — Automation & Monitoring`) на ветке `feat/automation-monitoring`.
+
 
 ## Этап 9: v0.9.7 — Extensions (VERIFIED)
 - Этап / версия / ветка / HEAD: Этап 9 / `v0.9.7` / `feat/extensions` / `62c6708`

@@ -2,9 +2,10 @@ name: MCP transport checks
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, "feat/**"]
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read

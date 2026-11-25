@@ -48,6 +48,7 @@ hiddenimports = [
     *collect_submodules("backend.gateway"),
     *collect_submodules("backend.tasks"),
     *collect_submodules("backend.servers"),
+    *collect_submodules("backend.workspaces"),
     *collect_submodules("app.ui"),
     *collect_submodules("uvicorn"),
     *collect_submodules("mcp", filter=lambda name: not name.startswith("mcp.cli")),

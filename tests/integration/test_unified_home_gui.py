@@ -49,7 +49,7 @@ class UnifiedHomeTests(unittest.TestCase):
     def test_only_one_main_page_contains_server_connection_and_profile(self):
         self.assertEqual(
             NAV_TITLES,
-            ("Главная", "Подключения", "AI-клиенты", "Gateway", "Задачи", "Серверы", "Безопасность", "Журналы", "Настройки"),
+            ("Главная", "Подключения", "AI-клиенты", "Gateway", "Задачи", "Серверы", "Workspaces", "Безопасность", "Журналы", "Настройки"),
         )
         self.assertEqual(self.window._stack.count(), len(PAGE_IDS))
         self.assertTrue(hasattr(self.window, "_toggle"))

@@ -622,6 +622,8 @@ class ServiceManager(QObject):
             "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
             "MCP_GATEWAY_CONFIG_PATH": str(self.gateway_config_path()),
             "MCP_MANAGED_SERVERS_PATH": str(self.managed_servers_path()),
+            "MCP_WORKSPACES_CONFIG_PATH": str(self.workspaces_config_path()),
+            "MCP_WORKSPACES_HISTORY_DIR": str(self.workspaces_history_dir()),
             "MCP_SECRETS_DIR": str(user_data_dir() / "secrets"),
             "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
             "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
@@ -632,6 +634,12 @@ class ServiceManager(QObject):
 
     def gateway_config_path(self) -> Path:
         return user_data_dir() / "gateway" / "servers.json"
+
+    def workspaces_config_path(self) -> Path:
+        return user_data_dir() / "workspaces" / "workspaces.json"
+
+    def workspaces_history_dir(self) -> Path:
+        return user_data_dir() / "workspaces" / "history"
 
     def managed_servers_path(self) -> Path:
         target = user_data_dir() / "servers" / "managed_servers.json"
@@ -681,9 +689,21 @@ class ServiceManager(QObject):
         except Exception:
             pass
 
+    def refresh_workspace_secrets(self) -> None:
+        from app.core.secret_store import SecretStore
+        from backend.workspaces.store import WorkspaceStore
+
+        try:
+            store = WorkspaceStore(self.workspaces_config_path(), secret_store=SecretStore())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
     def _start_server(self) -> None:
         self.refresh_gateway_secrets()
         self.refresh_server_secrets()
+        self.refresh_workspace_secrets()
         program, args = backend_command()
         workdir = self.settings.backend_workdir or str(default_backend_workdir())
         Path(workdir).mkdir(parents=True, exist_ok=True)

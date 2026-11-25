@@ -16,8 +16,12 @@ if __package__:
     from .oauth_execution import ExecutionApprovals
     from .oauth_store import OAuthStore
     from .tool_registry import (
+        ALL_REGISTERED_OAUTH_TOOLS,
         BASIC_TOOLS,
         DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
         EXEC_MANAGED,
         EXEC_SSH,
         EXEC_TOOLS,
@@ -30,8 +34,12 @@ else:
     from oauth_execution import ExecutionApprovals
     from oauth_store import OAuthStore
     from tool_registry import (
+        ALL_REGISTERED_OAUTH_TOOLS,
         BASIC_TOOLS,
         DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
         EXEC_MANAGED,
         EXEC_SSH,
         EXEC_TOOLS,
@@ -42,8 +50,12 @@ else:
     )
 
 __all__ = [
+    "ALL_REGISTERED_OAUTH_TOOLS",
     "BASIC_TOOLS",
     "DEFAULT_REGISTRY",
+    "DESKTOP_CONTROL_TOOLS",
+    "DESKTOP_TOOLS",
+    "DESKTOP_VIEW_TOOLS",
     "EXEC_MANAGED",
     "EXEC_SSH",
     "EXEC_TOOLS",
@@ -65,9 +77,13 @@ def allowed_tools(
     principal: Any,
     execution: ExecutionApprovals | None = None,
     registry: ToolRegistry = DEFAULT_REGISTRY,
+    *,
+    desktop_policy_store: Any = None,
 ) -> frozenset[str]:
     """Return tools permitted for this OAuth principal; never caches approval."""
-    return registry.allowed_tools(store, principal, execution)
+    return registry.allowed_tools(
+        store, principal, execution, desktop_policy_store=desktop_policy_store
+    )
 
 
 def require_execution_permission(
@@ -75,11 +91,15 @@ def require_execution_permission(
     store: OAuthStore | None,
     execution: ExecutionApprovals | None,
     registry: ToolRegistry = DEFAULT_REGISTRY,
+    *,
+    desktop_policy_store: Any = None,
 ) -> str:
     principal = get_access_token()
     if tool not in EXEC_TOOLS:
         raise PermissionError("OAuth client is not authorized to request execution")
-    return registry.authorize_call(tool, store, principal, execution)
+    return registry.authorize_call(
+        tool, store, principal, execution, desktop_policy_store=desktop_policy_store
+    )
 
 
 def make_tool_middleware(
@@ -88,12 +108,26 @@ def make_tool_middleware(
     registry: ToolRegistry = DEFAULT_REGISTRY,
     gateway_router: Any = None,
     metrics_registry: Any = None,
+    desktop_policy_store: Any = None,
+    session_tracker: Any = None,
 ):
     async def restrict_tools(ctx, call_next):
         if ctx.method not in ("tools/list", "tools/call"):
             return await call_next(ctx)
         principal = get_access_token()
-        allowed = allowed_tools(store, principal, execution, registry)
+        allowed = allowed_tools(
+            store, principal, execution, registry, desktop_policy_store=desktop_policy_store
+        )
+        if session_tracker is not None and getattr(ctx, "session", None) is not None:
+            gw_names: frozenset[str] = frozenset()
+            if gateway_router is not None:
+                try:
+                    gw_names = frozenset(
+                        t.name for t in gateway_router.list_authorized_tools(principal, execution)
+                    )
+                except Exception:  # noqa: BLE001
+                    gw_names = frozenset()
+            session_tracker.observe(ctx.session, principal, allowed | gw_names)
         if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)

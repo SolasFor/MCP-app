@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import weakref
+from contextlib import asynccontextmanager
 from typing import Any, Literal
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -16,20 +18,26 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import paramiko
 from pydantic import AnyHttpUrl
 from mcp.server import MCPServer
-from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_context_var
+from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_context_var, get_access_token
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.datastructures import Headers
-from starlette.responses import JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 if __package__:
     from .transport_config import transport_allowlists, validate_mcp_path, validate_public_url
-    from .oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
-    from .oauth_store import default_store_path
-    from .oauth_execution import ExecutionApprovals
+    from .oauth_provider import (
+        SECURITY_HEADERS,
+        LocalConsentOAuthProvider,
+        READ_SCOPE,
+        _render_error_html,
+    )
+    from .oauth_store import canonical_oauth_urls, default_store_path
+    from .oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
     from .execution_audit import ExecutionAudit, classify_command_output
     from .gateway import GatewayConfigStore, GatewayRouter
     from .gateway.security import check_loop_headers
@@ -51,6 +59,7 @@ if __package__:
         UnavailableDesktopBackend,
         Win32DesktopBackend,
     )
+    from .desktop.models import effective_desktop_access
     from .extensions import ExtensionManager, ExtensionStore
     from .remote import DeviceStore, RemoteManager, SSHConnectionError
     from .automation import (
@@ -63,6 +72,9 @@ if __package__:
     )
     from .tool_registry import (
         DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
         DT_CLICK,
         DT_CLOSE_WINDOW,
         DT_DRAG,
@@ -131,7 +143,7 @@ if __package__:
     )
     from app.core.secret_store import SecretStore
     from .tool_permissions import (
-        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
+        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, allowed_tools, make_tool_middleware,
         require_execution_permission,
     )
     from .security_policy import (
@@ -140,9 +152,14 @@ if __package__:
     )
 else:
     from transport_config import transport_allowlists, validate_mcp_path, validate_public_url
-    from oauth_provider import LocalConsentOAuthProvider, READ_SCOPE
-    from oauth_store import default_store_path
-    from oauth_execution import ExecutionApprovals
+    from oauth_provider import (
+        SECURITY_HEADERS,
+        LocalConsentOAuthProvider,
+        READ_SCOPE,
+        _render_error_html,
+    )
+    from oauth_store import canonical_oauth_urls, default_store_path
+    from oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
     from execution_audit import ExecutionAudit, classify_command_output
     from gateway import GatewayConfigStore, GatewayRouter
     from gateway.security import check_loop_headers
@@ -164,6 +181,7 @@ else:
         UnavailableDesktopBackend,
         Win32DesktopBackend,
     )
+    from desktop.models import effective_desktop_access
     from extensions import ExtensionManager, ExtensionStore
     from remote import DeviceStore, RemoteManager, SSHConnectionError
     from automation import (
@@ -176,6 +194,9 @@ else:
     )
     from tool_registry import (
         DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
         DT_CLICK,
         DT_CLOSE_WINDOW,
         DT_DRAG,
@@ -244,7 +265,7 @@ else:
     )
     from app.core.secret_store import SecretStore
     from tool_permissions import (
-        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, make_tool_middleware,
+        EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED, allowed_tools, make_tool_middleware,
         require_execution_permission,
     )
     from security_policy import (
@@ -252,6 +273,11 @@ else:
         parse_allowed_command, workspace_path,
     )
 
+from app.core.logging_manager import (
+    LogConfig,
+    configure_logging,
+    default_logs_dir,
+)
 from app.core.redaction import RedactingLogFilter, SecretRedactor
 
 # ==========================================
@@ -297,6 +323,23 @@ logger.addFilter(_REDACT_FILTER)
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(_REDACT_FILTER)
 
+_LOGGING_MGR = configure_logging(
+    base_dir=default_logs_dir(),
+    config=LogConfig(
+        enabled=_env_flag("MCP_LOGGING_ENABLED", True),
+        level=os.environ.get("MCP_LOG_LEVEL", "INFO"),
+    ),
+    redactor=REDACTOR,
+)
+_LOGGING_MGR.install_exception_hooks(chain_previous=False)
+_BACKEND_LOG_HANDLER = _LOGGING_MGR.std_logging_handler("backend", event_code="backend_log")
+_BACKEND_LOG_HANDLER.addFilter(_REDACT_FILTER)
+logger.addHandler(_BACKEND_LOG_HANDLER)
+for _uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    _uv_logger = logging.getLogger(_uv_name)
+    _uv_logger.addFilter(_REDACT_FILTER)
+    _uv_logger.addHandler(_BACKEND_LOG_HANDLER)
+
 # The GUI passes the active Quick Tunnel URL and MCP path for each server start.
 MCP_PATH = validate_mcp_path(os.environ.get("MCP_PATH", "/mcp"))
 # Local loopback only by default; cloudflared exposes the public HTTPS endpoint.
@@ -310,8 +353,9 @@ PUBLIC_URL = validate_public_url(
 )
 _public = urlsplit(PUBLIC_URL)
 PUBLIC_HOST = (_public.hostname or "").lower()
-BASE_URL = f"{_public.scheme}://{_public.netloc}"
-RESOURCE_URL = str(AnyHttpUrl(PUBLIC_URL))
+_canon_base, _canon_resource = canonical_oauth_urls(str(AnyHttpUrl(PUBLIC_URL)))
+BASE_URL = _canon_base or f"{_public.scheme}://{_public.netloc}"
+RESOURCE_URL = _canon_resource or str(AnyHttpUrl(PUBLIC_URL))
 
 # Проверка живости для GUI (HealthMonitor раз в 2 с). Без токена и без записи в аудит.
 HEALTH_PATH = os.environ.get("MCP_HEALTH_PATH", "/health")
@@ -522,21 +566,88 @@ class HybridAuthMiddleware:
             if query_token is not None:
                 logger.warning("Токен в ссылке запрещён ← %s %s", client[0], path)
 
+        is_oauth_path = path in ("/authorize", "/oauth/consent", "/token", "/register") or path.startswith("/.well-known/")
+        accept_hdr = (headers.get("accept") or "").lower()
+        intercept_authorize_html = (
+            path == "/authorize"
+            and scope.get("method") == "GET"
+            and "text/html" in accept_hdr
+        )
+        buffered_start = None
+        buffered_body = bytearray()
+
         async def observe_auth_result(message):
-            if message["type"] == "http.response.start" and path.rstrip("/") == MCP_PATH:
+            nonlocal buffered_start
+            if message["type"] == "http.response.start":
                 status = message["status"]
-                if status in (401, 403):
+                if path.rstrip("/") == MCP_PATH and status in (401, 403):
                     if is_bearer:
                         logger.warning(
                             "MCP авторизация отклонена HTTP %d ← %s %s %s",
                             status, client[0], scope.get("method"), path,
                         )
+                        _LOGGING_MGR.warning(
+                            "oauth",
+                            f"MCP Bearer rejected HTTP {status} method={scope.get('method')} path={path}",
+                            event_code="mcp_auth_rejected",
+                        )
                     elif scope.get("method") not in ("HEAD", "OPTIONS"):
-                        # Anonymous HEAD is a common OAuth discovery probe.
                         logger.info(
                             "MCP запрос без Bearer отклонён HTTP %d ← %s %s",
                             status, client[0], scope.get("method"),
                         )
+                elif is_oauth_path and status >= 400:
+                    lvl = "ERROR" if status >= 500 else "WARNING"
+                    _LOGGING_MGR.log(
+                        "oauth",
+                        lvl,
+                        f"OAuth endpoint HTTP {status} method={scope.get('method')} path={path}",
+                        event_code="oauth_http_error",
+                    )
+                if intercept_authorize_html and status >= 400:
+                    resp_headers = {
+                        k.decode("latin-1").lower(): v.decode("latin-1")
+                        for k, v in message.get("headers", [])
+                    }
+                    if "application/json" in resp_headers.get("content-type", "").lower():
+                        buffered_start = message
+                        return
+            elif message["type"] == "http.response.body" and buffered_start is not None:
+                buffered_body.extend(message.get("body", b""))
+                if message.get("more_body", False):
+                    return
+                err_code = "invalid_request"
+                err_desc = "Invalid OAuth authorization request."
+                try:
+                    parsed = json.loads(buffered_body.decode("utf-8", errors="replace"))
+                    if isinstance(parsed, dict):
+                        err_code = str(parsed.get("error") or err_code)
+                        err_desc = REDACTOR.redact_text(str(parsed.get("error_description") or err_desc))
+                except Exception:  # noqa: BLE001
+                    pass
+                _LOGGING_MGR.warning(
+                    "oauth",
+                    f"Browser /authorize error {buffered_start['status']} ({err_code}): {err_desc}",
+                    event_code="oauth_authorize_browser_error",
+                )
+                hint = (
+                    "This usually means the MCP server restarted or switched URL/provider after the client registered. "
+                    "Return to your AI client and click Reconnect to register and authorize cleanly."
+                    if "not found" in err_desc.lower() or "client" in err_desc.lower()
+                    else "Verify the server public URL and restart authorization from your AI client."
+                )
+                html_resp = HTMLResponse(
+                    _render_error_html(
+                        "Authorization failed",
+                        f"Authorization failed ({err_code})",
+                        err_desc,
+                        hint=hint,
+                    ),
+                    status_code=buffered_start["status"],
+                    headers=SECURITY_HEADERS,
+                )
+                await html_resp(scope, receive, send)
+                return
             await send(message)
 
         await self.app(scope, receive, observe_auth_result)
@@ -588,16 +699,66 @@ auth_settings = AuthSettings(
     revocation_options=RevocationOptions(enabled=True) if OAUTH_ENABLED else None,
     validate_token_resource=True,
 )
+_raw_default_profile = os.environ.get("MCP_DEFAULT_ACCESS_PROFILE", "").strip()
+DEFAULT_ACCESS_PROFILE = (
+    PROFILE_ALLOWLIST
+    if not _raw_default_profile
+    else (_raw_default_profile if _raw_default_profile in PROFILES else PROFILE_SAFE)
+)
+
 oauth_provider = (
     LocalConsentOAuthProvider(
         BASE_URL, RESOURCE_URL, SECRET_TOKEN,
         store_path=os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path(),
+        default_profile=DEFAULT_ACCESS_PROFILE,
     )
     if OAUTH_ENABLED else None
 )
-oauth_execution = ExecutionApprovals(oauth_provider.store) if oauth_provider is not None else None
+oauth_execution = (
+    ExecutionApprovals(oauth_provider.store, default_profile=DEFAULT_ACCESS_PROFILE)
+    if oauth_provider is not None else None
+)
 if oauth_execution is not None:
     DESKTOP_MANAGER.emergency_stop_checker = oauth_execution.emergency_stopped
+
+
+class _ActiveSessionToolTracker:
+    """Tracks live MCP sessions and emits notifications/tools/list_changed when permissions shift."""
+
+    def __init__(self) -> None:
+        self._sessions: weakref.WeakKeyDictionary[Any, tuple[Any, frozenset[str]]] = weakref.WeakKeyDictionary()
+
+    def observe(self, session: Any, principal: Any, allowed_names: frozenset[str]) -> None:
+        if session is not None:
+            self._sessions[session] = (principal, frozenset(allowed_names))
+
+    async def check_and_notify(self) -> None:
+        if oauth_provider is None or oauth_execution is None:
+            return
+        for session, (principal, previous) in list(self._sessions.items()):
+            current = allowed_tools(
+                oauth_provider.store,
+                principal,
+                oauth_execution,
+                DEFAULT_REGISTRY,
+                desktop_policy_store=DESKTOP_POLICY_STORE,
+            )
+            try:
+                gw_names = frozenset(
+                    t.name for t in GATEWAY_ROUTER.list_authorized_tools(principal, oauth_execution)
+                )
+            except Exception:  # noqa: BLE001
+                gw_names = frozenset()
+            effective = current | gw_names
+            if effective != previous:
+                self._sessions[session] = (principal, effective)
+                try:
+                    await session.send_tool_list_changed()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+SESSION_TRACKER = _ActiveSessionToolTracker()
 
 
 def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
@@ -615,7 +776,9 @@ def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
     )
     if not oauth_execution.client_approved(spec.client_id):
         return (False, f"Client {spec.client_id!r} is not approved")
-    allowed = DEFAULT_REGISTRY.allowed_tools(oauth_provider.store, tok, oauth_execution)
+    allowed = DEFAULT_REGISTRY.allowed_tools(
+        oauth_provider.store, tok, oauth_execution, desktop_policy_store=DESKTOP_POLICY_STORE
+    )
     if spec.tool_name not in allowed:
         return (False, f"Client {spec.client_id!r} is not authorized for {spec.tool_name}")
     return (True, "")
@@ -652,12 +815,33 @@ mcp = (
                 oauth_execution,
                 gateway_router=GATEWAY_ROUTER,
                 metrics_registry=METRICS_REGISTRY,
+                desktop_policy_store=DESKTOP_POLICY_STORE,
+                session_tracker=SESSION_TRACKER,
             )
         ],
     )
     if oauth_provider is not None
     else MCPServer(SERVER_NAME, auth=auth_settings, token_verifier=SimpleTokenVerifier())
 )
+_orig_get_capabilities = mcp._lowlevel_server.get_capabilities
+
+
+def _get_capabilities_with_tools_list_changed(
+    notification_options: NotificationOptions | None = None, *args: Any, **kwargs: Any
+):
+    opts = notification_options or NotificationOptions()
+    return _orig_get_capabilities(
+        NotificationOptions(
+            prompts_changed=opts.prompts_changed,
+            resources_changed=opts.resources_changed,
+            tools_changed=True,
+        ),
+        *args,
+        **kwargs,
+    )
+
+
+mcp._lowlevel_server.get_capabilities = _get_capabilities_with_tools_list_changed  # type: ignore[method-assign]
 if oauth_provider is not None:
     @mcp.custom_route("/oauth/consent", methods=["GET", "POST"])
     async def oauth_consent(request):
@@ -679,11 +863,41 @@ def _conditional_tool(should_register: bool):
     return decorator
 
 
+def _current_client_effective_state() -> tuple[str, str]:
+    """Return ``(profile, computer_use)`` for the current caller using fail-closed rules."""
+    if not OAUTH_ENABLED or oauth_provider is None or oauth_execution is None:
+        return PROFILE_SAFE, "disabled"
+    if oauth_execution.emergency_stopped():
+        return PROFILE_SAFE, "disabled"
+    principal = get_access_token()
+    if principal is None:
+        return PROFILE_SAFE, "disabled"
+    client_id = getattr(principal, "client_id", None)
+    scopes = getattr(principal, "scopes", None) or []
+    if not isinstance(client_id, str) or "mcp:read" not in scopes:
+        return PROFILE_SAFE, "disabled"
+    if not oauth_execution.client_approved(client_id):
+        return PROFILE_SAFE, "disabled"
+    profile = oauth_execution.profile_for(client_id)
+    if profile == PROFILE_SAFE:
+        return PROFILE_SAFE, "disabled"
+    cu_level = effective_desktop_access(
+        DESKTOP_POLICY_STORE.load(),
+        client_id,
+        profile,
+        emergency_stopped=False,
+    )
+    return profile, cu_level
+
+
 @mcp.tool()
 def server_info() -> str:
-    """Safe read-only connectivity check; returns no machine paths or secrets."""
-    return "MCP app ready; transport=streamable-http; profile=standard" if not ADVANCED_TOOLS else (
-        "MCP app ready; transport=streamable-http; profile=advanced"
+    """Safe read-only connectivity check; returns effective client profile without secrets or paths."""
+    server_mode = "advanced" if ADVANCED_TOOLS else "standard"
+    profile, computer_use = _current_client_effective_state()
+    return (
+        f"MCP app ready; transport=streamable-http; profile={profile}; "
+        f"computer_use={computer_use}; server_mode={server_mode}"
     )
 
 
@@ -1768,7 +1982,8 @@ async def desktop_screenshot(
 ) -> CallToolResult:
     """Capture a bounded in-memory PNG screenshot when screen access is opted in by owner."""
     client_id = require_execution_permission(
-        DT_SCREENSHOT, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_SCREENSHOT, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1804,7 +2019,8 @@ async def desktop_screenshot(
 async def desktop_list_windows(include_minimized: bool = False) -> dict:
     """List visible top-level windows (elevated/protected titles are masked)."""
     client_id = require_execution_permission(
-        DT_LIST_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_LIST_WINDOWS, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1823,7 +2039,8 @@ async def desktop_list_windows(include_minimized: bool = False) -> dict:
 async def desktop_list_monitors() -> dict:
     """List displays, virtual desktop bounds, and per-monitor DPI scale percentages."""
     client_id = require_execution_permission(
-        DT_LIST_MONITORS, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_LIST_MONITORS, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1841,7 +2058,8 @@ async def desktop_open_app(
 ) -> dict:
     """Launch an approved interactive Windows executable without shell interpolation."""
     client_id = require_execution_permission(
-        DT_OPEN_APP, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_OPEN_APP, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1867,7 +2085,8 @@ async def desktop_open_app(
 async def desktop_close_window(hwnd: int) -> dict:
     """Request window closure via WM_CLOSE (never touches elevated or credential windows)."""
     client_id = require_execution_permission(
-        DT_CLOSE_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_CLOSE_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1889,7 +2108,8 @@ async def desktop_focus_window(
 ) -> dict:
     """Focus/restore an authorized window and optionally move/resize it."""
     client_id = require_execution_permission(
-        DT_FOCUS_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_FOCUS_WINDOW, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1914,7 +2134,8 @@ async def desktop_get_ui_tree(
 ) -> dict:
     """Inspect bounded Windows UI Automation tree with password controls redacted."""
     client_id = require_execution_permission(
-        DT_GET_UI_TREE, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_GET_UI_TREE, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1944,7 +2165,8 @@ async def desktop_click(
 ) -> dict:
     """Click a UI element (preferring UIA InvokePattern over raw coordinates)."""
     client_id = require_execution_permission(
-        DT_CLICK, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_CLICK, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1975,7 +2197,8 @@ async def desktop_type(
 ) -> dict:
     """Type Unicode text into a UIA input or focused window (blocks password/secret inputs unless opted in)."""
     client_id = require_execution_permission(
-        DT_TYPE, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_TYPE, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -1997,7 +2220,8 @@ async def desktop_type(
 async def desktop_keypress(keys: str, hwnd: int | None = None) -> dict:
     """Send a named key or key combo (e.g. 'Enter', 'Ctrl+S'; blocks SAS/Win+L)."""
     client_id = require_execution_permission(
-        DT_KEYPRESS, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_KEYPRESS, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -2023,7 +2247,8 @@ async def desktop_scroll(
 ) -> dict:
     """Scroll vertically or horizontally via SendInput mouse wheel."""
     client_id = require_execution_permission(
-        DT_SCROLL, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_SCROLL, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -2054,7 +2279,8 @@ async def desktop_drag(
 ) -> dict:
     """Drag pointer smoothly between virtual screen coordinates."""
     client_id = require_execution_permission(
-        DT_DRAG, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_DRAG, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -2085,7 +2311,8 @@ async def desktop_wait_for_element(
 ) -> dict:
     """Poll boundedly until a matching UI Automation element appears."""
     client_id = require_execution_permission(
-        DT_WAIT_FOR_ELEMENT, oauth_provider.store if oauth_provider else None, oauth_execution
+        DT_WAIT_FOR_ELEMENT, oauth_provider.store if oauth_provider else None, oauth_execution,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
     )
     assert oauth_execution is not None
     profile_mode = oauth_execution.profile_for(client_id)
@@ -2903,6 +3130,29 @@ def write_workspace_file(relative_path: str, content: str) -> str:
 # 6. ЗАПУСК
 # ==========================================
 
+def _policy_fingerprint() -> tuple[Any, ...]:
+    oauth_stat = None
+    if oauth_provider is not None and oauth_provider.store is not None:
+        try:
+            st = oauth_provider.store.path.stat()
+            oauth_stat = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            oauth_stat = None
+    desktop_stat = None
+    try:
+        st = DESKTOP_POLICY_STORE.path.stat()
+        desktop_stat = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        desktop_stat = None
+    gw_stat = None
+    try:
+        st = GATEWAY_STORE.path.stat()
+        gw_stat = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        gw_stat = None
+    return (oauth_stat, desktop_stat, gw_stat)
+
+
 def build_app():
     """Starlette-приложение MCP с нашим middleware снаружи."""
     app = mcp.streamable_http_app(
@@ -2910,6 +3160,38 @@ def build_app():
         streamable_http_path=MCP_PATH,
         transport_security=TRANSPORT_SECURITY,
     )
+    orig_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def _lifespan_with_policy_watcher(asgi_app):
+        async with orig_lifespan(asgi_app):
+            stop_event = asyncio.Event()
+
+            async def _watch() -> None:
+                last_fp = _policy_fingerprint()
+                while not stop_event.is_set():
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=0.4)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                    cur_fp = _policy_fingerprint()
+                    if cur_fp != last_fp:
+                        last_fp = cur_fp
+                        await SESSION_TRACKER.check_and_notify()
+
+            watcher_task = asyncio.create_task(_watch())
+            try:
+                yield
+            finally:
+                stop_event.set()
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
+
+    app.router.lifespan_context = _lifespan_with_policy_watcher
     # add_middleware ставит наш слой СНАРУЖИ middleware SDK: заголовок из ?token=
     # появляется до того, как SDK проверит авторизацию.
     app.add_middleware(HybridAuthMiddleware)
@@ -3001,6 +3283,35 @@ async def invoke_playground_tool(
                 f"(selected: '{profile}')"
             ),
         }
+    if tool_name in DESKTOP_TOOLS:
+        dt_policy = DESKTOP_POLICY_STORE.load()
+        if dt_policy.emergency_stop or not dt_policy.enabled:
+            METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+            return {
+                "allowed": False,
+                "live_execution": True,
+                "profile": profile,
+                "tool_name": tool_name,
+                "error": "Denied: Computer Use is disabled by owner",
+            }
+        if tool_name in DESKTOP_VIEW_TOOLS and not dt_policy.allow_screen_capture:
+            METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+            return {
+                "allowed": False,
+                "live_execution": True,
+                "profile": profile,
+                "tool_name": tool_name,
+                "error": "Denied: Screen capture is disabled by owner",
+            }
+        if tool_name in DESKTOP_CONTROL_TOOLS and not dt_policy.allow_input_control:
+            METRICS_REGISTRY.record_call(tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+            return {
+                "allowed": False,
+                "live_execution": True,
+                "profile": profile,
+                "tool_name": tool_name,
+                "error": "Denied: Desktop input control is disabled by owner",
+            }
 
     ephemeral_id = f"{client_id}-{secrets.token_hex(4)}"
     created_ephemeral = False
@@ -3082,6 +3393,23 @@ def main() -> None:
             "OAuth authorization server: enabled (local owner consent required; "
             "client-specific Windows/SSH access profiles)"
         )
+        _LOGGING_MGR.info(
+            "oauth",
+            f"OAuth server initialized issuer={BASE_URL} default_profile={oauth_execution.profile()}",
+            event_code="oauth_init",
+        )
+        _LOGGING_MGR.info("gateway", f"Gateway initialized profiles={len(GATEWAY_STORE.list_profiles())}", event_code="gateway_init")
+        _LOGGING_MGR.info("tasks", "TaskManager initialized", event_code="tasks_init")
+        _LOGGING_MGR.info("servers", "ManagedServers initialized", event_code="servers_init")
+        _LOGGING_MGR.info("workspaces", "WorkspaceManager initialized", event_code="workspaces_init")
+        _LOGGING_MGR.info("extensions", "ExtensionManager initialized", event_code="extensions_init")
+        _LOGGING_MGR.info("ssh", "RemoteManager initialized", event_code="ssh_init")
+        _LOGGING_MGR.info("automation", "Automation subsystem initialized", event_code="automation_init")
+        _LOGGING_MGR.info(
+            "computer_use",
+            f"DesktopManager initialized enabled={DESKTOP_POLICY_STORE.load().enabled}",
+            event_code="computer_use_init",
+        )
         logger.info(
             "OAuth command policies: global_default=%s; registered_clients=%d; "
             "Windows allowlist=%d; SSH hosts=%d; SSH commands=%d; "
@@ -3124,6 +3452,7 @@ def main() -> None:
         EXTENSION_MANAGER.shutdown_all()
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()
+        _LOGGING_MGR.shutdown(timeout=1.5)
 
 
 if __name__ == "__main__":

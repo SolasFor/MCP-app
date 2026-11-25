@@ -11,10 +11,8 @@ from app import APP_NAME
 from app.config import Settings
 from app.core.service_manager import Overall, ServiceManager
 from app.ui import icons, theme
+from app.ui.components.toast import SilentNotificationPopup, silent_popup_available
 from app.ui.i18n import i18n, tr
-
-_Info = QSystemTrayIcon.MessageIcon.Information
-_Warn = QSystemTrayIcon.MessageIcon.Warning
 
 
 class TrayIcon(QSystemTrayIcon):
@@ -34,6 +32,8 @@ class TrayIcon(QSystemTrayIcon):
         self._should_notify = should_notify
         self._prev = manager.overall
         self._announced_url = ""
+        self._active_popup: SilentNotificationPopup | None = None
+        self.last_notification: tuple[str, str, str] | None = None
 
         menu = QMenu()
         self._menu = menu
@@ -58,14 +58,42 @@ class TrayIcon(QSystemTrayIcon):
 
         self.setContextMenu(menu)
         self.activated.connect(self._on_activated)
-        self.messageClicked.connect(lambda: self.show_requested.emit())
         manager.overall_state_changed.connect(self._on_overall)
         manager.public_url_changed.connect(self._on_public_url)
         theme.manager().theme_changed.connect(self._on_theme_changed)
         i18n.language_changed.connect(self._on_language_changed)
         self._update(manager.overall)
 
+    def show_silent_notification(
+        self,
+        title: str,
+        message: str,
+        *,
+        variant: str = "info",
+        timeout_ms: int = 4000,
+    ) -> None:
+        """Display a silent custom popup without invoking Win32 tray sounds."""
+        self.last_notification = (title, message, variant)
+        if not silent_popup_available():
+            return
+        if self._active_popup is not None:
+            try:
+                self._active_popup.dismiss()
+            except RuntimeError:
+                pass
+            self._active_popup = None
+        popup = SilentNotificationPopup(
+            title,
+            message,
+            variant=variant,
+            timeout_ms=timeout_ms,
+            on_activate=self.show_requested.emit,
+        )
+        self._active_popup = popup
+        popup.show()
+
     def _on_theme_changed(self, *_args: object) -> None:
+        theme.apply_to_widget(self._menu)
         self._update(self.manager.overall)
 
     def _on_language_changed(self, *_args: object) -> None:
@@ -93,7 +121,7 @@ class TrayIcon(QSystemTrayIcon):
         if not url:
             return
         QGuiApplication.clipboard().setText(url)
-        self.showMessage(APP_NAME, f"{url}", _Info, 2000)
+        self.show_silent_notification(APP_NAME, f"{url}", variant="info", timeout_ms=2000)
 
     def _on_public_url(self, url: str) -> None:
         self._update(self.manager.overall)
@@ -104,7 +132,7 @@ class TrayIcon(QSystemTrayIcon):
             and url != self._announced_url
             and self._should_notify()
         ):
-            self.showMessage(APP_NAME, f"{url}", _Warn, 6000)
+            self.show_silent_notification(APP_NAME, f"{url}", variant="warn", timeout_ms=6000)
         if url:
             self._announced_url = url
 
@@ -114,19 +142,19 @@ class TrayIcon(QSystemTrayIcon):
         if not self._should_notify():
             return
         if state == Overall.ERROR:
-            self.showMessage(APP_NAME, tr("home.err.banner"), _Warn, 6000)
+            self.show_silent_notification(APP_NAME, tr("home.err.banner"), variant="warn", timeout_ms=6000)
         elif state == Overall.DEGRADED and prev == Overall.RUNNING:
-            self.showMessage(APP_NAME, tr("overview.degraded.lead"), _Warn, 4000)
+            self.show_silent_notification(APP_NAME, tr("overview.degraded.lead"), variant="warn", timeout_ms=4000)
         elif state == Overall.RUNNING and prev in (Overall.STARTING, Overall.DEGRADED):
             url = self.manager.public_url
-            self.showMessage(APP_NAME, url or tr("status.overall.running"), _Info, 3000)
+            self.show_silent_notification(APP_NAME, url or tr("status.overall.running"), variant="info", timeout_ms=3000)
 
     def notify_task_event(self, task_id: str, title: str, status: str) -> None:
         if not self._should_notify():
             return
-        icon = _Info if status == "succeeded" else _Warn
+        variant = "info" if status == "succeeded" else "warn"
         label = tr(f"tasks.status.{status}")
-        self.showMessage(APP_NAME, f"{title or task_id}: {label}", icon, 4000)
+        self.show_silent_notification(APP_NAME, f"{title or task_id}: {label}", variant=variant, timeout_ms=4000)
 
     def _update(self, state: Overall) -> None:
         text, color = theme.overall_label_color(state.value)

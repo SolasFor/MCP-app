@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
 
 from app.core import proxy as px
+from app.core.logging_manager import get_logging_manager
 
 QUICK_SERVICE_HOST = "api.trycloudflare.com"
 LISTENERS_PER_TARGET = 2
@@ -54,8 +55,8 @@ def _pipe(src: socket.socket, dst: socket.socket) -> None:
 class _EdgeListener:
     """127.0.0.1:<случайный порт> → через прокси → один хост :7844."""
 
-    def __init__(self, settings: px.ProxySettings, target: tuple[str, int], log: LogFn) -> None:
-        self._endpoint = settings.endpoint()
+    def __init__(self, endpoint: px.ProxyEndpoint, target: tuple[str, int], log: LogFn) -> None:
+        self._endpoint = endpoint
         self._target = target
         self._log = log
         self._closed = False
@@ -80,7 +81,12 @@ class _EdgeListener:
         try:
             upstream = px.open_via_proxy(self._endpoint, host, port, px.TIMEOUT)
         except OSError as exc:
-            self._log(f"Прокси: нет соединения с {host}:{port} — {px.describe(exc)}")
+            msg = f"Прокси: нет соединения с {host}:{port} — {px.describe(exc)}"
+            self._log(msg)
+            try:
+                get_logging_manager().error("proxy", msg, event_code="edge_relay_error")
+            except Exception:  # noqa: BLE001
+                pass
             client.close()
             return
         upstream.settimeout(None)
@@ -117,7 +123,12 @@ class _QuickServiceHandler(BaseHTTPRequestHandler):
                 bridge.settings, "POST", f"https://{QUICK_SERVICE_HOST}{self.path}", headers, body, timeout=15)
         except (OSError, ValueError) as exc:
             reason = px.describe(exc) if isinstance(exc, OSError) else str(exc)
-            bridge.log(f"Прокси: {QUICK_SERVICE_HOST} недоступен — {reason}")
+            msg = f"Прокси: {QUICK_SERVICE_HOST} недоступен — {reason}"
+            bridge.log(msg)
+            try:
+                get_logging_manager().error("proxy", msg, event_code="quick_relay_error")
+            except Exception:  # noqa: BLE001
+                pass
             status, resp_headers = 502, {"content-type": "application/json"}
             data = json.dumps({"success": False, "errors": [{"code": 502, "message": f"proxy: {reason}"}]}).encode()
         self.send_response(status)
@@ -149,17 +160,20 @@ class ProxyBridge:
         return bool(self._listeners)
 
     def start(self) -> None:
-        """Поднять мосты. ValueError — неверные настройки (текст понятен пользователю)."""
+        """Поднять мосты. ValueError / OSError — неверные или недоступные настройки прокси."""
         self.stop()
         if not self.settings.enabled:
             return
         errors = self.settings.validate()
         if errors:
             raise ValueError("; ".join(errors))
+        ep = self.settings.resolve_active_endpoint()
+        if ep is None:
+            return
         try:
             for target in self.settings.edge_targets():
                 for _ in range(LISTENERS_PER_TARGET):
-                    self._listeners.append(_EdgeListener(self.settings, target, self.log))
+                    self._listeners.append(_EdgeListener(ep, target, self.log))
             if self.settings.covers(QUICK_SERVICE_HOST, 443):
                 server = ThreadingHTTPServer(("127.0.0.1", 0), _QuickServiceHandler)
                 server.daemon_threads = True
@@ -170,8 +184,12 @@ class ProxyBridge:
             self.stop()
             raise
         if self.active:
-            ep = self.settings.endpoint()
-            self.log(f"Прокси: хосты Cloudflare идут через {ep.scheme}://{ep.host}:{ep.port}")
+            msg = f"Прокси: хосты Cloudflare идут через {ep.redacted_url}"
+            self.log(msg)
+            try:
+                get_logging_manager().info("proxy", msg, event_code="edge_relay_started")
+            except Exception:  # noqa: BLE001
+                pass
 
     def stop(self) -> None:
         for listener in self._listeners:

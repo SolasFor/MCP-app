@@ -15,21 +15,33 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from app.core.logging_manager import configure_logging
 from app.core.redaction import SecretRedactor
 from backend.extensions.store import runtime_entrypoint_prefix
 
 
 def run_extension_entrypoint(entrypoint: str) -> int:
     """Execute an extension entrypoint inside `MCPApp.exe --run-extension <path>`."""
+    lm = configure_logging()
+    lm.install_exception_hooks()
     script = Path(entrypoint).resolve()
     if not script.is_file():
+        lm.error("extensions", f"Extension entrypoint not found: {script}", event_code="ext_missing")
         sys.stderr.write(f"Extension entrypoint not found: {script}\n")
+        lm.shutdown(timeout=1.0)
         return 2
+    lm.info("extensions", f"Running extension worker entrypoint: {script.name}", event_code="ext_worker_start")
     for folder in (str(script.parent), str(Path(__file__).resolve().parents[2])):
         if folder not in sys.path:
             sys.path.insert(0, folder)
-    runpy.run_path(str(script), run_name="__main__")
-    return 0
+    try:
+        runpy.run_path(str(script), run_name="__main__")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        lm.log_crash(type(exc), exc, exc.__traceback__, context=f"extension:{script.name}")
+        raise
+    finally:
+        lm.shutdown(timeout=1.0)
 
 
 class ExtensionProcessHost:

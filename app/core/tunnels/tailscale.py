@@ -42,7 +42,10 @@ class TailscaleFunnelProvider(TunnelProvider):
     def detect(self) -> ProviderDetection:
         exe = _find_tailscale(str(self._config.get("binary_path") or "").strip())
         if not exe:
-            return ProviderDetection(installed=False, detail="tailscale CLI not found")
+            return ProviderDetection(
+                installed=False,
+                detail="tailscale CLI не найден. Установите: winget install --id Tailscale.Tailscale (https://tailscale.com/download).",
+            )
         version = ""
         try:
             rc, out, err = run_cli_capture([exe, "version"], timeout=4.0)

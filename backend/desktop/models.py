@@ -6,9 +6,10 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from app.platform import get_platform
 
@@ -20,6 +21,7 @@ MAX_UI_TREE_NODES = 250
 MAX_WAIT_TIMEOUT_S = 30.0
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 DESKTOP_MIN_PROFILES = ("allowlist", "full")
+_PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
 SENSITIVE_TITLE_KEYWORDS = (
     "1password",
@@ -53,6 +55,23 @@ class DesktopPolicy:
     max_image_bytes: int = MAX_SCREENSHOT_BYTES
     emergency_stop: bool = False
     emergency_reason: str = ""
+
+    @property
+    def effective_screen_capture(self) -> bool:
+        return bool(self.enabled and not self.emergency_stop and self.allow_screen_capture)
+
+    @property
+    def effective_input_control(self) -> bool:
+        return bool(self.enabled and not self.emergency_stop and self.allow_input_control)
+
+    @property
+    def effective_secret_typing(self) -> bool:
+        return bool(
+            self.enabled
+            and not self.emergency_stop
+            and self.allow_input_control
+            and self.allow_secret_typing
+        )
 
     def validate(self) -> None:
         if self.min_profile not in DESKTOP_MIN_PROFILES:
@@ -282,6 +301,14 @@ class DesktopPolicyStore:
             os.replace(tmp, self.path)
             self._platform.restrict_path_acl(self.path, is_dir=False)
 
+    def update(self, **changes: Any) -> DesktopPolicy:
+        """Atomically update selected fields while preserving min_profile, lists, and emergency_stop."""
+        with self._lock:
+            cur = self.load()
+            updated = replace(cur, **changes)
+            self.save(updated)
+            return updated
+
     def set_emergency_stop(self, active: bool, reason: str = "") -> DesktopPolicy:
         with self._lock:
             cur = self.load()
@@ -338,3 +365,78 @@ class DesktopPolicyStore:
                 }
             except (OSError, ValueError):
                 return {"active": False, "client_id": "", "tool": "", "updated_at": 0.0}
+
+
+def record_desktop_policy_audit(
+    audit_path: Path,
+    old_policy: DesktopPolicy,
+    new_policy: DesktopPolicy,
+    *,
+    actor: str = "owner",
+) -> None:
+    """Append a tamper-resistant protected JSONL audit entry for Computer Use policy edits."""
+    changed = {
+        field_name: {"old": getattr(old_policy, field_name), "new": getattr(new_policy, field_name)}
+        for field_name in (
+            "enabled",
+            "allow_screen_capture",
+            "allow_input_control",
+            "allow_secret_typing",
+            "allowed_clients",
+            "allowed_apps",
+            "min_profile",
+            "emergency_stop",
+        )
+        if getattr(old_policy, field_name) != getattr(new_policy, field_name)
+    }
+    if not changed:
+        return
+    entry = {
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "actor": actor,
+        "changes": changed,
+    }
+    target = Path(audit_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    get_platform().restrict_path_acl(target.parent, is_dir=True)
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    get_platform().restrict_path_acl(target, is_dir=False)
+
+
+def desktop_tool_permissions(
+    policy: DesktopPolicy | None,
+    client_id: str | None,
+    client_profile: str,
+    *,
+    emergency_stopped: bool = False,
+) -> tuple[bool, bool]:
+    """Return ``(allow_view, allow_control)`` for an OAuth client under live Computer Use policy."""
+    if emergency_stopped or policy is None or policy.emergency_stop or not policy.enabled:
+        return (False, False)
+    if client_id not in (None, "", "owner"):
+        if client_id == "mcp-app-user" or client_profile == "safe":
+            return (False, False)
+        if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(policy.min_profile, 1):
+            return (False, False)
+        if policy.allowed_clients and client_id not in policy.allowed_clients:
+            return (False, False)
+    return (bool(policy.allow_screen_capture), bool(policy.allow_input_control))
+
+
+def effective_desktop_access(
+    policy: DesktopPolicy | None,
+    client_id: str | None,
+    client_profile: str,
+    *,
+    emergency_stopped: bool = False,
+) -> Literal["disabled", "view", "control"]:
+    """Return effective Computer Use capability level (``disabled``, ``view``, or ``control``)."""
+    allow_view, allow_control = desktop_tool_permissions(
+        policy, client_id, client_profile, emergency_stopped=emergency_stopped
+    )
+    if allow_control:
+        return "control"
+    if allow_view:
+        return "view"
+    return "disabled"

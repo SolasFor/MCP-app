@@ -153,11 +153,18 @@ class TaskManagerIntegrationTests(unittest.TestCase):
             self.assertTrue(tid.startswith("tsk_"))
             self.assertEqual(res["status"], STATUS_SUCCEEDED)
 
-            # Verify TrayIcon.notify_task_event invokes showMessage when backgrounded
-            with patch.object(TrayIcon, "showMessage") as mock_msg:
-                fake_self = type("_Dummy", (), {"_should_notify": lambda self: True, "showMessage": mock_msg})()
+            # Verify TrayIcon.notify_task_event uses silent notification (never QSystemTrayIcon.showMessage)
+            with patch.object(TrayIcon, "show_silent_notification") as mock_msg, patch.object(
+                TrayIcon, "showMessage"
+            ) as mock_audible:
+                fake_self = type(
+                    "_Dummy",
+                    (),
+                    {"_should_notify": lambda self: True, "show_silent_notification": mock_msg},
+                )()
                 TrayIcon.notify_task_event(fake_self, tid, "job", STATUS_SUCCEEDED)
                 mock_msg.assert_called_once()
+                mock_audible.assert_not_called()
 
 
 if __name__ == "__main__":

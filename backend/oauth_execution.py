@@ -1,8 +1,8 @@
 """Three owner-selected execution profiles for OAuth MCP clients.
 
-safe (default): no command/SSH tools.
-allowlist: Windows command lines and SSH host+commands must match exact owner
-           entries (global or per-client); no per-call confirmation.
+safe: no command/SSH tools (fail-closed fallback for unapproved/corrupt/emergency-stop).
+allowlist (default): Windows command lines and SSH host+commands must match exact owner
+                     entries (global or per-client); no per-call confirmation.
 full: approved OAuth clients can run Windows shell/SSH commands immediately.
 
 Supports per-client allowlist overrides, time-bounded temporary grants, and
@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import secrets
 import time
+from pathlib import Path
 from typing import Literal
 
 if __package__:
@@ -24,6 +25,8 @@ ActionKind = Literal["windows", "ssh"]
 PROFILE_SAFE = "safe"
 PROFILE_ALLOWLIST = "allowlist"
 PROFILE_FULL = "full"
+DEFAULT_PROFILE = PROFILE_ALLOWLIST
+DEFAULT_POLICY_ISSUER = "__default__"
 PROFILES = frozenset({PROFILE_SAFE, PROFILE_ALLOWLIST, PROFILE_FULL})
 _PROFILE_RANK = {PROFILE_SAFE: 0, PROFILE_ALLOWLIST: 1, PROFILE_FULL: 2}
 MAX_RULES = 24
@@ -66,7 +69,7 @@ def windows_whitelisted(command: str, entries: tuple[str, ...]) -> bool:
 class ExecutionApprovals:
     """Encrypted SQLite execution policy, per-client allowlists, and temporary grants."""
 
-    def __init__(self, store: OAuthStore) -> None:
+    def __init__(self, store: OAuthStore, *, default_profile: str | None = None) -> None:
         self.store = store
         with store._db() as db:
             db.executescript("""
@@ -82,20 +85,67 @@ class ExecutionApprovals:
                 );
                 DROP TABLE IF EXISTS exec_grants;
             """)
+            template = self._load_template_from_db(db)
+            if default_profile is not None:
+                initial_profile = default_profile if default_profile in PROFILES else PROFILE_SAFE
+            elif template is not None:
+                initial_profile = template["profile"]
+            else:
+                initial_profile = DEFAULT_PROFILE
+            initial_windows = list(template["windows"]) if template is not None else list(DEFAULT_WINDOWS_ALLOWLIST)
+            initial_hosts = list(template["hosts"]) if template is not None else []
+            initial_ssh = list(template["ssh_commands"]) if template is not None else []
             db.execute(
                 "INSERT OR IGNORE INTO exec_policy(issuer, encrypted) VALUES (?,?)",
                 (
                     store.issuer,
                     store._encrypt({
-                        "profile": PROFILE_SAFE,
-                        "windows": list(DEFAULT_WINDOWS_ALLOWLIST),
-                        "hosts": [],
-                        "ssh_commands": [],
+                        "profile": initial_profile,
+                        "windows": initial_windows,
+                        "hosts": initial_hosts,
+                        "ssh_commands": initial_ssh,
                     }),
                 ),
             )
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='exec_requests'").fetchone():
                 db.execute("DELETE FROM exec_requests WHERE issuer=?", (store.issuer,))
+
+    def _load_template_from_db(self, db) -> dict | None:
+        if self.store.issuer == DEFAULT_POLICY_ISSUER:
+            return None
+        row = db.execute(
+            "SELECT encrypted FROM exec_policy WHERE issuer=?", (DEFAULT_POLICY_ISSUER,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = self.store._decrypt(row[0])
+        except Exception:  # noqa: BLE001
+            return None
+        if not isinstance(payload, dict):
+            return None
+        prof = payload.get("profile")
+        if prof not in PROFILES:
+            prof = PROFILE_SAFE
+        return {
+            "profile": prof,
+            "windows": tuple(payload.get("windows", DEFAULT_WINDOWS_ALLOWLIST)),
+            "hosts": tuple(payload.get("hosts", ())),
+            "ssh_commands": tuple(payload.get("ssh_commands", ())),
+        }
+
+    @classmethod
+    def default_template(cls, store_path: Path, *, default_profile: str | None = None) -> ExecutionApprovals:
+        """Return the issuer-independent template policy used before server start and to seed new issuers."""
+        store = OAuthStore(store_path, DEFAULT_POLICY_ISSUER, DEFAULT_POLICY_ISSUER)
+        return cls(store, default_profile=default_profile)
+
+    @classmethod
+    def save_default_template(cls, store_path: Path, *, profile: str) -> None:
+        if profile not in PROFILES:
+            raise ValueError("Unknown access scenario")
+        tmpl = cls.default_template(store_path, default_profile=profile)
+        tmpl.set_profile(profile)
 
     def policy(self) -> dict:
         with self.store._db() as db:
@@ -105,11 +155,27 @@ class ExecutionApprovals:
         if not row:
             return {
                 "profile": PROFILE_SAFE,
-                "windows": DEFAULT_WINDOWS_ALLOWLIST,
+                "windows": (),
                 "hosts": (),
                 "ssh_commands": (),
             }
-        payload = self.store._decrypt(row[0])
+        try:
+            payload = self.store._decrypt(row[0])
+        except Exception:  # noqa: BLE001
+            # Fail closed on corrupted/tampered policy payload.
+            return {
+                "profile": PROFILE_SAFE,
+                "windows": (),
+                "hosts": (),
+                "ssh_commands": (),
+            }
+        if not isinstance(payload, dict):
+            return {
+                "profile": PROFILE_SAFE,
+                "windows": (),
+                "hosts": (),
+                "ssh_commands": (),
+            }
         profile = payload.get("profile", PROFILE_SAFE)
         if profile not in PROFILES:
             profile = PROFILE_SAFE
@@ -136,8 +202,11 @@ class ExecutionApprovals:
                 (self.store.issuer, client_id),
             ).fetchone()
         if row:
-            stored = self.store._decrypt(row[0]).get("profile")
-            base = stored if stored in PROFILES else PROFILE_SAFE
+            try:
+                stored = self.store._decrypt(row[0]).get("profile")
+                base = stored if stored in PROFILES else PROFILE_SAFE
+            except Exception:  # noqa: BLE001
+                base = PROFILE_SAFE
         else:
             base = self.profile()
 
@@ -164,6 +233,11 @@ class ExecutionApprovals:
                 "INSERT OR REPLACE INTO exec_client_profiles (issuer,client_id,encrypted) VALUES (?,?,?)",
                 (self.store.issuer, client_id, self.store._encrypt({"profile": profile})),
             )
+            if profile == PROFILE_SAFE:
+                db.execute(
+                    "DELETE FROM exec_temp_grants WHERE issuer=? AND client_id=?",
+                    (self.store.issuer, client_id),
+                )
 
     def client_allowlist(self, client_id: str) -> dict | None:
         with self.store._db() as db:
@@ -209,7 +283,10 @@ class ExecutionApprovals:
         base = self.policy()
         custom = self.client_allowlist(client_id)
         if custom is None:
-            return base
+            return {
+                **base,
+                "profile": self.profile_for(client_id),
+            }
         return {
             "profile": self.profile_for(client_id),
             "windows": custom["windows"],

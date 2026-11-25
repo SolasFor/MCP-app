@@ -6,21 +6,20 @@ Windows user's encrypted OAuth database and not exposed through Cloudflare.
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
-    QDialog,
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from backend.oauth_execution import ExecutionApprovals, DEFAULT_WINDOWS_ALLOWLIST
 
 
-class ExecutionPolicyDialog(QDialog):
+class ExecutionPolicyDialog(SilentDialog):
     def __init__(self, approvals: ExecutionApprovals, parent: QWidget | None = None):
         super().__init__(parent)
         self.approvals = approvals
@@ -78,8 +77,9 @@ class ExecutionPolicyDialog(QDialog):
                 ssh_commands=self.ssh_commands.toPlainText(),
             )
         except (ValueError, OSError) as exc:
-            QMessageBox.warning(self, "Разрешённые команды",
-                                f"Некорректный список: {exc}")
+            SilentMessageBox.warning(
+                self, "Разрешённые команды", f"Некорректный список: {exc}"
+            )
             return
         self.accept()
 

@@ -15,7 +15,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -29,6 +28,7 @@ from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import theme
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -353,7 +353,7 @@ class ExtensionsPage(PageScaffold):
             self.toast_requested.emit(tr("extensions.toast.installed", name=res["name"]))
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("extensions.title"), str(exc))
+            SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
     def install_selected_catalog(self) -> None:
         row = self.catalog_table.currentRow()
@@ -366,7 +366,7 @@ class ExtensionsPage(PageScaffold):
             self.toast_requested.emit(tr("extensions.toast.installed", name=res["name"]))
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("extensions.title"), str(exc))
+            SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
     def toggle_selected(self) -> None:
         item = self._selected_installed()
@@ -379,7 +379,7 @@ class ExtensionsPage(PageScaffold):
                 self.manager.enable(item["id"])
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("extensions.title"), str(exc))
+            SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
     def edit_permissions_selected(self) -> None:
         item = self._selected_installed()
@@ -414,7 +414,7 @@ class ExtensionsPage(PageScaffold):
             self.toast_requested.emit(tr("extensions.toast.updated", name=res["name"]))
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("extensions.title"), str(exc))
+            SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
     def rollback_selected(self) -> None:
         item = self._selected_installed()
@@ -425,7 +425,7 @@ class ExtensionsPage(PageScaffold):
             self.toast_requested.emit(tr("extensions.toast.rolled_back", name=res["name"]))
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("extensions.title"), str(exc))
+            SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
     def uninstall_selected(self) -> None:
         item = self._selected_installed()

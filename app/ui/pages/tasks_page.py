@@ -7,11 +7,9 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -23,6 +21,8 @@ from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -79,7 +79,7 @@ class TasksPage(PageScaffold):
         for btn in (self.scope_all_btn, self.scope_active_btn, self.scope_history_btn):
             top_bar.addWidget(btn)
 
-        self.status_combo = QComboBox()
+        self.status_combo = SafeComboBox()
         self.status_combo.addItem("", "")
         for st in (
             STATUS_QUEUED,
@@ -120,7 +120,7 @@ class TasksPage(PageScaffold):
 
         logs_card = Card(margins=(12, 12, 12, 12))
         self.logs_header = SectionHeader()
-        self.stream_combo = QComboBox()
+        self.stream_combo = SafeComboBox()
         self.stream_combo.addItem("stdout", "stdout")
         self.stream_combo.addItem("stderr", "stderr")
         self.stream_combo.currentIndexChanged.connect(lambda *_: self._refresh_details())
@@ -133,7 +133,7 @@ class TasksPage(PageScaffold):
 
         art_card = Card(margins=(12, 12, 12, 12))
         self.art_header = SectionHeader()
-        self.artifact_combo = QComboBox()
+        self.artifact_combo = SafeComboBox()
         self.artifact_combo.currentIndexChanged.connect(lambda *_: self._refresh_artifact_preview())
         self.art_header.right_box.addWidget(self.artifact_combo)
         art_card.body.addWidget(self.art_header)
@@ -354,7 +354,7 @@ class TasksPage(PageScaffold):
             self.status_message.emit(tr("tasks.toast.cancelled", task_id=tid[:12]), "info")
             self.reload()
         except Exception as exc:
-            QMessageBox.warning(self, tr("tasks.title"), str(exc))
+            SilentMessageBox.warning(self, tr("tasks.title"), str(exc))
 
     def restart_selected(self) -> None:
         tid = self._selected_task_id()
@@ -367,7 +367,7 @@ class TasksPage(PageScaffold):
                 self.status_message.emit(tr("tasks.toast.restarted", task_id=created.task_id[:12]), "ok")
                 self.reload()
         except Exception as exc:
-            QMessageBox.warning(self, tr("tasks.title"), str(exc))
+            SilentMessageBox.warning(self, tr("tasks.title"), str(exc))
 
     def export_selected_artifact(self) -> None:
         text = self.artifact_view.toPlainText()

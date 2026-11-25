@@ -228,11 +228,11 @@ class LogView(QPlainTextEdit):
         self.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.setPlaceholderText(tr("logs.placeholder"))
 
-        self._records: list[tuple[str, str, str]] = []
-        self._pending: list[tuple[str, str, str]] = []
+        self._records: list[tuple[str, str, str, str]] = []
+        self._pending: list[tuple[str, str, str, str]] = []
         self._redact: Callable[[str], str] | None = None
         self._source_filter = "all"
-        self._level_filter = "all"
+        self._level_filter = "ALL"
         self._query = ""
         self._auto_scroll = True
 
@@ -255,25 +255,62 @@ class LogView(QPlainTextEdit):
         query: str | None = None,
     ) -> None:
         if source is not None:
-            self._source_filter = source
+            norm = (source or "all").strip().lower()
+            self._source_filter = "backend" if norm == "server" else norm
         if level is not None:
-            self._level_filter = level
+            self._level_filter = (level or "ALL").strip()
         if query is not None:
             self._query = query.strip().lower()
         self.re_render()
 
-    def append_line(self, source: str, line: str) -> None:
+    @staticmethod
+    def _infer_level(line: str, explicit: str | None = None) -> str:
+        if explicit and explicit.upper() in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            return explicit.upper()
+        if "[CRITICAL]" in line or "CRITICAL" in line:
+            return "CRITICAL"
+        if _ERR_RE.search(line):
+            return "ERROR"
+        if _WARN_RE.search(line):
+            return "WARNING"
+        if "[DEBUG]" in line or " DEBUG " in line:
+            return "DEBUG"
+        return "INFO"
+
+    def append_line(self, source: str, line: str, *, level: str | None = None, stamp: str | None = None) -> None:
         if self._redact is not None:
             line = self._redact(line)
-        record = (datetime.now().strftime("%H:%M:%S"), source, line)
+        norm_source = "backend" if source == "server" else source
+        lvl = self._infer_level(line, level)
+        record = (stamp or datetime.now().strftime("%H:%M:%S"), norm_source, lvl, line)
         self._records.append(record)
         if len(self._records) > self.MAX_LINES:
             del self._records[: len(self._records) - self.MAX_LINES]
         self._pending.append(record)
-        if _ERR_RE.search(line):
+        if lvl in ("ERROR", "CRITICAL"):
             self.error_logged.emit()
         if not self._timer.isActive():
             self._timer.start()
+
+    def load_records(self, items: list[dict[str, str]], *, prepend: bool = False) -> None:
+        converted: list[tuple[str, str, str, str]] = []
+        for item in items:
+            raw_msg = str(item.get("raw") or item.get("message") or "")
+            if self._redact is not None:
+                raw_msg = self._redact(raw_msg)
+            src = str(item.get("component") or "app")
+            if src == "server":
+                src = "backend"
+            ts = str(item.get("timestamp") or "")
+            stamp = ts[11:19] if len(ts) >= 19 else (ts[:8] or datetime.now().strftime("%H:%M:%S"))
+            lvl = self._infer_level(raw_msg, item.get("level"))
+            converted.append((stamp, src, lvl, raw_msg))
+        self._pending.clear()
+        if prepend:
+            self._records = (converted + self._records)[-self.MAX_LINES :]
+        else:
+            self._records = converted[-self.MAX_LINES :]
+        self.re_render()
 
     def plain_text(self) -> str:
         return self.toPlainText().replace("\u00a0", " ")
@@ -283,6 +320,9 @@ class LogView(QPlainTextEdit):
         self._records.clear()
         self.clear()
         self.counts_changed.emit(0, 0)
+
+    def error_count(self) -> int:
+        return sum(1 for _st, _sr, lvl, _ln in self._records if lvl in ("ERROR", "CRITICAL"))
 
     def records_count(self) -> tuple[int, int]:
         shown = sum(1 for r in self._records if self._matches(r))
@@ -304,14 +344,24 @@ class LogView(QPlainTextEdit):
                 bar.setValue(bar.maximum())
         self.counts_changed.emit(len(matched), len(self._records))
 
-    def _matches(self, record: tuple[str, str, str]) -> bool:
-        _stamp, source, line = record
-        if self._source_filter != "all" and source != self._source_filter:
-            return False
-        if self._level_filter == "err" and not _ERR_RE.search(line):
-            return False
-        if self._level_filter == "warn" and not (_ERR_RE.search(line) or _WARN_RE.search(line)):
-            return False
+    def _matches(self, record: tuple[str, str, str, str]) -> bool:
+        _stamp, source, lvl, line = record
+        if self._source_filter != "all":
+            if self._source_filter == "errors":
+                if lvl not in ("ERROR", "CRITICAL") and source != "errors":
+                    return False
+            elif source != self._source_filter:
+                return False
+        lf = self._level_filter.upper()
+        if lf == "ERR":
+            if lvl not in ("ERROR", "CRITICAL"):
+                return False
+        elif lf == "WARN":
+            if lvl not in ("WARNING", "ERROR", "CRITICAL"):
+                return False
+        elif lf in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            if lvl != lf:
+                return False
         if self._query and self._query not in line.lower() and self._query not in source.lower():
             return False
         return True
@@ -332,21 +382,29 @@ class LogView(QPlainTextEdit):
             self._timer.start()
 
     @staticmethod
-    def _format(stamp: str, source: str, line: str) -> str:
+    def _format(stamp: str, source: str, level: str, line: str) -> str:
         label, label_color = theme.LOG_SOURCES.get(source, (source, theme.TEXT_MUTED))
-        if _ERR_RE.search(line):
+        if level in ("ERROR", "CRITICAL"):
             color = theme.ERR
-        elif _WARN_RE.search(line):
+        elif level == "WARNING":
             color = theme.WARN
+        elif level == "DEBUG":
+            color = theme.TEXT_FAINT
         elif line.startswith("✔"):
             color = theme.OK
-        elif source == "app":
+        elif source in ("app", "backend"):
             color = theme.TEXT
         else:
             color = theme.TEXT_MUTED
-        pad = "&nbsp;" * max(1, 8 - len(label))
+        pad = "&nbsp;" * max(1, 9 - len(label))
+        lvl_tag = (
+            f'<span style="color:{color}; font-weight:600">{escape(level[:4]):4s}</span>&nbsp;'
+            if level in ("ERROR", "CRITICAL", "WARNING")
+            else ""
+        )
         return (
-            f'<span style="color:{theme.TEXT_FAINT}">{stamp}</span>&nbsp;&nbsp;'
+            f'<span style="color:{theme.TEXT_FAINT}">{escape(stamp)}</span>&nbsp;&nbsp;'
             f'<span style="color:{label_color}; font-weight:600">{escape(label)}</span>{pad}'
+            f'{lvl_tag}'
             f'<span style="color:{color}">{escape(line)}</span>'
         )

@@ -11,12 +11,15 @@ from typing import Any
 INTERNAL_SECRET_ENV_PREFIXES: tuple[str, ...] = ("MCP_",)
 INTERNAL_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "MCP_SECRET_TOKEN",
+    "MCP_ADMIN_TOKEN",
     "TUNNEL_TOKEN",
     "CLOUDFLARE_API_TOKEN",
     "CF_API_TOKEN",
     "NGROK_AUTHTOKEN",
     "OPENAI_API_KEY",
-    "OPENAI_TUNNEL_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
 })
 
 _SECRET_FIELD_NAMES = frozenset({
@@ -24,34 +27,79 @@ _SECRET_FIELD_NAMES = frozenset({
     "secret",
     "password",
     "passwd",
+    "pwd",
     "api_key",
     "apikey",
     "authtoken",
     "authorization",
+    "proxy_authorization",
+    "proxy-authorization",
     "private_key",
     "credential",
     "credentials",
     "tunnel_token",
+    "cloudflare_api_token",
+    "cloudflare_tunnel_token",
     "access_token",
     "refresh_token",
+    "authorization_code",
+    "code_verifier",
+    "pkce_verifier",
     "client_secret",
     "owner_token",
     "bearer",
+    "screenshot",
+    "image_base64",
+    "png_base64",
 })
 
 _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9\-._~+/=]{6,}"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)((?:proxy-)?authorization\s*[:=]\s*(?:bearer|basic|digest)\s+)[A-Za-z0-9\-._~+/=]{4,}"), r"\1[REDACTED]"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9\-._~+/=]{8,}"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)([?&](?:token|access_token|secret|api_key)=)[^&\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(basic\s+)[A-Za-z0-9+/=]{8,}"), r"\1[REDACTED]"),
     (
         re.compile(
-            r"(?i)((?:MCP_SECRET_TOKEN|TUNNEL_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN|"
-            r"NGROK_AUTHTOKEN|OPENAI_API_KEY|OPENAI_TUNNEL_TOKEN)\s*=\s*)[^\s\"']+"
+            r"(?i)([?&](?:token|access_token|refresh_token|code|code_verifier|secret|api_key|owner_token|client_secret|password)=)[^&\s\"']+"
         ),
         r"\1[REDACTED]",
     ),
+    (
+        re.compile(
+            r"(?i)((?:MCP_SECRET_TOKEN|MCP_ADMIN_TOKEN|TUNNEL_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN|"
+            r"NGROK_AUTHTOKEN|OPENAI_API_KEY)\s*[:=]\s*)[^\s\"']+"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)([\"']?(?:owner_token|tunnel_token|access_token|refresh_token|code_verifier|"
+            r"authorization_code|client_secret|authtoken|api_key|password|passwd|mcp_oauth_csrf)[\"']?\s*[:=]\s*[\"']?)([^\s\"',}&]{4,})"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(?<![A-Za-z0-9_])((?:code|state_secret|csrf_token)\s*[:=]\s*[\"']?)([^\s\"',}&]{4,})"),
+        r"\1[REDACTED]",
+    ),
     (re.compile(r"(?i)((?:socks5h?|https?)://[^:/@\s]+:)[^@\s]+(@)"), r"\1[REDACTED]\2"),
-    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|cfut_[A-Za-z0-9_-]{16,})\b"), "[REDACTED]"),
+    (
+        re.compile(
+            r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|cfut_[A-Za-z0-9_-]{16,}|eyJhIjoi[A-Za-z0-9+/=_-]{20,})\b"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=]{16,}"),
+        "[REDACTED SCREENSHOT DATA]",
+    ),
+    (
+        re.compile(r"\biVBORw0KGgo[A-Za-z0-9+/=]{16,}"),
+        "[REDACTED SCREENSHOT DATA]",
+    ),
+    (
+        re.compile(r"\biVBORw0KGgo[A-Za-z0-9+/=]{64,}"),
+        "[REDACTED SCREENSHOT DATA]",
+    ),
     (
         re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"),
         "[REDACTED PRIVATE KEY]",

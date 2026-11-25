@@ -8,14 +8,11 @@ from typing import Any
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QComboBox,
-    QDialog,
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
@@ -29,6 +26,8 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -45,7 +44,7 @@ def _parse_lines(raw: str) -> tuple[str, ...]:
     return tuple(line.strip() for line in raw.splitlines() if line.strip())
 
 
-class DeviceProfileDialog(QDialog):
+class DeviceProfileDialog(SilentDialog):
     """Create or edit an SSH/SFTP DeviceProfile with strict host-key verification and SecretStore refs."""
 
     def __init__(
@@ -83,7 +82,7 @@ class DeviceProfileDialog(QDialog):
         self.user_edit = QLineEdit(self._base.username)
         self.user_edit.setObjectName("UiInput")
 
-        self.auth_combo = QComboBox()
+        self.auth_combo = SafeComboBox()
         for mode in ("agent", "key", "password_ref"):
             self.auth_combo.addItem(mode, mode)
         self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(self._base.auth_method)))
@@ -105,7 +104,7 @@ class DeviceProfileDialog(QDialog):
         self.clients_edit = QLineEdit(", ".join(self._base.allowed_clients))
         self.clients_edit.setObjectName("UiInput")
 
-        self.min_profile_combo = QComboBox()
+        self.min_profile_combo = SafeComboBox()
         self.min_profile_combo.addItem("Allowlist", "allowlist")
         self.min_profile_combo.addItem("Full Access", "full")
         self.min_profile_combo.setCurrentIndex(max(0, self.min_profile_combo.findData(self._base.min_profile)))
@@ -197,7 +196,7 @@ class DeviceProfileDialog(QDialog):
             if self._is_new and prof.device_id in self._store.load_all():
                 raise ValueError(f"Device '{prof.device_id}' already exists")
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, tr("devices.title"), str(exc))
+            SilentMessageBox.warning(self, tr("devices.title"), str(exc))
             return
         self.saved_profile = prof
         self.accept()
@@ -348,7 +347,7 @@ class DevicesPage(PageScaffold):
 
     def add_device(self) -> None:
         dlg = DeviceProfileDialog(self.store, is_new=True, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_profile is not None:
+        if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.saved_profile is not None:
             self.store.upsert(dlg.saved_profile)
             self.manager._register_secrets()
             self.toast_requested.emit(tr("devices.toast.saved", name=dlg.saved_profile.name))
@@ -362,7 +361,7 @@ class DevicesPage(PageScaffold):
         if existing is None:
             return
         dlg = DeviceProfileDialog(self.store, existing=existing, is_new=False, parent=self)
-        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.saved_profile is not None:
+        if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.saved_profile is not None:
             self.store.upsert(dlg.saved_profile)
             self.manager._register_secrets()
             self.toast_requested.emit(tr("devices.toast.saved", name=dlg.saved_profile.name))

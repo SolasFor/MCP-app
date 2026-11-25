@@ -1,4 +1,4 @@
-"""Unit tests for Stage 3 ConnectionManager and all 6 TunnelProvider implementations."""
+"""Unit tests for Stage 3 ConnectionManager and all 5 TunnelProvider implementations."""
 from __future__ import annotations
 
 import http.server
@@ -15,10 +15,9 @@ from app.core.tunnels import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     ConnectionManager,
-    OpenAISecureTunnelProvider,
     TailscaleFunnelProvider,
 )
 from backend.oauth_store import OAuthStore
@@ -51,13 +50,16 @@ class ConnectionManagerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_all_six_providers_registered_and_single_active_policy(self) -> None:
-        self.assertEqual(set(self.mgr.providers.keys()), set(ALL_PROVIDERS))
+    def test_all_four_ui_providers_registered_and_single_active_policy(self) -> None:
+        self.assertEqual(len(ALL_PROVIDERS), 4)
+        self.assertNotIn(PROVIDER_LOCAL, ALL_PROVIDERS)
+        self.assertTrue(set(ALL_PROVIDERS).issubset(set(self.mgr.providers.keys())))
+        self.assertEqual(set(self.mgr.list_statuses(local_host="127.0.0.1", local_port=8000, mcp_path="/mcp", runtime_url="", running=False).keys()), set(ALL_PROVIDERS))
         self.assertEqual(self.mgr.active_provider_id, PROVIDER_CF_QUICK)
         self.mgr.set_active_provider(PROVIDER_NGROK)
         self.assertEqual(self.mgr.active_provider_id, PROVIDER_NGROK)
-        self.mgr.set_active_provider(PROVIDER_LOCAL)
-        self.assertEqual(self.mgr.active_provider_id, PROVIDER_LOCAL)
+        self.mgr.set_active_provider(PROVIDER_NONE)
+        self.assertEqual(self.mgr.active_provider_id, PROVIDER_NONE)
 
     def test_local_only_enforces_loopback_and_no_public_url(self) -> None:
         local = self.mgr.get(PROVIDER_LOCAL)
@@ -171,32 +173,37 @@ class ConnectionManagerTests(unittest.TestCase):
             self.assertIn("off", funnel_calls[0])
             self.assertNotIn("reset", funnel_calls[0])
 
-    def test_openai_tunnel_keeps_public_url_empty_and_guards_api_key(self) -> None:
-        oai = self.mgr.get(PROVIDER_OPENAI)
-        assert isinstance(oai, OpenAISecureTunnelProvider)
-        errors = self.mgr.configure_provider(
-            PROVIDER_OPENAI,
-            {"tunnel_id": "tunnel_0123456789abcdef0123", "profile_name": "workstation"},
-            secrets={"api_key": "sk-tunnel-secret-xyz"},
+    def test_legacy_openai_tunnel_migrates_safely_and_purges_only_legacy_secret(self) -> None:
+        tunnels_dir = self.data_dir / "tunnels"
+        tunnels_dir.mkdir(parents=True, exist_ok=True)
+        (tunnels_dir / "connections.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "active_provider": "openai_tunnel",
+                    "providers": {
+                        "openai_tunnel": {"tunnel_id": "tunnel_legacy_123", "profile_name": "workstation"},
+                        "ngrok": {"reserved_domain": "demo.ngrok.app"},
+                    },
+                }
+            ),
+            encoding="utf-8",
         )
-        self.assertEqual(errors, [])
-        raw_json = (self.data_dir / "tunnels" / "connections.json").read_text(encoding="utf-8")
-        self.assertNotIn("sk-tunnel-secret-xyz", raw_json)
+        self.secrets.set_secret("tunnel", "openai_tunnel_api_key", "sk-legacy-secret")
+        self.secrets.set_secret("tunnel", "ngrok_authtoken", "ng-keep-secret")
 
-        ident = oai.connection_identity(local_host="127.0.0.1", local_port=8000, mcp_path="/mcp")
-        self.assertFalse(ident.is_public_url)
-        self.assertEqual(ident.public_url, "")
-        self.assertEqual(ident.private_tunnel_id, "tunnel_0123456789abcdef0123")
-        self.assertEqual(ident.oauth_resource_url, "http://127.0.0.1:8000/mcp")
+        migrated_mgr = ConnectionManager(self.data_dir, secret_store=self.secrets)
+        self.assertEqual(migrated_mgr.migrated_from_provider, "openai_tunnel")
+        self.assertEqual(migrated_mgr.active_provider_id, PROVIDER_NONE)
+        self.assertIsNone(migrated_mgr.providers.get("openai_tunnel"))
 
-        with patch("app.core.tunnels.openai_tunnel._find_tunnel_client", return_value="tunnel-client.exe"), patch(
-            "app.core.tunnels.openai_tunnel.run_cli_capture", return_value=(0, "v0.3.1", "")
-        ):
-            spec = oai.build_launch_spec(local_host="127.0.0.1", local_port=8000, mcp_path="/mcp")
-        assert spec is not None
-        self.assertEqual(spec.args, ("run", "--profile", "workstation"))
-        self.assertEqual(spec.env.get("CONTROL_PLANE_API_KEY"), "sk-tunnel-secret-xyz")
-        self.assertNotIn("sk-tunnel-secret-xyz", " ".join(spec.args))
+        saved_raw = (tunnels_dir / "connections.json").read_text(encoding="utf-8")
+        self.assertNotIn("openai_tunnel", saved_raw)
+        self.assertTrue(migrated_mgr.has_legacy_openai_secret())
+        self.assertTrue(migrated_mgr.purge_legacy_openai_secret())
+        self.assertFalse(migrated_mgr.has_legacy_openai_secret())
+        self.assertIsNone(self.secrets.get_secret("tunnel", "openai_tunnel_api_key"))
+        self.assertEqual(self.secrets.get_secret("tunnel", "ngrok_authtoken"), "ng-keep-secret")
 
     def test_issuer_transition_warning_and_oauth_store_isolation(self) -> None:
         self.mgr.configure_provider(PROVIDER_NGROK, {"reserved_domain": "alpha.ngrok.app"})

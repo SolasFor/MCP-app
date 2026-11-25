@@ -9,14 +9,11 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
-    QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -32,6 +29,8 @@ from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -61,7 +60,7 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
-class WorkspaceProfileDialog(QDialog):
+class WorkspaceProfileDialog(SilentDialog):
     """Create or edit a WorkspaceProfile with granular permissions and SecretStore refs."""
 
     def __init__(
@@ -164,7 +163,7 @@ class WorkspaceProfileDialog(QDialog):
         form.addRow("", opts_row)
 
         access_row = QHBoxLayout()
-        self.min_profile_combo = QComboBox()
+        self.min_profile_combo = SafeComboBox()
         for mp in WORKSPACE_MIN_PROFILES:
             self.min_profile_combo.addItem(mp, mp)
         self.min_profile_combo.setCurrentIndex(
@@ -216,7 +215,7 @@ class WorkspaceProfileDialog(QDialog):
         try:
             meta = detect_workspace_metadata(root)
         except Exception as exc:
-            QMessageBox.warning(self, tr("workspaces.title"), str(exc))
+            SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
             return
         if not self.id_edit.isReadOnly() and not self.id_edit.text().strip():
             clean_id = "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in str(meta["name"]))
@@ -269,7 +268,7 @@ class WorkspaceProfileDialog(QDialog):
             if self._is_new and wid in self._store.load_workspaces():
                 raise ValueError(f"Workspace '{wid}' already exists")
         except Exception as exc:
-            QMessageBox.warning(self, tr("workspaces.title"), str(exc))
+            SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
             return
         self.saved_profile = profile
         self.accept()
@@ -351,7 +350,7 @@ class WorkspacesPage(PageScaffold):
         self.file_search_edit = QLineEdit()
         self.file_search_edit.setObjectName("UiInput")
         self.file_search_btn = self._make_btn(self.search_in_selected_workspace)
-        self.cmd_combo = QComboBox()
+        self.cmd_combo = SafeComboBox()
         self.git_header.right_box.addWidget(self.file_search_edit)
         self.git_header.right_box.addWidget(self.file_search_btn)
         self.git_header.right_box.addWidget(self.cmd_combo)
@@ -520,14 +519,14 @@ class WorkspacesPage(PageScaffold):
         wid = self._selected_id()
         if not wid:
             return
-        ans = QMessageBox.question(
+        ans = SilentMessageBox.question(
             self,
             tr("workspaces.title"),
             tr("workspaces.delete.confirm", name=wid),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.No,
         )
-        if ans != QMessageBox.StandardButton.Yes:
+        if ans != SilentMessageBox.StandardButton.Yes:
             return
         self.store.delete_workspace(wid)
         self.config_changed.emit()
@@ -557,7 +556,7 @@ class WorkspacesPage(PageScaffold):
             )
             self.reload()
         except Exception as exc:
-            QMessageBox.warning(self, tr("workspaces.title"), str(exc))
+            SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
 
     def search_in_selected_workspace(self) -> None:
         wid = self._selected_id()
@@ -570,7 +569,7 @@ class WorkspacesPage(PageScaffold):
                 self._redactor.redact_text(json.dumps(res, indent=2, ensure_ascii=False))
             )
         except Exception as exc:
-            QMessageBox.warning(self, tr("workspaces.title"), str(exc))
+            SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
 
     def run_selected_task(self) -> None:
         wid = self._selected_id()
@@ -583,7 +582,7 @@ class WorkspacesPage(PageScaffold):
                 self._redactor.redact_text(json.dumps(res, indent=2, ensure_ascii=False))
             )
         except Exception as exc:
-            QMessageBox.warning(self, tr("workspaces.title"), self._redactor.redact_text(str(exc)))
+            SilentMessageBox.warning(self, tr("workspaces.title"), self._redactor.redact_text(str(exc)))
 
     def shutdown(self) -> None:
         self.manager.close()

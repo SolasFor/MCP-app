@@ -65,6 +65,7 @@ class ToolRegistryAndGrantsTests(unittest.TestCase):
         self.assertFalse(self.exec.can_request("alpha", "windows", command="whoami"))
 
     def test_temporary_grants_authorize_expire_and_revoke(self) -> None:
+        self.exec.set_client_profile("alpha", "safe")
         self.assertEqual(self.registry.allowed_tools(self.store, _principal("alpha"), self.exec), BASIC_TOOLS)
         grant_id = self.exec.grant_temporary_access(
             "alpha",

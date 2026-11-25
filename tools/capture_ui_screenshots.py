@@ -34,6 +34,8 @@ def verify_layout_geometry(scale: str = "1.0") -> dict[str, str]:
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp)
         with patch("app.paths.user_data_dir", return_value=data_dir), patch(
+            "app.core.service_manager.user_data_dir", return_value=data_dir
+        ), patch(
             "app.config.user_data_dir", return_value=data_dir
         ), patch("app.ui.theme.user_data_dir", return_value=data_dir, create=True), patch(
             "app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"
@@ -69,6 +71,8 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp)
         with patch("app.paths.user_data_dir", return_value=data_dir), patch(
+            "app.core.service_manager.user_data_dir", return_value=data_dir
+        ), patch(
             "app.config.user_data_dir", return_value=data_dir
         ), patch("app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"):
             i18n.set_language(LANG_RU)
@@ -82,7 +86,7 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             app.processEvents()
 
             # Sample redacted logs for logs screenshot
-            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v0.9.0 UI initialized")
+            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v1.0.0 UI initialized")
             win.logs_page.viewer.log_view.append_line("server", "Uvicorn running on http://127.0.0.1:8000")
             win.logs_page.viewer.log_view.append_line("tunnel", f"Connected token={mgr.token}")
             win.logs_page.viewer.log_view.append_line("tunnel", "WRN edge reconnect in 2s")
@@ -126,6 +130,34 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             p4 = out_dir / "logs-light.png"
             win.grab().save(str(p4))
             saved.append(p4)
+
+            # 5. Security Dark (RU) - Default access profile & Computer Use ToggleSwitches
+            win.set_theme_mode(theme.THEME_DARK)
+            win.set_language(LANG_RU)
+            win.show_page("security")
+            win.toasts.clear_all()
+            app.processEvents()
+            p5 = out_dir / "security-dark.png"
+            win.grab().save(str(p5))
+            saved.append(p5)
+
+            # 6. Security Light (RU) - Light theme verification of disabled toggles
+            win.set_theme_mode(theme.THEME_LIGHT)
+            win.show_page("security")
+            win.toasts.clear_all()
+            app.processEvents()
+            p5_light = out_dir / "security-light.png"
+            win.grab().save(str(p5_light))
+            saved.append(p5_light)
+
+            # 7. Settings Dark (RU) - Persistent Logging & Appearance
+            win.set_theme_mode(theme.THEME_DARK)
+            win.show_page("settings")
+            win.toasts.clear_all()
+            app.processEvents()
+            p6 = out_dir / "settings-dark.png"
+            win.grab().save(str(p6))
+            saved.append(p6)
 
             win.allow_close()
             win.close()

@@ -4,16 +4,18 @@ This document summarizes the security architecture, trust boundaries, verified m
 
 ## 1. Trust Boundaries
 
-1. **External MCP Clients & Public Tunnels** (`Cloudflare Quick/Named`, `ngrok`, `Tailscale Funnel`, `OpenAI Secure MCP Tunnel`, `Local only`):
+1. **External MCP Clients & Public Tunnels** (`Cloudflare Quick/Named`, `ngrok`, `Tailscale Funnel`):
    - Untrusted external requests arrive over TLS tunnels forwarding to `127.0.0.1:<port>`.
    - `HybridAuthMiddleware` strips legacy `?token=` from URLs (never logging tokens) and enforces DNS-rebinding allowlists (`TransportSecuritySettings`) plus Gateway loop header defense (`check_loop_headers`).
+   - Browser OAuth `/oauth/consent` enforces `Origin`, `Sec-Fetch-Site`, double-submit `csrf_token` cookie+form validation, and scopes CSP `form-action` strictly to `'self'` plus the single validated client `redirect_uri` origin/scheme (never `*`), blocking `javascript:`/`data:`/`vbscript:`/`blob:`/`file:` URIs.
    - Authentication is **never** disabled based on loopback source IP or tunnel trust; OAuth bearer tokens (`LocalConsentOAuthProvider`) validate `issuer`, `resource`, expiry, and live approval.
+   - Rotating the owner token revokes all issued OAuth access/refresh tokens and resets `clients.approved_at` while keeping DCR `client_id` entries so authorized clients can reconnect and re-consent cleanly with the new owner token.
    - `issuer` transitions across incompatible providers prompt the owner before switching and never reuse tokens across issuers.
-   - OpenAI Secure MCP Tunnel uses outbound tunnel-client connections and is explicitly marked non-public (`is_public_url=False`); official OpenAI product support depends on account entitlement and cannot be assumed across arbitrary plans.
+   - Persistent logs in `%APPDATA%\MCPApp\logs\` and exported diagnostic ZIP bundles pass through `SecretRedactor` before writing (including at `DEBUG` level) and preserve protected security audits (`mcp_execution_audit.jsonl`, `desktop_policy_audit.jsonl`) against normal clearing or log rotation.
 
 2. **Three OAuth Execution Profiles (`safe`, `allowlist`, `full`)**:
-   - **`safe`** (default): Exposes only read-only `server_info`.
-   - **`allowlist`**: Grants exact-command Windows execution (`ExecutionApprovals`, non-shell built-ins for `dir`/`ls`/`pwd`/`echo`), exact SSH host/command allowlists, Workspaces/Git/Servers/Tasks/Computer Use/Extensions/Remote tools gated by per-client policies and permissions.
+   - **`safe`**: Fail-closed fallback for unapproved clients, corrupted encrypted policies, invalid configuration values, and active Emergency Stop; exposes only read-only `server_info`.
+   - **`allowlist`** *(default scenario on first launch)*: Grants exact-command Windows execution (`ExecutionApprovals`, non-shell built-ins for `dir`/`ls`/`pwd`/`echo`), exact SSH host/command allowlists, and Workspaces/Git/Servers/Tasks/Extensions/Remote tools gated by per-client policies and permissions.
    - **`full`**: Enables arbitrary Windows `cmd.exe` / PowerShell / SSH commands and `oauth_managed_server` / `extension_enable` / `extension_disable` without per-call confirmations inside MCP-app.
    - **CRITICAL NON-GUARANTEE**: **Full access is NOT an OS sandbox.** Arbitrary code executed under `full` runs with the full privileges of the signed-in Windows user (including access to user files and DPAPI-protected data). Do not enable `full` for untrusted clients.
    - Emergency Stop (`runtime_control` in SQLite + `DesktopPolicyStore`) immediately blocks all non-`server_info` OAuth discovery and live/queued execution fail-closed.

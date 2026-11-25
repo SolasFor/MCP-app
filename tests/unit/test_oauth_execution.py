@@ -35,23 +35,26 @@ class OAuthExecutionTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_fresh_default_safe_and_allowlist_preset(self):
-        self.assertEqual(self.policy.profile(), PROFILE_SAFE)
+    def test_fresh_default_allowlist_and_fail_closed_for_unapproved(self):
+        self.assertEqual(self.policy.profile(), PROFILE_ALLOWLIST)
         self.assertEqual(self.policy.policy()["windows"], DEFAULT_WINDOWS_ALLOWLIST)
-        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
+        self.assertTrue(self.policy.can_request("client-a", "windows", command="whoami"))
+        self.assertFalse(self.policy.can_request("client-b", "windows", command="whoami"))
         self.assertFalse(self.policy.can_request("client-a", "ssh", command="uptime", host="machine.local"))
 
     def test_default_commands_are_seeded_and_survive_restart(self):
         expected = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
         self.assertEqual(self.policy.policy()["windows"], expected)
-        self.assertEqual(self.policy.profile(), PROFILE_SAFE)
+        self.assertEqual(self.policy.profile(), PROFILE_ALLOWLIST)
         with self.store._db() as db:
             self.assertIsNotNone(db.execute(
                 "SELECT encrypted FROM exec_policy WHERE issuer=?", (BASE,)
             ).fetchone())
         reloaded = ExecutionApprovals(OAuthStore(self.path, BASE, RESOURCE))
         self.assertEqual(reloaded.policy()["windows"], expected)
-        self.assertEqual(reloaded.profile(), PROFILE_SAFE)
+        self.assertEqual(reloaded.profile(), PROFILE_ALLOWLIST)
+        self.policy.set_profile(PROFILE_SAFE)
+        self.assertFalse(self.policy.can_request("client-a", "windows", command="whoami"))
 
     def test_explicit_empty_allowlist_remains_empty_on_upgrade(self):
         self.policy.set_policy(windows="", hosts="", ssh_commands="")

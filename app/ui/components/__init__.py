@@ -11,14 +11,19 @@ __all__ = [
     "ErrorBanner",
     "LogViewerWidget",
     "PaletteAction",
+    "SafeComboBox",
     "SectionHeader",
     "Sidebar",
+    "SilentDialog",
+    "SilentMessageBox",
     "ToastManager",
 ]
 
 from app.ui.components.cards import Badge, Card, Divider, EmptyState, ErrorBanner, SectionHeader
 from app.ui.components.command_palette import CommandPaletteDialog, PaletteAction
 from app.ui.components.log_viewer import LogViewerWidget
+from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.sidebar import Sidebar
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.components.toast import ToastManager

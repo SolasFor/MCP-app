@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -21,7 +21,7 @@ from app.paths import user_data_dir
 
 SETTINGS_FILE = "settings.json"
 
-# Режимы туннеля и провайдеры (v0.9.1)
+# Режимы туннеля и провайдеры (v0.9.1+)
 TUNNEL_NAMED = "named"   # свой домен: config.yml + `cloudflared tunnel run`
 TUNNEL_QUICK = "quick"   # временный адрес *.trycloudflare.com: `cloudflared tunnel --url …`
 TUNNEL_MODES = (TUNNEL_NAMED, TUNNEL_QUICK)
@@ -31,16 +31,23 @@ PROVIDER_CF_QUICK = "cloudflare_quick"
 PROVIDER_CF_NAMED = "cloudflare_named"
 PROVIDER_NGROK = "ngrok"
 PROVIDER_TAILSCALE = "tailscale_funnel"
-PROVIDER_OPENAI = "openai_tunnel"
 PROVIDER_LOCAL = "local_only"
-ACTIVE_PROVIDERS = (
+PROVIDER_NONE = "none"
+REMOVED_PROVIDER_OPENAI = "openai_tunnel"
+UI_PROVIDERS = (
     PROVIDER_CF_QUICK,
     PROVIDER_CF_NAMED,
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
-    PROVIDER_OPENAI,
-    PROVIDER_LOCAL,
 )
+ACTIVE_PROVIDERS = (
+    *UI_PROVIDERS,
+    PROVIDER_LOCAL,
+    PROVIDER_NONE,
+)
+LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+ACCESS_PROFILES = ("safe", "allowlist", "full")
+DEFAULT_ACCESS_PROFILE = "allowlist"
 
 DEFAULT_MCP_PATH = "/mcp"
 DEFAULT_PUBLIC_URL = ""  # своего домена по умолчанию нет
@@ -119,11 +126,21 @@ class Settings:
     enable_advanced_tools: bool = False
     enable_execution_tools: bool = False
     enable_oauth: bool = True  # OAuth DCR + browser consent for read-only external MCP clients
+    default_access_profile: str = DEFAULT_ACCESS_PROFILE
 
     # Поведение
     start_services_on_launch: bool = False
     minimize_to_tray_on_close: bool = True
     auto_restart: bool = True
+
+    # Постоянное логирование (v1.0.0 Wave 2)
+    logging_enabled: bool = True
+    logging_level: str = "INFO"
+    logging_max_file_mb: int = 10
+    logging_retention_days: int = 30
+    logging_max_total_mb: int = 200
+    logging_auto_rotate: bool = True
+    logging_archive_enabled: bool = True
 
     # Интерфейс и окно (v0.9.0)
     theme_mode: str = "dark"         # dark | light | system
@@ -134,6 +151,7 @@ class Settings:
     window_x: int | None = None
     window_y: int | None = None
     window_maximized: bool = False
+    migrated_from_provider: str = field(default="", repr=False, compare=False)
 
     # ------------------------------------------------------------------ свойства
     @property
@@ -168,7 +186,7 @@ class Settings:
             return cls()
         if not isinstance(data, dict):
             return cls()
-        known = {f.name for f in fields(cls)}
+        known = {f.name for f in fields(cls) if f.name != "migrated_from_provider"}
         try:
             settings = cls(**{k: v for k, v in data.items() if k in known})
         except TypeError:
@@ -177,7 +195,18 @@ class Settings:
             settings.active_provider = (
                 PROVIDER_CF_NAMED if settings.tunnel_mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
             )
+        raw_provider = str(data.get("active_provider") or settings.active_provider)
+        was_migrated = raw_provider in (REMOVED_PROVIDER_OPENAI, PROVIDER_LOCAL)
+        if raw_provider == PROVIDER_LOCAL:
+            # Legacy Local only UI mode -> safe state with no active external transport.
+            settings.migrated_from_provider = PROVIDER_LOCAL
+            settings.active_provider = PROVIDER_NONE
         settings.sanitize()
+        if was_migrated:
+            try:
+                settings.save()
+            except OSError:
+                pass
         return settings
 
     @classmethod
@@ -197,9 +226,18 @@ class Settings:
 
     def sanitize(self) -> None:
         """Подправить значения, которые могли быть отредактированы вручную."""
-        for field in ("allow_query_token", "enable_advanced_tools", "enable_execution_tools", "enable_oauth"):
-            if not isinstance(getattr(self, field), bool):
-                setattr(self, field, False)
+        for field_name in (
+            "allow_query_token",
+            "enable_advanced_tools",
+            "enable_execution_tools",
+            "enable_oauth",
+            "logging_enabled",
+            "logging_auto_rotate",
+            "logging_archive_enabled",
+        ):
+            if not isinstance(getattr(self, field_name), bool):
+                default_val = field_name.startswith("logging_")
+                setattr(self, field_name, default_val)
         # Query tokens can leak via logs, history and copied URLs. OAuth
         # replaces the need for them; disable on existing installs too.
         self.allow_query_token = False
@@ -207,7 +245,11 @@ class Settings:
             self.enable_execution_tools = False
         if self.tunnel_mode not in TUNNEL_MODES:
             self.tunnel_mode = DEFAULT_TUNNEL_MODE
-        if self.active_provider not in ACTIVE_PROVIDERS:
+        if self.active_provider == REMOVED_PROVIDER_OPENAI:
+            # Safely migrate removed OpenAI Tunnel to no-active-transport state; never auto-publish.
+            self.migrated_from_provider = REMOVED_PROVIDER_OPENAI
+            self.active_provider = PROVIDER_NONE
+        elif self.active_provider not in ACTIVE_PROVIDERS:
             self.active_provider = (
                 PROVIDER_CF_NAMED if self.tunnel_mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
             )
@@ -215,6 +257,23 @@ class Settings:
             self.tunnel_mode = TUNNEL_NAMED
         elif self.active_provider == PROVIDER_CF_QUICK:
             self.tunnel_mode = TUNNEL_QUICK
+        if not isinstance(self.default_access_profile, str) or self.default_access_profile not in ACCESS_PROFILES:
+            # Fail closed when persisted policy value is invalid/corrupted.
+            self.default_access_profile = "safe"
+        if not isinstance(self.logging_level, str) or self.logging_level.strip().upper() not in LOG_LEVEL_NAMES:
+            self.logging_level = "INFO"
+        else:
+            self.logging_level = self.logging_level.strip().upper()
+        for attr, default, minimum, maximum in (
+            ("logging_max_file_mb", 10, 1, 512),
+            ("logging_retention_days", 30, 1, 3650),
+            ("logging_max_total_mb", 200, 10, 10240),
+        ):
+            val = getattr(self, attr)
+            if not isinstance(val, int) or isinstance(val, bool) or val < minimum or val > maximum:
+                setattr(self, attr, default)
+        if self.logging_max_total_mb < self.logging_max_file_mb:
+            self.logging_max_total_mb = self.logging_max_file_mb
         self.mcp_path = normalize_mcp_path(self.mcp_path)
         self.server_health_path = normalize_mcp_path(self.server_health_path)
         url = normalize_public_url(self.public_url, self.mcp_path)
@@ -222,6 +281,15 @@ class Settings:
             url = ""  # временный адрес — не свой домен
         if url in _LEGACY_DEFAULT_PUBLIC_URLS and not self.has_named_tunnel_config():
             url = ""
+        if not url and self.active_provider == PROVIDER_CF_NAMED:
+            try:
+                from app.core import domain_state
+
+                wiz = domain_state.load()
+                if wiz.hostname:
+                    url = normalize_public_url(wiz.hostname, self.mcp_path)
+            except Exception:  # noqa: BLE001
+                pass
         self.public_url = url
         if (
             self.active_provider == PROVIDER_CF_NAMED
@@ -254,6 +322,9 @@ class Settings:
 
     def save(self) -> None:
         target = self.path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = asdict(self)
+        payload.pop("migrated_from_provider", None)
         tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(target)  # атомарная запись

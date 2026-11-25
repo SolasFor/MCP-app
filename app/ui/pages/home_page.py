@@ -1,10 +1,9 @@
-"""Unified Overview / Home page: Engine state, endpoint, quick/named mode, OAuth profile, client summary."""
+"""Unified Overview / Home page: Engine state, endpoint, and quick/named mode."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -15,8 +14,7 @@ from PyQt6.QtWidgets import (
 
 from app.config import TUNNEL_NAMED, TUNNEL_QUICK
 from app.ui import theme
-from app.ui.components.cards import Card, Divider, ErrorBanner, SectionHeader
-from app.ui.components.table import DataTable
+from app.ui.components.cards import Card, Divider, ErrorBanner
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from app.ui.widgets import StatusRow
@@ -31,7 +29,7 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
 
 
 class HomePage(PageScaffold):
-    """Unified operational dashboard keeping quick control over Engine, URL, and OAuth profiles."""
+    """Unified operational dashboard keeping quick control over Engine and endpoint."""
 
     toggle_requested = pyqtSignal()
     emergency_stop_requested = pyqtSignal()
@@ -42,9 +40,6 @@ class HomePage(PageScaffold):
     url_edited = pyqtSignal(str)
     url_save_requested = pyqtSignal()
     copy_requested = pyqtSignal(str, object)
-    access_profile_changed = pyqtSignal(int)
-    allowlist_requested = pyqtSignal()
-    diagnostics_requested = pyqtSignal()
 
     def __init__(self, parent=None) -> None:  # noqa: ANN001
         super().__init__(scroll=True, parent=parent)
@@ -186,76 +181,8 @@ class HomePage(PageScaffold):
         endpoint_card.body.addWidget(self.client_hint)
         self.content.addWidget(endpoint_card)
 
-        # --- Access Profile & Clients Card
-        access_card = Card()
-        self.access_header = SectionHeader()
-        access_card.body.addWidget(self.access_header)
-
-        self.access_label = QLabel()
-        self.access_label.setObjectName("FieldLabel")
-        access_card.body.addWidget(self.access_label)
-
-        self.access_profile = QComboBox()
-        self.access_profile.addItem("", "safe")
-        self.access_profile.addItem("", "allowlist")
-        self.access_profile.addItem("", "full")
-        self.access_profile.setEnabled(False)
-        self.access_profile.currentIndexChanged.connect(self.access_profile_changed.emit)
-        access_card.body.addWidget(self.access_profile)
-
-        self.access_profile_hint = QLabel()
-        self.access_profile_hint.setObjectName("Hint")
-        self.access_profile_hint.setWordWrap(True)
-        access_card.body.addWidget(self.access_profile_hint)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-        self.allowlist_btn = _button("")
-        self.allowlist_btn.clicked.connect(self.allowlist_requested.emit)
-        self.clients_btn = _button("", "Accent")
-        self.clients_btn.clicked.connect(lambda: self.open_page_requested.emit("clients"))
-        self.diag_btn = _button("")
-        self.diag_btn.clicked.connect(self.diagnostics_requested.emit)
-        btn_row.addWidget(self.allowlist_btn)
-        btn_row.addWidget(self.clients_btn)
-        btn_row.addWidget(self.diag_btn)
-        btn_row.addStretch(1)
-        access_card.body.addLayout(btn_row)
-
-        access_card.body.addWidget(Divider())
-        self.clients_summary_lbl = QLabel()
-        self.clients_summary_lbl.setObjectName("FieldLabel")
-        access_card.body.addWidget(self.clients_summary_lbl)
-
-        self.clients_table = DataTable(["", "", ""])
-        self.clients_table.setMaximumHeight(175)
-        self.clients_table.hide()
-        access_card.body.addWidget(self.clients_table)
-
-        self.clients_empty_lbl = QLabel()
-        self.clients_empty_lbl.setObjectName("Hint")
-        self.clients_empty_lbl.setWordWrap(True)
-        access_card.body.addWidget(self.clients_empty_lbl)
-        self.content.addWidget(access_card)
-
         self.content.addStretch(1)
         self.retranslate()
-
-    def set_clients_summary(self, rows: list[tuple[str, str, str]]) -> None:
-        from PyQt6.QtWidgets import QTableWidgetItem
-
-        if not rows:
-            self.clients_table.setRowCount(0)
-            self.clients_table.hide()
-            self.clients_empty_lbl.show()
-            return
-        self.clients_empty_lbl.hide()
-        self.clients_table.show()
-        self.clients_table.setRowCount(len(rows[:5]))
-        for idx, (name, status, mode) in enumerate(rows[:5]):
-            self.clients_table.setItem(idx, 0, QTableWidgetItem(name))
-            self.clients_table.setItem(idx, 1, QTableWidgetItem(status))
-            self.clients_table.setItem(idx, 2, QTableWidgetItem(mode))
 
     def set_mode_highlight(self, mode: str | None) -> None:
         self.mode_group.setExclusive(False)
@@ -287,21 +214,6 @@ class HomePage(PageScaffold):
         self.url_save.setText(tr("common.save"))
         self.url_copy.setText(tr("conn.token.copy"))
         self.client_hint.setText(tr("home.url.client_hint"))
-
-        self.access_header.set_texts(tr("home.access.title"), tr("home.access.desc"))
-        self.access_label.setText(tr("home.access.label"))
-        self.access_profile.blockSignals(True)
-        for idx, key in enumerate(("safe", "allowlist", "full")):
-            self.access_profile.setItemText(idx, tr(f"home.access.{key}"))
-        self.access_profile.blockSignals(False)
-        self.allowlist_btn.setText(tr("home.access.allowlist_btn"))
-        self.clients_btn.setText(tr("home.access.clients_btn"))
-        self.diag_btn.setText(tr("home.access.diag_btn"))
-        self.clients_summary_lbl.setText(tr("home.clients.summary_title"))
-        self.clients_empty_lbl.setText(tr("home.clients.empty"))
-        self.clients_table.setHorizontalHeaderLabels(
-            [tr("clients.col.name"), tr("clients.col.status"), tr("clients.col.rights")]
-        )
 
     def apply_theme(self) -> None:
         self.error_banner.apply_theme()

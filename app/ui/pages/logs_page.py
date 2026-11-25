@@ -16,7 +16,7 @@ class LogsPage(PageScaffold):
         self.retranslate()
 
     def retranslate(self) -> None:
-        self.set_header(tr("logs.title"), tr("logs.lead"))
+        self.set_header(tr("logs.title"), "")
         self.viewer.retranslate()
 
     def apply_theme(self) -> None:

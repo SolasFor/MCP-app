@@ -43,6 +43,8 @@ jobs:
       - name: Dependency vulnerability audit
         run: python -m pip_audit -r requirements.lock --no-deps --disable-pip
       - name: Unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests/unit -p "test_*.py" -v
       - name: Integration tests
         env:

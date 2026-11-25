@@ -26,7 +26,6 @@ from app.config import (
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
     PROVIDER_TAILSCALE,
     Settings,
 )
@@ -327,27 +326,29 @@ class ConnectionManagerGuiTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
-    def test_connections_page_lists_all_six_providers_and_switches_with_issuer_guard(self) -> None:
+    def test_connections_page_lists_four_ui_providers_and_switches_with_issuer_guard(self) -> None:
+        self.assertEqual(len(ALL_PROVIDERS), 4)
+        self.assertNotIn(PROVIDER_LOCAL, ALL_PROVIDERS)
         self.assertEqual(set(self.window.connections_page.provider_rows.keys()), set(ALL_PROVIDERS))
         self.assertEqual(self.manager.active_provider, PROVIDER_CF_QUICK)
 
-        # Configure OpenAI tunnel via dialog
-        dlg = ProviderConfigDialog(self.manager.connections, PROVIDER_OPENAI, parent=self.window)
-        dlg.tunnel_id_edit.setText("tunnel_abc123456789")
-        dlg.api_key_edit.setText("sk-openai-secret-999")
-        dlg.accept() if dlg._apply_current() else self.fail("Expected valid OpenAI config")
+        # Configure ngrok via dialog (reserved domain + secret stored in DPAPI)
+        dlg = ProviderConfigDialog(self.manager.connections, PROVIDER_NGROK, parent=self.window)
+        dlg.domain_edit.setText("demo-mcp.ngrok-free.app")
+        dlg.authtoken_edit.setText("ng_secret_999")
+        dlg.accept() if dlg._apply_current() else self.fail("Expected valid ngrok config")
 
-        # Switching to Local Only while running prompts/warns on issuer transition
+        # Switching to ngrok while quick url exists prompts/warns on issuer transition
         self.manager._quick_url = "https://old-quick.trycloudflare.com/mcp"
         with patch.object(self.window, "_confirm", return_value=True) as confirm_mock:
-            self.window._on_provider_selected(PROVIDER_LOCAL)
+            self.window._on_provider_selected(PROVIDER_NGROK)
             self.assertTrue(confirm_mock.called)
-        self.assertEqual(self.manager.active_provider, PROVIDER_LOCAL)
-        self.assertEqual(self.manager.public_url, "")
-        self.assertIn("127.0.0.1", self.window.home_page.ov_url.text())
+        self.assertEqual(self.manager.active_provider, PROVIDER_NGROK)
 
-        # Local Only preflight succeeds without cloudflared
-        self.assertEqual(self.manager.preflight(), [])
+        # Internal LocalOnly backend provider remains available programmatically for local testing
+        local_prov = self.manager.connections.get(PROVIDER_LOCAL)
+        self.assertTrue(local_prov.detect().installed)
+        self.assertEqual(local_prov.validate_config({"bind_host": "127.0.0.1"}), [])
         self.assertTrue(len(self.window.connections_page.provider_rows[PROVIDER_NGROK]) > 0)
         self.assertTrue(len(self.window.connections_page.provider_rows[PROVIDER_TAILSCALE]) > 0)
 

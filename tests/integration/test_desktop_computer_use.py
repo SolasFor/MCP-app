@@ -57,34 +57,78 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
-    def test_gui_opt_in_visible_topbar_indicator_and_stop_button(self) -> None:
+    def test_gui_opt_in_visible_topbar_indicator_and_master_toggle(self) -> None:
+        from app.ui.components.toggle_switch import ToggleSwitch
+
         sec = self.window.security_page
         self.window.show_page("security")
-        self.assertFalse(sec.desktop_enabled_chk.isChecked())
+        self.assertIsInstance(sec.desktop_enabled_sw, ToggleSwitch)
+        self.assertFalse(hasattr(sec, "desktop_save_btn"))
+        self.assertFalse(hasattr(sec, "desktop_stop_btn"))
+        self.assertFalse(hasattr(sec, "stop_computer_use"))
+        self.assertFalse(sec.desktop_enabled_sw.isChecked())
+        self.assertFalse(sec.desktop_screen_sw.isEnabled())
+        self.assertFalse(sec.desktop_control_sw.isEnabled())
+        self.assertFalse(sec.desktop_secrets_sw.isEnabled())
         self.assertTrue(self.window._desktop_indicator_btn.isHidden())
 
-        # Enable view-only opt-in
-        sec.desktop_enabled_chk.setChecked(True)
-        sec.desktop_screen_chk.setChecked(True)
+        # Enable view-only opt-in via ToggleSwitch immediate auto-save (no Save button)
         sec.desktop_clients_edit.setText("c-view")
-        sec.save_desktop_policy()
+        sec.desktop_clients_edit.editingFinished.emit()
+        sec.desktop_enabled_sw.click()
+        self.assertTrue(sec.desktop_screen_sw.isEnabled())
+        self.assertTrue(sec.desktop_control_sw.isEnabled())
+        self.assertFalse(sec.desktop_secrets_sw.isEnabled())
+        sec.desktop_screen_sw.click()
         self.assertFalse(self.window._desktop_indicator_btn.isHidden())
         self.assertIn("Просмотр", self.window._desktop_indicator_btn.text())
 
-        # Enable input control -> indicator updates & retranslates EN/RU
-        sec.desktop_control_chk.setChecked(True)
-        sec.save_desktop_policy()
+        # Enable input control -> indicator updates immediately & unlocks secret typing toggle
+        sec.desktop_control_sw.click()
+        self.assertTrue(sec.desktop_secrets_sw.isEnabled())
+        sec.desktop_secrets_sw.click()
         self.assertIn("Контроль", self.window._desktop_indicator_btn.text())
         self.window.set_language(LANG_EN)
         self.assertIn("Control", self.window._desktop_indicator_btn.text())
         self.window.set_language(LANG_RU)
 
-        # Click Stop Computer Use -> persists emergency stop & hides topbar indicator
-        sec.stop_computer_use()
+        # Turn master switch OFF -> dependent toggles become disabled/greyed while preserving saved values
+        sec.desktop_enabled_sw.click()
+        self.assertFalse(sec.desktop_enabled_sw.isChecked())
+        self.assertFalse(sec.desktop_screen_sw.isEnabled())
+        self.assertFalse(sec.desktop_control_sw.isEnabled())
+        self.assertFalse(sec.desktop_secrets_sw.isEnabled())
+        self.assertTrue(sec.desktop_screen_sw.isChecked())
+        self.assertTrue(sec.desktop_control_sw.isChecked())
+        self.assertTrue(sec.desktop_secrets_sw.isChecked())
+        self.assertTrue(self.window._desktop_indicator_btn.isHidden())
+        pol_off = sec._desktop_store.load()
+        self.assertFalse(pol_off.enabled)
+        self.assertTrue(pol_off.allow_screen_capture)
+        self.assertTrue(pol_off.allow_input_control)
+        self.assertTrue(pol_off.allow_secret_typing)
+        self.assertFalse(pol_off.effective_screen_capture)
+        self.assertFalse(pol_off.effective_input_control)
+        self.assertFalse(pol_off.effective_secret_typing)
+
+        # Turn master switch back ON -> saved choices restore cleanly and become enabled
+        sec.desktop_enabled_sw.click()
+        self.assertTrue(sec.desktop_screen_sw.isEnabled())
+        self.assertTrue(sec.desktop_control_sw.isEnabled())
+        self.assertTrue(sec.desktop_secrets_sw.isEnabled())
+        self.assertTrue(sec.desktop_screen_sw.isChecked())
+        self.assertTrue(sec.desktop_control_sw.isChecked())
+        self.assertTrue(sec.desktop_secrets_sw.isChecked())
+
+        # Internal emergency stop mechanism remains functional
+        sec._desktop_store.set_emergency_stop(True, "Internal emergency stop")
+        sec.reload_desktop_policy()
+        self.window._refresh_desktop_indicator()
         loaded = sec._desktop_store.load()
         self.assertTrue(loaded.emergency_stop)
         self.assertFalse(loaded.enabled)
         self.assertTrue(self.window._desktop_indicator_btn.isHidden())
+        self.assertFalse(sec.desktop_clear_stop_btn.isHidden())
 
     def test_mcp_desktop_tools_pipeline_and_image_content(self) -> None:
         import asyncio

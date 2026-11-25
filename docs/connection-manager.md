@@ -1,26 +1,23 @@
-# MCP-app Connection Manager (`v0.9.1`)
+# MCP-app Connection Manager (`v1.0.0`)
 
-Единый слой управления транспортами (`app/core/tunnels/`) с разделением публичного HTTPS-адреса и приватного `Tunnel ID` / loopback-цели, единым жизненным циклом, защитой секретов в `SecretStore` и изоляцией OAuth по `issuer`.
+Единый слой управления транспортами (`app/core/tunnels/`) с разделением публичного HTTPS-адреса и loopback-цели, единым жизненным циклом, защитой секретов в `SecretStore` и изоляцией OAuth по `issuer` / `resource_url`.
 
-## Поддерживаемые провайдеры (все 6)
+## Транспортные провайдеры в интерфейсе (4 провайдера)
+
+В разделе **«Подключения → Транспортные провайдеры»** отображаются только 4 внешних провайдера (без индикаторов «Не найден / Установлен / Доступен», версий агентов и Loopback):
 
 | Провайдер | Идентификатор | Публичный HTTPS URL | Особенности и ограничения |
 | --- | --- | --- | --- |
 | **Cloudflare Quick** | `cloudflare_quick` | Да (`*.trycloudflare.com`) | Временный URL при каждом запуске; без SSE (`MCP_JSON_RESPONSE=1`); клиенты переавторизуются при смене адреса. |
-| **Cloudflare Named** | `cloudflare_named` | Да (свой домен) | Переиспользует существующий туннель (`domain.json` или `~/.cloudflared/config.yml`), не пересоздавая его при запуске. |
-| **ngrok Agent v3** | `ngrok` | Да (`*.ngrok-free.*` / reserved) | `NGROK_AUTHTOKEN` хранится в DPAPI `SecretStore` и передаётся только через окружение. Читает реальный endpoint из `http://127.0.0.1:4040/api/endpoints` (`/api/tunnels` fallback). Бесплатные домены могут показывать browser warning interstitial. |
-| **Tailscale Funnel** | `tailscale_funnel` | Да (`*.ts.net` HTTPS) | Использует `tailscale status --json`, `funnel status --json`; разрешены только порты `443`, `8443`, `10000`. Проверяет чужие маршруты и при остановке снимает только свой путь (`off`), не вызывая `tailscale funnel reset`. Отличает публичный Funnel от приватного Serve. |
-| **OpenAI Secure MCP Tunnel** | `openai_tunnel` | **Нет** (`is_public_url=False`) | Официальный `openai/tunnel-client` (`init`, `doctor`, `run`). `CONTROL_PLANE_API_KEY` хранится в DPAPI `SecretStore`. Передаёт только приватный `tunnel_id` в поддерживаемые workspace OpenAI (не любой тариф ChatGPT). НЕ отключает OAuth/Bearer-проверку. |
-| **Local Only** | `local_only` | **Нет** | Строгий loopback (`127.0.0.1`, `localhost`, `::1`), внешние маршруты не открываются, авторизация OAuth/Bearer остаётся включённой. |
+| **Cloudflare Named** | `cloudflare_named` | Да (свой домен) | Поддерживает автонастройку через API Token и подключение к существующему туннелю по **Cloudflare Tunnel Token**; сохраняет домен/токен независимо от переключений провайдеров. |
+| **ngrok Agent v3** | `ngrok` | Да (`*.ngrok-free.*` / reserved) | `NGROK_AUTHTOKEN` хранится в DPAPI `SecretStore` (`NGROK_AUTHTOKEN` env). Поддерживает только `HTTP_PROXY`/`HTTPS_PROXY` (при выборе SOCKS5 выводит предупреждение). Читает endpoint из `/api/endpoints`. |
+| **Tailscale Funnel** | `tailscale_funnel` | Да (`*.ts.net` HTTPS) | Использует `tailscale status --json`, `funnel status --json`; порты `443`, `8443`, `10000`. Управляется системным демоном Tailscale напрямую (без прокси-моста MCP-app). При остановке снимается только маршрут MCP-app. |
 
-## Изоляция OAuth и владелец маршрутов
+> **Удаление Loopback и `openai_tunnel` из UI:** Пункт `Loopback / Local only` убран из списка провайдеров GUI, а `openai_tunnel` полностью исключён. Устаревшие конфигурации с `local_only` или `openai_tunnel` безопасно мигрируют в безопасное состояние `none` (`PROVIDER_NONE` — транспорт не выбран, без автопубликации наружу), а внутренний `LocalOnlyProvider` остаётся только для headless/Admin/тестовых режимов.
 
-- Одновременно активен один внешний провайдер; локальный loopback доступен всегда.
-- При смене провайдера или `issuer` выводится явное предупреждение (`IssuerTransitionWarning`): токены OAuth привязаны к конкретному `issuer` и никогда не переносятся автоматически.
-- `RouteOwnershipStore` (`%APPDATA%\MCPApp\tunnels\routes.json`) записывает принадлежащие MCP-app PID + `create_time` и маршруты Tailscale Funnel, чтобы остановка не завершала чужие процессы и не удаляла посторонние маршруты.
-- Все несекретные настройки лежат в `%APPDATA%\MCPApp\tunnels\connections.json`, а токены/ключи — исключительно в `SecretStore` (`DPAPI` / `POSIX`).
+## Изоляция OAuth, переключение провайдеров и владелец маршрутов
 
-## Статус live-проверок vs mocks
-
-- **`local_only`**: проверен реальный end-to-end MCP/OAuth round trip (`tests/integration/test_connection_transports.py`).
-- **`ngrok` / `Tailscale Funnel` / `OpenAI Secure MCP Tunnel` / публичный `Cloudflare`**: полностью покрыты unit- и интеграционными тестами с локальными mock HTTP API и mock CLI; реальные публичные маршруты и коммерческие аккаунты не публикуются без отдельного согласия владельца (помечены как `BLOCKED` в `PROGRESS.md`).
+- Одновременно активен один внешний провайдер. При смене провайдера предыдущий транспорт корректно останавливается (включая дочерние процессы и собственные маршруты) без обрыва чужих системных сервисов.
+- Конфигурация каждого провайдера хранится независимо: переключение `Cloudflare Named → Cloudflare Quick / ngrok / Tailscale → Cloudflare Named` и перезапуск приложения полностью сохраняют настроенный домен, `public_url` и DPAPI Tunnel Token.
+- При смене `issuer` выводится явное предупреждение (`IssuerTransitionWarning`): токены OAuth привязаны к конкретному `issuer` и никогда не переносятся автоматически.
+- Подробности: [свой домен](custom-domain.md), [прокси](proxy.md), [логирование](logging.md).

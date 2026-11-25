@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -22,25 +21,29 @@ from PyQt6.QtWidgets import (
 
 from app import APP_NAME
 from app.config import (
+    ACCESS_PROFILES,
+    DEFAULT_ACCESS_PROFILE,
     PROVIDER_CF_NAMED,
     PROVIDER_CF_QUICK,
     PROVIDER_LOCAL,
     PROVIDER_NGROK,
-    PROVIDER_OPENAI,
+    PROVIDER_NONE,
     PROVIDER_TAILSCALE,
     TUNNEL_NAMED,
     Settings,
 )
 from app.core import autostart, token_store
+from app.core.logging_manager import LogConfig, get_logging_manager
 from app.core.process import ProcState
 from app.core.service_manager import APP, Overall, ServiceManager
 from app.paths import user_data_dir
 from app.ui import icons, theme
 from app.ui.components.cards import Badge
 from app.ui.components.command_palette import CommandPaletteDialog, PaletteAction
+from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.sidebar import NavItemSpec, Sidebar
+from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.toast import ToastManager
-from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog
 from app.ui.domain_guide import DomainGuideDialog
 from app.ui.domain_wizard import DomainWizard
 from app.ui.i18n import LANG_EN, LANG_RU, i18n, tr
@@ -64,8 +67,9 @@ from app.ui.pages import (
 )
 from app.ui.widgets import StatusRow, repolish
 from backend.oauth_execution import ExecutionApprovals
-from backend.oauth_store import OAuthStore, default_store_path
+from backend.oauth_store import OAuthStore, canonical_oauth_urls, default_store_path
 
+_ORIGINAL_DEFAULT_STORE_PATH = default_store_path
 FLASH_MS = 1500
 _QUERY_TOKEN_RE = re.compile(r"(token=)[A-Za-z0-9\-._~+/=]{8,}")
 
@@ -110,7 +114,6 @@ _PAGE_NAV_KEY = {spec.page_id: spec.i18n_key for spec in NAV_SPECS}
 
 class MainWindow(QMainWindow):
     quit_requested = pyqtSignal()
-    hidden_to_tray = pyqtSignal()
     task_notification = pyqtSignal(str, str, str)
 
     def __init__(
@@ -125,12 +128,12 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self._tray_available = tray_available
         self._allow_close = False
-        self._tray_hint_shown = False
         self._unseen_errors = 0
         self._domain_guide: DomainGuideDialog | None = None
         self._domain_wizard: DomainWizard | None = None
         self._current_page_id = "home"
 
+        self.setObjectName("MainWindow")
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icons.app_icon())
         self.setMinimumSize(860, 600)
@@ -154,12 +157,13 @@ class MainWindow(QMainWindow):
         right_box.setContentsMargins(0, 0, 0, 0)
         right_box.setSpacing(0)
 
-        right_box.addWidget(self._build_topbar())
+        self._topbar = self._build_topbar()
+        right_box.addWidget(self._topbar)
 
         self._stack = QStackedWidget()
         self.home_page = HomePage()
         self.connections_page = ConnectionsPage()
-        self.clients_page = ClientsPage()
+        self.clients_page = ClientsPage(store_path_fn=self._oauth_store_path)
         self.gateway_page = GatewayPage(config_path=manager.gateway_config_path())
         self.tasks_page = TasksPage(
             db_path=manager.tasks_db_path(),
@@ -231,7 +235,7 @@ class MainWindow(QMainWindow):
         self._emergency_btn = self.home_page.emergency_btn
         self._mode_buttons = self.home_page.mode_buttons
         self._url_copy = self.home_page.url_copy
-        self._access_profile = self.home_page.access_profile
+        self._access_profile = self.security_page.access_profile
         self._log_view = self.logs_page.viewer.log_view
         self._proxy_page = self.connections_page.proxy_page
 
@@ -239,13 +243,9 @@ class MainWindow(QMainWindow):
         self._connect_manager_signals()
         self._install_shortcuts()
 
-        theme.manager().theme_changed.connect(self._on_theme_changed)
-        i18n.language_changed.connect(self._on_language_changed)
-
         self._desktop_poll = QTimer(self)
         self._desktop_poll.setInterval(1000)
         self._desktop_poll.timeout.connect(self._refresh_desktop_indicator)
-        self._desktop_poll.start()
 
         self.sidebar.set_collapsed(settings.sidebar_collapsed, emit=False)
         self._refresh_mode()
@@ -254,6 +254,10 @@ class MainWindow(QMainWindow):
         self._on_overall(manager.overall)
         self.show_page("home")
         self._apply_theme()
+
+        theme.manager().theme_changed.connect(self._on_theme_changed)
+        i18n.language_changed.connect(self._on_language_changed)
+        self._desktop_poll.start()
 
     # ================================================================== layout & shell
     def _build_topbar(self) -> QFrame:
@@ -286,12 +290,16 @@ class MainWindow(QMainWindow):
         self._palette_top_btn.clicked.connect(self.open_command_palette)
         row.addWidget(self._palette_top_btn)
 
-        self._quick_theme_btn = QPushButton("")
-        self._quick_theme_btn.setObjectName("Ghost")
-        self._quick_theme_btn.setIconSize(QSize(14, 14))
-        self._quick_theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._quick_theme_btn.clicked.connect(self._cycle_theme_mode)
-        row.addWidget(self._quick_theme_btn)
+        self._theme_combo = SafeComboBox()
+        self._theme_combo.setObjectName("ThemeCombo")
+        self._theme_combo.setMinimumWidth(142)
+        self._theme_combo.setIconSize(QSize(14, 14))
+        self._theme_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._theme_combo.addItem("", theme.THEME_LIGHT)
+        self._theme_combo.addItem("", theme.THEME_DARK)
+        self._theme_combo.addItem("", theme.THEME_SYSTEM)
+        self._theme_combo.currentIndexChanged.connect(self._on_theme_combo_changed)
+        row.addWidget(self._theme_combo)
         return bar
 
     def _connect_page_signals(self) -> None:
@@ -305,9 +313,6 @@ class MainWindow(QMainWindow):
         h.url_edited.connect(self._on_url_edited)
         h.url_save_requested.connect(self._save_url)
         h.copy_requested.connect(self._handle_copy_request)
-        h.access_profile_changed.connect(self._on_access_profile_changed)
-        h.allowlist_requested.connect(self._open_allowlist)
-        h.diagnostics_requested.connect(self._open_connection_diagnostics)
 
         c = self.connections_page
         c.domain_wizard_requested.connect(self.show_domain_wizard)
@@ -319,11 +324,12 @@ class MainWindow(QMainWindow):
         c.token_save_requested.connect(self._save_token)
         c.token_generate_requested.connect(self._generate_token)
         c.copy_requested.connect(self._handle_copy_request)
+        c.purge_openai_secret_requested.connect(self._on_purge_legacy_openai_secret)
         c.proxy_page.saved.connect(self._on_proxy_saved)
 
         cl = self.clients_page
         cl.allowlist_requested.connect(self._open_allowlist)
-        cl.clients_updated.connect(h.set_clients_summary)
+        cl.status_message.connect(self.toasts.show_toast)
 
         gw = self.gateway_page
         gw.config_changed.connect(self.manager.refresh_gateway_secrets)
@@ -344,10 +350,9 @@ class MainWindow(QMainWindow):
         self.automation_page.status_message.connect(self.toasts.show_toast)
 
         s = self.security_page
+        s.access_profile_changed.connect(self._on_access_profile_changed)
         s.allowlist_requested.connect(self._open_allowlist)
         s.clients_requested.connect(lambda: self.show_page("clients"))
-        s.diagnostics_requested.connect(self._open_connection_diagnostics)
-        s.emergency_stop_requested.connect(self._on_emergency_stop)
         s.desktop_policy_changed.connect(self._on_desktop_policy_changed)
 
         self.logs_page.viewer.copy_requested.connect(self._copy)
@@ -361,6 +366,7 @@ class MainWindow(QMainWindow):
         st.start_on_launch_toggled.connect(self._on_start_on_launch)
         st.minimize_toggled.connect(self._on_minimize_toggled)
         st.auto_restart_toggled.connect(self._on_auto_restart)
+        st.logging_settings_changed.connect(self._on_logging_settings_changed)
 
     def _connect_manager_signals(self) -> None:
         m = self.manager
@@ -397,12 +403,16 @@ class MainWindow(QMainWindow):
             page_id = target if target in self._pages_by_id else "home"
         index = PAGE_IDS.index(page_id)
         self._current_page_id = page_id
+        self._ensure_page_themed(page_id)
         self._stack.setCurrentIndex(index)
         self.sidebar.set_current(page_id)
         self._topbar_title.setText(tr(_PAGE_NAV_KEY[page_id]))
         if page_id == "logs":
             self._unseen_errors = 0
             self.sidebar.set_badge("logs", 0)
+            self.logs_page.viewer.reload_from_disk()
+        elif page_id == "connections":
+            self._refresh_services()
         elif page_id == "clients":
             self.clients_page.set_public_url(self._effective_oauth_url())
         elif page_id == "gateway":
@@ -415,6 +425,13 @@ class MainWindow(QMainWindow):
             self.workspaces_page.reload()
         elif page_id == "automation":
             self.automation_page.reload()
+
+    def _ensure_page_themed(self, page_id: str) -> None:
+        page = self._pages_by_id.get(page_id)
+        if page is None:
+            return
+        if theme.manager().apply_to_widget(page) and hasattr(page, "apply_theme"):
+            page.apply_theme()  # type: ignore[attr-defined]
 
     def open_command_palette(self) -> None:
         actions: list[PaletteAction] = []
@@ -483,24 +500,44 @@ class MainWindow(QMainWindow):
         )
         self.settings.theme_mode = chosen
         self._save_settings()
-        self.settings_page.sync_selections(
-            self.settings.theme_mode, self.settings.language, self.sidebar.is_collapsed
-        )
-        self.toasts.show_toast(tr("toast.theme_changed", theme=tr(f"settings.theme.{chosen}")), "info")
+        self._sync_theme_controls()
+
+    def _on_theme_combo_changed(self, _index: int) -> None:
+        mode = str(self._theme_combo.currentData() or theme.THEME_DARK)
+        if mode != self.settings.theme_mode:
+            self.set_theme_mode(mode)
 
     def _cycle_theme_mode(self) -> None:
-        order = (theme.THEME_DARK, theme.THEME_LIGHT, theme.THEME_SYSTEM)
+        order = (theme.THEME_LIGHT, theme.THEME_DARK, theme.THEME_SYSTEM)
         nxt = order[(order.index(self.settings.theme_mode) + 1) % len(order)] if self.settings.theme_mode in order else theme.THEME_DARK
         self.set_theme_mode(nxt)
+
+    def _sync_theme_controls(self) -> None:
+        mode = self.settings.theme_mode if self.settings.theme_mode in theme.THEME_MODES else theme.THEME_DARK
+        self.settings_page.sync_selections(
+            mode, self.settings.language, self.sidebar.is_collapsed
+        )
+        self._theme_combo.blockSignals(True)
+        for idx, opt_mode in enumerate((theme.THEME_LIGHT, theme.THEME_DARK, theme.THEME_SYSTEM)):
+            icon_name = {
+                theme.THEME_LIGHT: "sun",
+                theme.THEME_DARK: "moon",
+                theme.THEME_SYSTEM: "monitor",
+            }[opt_mode]
+            self._theme_combo.setItemText(idx, tr(f"settings.theme.{opt_mode}"))
+            self._theme_combo.setItemIcon(idx, icons.vector_icon(icon_name, theme.TEXT_MUTED, 14))
+        target_idx = self._theme_combo.findData(mode)
+        if target_idx >= 0:
+            self._theme_combo.setCurrentIndex(target_idx)
+        self._theme_combo.setToolTip(tr("topbar.theme.tooltip"))
+        self._theme_combo.blockSignals(False)
 
     def set_language(self, lang: str) -> None:
         chosen = i18n.set_language(lang)
         theme.manager().refresh_translations()
         self.settings.language = chosen
         self._save_settings()
-        self.settings_page.sync_selections(
-            self.settings.theme_mode, self.settings.language, self.sidebar.is_collapsed
-        )
+        self._sync_theme_controls()
         self.toasts.show_toast(tr("toast.lang_changed"), "info")
 
     def _on_theme_changed(self, *_args: object) -> None:
@@ -511,26 +548,60 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self) -> None:
         theme.apply_window_titlebar(self)
+        tm = theme.manager()
+        tm.apply_to_widget(self.sidebar)
+        tm.apply_to_widget(self._topbar)
+        tm.apply_to_widget(self.toasts._container)
         self.sidebar.apply_theme()
-        for page in self._pages_by_id.values():
-            if hasattr(page, "apply_theme"):
-                page.apply_theme()  # type: ignore[attr-defined]
+        self._ensure_page_themed(self._current_page_id)
         self._palette_top_btn.setIcon(icons.vector_icon("search", theme.TEXT_MUTED, 13))
-        theme_icon = {
-            theme.THEME_DARK: "moon",
-            theme.THEME_LIGHT: "sun",
-        }.get(theme.manager().resolved, "monitor")
-        self._quick_theme_btn.setIcon(icons.vector_icon(theme_icon, theme.TEXT_MUTED, 14))
-        self._quick_theme_btn.setText(tr(f"topbar.theme_{theme.manager().mode}"))
-        self._on_overall(self.manager.overall)
+        self._sync_theme_controls()
+        self._refresh_status_colors()
         if self._domain_guide is not None and self._domain_guide.isVisible():
+            tm.apply_to_widget(self._domain_guide)
             self._domain_guide.apply_theme()
+
+    def _refresh_status_colors(self) -> None:
+        state = self.manager.overall
+        text, color = theme.overall_label_color(state.value)
+        pending = state.value in theme.PENDING
+        host = urlsplit(self.manager.public_url).hostname if self.manager.public_url else ""
+        quick = self.settings.is_quick_tunnel
+        detail = host or tr("common.quick_short" if quick else "common.named_short")
+        self.sidebar.set_engine_status(text, detail, color, pending)
+
+        m = self.manager
+        pid = m.active_provider
+        self._apply_row(
+            self.home_page.server_row,
+            m.server.state,
+            waiting=m.is_active and m.is_quick and m.server.state == ProcState.STOPPED,
+            waiting_text=tr("status.waiting_url"),
+        )
+        if pid == PROVIDER_LOCAL:
+            self.home_page.tunnel_row.set_state(
+                tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
+                theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
+            )
+        elif pid == PROVIDER_TAILSCALE:
+            ts_on = m._tailscale_active
+            self.home_page.tunnel_row.set_state(
+                tr("status.service.running") if ts_on else tr("status.service.stopped"),
+                theme.OK if ts_on else theme.IDLE,
+            )
+        else:
+            self._apply_row(
+                self.home_page.tunnel_row,
+                m.tunnel.state,
+                waiting=m.is_active and not m.is_quick and m.tunnel.state == ProcState.STOPPED,
+                waiting_text=tr("status.waiting_server"),
+            )
 
     def _retranslate_all(self) -> None:
         self.sidebar.retranslate()
         self._topbar_title.setText(tr(_PAGE_NAV_KEY[self._current_page_id]))
         self._palette_top_btn.setText(tr("topbar.palette"))
-        self._quick_theme_btn.setText(tr(f"topbar.theme_{self.settings.theme_mode}"))
+        self._sync_theme_controls()
         for page in self._pages_by_id.values():
             if hasattr(page, "retranslate"):
                 page.retranslate()  # type: ignore[attr-defined]
@@ -586,12 +657,12 @@ class MainWindow(QMainWindow):
             PROVIDER_CF_NAMED: "Cloudflare Tunnel",
             PROVIDER_NGROK: "ngrok Agent",
             PROVIDER_TAILSCALE: "Tailscale Funnel",
-            PROVIDER_OPENAI: "OpenAI Secure Tunnel",
             PROVIDER_LOCAL: "Local Loopback",
+            PROVIDER_NONE: tr("conn.provider.none"),
         }
         self.home_page.tunnel_row.set_title(tunnel_titles.get(pid, "Tunnel"))
-        if pid in (PROVIDER_LOCAL, PROVIDER_TAILSCALE):
-            if pid == PROVIDER_LOCAL:
+        if pid in (PROVIDER_LOCAL, PROVIDER_NONE, PROVIDER_TAILSCALE):
+            if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
                 self.home_page.tunnel_row.set_state(
                     tr("status.service.running") if m.server.state == ProcState.RUNNING else tr("status.service.stopped"),
                     theme.OK if m.server.state == ProcState.RUNNING else theme.IDLE,
@@ -611,11 +682,12 @@ class MainWindow(QMainWindow):
             )
         self.home_page.server_row.set_detail(f"{s.local_host()}:{s.server_port}")
         host = urlsplit(m.public_url).hostname if m.public_url else ""
-        if pid == PROVIDER_LOCAL:
-            detail = f"http://{s.local_host()}:{s.server_port}{s.mcp_path} (no tunnel)"
-        elif pid == PROVIDER_OPENAI:
-            tid = m.private_tunnel_id or "not set"
-            detail = f"tunnel_id: {tid}"
+        if pid in (PROVIDER_LOCAL, PROVIDER_NONE):
+            detail = (
+                f"http://{s.local_host()}:{s.server_port}{s.mcp_path} (no tunnel)"
+                if pid == PROVIDER_LOCAL
+                else tr("conn.provider.none")
+            )
         else:
             detail = host or ("*.trycloudflare.com" if quick else "—")
             parts = [detail]
@@ -634,13 +706,13 @@ class MainWindow(QMainWindow):
             ),
             PROVIDER_NGROK: ("Transport: ngrok Agent v3", "ngrok"),
             PROVIDER_TAILSCALE: ("Transport: Tailscale Funnel (HTTPS)", "Tailscale Funnel"),
-            PROVIDER_OPENAI: ("Transport: OpenAI Secure MCP Tunnel (outbound)", "OpenAI Tunnel"),
             PROVIDER_LOCAL: ("Transport: Local Only (127.0.0.1)", "Local Only"),
+            PROVIDER_NONE: (tr("conn.provider.none"), tr("conn.provider.none")),
         }
         caption, badge_text = provider_badges.get(pid, ("", pid))
         self.home_page.mode_caption.setText(caption)
         self._transport_badge.setText(badge_text)
-        self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else "accent")
+        self._transport_badge.set_variant("ok" if m.overall == Overall.RUNNING else ("warn" if pid == PROVIDER_NONE else "accent"))
         try:
             statuses = m.connections.list_statuses(
                 local_host=s.local_host(),
@@ -655,6 +727,12 @@ class MainWindow(QMainWindow):
             active_provider=pid,
             statuses=statuses,
             has_domain=m.has_domain(),
+        )
+        migrated_from = str(getattr(m, "migrated_from_provider", "") or getattr(self.settings, "migrated_from_provider", ""))
+        self.connections_page.set_legacy_openai_migration(
+            migrated=bool(getattr(m, "migrated_from_openai_tunnel", False)) or migrated_from in ("openai_tunnel", "local_only"),
+            has_secret=bool(m.has_legacy_openai_secret()) if hasattr(m, "has_legacy_openai_secret") else False,
+            migrated_from=migrated_from,
         )
 
     @staticmethod
@@ -758,7 +836,29 @@ class MainWindow(QMainWindow):
             mcp_path=self.settings.mcp_path,
         )
         lines = [f"{'✓' if c.ok else '✕'} {c.label}: {c.detail}" for c in checks]
-        QMessageBox.information(self, f"{APP_NAME} — {provider_id}", "\n".join(lines))
+        SilentMessageBox.information(self, f"{APP_NAME} — {provider_id}", "\n".join(lines))
+
+    def _on_purge_legacy_openai_secret(self) -> None:
+        if not self.manager.has_legacy_openai_secret():
+            self.connections_page.set_legacy_openai_migration(
+                migrated=self.manager.migrated_from_openai_tunnel,
+                has_secret=False,
+            )
+            return
+        if not self._confirm(
+            tr("conn.openai_removed.purge_confirm_title"),
+            tr("conn.openai_removed.purge_confirm_body"),
+        ):
+            return
+        removed = self.manager.purge_legacy_openai_secret()
+        self.connections_page.set_legacy_openai_migration(
+            migrated=self.manager.migrated_from_openai_tunnel,
+            has_secret=self.manager.has_legacy_openai_secret(),
+        )
+        self.toasts.show_toast(
+            tr("conn.openai_removed.purge_done" if removed else "conn.openai_removed.purge_missing"),
+            "ok" if removed else "info",
+        )
 
     def _refresh_mode(self) -> None:
         s, m = self.settings, self.manager
@@ -777,10 +877,8 @@ class MainWindow(QMainWindow):
             hint = tr("home.mode.named_wizard_hint", host=wizard.hostname)
         elif pid == PROVIDER_CF_NAMED:
             hint = tr("home.mode.named_config_hint")
-        elif pid == PROVIDER_LOCAL:
-            hint = tr("conn.provider.local")
-        elif pid == PROVIDER_OPENAI:
-            hint = tr("conn.provider.openai")
+        elif pid in (PROVIDER_LOCAL, PROVIDER_NONE):
+            hint = tr("conn.provider.none")
         else:
             hint = tr("conn.providers.note")
         h = self.home_page
@@ -813,15 +911,9 @@ class MainWindow(QMainWindow):
         elif ident.provider_id == PROVIDER_LOCAL:
             h.ov_url.setText(tr("home.url.local_only_value", local_url=ident.local_url))
             h.ov_url.setStyleSheet("")
-        elif ident.provider_id == PROVIDER_OPENAI:
-            h.ov_url.setText(
-                tr(
-                    "home.url.openai_tunnel_value",
-                    tunnel_id=ident.private_tunnel_id or "—",
-                    local_url=ident.local_url,
-                )
-            )
-            h.ov_url.setStyleSheet("")
+        elif ident.provider_id == PROVIDER_NONE:
+            h.ov_url.setText(tr("conn.provider.none"))
+            h.ov_url.setStyleSheet(f"color: {theme.TEXT_FAINT};")
         else:
             h.ov_url.setText(
                 tr("home.url.placeholder_quick" if self.settings.is_quick_tunnel else "home.url.placeholder_named")
@@ -857,10 +949,21 @@ class MainWindow(QMainWindow):
         self._flash(h.url_copy, tr("home.url.copied"))
 
     # ================================================================== OAuth & security
+    def _oauth_store_path(self):  # noqa: ANN202
+        if default_store_path is not _ORIGINAL_DEFAULT_STORE_PATH:
+            return default_store_path()
+        path = getattr(self.manager, "oauth_store_path", None)
+        if path is not None:
+            return path
+        return default_store_path()
+
     def _effective_oauth_url(self) -> str:
+        active_url = getattr(self.manager, "active_server_oauth_url", "")
+        if isinstance(active_url, str) and active_url:
+            return active_url
         if self.manager.public_url:
             return self.manager.public_url
-        if self.manager.is_active and self.manager.active_provider in (PROVIDER_LOCAL, PROVIDER_OPENAI):
+        if self.manager.is_active and self.manager.active_provider == PROVIDER_LOCAL:
             return self.manager.oauth_resource_url
         return ""
 
@@ -871,38 +974,49 @@ class MainWindow(QMainWindow):
         parts = urlsplit(url)
         if parts.scheme not in ("https", "http") or not parts.netloc:
             return None
-        issuer = f"{parts.scheme}://{parts.netloc}"
-        return ExecutionApprovals(OAuthStore(default_store_path(), issuer, url))
+        issuer, resource_url = canonical_oauth_urls(url)
+        default_prof = (
+            self.settings.default_access_profile
+            if self.settings.default_access_profile in ACCESS_PROFILES
+            else "safe"
+        )
+        return ExecutionApprovals(
+            OAuthStore(self._oauth_store_path(), issuer, resource_url),
+            default_profile=default_prof,
+        )
+
+    def _configured_default_profile(self) -> str:
+        prof = getattr(self.settings, "default_access_profile", DEFAULT_ACCESS_PROFILE)
+        return prof if prof in ACCESS_PROFILES else "safe"
 
     def _refresh_access_profile(self) -> None:
         try:
             execution = self._execution_store()
-            mode = execution.profile() if execution else "safe"
-            self._access_profile.setEnabled(execution is not None)
+            mode = execution.profile() if execution else self._configured_default_profile()
+            self._access_profile.setEnabled(True)
             index = self._access_profile.findData(mode)
             self._access_profile.blockSignals(True)
             self._access_profile.setCurrentIndex(max(index, 0))
             self._access_profile.blockSignals(False)
-            self.home_page.access_profile_hint.setText(
-                tr(f"home.access.hint.{mode}") if execution else tr("home.access.need_server")
-            )
             self.security_page.set_access_mode(mode)
             oauth_url = self._effective_oauth_url()
             self.clients_page.set_public_url(oauth_url if execution else "")
-            self.home_page.set_clients_summary(self.clients_page.client_summaries())
         except Exception as exc:
-            self._access_profile.setEnabled(False)
-            self.home_page.access_profile_hint.setText(f"{type(exc).__name__}")
-            self.home_page.set_clients_summary([])
+            self._access_profile.setEnabled(True)
+            self._access_profile.blockSignals(True)
+            self._access_profile.setCurrentIndex(max(self._access_profile.findData("safe"), 0))
+            self._access_profile.blockSignals(False)
+            self.security_page.access_profile_hint.setText(f"{type(exc).__name__}")
 
     def _on_access_profile_changed(self, _index: int) -> None:
-        mode = self._access_profile.currentData()
+        mode = str(self._access_profile.currentData() or "safe")
         try:
             execution = self._execution_store()
-            if not execution or mode == execution.profile():
+            current_mode = execution.profile() if execution is not None else self._configured_default_profile()
+            if mode == current_mode:
                 return
             if mode == "full":
-                answer = QMessageBox.warning(
+                answer = SilentMessageBox.warning(
                     self,
                     "Полный доступ без подтверждений",
                     "OAuth-клиенты без индивидуального режима смогут сразу выполнять "
@@ -911,50 +1025,47 @@ class MainWindow(QMainWindow):
                     "Команды работают с правами текущего пользователя. "
                     "Это высокий риск при доступе через интернет.\n\n"
                     "Включить полный доступ?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.No,
                 )
-                if answer != QMessageBox.StandardButton.Yes:
+                if answer != SilentMessageBox.StandardButton.Yes:
                     self._refresh_access_profile()
                     return
-            execution.set_profile(mode)
+            self.settings.default_access_profile = mode if mode in ACCESS_PROFILES else "safe"
+            self._save_settings()
+            if execution is not None:
+                execution.set_profile(mode)
+            else:
+                ExecutionApprovals.save_default_template(self._oauth_store_path(), profile=mode)
+            get_logging_manager().info(
+                "oauth",
+                f"Default OAuth access profile updated: {current_mode} -> {mode}",
+                event_code="oauth_default_profile_changed",
+            )
             self._refresh_access_profile()
         except (ValueError, OSError, RuntimeError) as exc:
-            QMessageBox.warning(self, "Режим доступа", f"Не удалось сохранить режим: {type(exc).__name__}")
+            SilentMessageBox.warning(
+                self, "Режим доступа", f"Не удалось сохранить режим: {type(exc).__name__}"
+            )
             self._refresh_access_profile()
 
     def _open_allowlist(self) -> None:
         try:
             execution = self._execution_store()
             if execution is None:
-                QMessageBox.information(self, "Белый список", tr("home.access.need_server"))
-                return
+                execution = ExecutionApprovals.default_template(
+                    self._oauth_store_path(),
+                    default_profile=self._configured_default_profile(),
+                )
             ExecutionPolicyDialog(execution, self).exec()
         except (ValueError, OSError, RuntimeError) as exc:
-            QMessageBox.warning(self, "Белый список", f"Не удалось открыть: {type(exc).__name__}")
-
-    def _open_connection_diagnostics(self) -> None:
-        public_url = self._effective_oauth_url() or self.manager.public_url
-        if not public_url:
-            QMessageBox.information(self, "Диагностика", tr("home.access.need_server"))
-            return
-        dialog = ConnectionDiagnosticsDialog(
-            public_url,
-            self.settings.server_port,
-            self.settings.server_health_path,
-            self.manager.token,
-            self,
-            tunnel_mode=self.settings.tunnel_mode,
-            tunnel_protocol=self.manager.tunnel_protocol,
-            recent_logs=tuple(self._log_view.plain_text().splitlines()[-200:]),
-        )
-        dialog.exec()
+            SilentMessageBox.warning(self, "Белый список", f"Не удалось открыть: {type(exc).__name__}")
 
     def _on_emergency_stop(self) -> None:
         report = self.manager.emergency_stop()
         self.security_page.reload_desktop_policy()
         self._refresh_desktop_indicator()
-        QMessageBox.warning(
+        SilentMessageBox.warning(
             self,
             tr("home.btn.emergency"),
             f"{report['warning']}",
@@ -962,7 +1073,6 @@ class MainWindow(QMainWindow):
 
     def _on_desktop_policy_changed(self) -> None:
         self._refresh_desktop_indicator()
-        self.toasts.show_toast(tr("security.desktop.saved"), "info")
 
     def _refresh_desktop_indicator(self) -> None:
         try:
@@ -1036,9 +1146,13 @@ class MainWindow(QMainWindow):
         self.connections_page.set_token_visible(True)
 
     def _token_warning(self) -> str:
-        text = "Старый токен перестанет работать: обновите его в клиентах."
+        text = (
+            "Старый токен перестанет работать: обновите его в клиентах. "
+            "Ранее выданные OAuth-токены будут отозваны, а при переподключении клиенты "
+            "должны пройти OAuth-авторизацию заново с новым токеном владельца."
+        )
         if self.manager.is_active:
-            text += "\n\nСервисы перезапустятся."
+            text += "\n\nПерезапустится только локальный MCP-сервер (активный туннель сохранится)."
         return text
 
     def _on_token_changed(self) -> None:
@@ -1073,6 +1187,28 @@ class MainWindow(QMainWindow):
     def _on_auto_restart(self, enabled: bool) -> None:
         self.settings.auto_restart = enabled
         self._save_settings()
+
+    def _on_logging_settings_changed(self, cfg_dict: dict) -> None:
+        s = self.settings
+        s.logging_enabled = bool(cfg_dict.get("logging_enabled", True))
+        s.logging_level = str(cfg_dict.get("logging_level", "INFO")).upper()
+        s.logging_max_file_mb = int(cfg_dict.get("logging_max_file_mb", 10))
+        s.logging_retention_days = int(cfg_dict.get("logging_retention_days", 30))
+        s.logging_max_total_mb = int(cfg_dict.get("logging_max_total_mb", 200))
+        s.logging_auto_rotate = bool(cfg_dict.get("logging_auto_rotate", True))
+        s.logging_archive_enabled = bool(cfg_dict.get("logging_archive_enabled", True))
+        self._save_settings()
+        get_logging_manager().update_config(
+            LogConfig(
+                enabled=s.logging_enabled,
+                level=s.logging_level,
+                max_file_mb=s.logging_max_file_mb,
+                retention_days=s.logging_retention_days,
+                max_total_mb=s.logging_max_total_mb,
+                auto_rotate=s.logging_auto_rotate,
+                archive_enabled=s.logging_archive_enabled,
+            )
+        )
 
     def _on_error_logged(self) -> None:
         if self._current_page_id != "logs" or not self.isVisible():
@@ -1118,16 +1254,14 @@ class MainWindow(QMainWindow):
             repolish(edit)
 
     def _confirm(self, title: str, text: str) -> bool:
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle(APP_NAME)
-        box.setText(title)
-        box.setInformativeText(text)
-        accept = box.addButton(tr("common.continue"), QMessageBox.ButtonRole.AcceptRole)
-        cancel = box.addButton(tr("common.cancel"), QMessageBox.ButtonRole.RejectRole)
-        box.setDefaultButton(cancel)
-        box.exec()
-        return box.clickedButton() is accept
+        return SilentMessageBox.confirm(
+            self,
+            APP_NAME,
+            title,
+            text,
+            accept_label=tr("common.continue"),
+            cancel_label=tr("common.cancel"),
+        )
 
     def _save_settings(self) -> None:
         try:
@@ -1196,9 +1330,6 @@ class MainWindow(QMainWindow):
         event.ignore()
         if self._tray_available and self.settings.minimize_to_tray_on_close:
             self.hide()
-            if not self._tray_hint_shown:
-                self._tray_hint_shown = True
-                self.hidden_to_tray.emit()
         else:
             self.quit_requested.emit()
 

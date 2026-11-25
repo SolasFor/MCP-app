@@ -10,7 +10,6 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
@@ -18,7 +17,6 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
-    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
@@ -31,6 +29,8 @@ from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import Card, EmptyState, SectionHeader
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -103,7 +103,7 @@ class GatewayServerDialog(QDialog):
         self.name_edit.setObjectName("UiInput")
         form.addRow(tr("gateway.dlg.name"), self.name_edit)
 
-        self.transport_combo = QComboBox()
+        self.transport_combo = SafeComboBox()
         for tid in (TRANSPORT_STDIO, TRANSPORT_STREAMABLE_HTTP, TRANSPORT_SSE):
             self.transport_combo.addItem(tid, tid)
         self.transport_combo.setCurrentIndex(max(self.transport_combo.findData(self._base.transport), 0))
@@ -147,7 +147,7 @@ class GatewayServerDialog(QDialog):
         self.allow_redirects_chk.setChecked(self._base.allow_redirects)
         form.addRow("", self.allow_redirects_chk)
 
-        self.auth_combo = QComboBox()
+        self.auth_combo = SafeComboBox()
         for aid in (AUTH_NONE, AUTH_BEARER, AUTH_HEADERS):
             self.auth_combo.addItem(aid, aid)
         self.auth_combo.setCurrentIndex(max(self.auth_combo.findData(self._base.auth_mode), 0))
@@ -165,13 +165,13 @@ class GatewayServerDialog(QDialog):
         form.addRow(tr("gateway.dlg.secret_headers"), self.secret_headers_edit)
 
         # Access policy & lifecycle
-        self.profile_combo = QComboBox()
+        self.profile_combo = SafeComboBox()
         for pid in ("safe", "allowlist", "full"):
             self.profile_combo.addItem(tr(f"clients.role.{pid}"), pid)
         self.profile_combo.setCurrentIndex(max(self.profile_combo.findData(self._base.min_profile), 0))
         form.addRow(tr("gateway.dlg.min_profile"), self.profile_combo)
 
-        self.isolation_combo = QComboBox()
+        self.isolation_combo = SafeComboBox()
         for iid in (ISOLATION_PER_CLIENT, ISOLATION_SHARED):
             self.isolation_combo.addItem(tr(f"gateway.isolation.{iid}"), iid)
         self.isolation_combo.setCurrentIndex(
@@ -275,13 +275,13 @@ class GatewayServerDialog(QDialog):
             secret_headers=secret_headers or None,
         )
         if errors:
-            QMessageBox.warning(self, self.windowTitle(), "\n".join(errors))
+            SilentMessageBox.warning(self, self.windowTitle(), "\n".join(errors))
             return
         self.saved_profile = self._store.get(profile.server_id)
         self.accept()
 
 
-class GatewayImportPreviewDialog(QDialog):
+class GatewayImportPreviewDialog(SilentDialog):
     """Owner-confirmation preview dialog for imported `mcpServers` JSON configurations."""
 
     def __init__(self, items: list[ImportPreviewItem], parent: QWidget | None = None) -> None:
@@ -552,14 +552,14 @@ class GatewayPage(PageScaffold):
         prof = self.store.get(sid) if sid else None
         if prof is None:
             return
-        answer = QMessageBox.question(
+        answer = SilentMessageBox.question(
             self,
             tr("gateway.btn.delete"),
             tr("gateway.delete.confirm", name=prof.name),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.StandardButton.Yes:
+        if answer != SilentMessageBox.StandardButton.Yes:
             return
         self.store.delete(prof.server_id)
         self._statuses.pop(prof.server_id, None)
@@ -571,7 +571,7 @@ class GatewayPage(PageScaffold):
         """Parse standard MCP JSON, require owner confirmation, and persist."""
         items = self.store.preview_standard_mcp_json(raw_json)
         if not items:
-            QMessageBox.information(self, tr("gateway.import.title"), tr("gateway.import.no_servers"))
+            SilentMessageBox.information(self, tr("gateway.import.title"), tr("gateway.import.no_servers"))
             return []
         preview = GatewayImportPreviewDialog(items, parent=self)
         if preview.exec() != QDialog.DialogCode.Accepted or not preview.approve_chk.isChecked():
@@ -587,7 +587,7 @@ class GatewayPage(PageScaffold):
         return imported
 
     def _open_import_flow(self) -> None:
-        dlg = QDialog(self)
+        dlg = SilentDialog(self)
         dlg.setWindowTitle(tr("gateway.import.title"))
         dlg.setMinimumWidth(520)
         box = QVBoxLayout(dlg)
@@ -618,7 +618,7 @@ class GatewayPage(PageScaffold):
         try:
             self.import_json_with_preview(editor.toPlainText())
         except (ValueError, PermissionError, OSError) as exc:
-            QMessageBox.warning(self, tr("gateway.import.title"), str(exc))
+            SilentMessageBox.warning(self, tr("gateway.import.title"), str(exc))
 
     def export_redacted_text(self) -> str:
         """Return redacted gateway config JSON containing zero plaintext secrets."""

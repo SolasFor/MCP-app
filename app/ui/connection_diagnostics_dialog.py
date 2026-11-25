@@ -5,11 +5,9 @@ from pathlib import Path
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
@@ -24,6 +22,7 @@ from app.core.diagnostics import (
     probe_connection,
 )
 from app.paths import user_data_dir
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 
 
 class DiagnosticWorker(QThread):
@@ -64,7 +63,7 @@ class DiagnosticWorker(QThread):
         self.results_ready.emit(results)
 
 
-class ConnectionDiagnosticsDialog(QDialog):
+class ConnectionDiagnosticsDialog(SilentDialog):
     def __init__(
         self,
         public_url: str,
@@ -191,11 +190,11 @@ class ConnectionDiagnosticsDialog(QDialog):
         try:
             export_diagnostic_report(Path(dest), report)
         except OSError as exc:
-            QMessageBox.warning(
+            SilentMessageBox.warning(
                 self, "Диагностика", f"Не удалось сохранить отчёт: {type(exc).__name__}"
             )
             return
-        QMessageBox.information(
+        SilentMessageBox.information(
             self,
             "Диагностика",
             "Отчёт сохранён. Секретные токены и ключи исключены из файла.",

@@ -115,6 +115,13 @@ class TrayIcon(QSystemTrayIcon):
             url = self.manager.public_url
             self.showMessage(APP_NAME, url or tr("status.overall.running"), _Info, 3000)
 
+    def notify_task_event(self, task_id: str, title: str, status: str) -> None:
+        if not self._should_notify():
+            return
+        icon = _Info if status == "succeeded" else _Warn
+        label = tr(f"tasks.status.{status}")
+        self.showMessage(APP_NAME, f"{title or task_id}: {label}", icon, 4000)
+
     def _update(self, state: Overall) -> None:
         text, color = theme.overall_label_color(state.value)
         self.setIcon(icons.status_icon(color, theme.BG))

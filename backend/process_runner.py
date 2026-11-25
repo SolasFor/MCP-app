@@ -66,6 +66,7 @@ class ControlledProcessInfo:
     started_at: float
     process: Any = None
     controllable: bool = True
+    cancel_requested: bool = False
 
 
 @dataclass
@@ -287,9 +288,11 @@ class ProcessRunner:
         pre_dispatch_check: Callable[[], None] | None = None,
         lifecycle: ProcessLifecycle = "controlled",
         queue_timeout: float = 15.0,
+        run_id: str | None = None,
+        on_started: Callable[[str, int | None], None] | None = None,
     ) -> CommandResult:
         """Execute a command with bounded parallel output streaming and tree cleanup."""
-        run_id = secrets.token_hex(8)
+        run_id = run_id or secrets.token_hex(8)
         started = time.monotonic()
         conc = self._concurrency()
 
@@ -301,6 +304,7 @@ class ProcessRunner:
         job: ProcessJobHandle | None = None
         identity: ProcessIdentity | None = None
         process: Any = None
+        cmd_info: ControlledProcessInfo | None = None
         spool_writer = self.spool.create_spool(run_id) if use_spool else None
         out_buf = BoundedOutputBuffer(
             max_memory_bytes=max_memory_bytes, spool=spool_writer, stream_name="stdout"
@@ -324,15 +328,28 @@ class ProcessRunner:
             )
             launcher = spawn_fn or asyncio.create_subprocess_exec
             try:
-                process = await launcher(
-                    *argv,
-                    cwd=str(cwd),
-                    env=child_env,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    creationflags=flags,
-                )
+                try:
+                    process = await launcher(
+                        *argv,
+                        cwd=str(cwd),
+                        env=child_env,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        creationflags=flags,
+                    )
+                except TypeError as exc:
+                    if os.name == "nt" or "creationflags" not in str(exc):
+                        raise
+                    process = await launcher(
+                        *argv,
+                        cwd=str(cwd),
+                        env=child_env,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
             except PermissionError:
                 if lifecycle != "independent":
                     raise
@@ -357,18 +374,19 @@ class ProcessRunner:
                     job = self.platform.create_job(name=f"MCPApp-Cmd-{run_id}", kill_on_close=True)
                     if job is not None:
                         self.platform.assign_process_to_job(job, pid)
+                    cmd_info = ControlledProcessInfo(
+                        run_id=run_id,
+                        client_id=client_id,
+                        kind=kind,
+                        name=Path(argv[0]).name if argv else kind,
+                        identity=identity,
+                        job=job,
+                        started_at=time.time(),
+                        process=process,
+                        controllable=True,
+                    )
                     with self._lock:
-                        self._active_commands[run_id] = ControlledProcessInfo(
-                            run_id=run_id,
-                            client_id=client_id,
-                            kind=kind,
-                            name=Path(argv[0]).name if argv else kind,
-                            identity=identity,
-                            job=job,
-                            started_at=time.time(),
-                            process=process,
-                            controllable=True,
-                        )
+                        self._active_commands[run_id] = cmd_info
                 else:
                     with self._lock:
                         self._independent_processes[run_id] = IndependentProcessInfo(
@@ -379,6 +397,8 @@ class ProcessRunner:
                             started_at=time.time(),
                             process=process,
                         )
+            if on_started is not None:
+                on_started(run_id, pid if isinstance(pid, int) and pid > 0 else None)
 
             is_real_streams = isinstance(
                 getattr(process, "stdout", None), asyncio.StreamReader
@@ -436,12 +456,13 @@ class ProcessRunner:
                 or len(stdout_text) >= output_limit
                 or len(stderr_text) >= output_limit
             )
+            was_cancelled = bool(cmd_info.cancel_requested) if cmd_info is not None else False
             return CommandResult(
-                exit_code=None if timed_out else getattr(process, "returncode", None),
+                exit_code=None if (timed_out or was_cancelled) else getattr(process, "returncode", None),
                 stdout=stdout_text,
                 stderr=stderr_text,
-                timed_out=timed_out,
-                cancelled=False,
+                timed_out=timed_out and not was_cancelled,
+                cancelled=was_cancelled,
                 truncated=truncated,
                 stdout_bytes=out_buf.total_bytes,
                 stderr_bytes=err_buf.total_bytes,
@@ -595,6 +616,20 @@ class ProcessRunner:
             with self._lock:
                 self._active_managed.pop(handle.run_id, None)
 
+    def cancel_run(self, run_id: str) -> bool:
+        """Terminate an active controlled command process tree or SSH session by run_id."""
+        with self._lock:
+            cmd = self._active_commands.get(run_id)
+            ssh = self._active_ssh.get(run_id)
+        if ssh is not None:
+            ssh.cancel()
+            return True
+        if cmd is not None:
+            cmd.cancel_requested = True
+            self._terminate_controlled(cmd.job, cmd.identity, cmd.process, grace_seconds=0.3)
+            return True
+        return False
+
     async def run_ssh(
         self,
         ssh_fn: Callable[[threading.Event, Callable[[Any, Any], None]], str],
@@ -602,9 +637,10 @@ class ProcessRunner:
         client_id: str = "system",
         pre_dispatch_check: Callable[[], None] | None = None,
         queue_timeout: float = 15.0,
+        run_id: str | None = None,
     ) -> str:
         """Execute an SSH call on the dedicated executor with non-blocking cancellation."""
-        run_id = secrets.token_hex(8)
+        run_id = run_id or secrets.token_hex(8)
         conc = self._concurrency()
         try:
             await asyncio.wait_for(conc.ssh_sem.acquire(), timeout=max(0.1, queue_timeout))

@@ -621,12 +621,27 @@ class ServiceManager(QObject):
             "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
             "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
             "MCP_GATEWAY_CONFIG_PATH": str(self.gateway_config_path()),
+            "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
+            "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
+            "MCP_SPOOL_DIR": str(self.tasks_spool_dir()),
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
             "MCP_JSON_RESPONSE": "1" if not ident.supports_sse else "0",
         }
 
     def gateway_config_path(self) -> Path:
         return user_data_dir() / "gateway" / "servers.json"
+
+    def tasks_data_dir(self) -> Path:
+        return user_data_dir() / "tasks"
+
+    def tasks_db_path(self) -> Path:
+        return self.tasks_data_dir() / "tasks.sqlite3"
+
+    def tasks_artifacts_dir(self) -> Path:
+        return self.tasks_data_dir() / "artifacts"
+
+    def tasks_spool_dir(self) -> Path:
+        return self.tasks_data_dir() / "spool"
 
     def refresh_gateway_secrets(self) -> None:
         from backend.gateway.store import GatewayConfigStore

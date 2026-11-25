@@ -91,8 +91,12 @@ def _check_backend() -> str:
     os.environ["MCP_ENABLE_OAUTH"] = "1"
     previous = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
-        # Never touch a real user's encrypted OAuth state during selftest.
+        # Never touch a real user's encrypted OAuth/Gateway/Tasks state during selftest.
         os.environ["MCP_OAUTH_STORE_PATH"] = str(Path(tmp) / "oauth" / "selftest.sqlite3")
+        os.environ["MCP_GATEWAY_CONFIG_PATH"] = str(Path(tmp) / "gateway" / "servers.json")
+        os.environ["MCP_TASKS_DB_PATH"] = str(Path(tmp) / "tasks" / "selftest_tasks.sqlite3")
+        os.environ["MCP_TASKS_ARTIFACTS_DIR"] = str(Path(tmp) / "tasks" / "artifacts")
+        os.environ["MCP_SPOOL_DIR"] = str(Path(tmp) / "tasks" / "spool")
         os.chdir(tmp)
         try:
             import uvicorn  # noqa: F401
@@ -105,21 +109,18 @@ def _check_backend() -> str:
                 raise RuntimeError("OAuth execution approvals are missing")
             import asyncio
             registered = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
-            expected = {"server_info", "oauth_windows_command", "oauth_ssh_command", "oauth_managed_server"}
+            expected = set(_tr.FULL_TOOLS)
             if registered != expected:
                 raise RuntimeError(f"OAuth tool registry mismatch: {registered}")
-            # Обработчик лог-файла держит файл открытым — закрываем, иначе tmp не удалится.
+            return type(app).__name__
+        finally:
+            # Close root FileHandlers + audit handler before TemporaryDirectory cleanup on Windows.
             import logging
 
             for handler in list(logging.getLogger().handlers):
                 if isinstance(handler, logging.FileHandler):
                     handler.close()
                     logging.getLogger().removeHandler(handler)
-            return type(app).__name__
-        finally:
-            # On Windows a RotatingFileHandler keeps its file locked until
-            # explicitly closed; this separate OAuth execution audit handler
-            # must be released before TemporaryDirectory cleanup.
             if "server" in locals():
                 server.PROCESS_RUNNER.close()
                 server.EXEC_AUDIT.close()

@@ -58,7 +58,20 @@ class ToolRegistryTests(unittest.TestCase):
                           hosts="prod.example", executables=Path(sys.executable).name)
         self.assertEqual(
             result["tools"],
-            ["oauth_managed_server", "oauth_ssh_command", "oauth_windows_command", "server_info"],
+            [
+                "oauth_managed_server",
+                "oauth_ssh_command",
+                "oauth_windows_command",
+                "server_info",
+                "task_artifacts",
+                "task_cancel",
+                "task_list",
+                "task_output",
+                "task_restart",
+                "task_result",
+                "task_start",
+                "task_status",
+            ],
         )
         self.assertEqual(result["resources"], [])
         for prohibited in (

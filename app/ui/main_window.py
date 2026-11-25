@@ -591,10 +591,11 @@ class MainWindow(QMainWindow):
         quick = self.settings.is_quick_tunnel
         detail = host or tr("common.quick_short" if quick else "common.named_short")
         self.sidebar.set_engine_status(sidebar_label, detail, color, pending)
-        self._refresh_services()
+        self._refresh_services(refresh_connections=False)
 
     def _on_overall(self, state: Overall) -> None:
         self._on_overall_visual_sync()
+        self._refresh_connections_panel()
         self.home_page.error_banner.setVisible(state == Overall.ERROR)
         self.home_page.err_domain_btn.setVisible(not self.manager.has_domain())
 
@@ -605,7 +606,7 @@ class MainWindow(QMainWindow):
         self._toggle.setEnabled(active or state != Overall.STOPPING)
         self._emergency_btn.setVisible(active)
 
-    def _refresh_services(self) -> None:
+    def _refresh_services(self, *, refresh_connections: bool = True) -> None:
         m, s = self.manager, self.settings
         pid = m.active_provider
         quick = m.is_quick
@@ -703,6 +704,12 @@ class MainWindow(QMainWindow):
             running=m.is_active,
         )
 
+        if refresh_connections:
+            self._refresh_connections_panel()
+
+    def _refresh_connections_panel(self) -> None:
+        m, s = self.manager, self.settings
+        pid = m.active_provider
         try:
             statuses = m.connections.list_statuses(
                 local_host=s.local_host(),

@@ -20,7 +20,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -30,6 +29,7 @@ from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import ManagementTabs, management_list, management_split, management_toolbar
 from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.safe_spin import SafeDoubleSpinBox
@@ -340,27 +340,22 @@ class GatewayPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         self._config_path = config_path or (user_data_dir() / "gateway" / "servers.json")
         self.store = GatewayConfigStore(self._config_path)
         self._statuses: dict[str, GatewayServerStatus] = {}
         self._catalog_by_server: dict[str, list[UpstreamToolEntry]] = {}
         self._row_server_ids: list[str] = []
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
         self.search_edit.textChanged.connect(lambda q: self.server_table.filter_rows(q))
-        toolbar.addWidget(self.search_edit, 1)
 
         self.add_btn = self._make_btn(self._open_add_wizard, obj="Accent")
         self.refresh_btn = self._make_btn(lambda: self.refresh_servers_sync(), obj="Ghost")
         self.list_menu_btn = make_toolbar_menu_button(parent=self)
         self.list_menu_btn.clicked.connect(self._open_list_menu)
-        toolbar.addWidget(self.add_btn)
-        toolbar.addWidget(self.refresh_btn)
-        toolbar.addWidget(self.list_menu_btn)
-        self.content.addLayout(toolbar)
+        self.content.addWidget(management_toolbar(self.search_edit, (self.add_btn, self.refresh_btn, self.list_menu_btn)))
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
@@ -371,43 +366,41 @@ class GatewayPage(PageScaffold):
         self.server_table.set_row_menu_provider(self._build_row_menu)
         self.server_table.itemSelectionChanged.connect(self._on_server_selected)
         table_lay.addWidget(self.server_table, 1)
-        self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("gateway")
         self.empty_state.cta_button.clicked.connect(self._open_add_wizard)
-        self.content.addWidget(self.empty_state, 1)
+        list_panel = management_list(self.table_card, self.empty_state)
 
         # Details splitter: Tools/Schemas on left, Logs/Health on right
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.detail_tabs = ManagementTabs()
 
         tools_pane = QWidget()
         tools_lay = QVBoxLayout(tools_pane)
-        tools_lay.setContentsMargins(0, 4, 8, 0)
+        tools_lay.setContentsMargins(10, 10, 10, 10)
         tools_lay.setSpacing(6)
         self.tools_header = SectionHeader()
         tools_lay.addWidget(self.tools_header)
         self.tools_table = DataTable(["", "", ""])
         self.tools_table.itemSelectionChanged.connect(self._on_tool_selected)
-        tools_lay.addWidget(self.tools_table, 1)
         self.schema_view = QPlainTextEdit()
+        self.schema_view.setObjectName("ConsoleLog")
         self.schema_view.setReadOnly(True)
-        self.schema_view.setMaximumHeight(110)
-        tools_lay.addWidget(self.schema_view)
-        splitter.addWidget(tools_pane)
+        self.schema_view.setMinimumHeight(64)
+        tools_lay.addWidget(management_split(self.tools_table, self.schema_view), 1)
+        self.detail_tabs.add_section(tools_pane, "gateway.details.tools_title", self.tools_header)
 
         logs_pane = QWidget()
         logs_lay = QVBoxLayout(logs_pane)
-        logs_lay.setContentsMargins(8, 4, 0, 0)
+        logs_lay.setContentsMargins(10, 10, 10, 10)
         logs_lay.setSpacing(6)
         self.logs_header = SectionHeader()
         logs_lay.addWidget(self.logs_header)
         self.logs_view = QPlainTextEdit()
+        self.logs_view.setObjectName("ConsoleLog")
         self.logs_view.setReadOnly(True)
         logs_lay.addWidget(self.logs_view, 1)
-        splitter.addWidget(logs_pane)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        self.content.addWidget(splitter, 1)
+        self.detail_tabs.add_section(logs_pane, "gateway.details.logs_title", self.logs_header)
+        self.content.addWidget(management_split(list_panel, self.detail_tabs), 1)
 
         self.retranslate()
         self.reload()
@@ -787,6 +780,7 @@ class GatewayPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("gateway.title"), tr("gateway.lead"))
+        self.detail_tabs.retranslate()
         self.search_edit.setPlaceholderText(tr("gateway.search"))
         self.add_btn.setText(tr("gateway.btn.add"))
         self.refresh_btn.setText(tr("gateway.btn.refresh"))

@@ -38,7 +38,8 @@ def _button(text: str, name: str | None = None) -> QPushButton:
     button = QPushButton(text)
     if name:
         button.setObjectName(name)
-    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    if name in ("Link", "SubtleLink"):
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
     return button
 
 

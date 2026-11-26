@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 __all__ = [
+    "ALL_TASK_ERROR_CODES",
     "STATUS_CANCELLED",
     "STATUS_FAILED",
     "STATUS_INTERRUPTED",
@@ -13,8 +14,21 @@ __all__ = [
     "TaskRecord",
     "TaskSpec",
     "TaskStore",
+    "TaskToolError",
+    "build_task_error_payload",
+    "build_task_error_result",
+    "classify_task_exception",
+    "log_task_tool_error",
 ]
 
+from backend.tasks.errors import (
+    ALL_TASK_ERROR_CODES,
+    TaskToolError,
+    build_task_error_payload,
+    build_task_error_result,
+    classify_task_exception,
+    log_task_tool_error,
+)
 from backend.tasks.manager import TaskManager
 from backend.tasks.models import (
     STATUS_CANCELLED,

@@ -238,8 +238,12 @@ class ServiceManager(QObject):
         self._diagnosis: Diagnosis | None = None
         self._diagnosis_ready.connect(self._on_diagnosis)
 
+        self._token_storage_error = ""
         self._token = self._load_or_create_token()
-        self._redactor.register(self._token)
+        if self._token:
+            self._redactor.register(self._token, allow_short=True)
+        if self.bearer_transport_token:
+            self._redactor.register(self.bearer_transport_token, allow_short=True)
         for secret in self.connections.collect_secret_values():
             self._redactor.register(secret)
 
@@ -375,6 +379,10 @@ class ServiceManager(QObject):
     def token(self) -> str:
         return self._token
 
+    @property
+    def bearer_transport_token(self) -> str:
+        return token_store.transport_bearer_token(self._token)
+
     def url_with_token(self) -> str:
         """Deprecated compatibility helper: never expose owner Bearer in a URL."""
         return self.public_url
@@ -424,25 +432,35 @@ class ServiceManager(QObject):
             return "http2"  # через SOCKS5/HTTP CONNECT идёт только TCP
         return self.settings.tunnel_protocol.strip().lower()
 
-    # ================================================================== изменение настроек
+    @property
+    def token_storage_error(self) -> str:
+        return self._token_storage_error
     def set_token(self, token: str) -> str | None:
         """Сохранить свой токен. Вернёт текст ошибки или None."""
-        token = token.strip()
-        if not token:
+        if not isinstance(token, str) or token == "":
             return "Токен не может быть пустым. Нажмите «Сгенерировать», чтобы получить случайный."
         problem = token_store.problem(token)
         if problem:
             return problem
         if token == self._token:
             return None
+        old_transport = self.bearer_transport_token
         try:
             token_store.save(token)
         except OSError as exc:
             return f"Не удалось сохранить токен: {exc}"
-        self._redactor.unregister(self._token)
+        self._token_storage_error = ""
+        if self._token:
+            self._redactor.unregister(self._token)
+        if old_transport:
+            self._redactor.unregister(old_transport)
         self._token = token
-        self._redactor.register(token)
+        new_transport = self.bearer_transport_token
+        self._redactor.register(token, allow_short=True)
+        self._redactor.register(new_transport, allow_short=True)
         self._logging.register_secret(token)
+        if new_transport != token:
+            self._logging.register_secret(new_transport)
         self._bind_oauth_owner_token(token)
         self._logging.info(
             "oauth",
@@ -704,6 +722,25 @@ class ServiceManager(QObject):
         if not is_frozen() and not (project_root() / "backend" / "server.py").is_file():
             problems.append("Не найден backend/server.py.")
 
+        if self._token_storage_error or not self._token:
+            recheck = token_store.load_status()
+            if recheck.token:
+                self._token = recheck.token
+                self._token_storage_error = ""
+                self._redactor.register(self._token, allow_short=True)
+                if self.bearer_transport_token:
+                    self._redactor.register(self.bearer_transport_token, allow_short=True)
+            else:
+                err_detail = recheck.error or self._token_storage_error or "MCP Owner Token не доступен."
+                self._token_storage_error = err_detail
+                msg = (
+                    f"{err_detail} Восстановите права доступа к папке данных (--repair-acl) или задайте новый "
+                    "токен вручную на вкладке «Подключения» → «MCP Owner Token»."
+                )
+                self._logging.error("oauth", msg, event_code="owner_token_unavailable")
+                problems.append(msg)
+                return problems
+
         self._sync_named_provider_config()
 
         if pid == PROVIDER_NONE:
@@ -773,10 +810,15 @@ class ServiceManager(QObject):
 
     # ================================================================== запуск процессов
     def _server_env(self) -> dict[str, str]:
+        import base64
+
         s = self.settings
         ident = self.connection_identity
+        owner_b64 = base64.b64encode(self._token.encode("utf-8")).decode("ascii")
         return {
-            "MCP_SECRET_TOKEN": self._token,
+            "MCP_SECRET_TOKEN": self.bearer_transport_token,
+            "MCP_OWNER_SECRET_B64": owner_b64,
+            "MCP_LANGUAGE": str(getattr(s, "language", "ru") or "ru"),
             "MCP_PUBLIC_URL": ident.oauth_resource_url,
             "MCP_PATH": s.mcp_path,
             "MCP_HOST": "127.0.0.1" if self.active_provider == PROVIDER_LOCAL else s.server_host,
@@ -1323,9 +1365,22 @@ class ServiceManager(QObject):
 
     # ================================================================== helpers
     def _load_or_create_token(self) -> str:
-        token = token_store.load()
-        if token:
-            return token
+        status = token_store.load_status()
+        if status.token:
+            self._token_storage_error = ""
+            return status.token
+        if status.exists_on_disk or status.error:
+            # Never silently regenerate or overwrite an existing owner token on read/ACL failure:
+            # doing so would trigger OAuthStore.bind_owner() and wipe saved client permissions.
+            self._token_storage_error = status.error or "Не удалось прочитать сохранённый MCP Owner Token."
+            self._logging.error(
+                "oauth",
+                f"Refusing to overwrite unreadable persisted owner token: {self._token_storage_error}",
+                event_code="owner_token_read_failed",
+            )
+            err_note = f"✖ {self._token_storage_error}"
+            QTimer.singleShot(0, lambda: self._log(err_note))
+            return ""
         # Первый запуск: если токен уже задан переменной окружения, берём его —
         # иначе уже подключённые Notion/ChatGPT потеряли бы доступ.
         env_token = os.environ.get("MCP_SECRET_TOKEN", "").strip()
@@ -1335,9 +1390,13 @@ class ServiceManager(QObject):
             token, origin = token_store.generate(), "сгенерирован новый — скопируйте его в клиенты"
         try:
             token_store.save(token)
+            self._token_storage_error = ""
             note = f"Токен доступа {origin} ({token_store.mask(token)})"
         except OSError as exc:
-            note = f"⚠ Токен не сохранён ({exc}) — после перезапуска будет новый"
+            self._token_storage_error = f"Не удалось сохранить MCP Owner Token ({exc})."
+            note = f"✖ {self._token_storage_error}"
+            QTimer.singleShot(0, lambda: self._log(note))
+            return ""
         QTimer.singleShot(0, lambda: self._log(note))  # окно ещё не подписалось на лог
         return token
 

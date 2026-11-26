@@ -54,10 +54,15 @@ Step "Build environment (.venv-build)"
 $Venv = Join-Path $Root ".venv-build"
 $Py = Join-Path $Venv "Scripts\python.exe"
 if (-not (Test-Path $Py)) {
-    $parts = $Python -split " "
-    $exe = $parts[0]
-    $rest = @()
-    if ($parts.Length -gt 1) { $rest = $parts[1..($parts.Length - 1)] }
+    if (Test-Path -LiteralPath $Python) {
+        $exe = $Python
+        $rest = @()
+    } else {
+        $parts = $Python -split " "
+        $exe = $parts[0]
+        $rest = @()
+        if ($parts.Length -gt 1) { $rest = $parts[1..($parts.Length - 1)] }
+    }
     & $exe @rest -m venv $Venv
     Check "venv creation"
 }

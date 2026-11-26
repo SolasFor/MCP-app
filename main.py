@@ -39,6 +39,11 @@ def main() -> int:
 
         return run(sys.argv)
 
+    if "--repair-acl" in args:
+        from app.core.acl_recovery import run_repair_acl_cli
+
+        return run_repair_acl_cli(sys.argv)
+
     from app.gui import run_gui
 
     return run_gui(sys.argv)

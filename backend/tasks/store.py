@@ -489,7 +489,143 @@ class TaskStore:
 
         for tid, run_id in victims:
             if spool_manager is not None and run_id:
-                shutil.rmtree(spool_manager.spool_dir / run_id, ignore_errors=True)
+                self._safe_rmtree_under(spool_manager.spool_dir, spool_manager.spool_dir / run_id)
             if artifacts_dir is not None:
-                shutil.rmtree(Path(artifacts_dir) / tid, ignore_errors=True)
+                self._safe_rmtree_under(Path(artifacts_dir), Path(artifacts_dir) / tid)
         return len(victims)
+
+    @staticmethod
+    def _safe_rmtree_under(base_dir: Path, target_dir: Path) -> bool:
+        """Delete target_dir ONLY when its resolved path is a strict child of base_dir."""
+        try:
+            root = Path(base_dir).expanduser().resolve()
+            victim = Path(target_dir).expanduser().resolve()
+            if victim == root or not victim.is_relative_to(root):
+                return False
+            if not victim.exists():
+                return False
+            shutil.rmtree(victim, ignore_errors=True)
+            return not victim.exists()
+        except OSError:
+            return False
+
+    @staticmethod
+    def _inactive_filter_sql(
+        *,
+        task_ids: tuple[str, ...] | None = None,
+        older_than_days: int | None = None,
+        exclude_task_ids: tuple[str, ...] = (),
+        exclude_run_ids: tuple[str, ...] = (),
+    ) -> tuple[str, list[Any]]:
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        clauses = [f"status IN ({placeholders})"]
+        args: list[Any] = list(sorted(TERMINAL_STATUSES))
+
+        if task_ids is not None:
+            id_ph = ",".join("?" for _ in task_ids)
+            clauses.append(f"task_id IN ({id_ph})")
+            args.extend(task_ids)
+        if older_than_days is not None:
+            days = max(0, int(older_than_days))
+            cutoff = time.time() - days * 86400
+            clauses.append("COALESCE(finished_at, started_at, created_at) <= ?")
+            args.append(cutoff)
+        if exclude_task_ids:
+            ex_ph = ",".join("?" for _ in exclude_task_ids)
+            clauses.append(f"task_id NOT IN ({ex_ph})")
+            args.extend(exclude_task_ids)
+        if exclude_run_ids:
+            rx_ph = ",".join("?" for _ in exclude_run_ids)
+            clauses.append(f"(spool_run_id IS NULL OR spool_run_id NOT IN ({rx_ph}))")
+            args.extend(exclude_run_ids)
+        return " AND ".join(clauses), args
+
+    def count_purgeable_inactive(
+        self,
+        *,
+        older_than_days: int | None = None,
+        exclude_task_ids: tuple[str, ...] = (),
+        exclude_run_ids: tuple[str, ...] = (),
+    ) -> int:
+        where_sql, args = self._inactive_filter_sql(
+            older_than_days=older_than_days,
+            exclude_task_ids=tuple(exclude_task_ids),
+            exclude_run_ids=tuple(exclude_run_ids),
+        )
+        with self._db() as db:
+            row = db.execute(f"SELECT count(*) FROM tasks WHERE {where_sql}", tuple(args)).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def delete_inactive_tasks(
+        self,
+        *,
+        task_ids: list[str] | tuple[str, ...] | None = None,
+        older_than_days: int | None = None,
+        spool_manager: OutputSpoolManager | None = None,
+        artifacts_dir: Path | None = None,
+        exclude_task_ids: tuple[str, ...] = (),
+        exclude_run_ids: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Transactionally remove terminal tasks plus strictly owned internal spool/artifact dirs.
+
+        Refuses active states (queued/running/cancelling/live workers). Never deletes user files,
+        workspaces, exported results, or security audit logs.
+        """
+        explicit_ids = tuple(str(t) for t in task_ids) if task_ids is not None else None
+        if explicit_ids is not None and len(explicit_ids) == 0:
+            return {"deleted_count": 0, "deleted_task_ids": [], "cleaned_dirs": 0}
+
+        victims: list[tuple[str, str | None]] = []
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if explicit_ids is not None:
+                ph = ",".join("?" for _ in explicit_ids)
+                existing_rows = db.execute(
+                    f"SELECT task_id, status, cancel_requested, spool_run_id FROM tasks WHERE task_id IN ({ph})",
+                    explicit_ids,
+                ).fetchall()
+                for row in existing_rows:
+                    tid = str(row["task_id"])
+                    run_id = row["spool_run_id"]
+                    st = str(row["status"])
+                    if (
+                        st not in TERMINAL_STATUSES
+                        or tid in exclude_task_ids
+                        or (run_id and run_id in exclude_run_ids)
+                    ):
+                        raise ValueError(f"Cannot delete active or cancelling task {tid!r} (status={st})")
+
+            where_sql, args = self._inactive_filter_sql(
+                task_ids=explicit_ids,
+                older_than_days=older_than_days,
+                exclude_task_ids=tuple(exclude_task_ids),
+                exclude_run_ids=tuple(exclude_run_ids),
+            )
+            rows = db.execute(
+                f"SELECT task_id, spool_run_id FROM tasks WHERE {where_sql}",
+                tuple(args),
+            ).fetchall()
+            victims = [(str(r["task_id"]), r["spool_run_id"]) for r in rows]
+            if victims:
+                victim_ids = [tid for tid, _ in victims]
+                v_ph = ",".join("?" for _ in victim_ids)
+                # Clear dangling parent_task_id links on surviving tasks before deleting history.
+                db.execute(
+                    f"UPDATE tasks SET parent_task_id = NULL WHERE parent_task_id IN ({v_ph})",
+                    tuple(victim_ids),
+                )
+                db.executemany("DELETE FROM tasks WHERE task_id=?", [(tid,) for tid in victim_ids])
+
+        cleaned_dirs = 0
+        for tid, run_id in victims:
+            if spool_manager is not None and run_id:
+                if self._safe_rmtree_under(spool_manager.spool_dir, spool_manager.spool_dir / run_id):
+                    cleaned_dirs += 1
+            if artifacts_dir is not None:
+                if self._safe_rmtree_under(Path(artifacts_dir), Path(artifacts_dir) / tid):
+                    cleaned_dirs += 1
+        return {
+            "deleted_count": len(victims),
+            "deleted_task_ids": [tid for tid, _ in victims],
+            "cleaned_dirs": cleaned_dirs,
+        }

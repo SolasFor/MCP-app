@@ -5,6 +5,7 @@ import asyncio
 from collections import deque
 from contextlib import AsyncExitStack
 from typing import Any, Callable
+from urllib.parse import urljoin, urlsplit
 
 import httpx2 as httpx
 from mcp.client.session import ClientSession
@@ -30,7 +31,16 @@ from backend.gateway.security import (
     GATEWAY_HOP_HEADER,
     GATEWAY_ID_HEADER,
     strip_downstream_auth_headers,
+    validate_upstream_url,
 )
+
+
+def _origin_tuple(url: str) -> tuple[str, str, int]:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    port = parts.port or (443 if scheme == "https" else 80)
+    return (scheme, host, port)
 
 
 class UpstreamSessionHandle:
@@ -43,6 +53,7 @@ class UpstreamSessionHandle:
         env: dict[str, str],
         headers: dict[str, str],
         gateway_instance_id: str,
+        self_urls: tuple[str, ...] = (),
         redactor: SecretRedactor | None = None,
         client_id: str | None = None,
         on_tools_changed: Callable[[str, str | None], None] | None = None,
@@ -51,6 +62,7 @@ class UpstreamSessionHandle:
         self._env = dict(env)
         self._headers = dict(headers)
         self._instance_id = gateway_instance_id
+        self._self_urls = tuple(self_urls)
         self._redactor = redactor or SecretRedactor()
         self._client_id = client_id
         self._on_tools_changed = on_tools_changed
@@ -67,6 +79,28 @@ class UpstreamSessionHandle:
 
     def logs(self) -> tuple[str, ...]:
         return tuple(self._logs)
+
+    async def _validate_redirect_response(self, response: httpx.Response) -> None:
+        """Re-apply SSRF/loop guards on every HTTP redirect and block cross-origin credential forwarding."""
+        if not response.is_redirect or not self.profile.allow_redirects:
+            return
+        location = response.headers.get("location", "").strip()
+        if not location:
+            return
+        next_url = (
+            str(response.next_request.url)
+            if response.next_request is not None
+            else urljoin(str(response.url), location)
+        )
+        validate_upstream_url(
+            next_url,
+            allow_local_endpoint=self.profile.allow_local_endpoint,
+            self_urls=self._self_urls,
+        )
+        if self._headers and _origin_tuple(str(response.url)) != _origin_tuple(next_url):
+            raise PermissionError(
+                "Blocked cross-origin redirect on authenticated upstream MCP server to protect credentials."
+            )
 
     async def connect(self) -> ServerCapabilities | None:
         if self.session is not None:
@@ -121,6 +155,7 @@ class UpstreamSessionHandle:
                             headers=safe_headers,
                             follow_redirects=self.profile.allow_redirects,
                             timeout=httpx.Timeout(self.profile.timeout_seconds),
+                            event_hooks={"response": [self._validate_redirect_response]},
                         )
                     )
                     read_stream, write_stream = await stack.enter_async_context(
@@ -135,6 +170,7 @@ class UpstreamSessionHandle:
                         kwargs: dict[str, Any] = {
                             "follow_redirects": self.profile.allow_redirects,
                             "timeout": timeout or httpx.Timeout(self.profile.timeout_seconds),
+                            "event_hooks": {"response": [self._validate_redirect_response]},
                         }
                         if headers is not None:
                             kwargs["headers"] = headers

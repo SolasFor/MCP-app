@@ -74,7 +74,11 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             "app.core.service_manager.user_data_dir", return_value=data_dir
         ), patch("app.core.domain_state.user_data_dir", return_value=data_dir), patch(
             "app.config.user_data_dir", return_value=data_dir
-        ), patch("app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"):
+        ), patch("app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"), patch(
+            "backend.oauth_store.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"
+        ), patch(
+            "app.ui.pages.clients_page.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"
+        ):
             i18n.set_language(LANG_RU)
             settings = Settings()
             theme.apply(app, theme.THEME_DARK)
@@ -86,11 +90,44 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             app.processEvents()
 
             # Sample redacted logs for logs screenshot
-            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v1.0.0 UI initialized")
+            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v1.0.1 UI initialized")
             win.logs_page.viewer.log_view.append_line("server", "Uvicorn running on http://127.0.0.1:8000")
             win.logs_page.viewer.log_view.append_line("tunnel", f"Connected token={mgr.token}")
             win.logs_page.viewer.log_view.append_line("tunnel", "WRN edge reconnect in 2s")
             win.logs_page.viewer.log_view.flush_now()
+
+            # Seed a sample OAuth client in isolated temp dir for ClientsPage screenshot
+            try:
+                from mcp.shared.auth import OAuthClientInformationFull
+
+                win.clients_page.set_public_url(mgr.public_url or "https://mcp-preview.trycloudflare.com/mcp")
+                if win.clients_page._store is not None and win.clients_page._execution is not None:
+                    win.clients_page._store.save_client(
+                        OAuthClientInformationFull(
+                            client_id="demo-claude-client",
+                            client_secret="s" * 24,
+                            client_name="Claude Code",
+                            redirect_uris=["http://127.0.0.1/cb"],
+                            grant_types=["authorization_code", "refresh_token"],
+                            response_types=["code"],
+                        )
+                    )
+                    win.clients_page._store.mark_approved("demo-claude-client")
+                    win.clients_page._execution.set_client_profile("demo-claude-client", "allowlist")
+                    win.clients_page._store.save_client(
+                        OAuthClientInformationFull(
+                            client_id="demo-chatgpt-client",
+                            client_secret="s" * 24,
+                            client_name="ChatGPT",
+                            redirect_uris=["https://chatgpt.com/aip/callback"],
+                            grant_types=["authorization_code", "refresh_token"],
+                            response_types=["code"],
+                        )
+                    )
+                    win.clients_page._store.mark_approved("demo-chatgpt-client")
+                    win.clients_page._execution.set_client_profile("demo-chatgpt-client", "safe")
+            except Exception:
+                pass
 
             # 1. Home Dark (RU)
             win.set_theme_mode(theme.THEME_DARK)
@@ -159,8 +196,125 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             win.grab().save(str(p6))
             saved.append(p6)
 
+            # 8. AI Clients Dark & Light (RU) - inline scenario combo & context menu button
+            win.set_theme_mode(theme.THEME_DARK)
+            win.set_language(LANG_RU)
+            win.show_page("clients")
+            win.clients_page.reload()
+            win.toasts.clear_all()
+            app.processEvents()
+            p7 = out_dir / "clients-dark.png"
+            win.grab().save(str(p7))
+            saved.append(p7)
+
+            win.set_theme_mode(theme.THEME_LIGHT)
+            win.show_page("clients")
+            win.clients_page.reload()
+            win.toasts.clear_all()
+            app.processEvents()
+            p8 = out_dir / "clients-light.png"
+            win.grab().save(str(p8))
+            saved.append(p8)
+
+            # 9. Tasks Dark (RU)
+            win.set_theme_mode(theme.THEME_DARK)
+            win.show_page("tasks")
+            win.toasts.clear_all()
+            app.processEvents()
+            p9 = out_dir / "tasks-dark.png"
+            win.grab().save(str(p9))
+            saved.append(p9)
+
+            # 10. Gateway Add Wizard Dark (RU)
+            from app.ui.gateway_add_wizard import AddMcpServerWizard
+
+            wiz = AddMcpServerWizard(win.gateway_page.store, parent=win)
+            wiz.resize(760, 560)
+            wiz.show()
+            app.processEvents()
+            p10 = out_dir / "gateway-wizard-dark.png"
+            wiz.grab().save(str(p10))
+            saved.append(p10)
+            wiz.close()
+
             win.allow_close()
             win.close()
+
+    # 11. OAuth Consent browser pages (Dark RU + Light EN) rendered via Playwright if available
+    try:
+        import time
+
+        from mcp.server.auth.provider import AuthorizationParams
+        from mcp.shared.auth import OAuthClientInformationFull
+        from playwright.sync_api import sync_playwright
+
+        from backend.oauth_provider import LocalConsentOAuthProvider, PendingConsent
+
+        prov_ru = LocalConsentOAuthProvider(
+            "https://mcp.example.com",
+            "https://mcp.example.com/mcp",
+            "preview-secret",
+            default_profile="allowlist",
+        )
+        pending_ru = PendingConsent(
+            client=OAuthClientInformationFull(
+                client_id="cid-1",
+                client_name="ChatGPT",
+                redirect_uris=["https://chatgpt.com/aip/callback"],
+            ),
+            params=AuthorizationParams(
+                state="st-1",
+                scopes=["mcp:read", "mcp:exec"],
+                code_challenge="cc",
+                redirect_uri="https://chatgpt.com/aip/callback",
+                redirect_uri_provided_explicitly=True,
+            ),
+            expires_at=time.time() + 300,
+        )
+        html_ru = prov_ru._consent_form_html(pending_ru, "preview-req-1", lang="ru")
+
+        prov_en = LocalConsentOAuthProvider(
+            "https://mcp.example.com",
+            "https://mcp.example.com/mcp",
+            "preview-secret",
+            default_profile="full",
+        )
+        pending_en = PendingConsent(
+            client=OAuthClientInformationFull(
+                client_id="cid-2",
+                client_name="Claude Code",
+                redirect_uris=["http://127.0.0.1:4567/callback"],
+            ),
+            params=AuthorizationParams(
+                state="st-2",
+                scopes=["mcp:read", "mcp:exec"],
+                code_challenge="cc",
+                redirect_uri="http://127.0.0.1:4567/callback",
+                redirect_uri_provided_explicitly=True,
+            ),
+            expires_at=time.time() + 300,
+        )
+        html_en = prov_en._consent_form_html(pending_en, "preview-req-2", lang="en")
+
+        with sync_playwright() as pw:
+            br = pw.chromium.launch(headless=True)
+            try:
+                for scheme, html_doc, fname in (
+                    ("dark", html_ru, "oauth-consent-dark-ru.png"),
+                    ("light", html_en, "oauth-consent-light-en.png"),
+                ):
+                    ctx = br.new_context(viewport={"width": 640, "height": 820}, color_scheme=scheme)
+                    pg = ctx.new_page()
+                    pg.set_content(html_doc, wait_until="load")
+                    out_p = out_dir / fname
+                    pg.screenshot(path=str(out_p), full_page=True)
+                    saved.append(out_p)
+                    ctx.close()
+            finally:
+                br.close()
+    except Exception as exc:
+        print(f"Skipping OAuth Playwright screenshots: {exc}")
+
     return saved
 
 

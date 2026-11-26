@@ -163,7 +163,11 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self.home_page = HomePage()
         self.connections_page = ConnectionsPage()
-        self.clients_page = ClientsPage(store_path_fn=self._oauth_store_path)
+        self.clients_page = ClientsPage(
+            store_path_fn=self._oauth_store_path,
+            default_profile_fn=self._configured_default_profile,
+            desktop_policy_path=manager.desktop_policy_path(),
+        )
         self.gateway_page = GatewayPage(config_path=manager.gateway_config_path())
         self.tasks_page = TasksPage(
             db_path=manager.tasks_db_path(),
@@ -276,7 +280,6 @@ class MainWindow(QMainWindow):
 
         self._desktop_indicator_btn = QPushButton("")
         self._desktop_indicator_btn.setObjectName("Danger")
-        self._desktop_indicator_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._desktop_indicator_btn.clicked.connect(lambda: self.show_page("security"))
         self._desktop_indicator_btn.hide()
         row.addWidget(self._desktop_indicator_btn)
@@ -288,7 +291,6 @@ class MainWindow(QMainWindow):
         self._palette_top_btn.setIconSize(QSize(14, 14))
         self._palette_top_btn.setToolTip(tr("topbar.palette"))
         self._palette_top_btn.setAccessibleName(tr("topbar.palette"))
-        self._palette_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._palette_top_btn.clicked.connect(self.open_command_palette)
         row.addWidget(self._palette_top_btn)
 
@@ -296,7 +298,6 @@ class MainWindow(QMainWindow):
         self._theme_combo.setObjectName("ThemeCombo")
         self._theme_combo.setMinimumWidth(116)
         self._theme_combo.setIconSize(QSize(13, 13))
-        self._theme_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_combo.addItem("", theme.THEME_LIGHT)
         self._theme_combo.addItem("", theme.THEME_DARK)
         self._theme_combo.addItem("", theme.THEME_SYSTEM)
@@ -869,7 +870,7 @@ class MainWindow(QMainWindow):
             url,
             self.settings.server_port,
             self.settings.server_health_path,
-            self.manager.token,
+            getattr(self.manager, "bearer_transport_token", self.manager.token),
             self,
             tunnel_mode=self.manager.active_provider,
             tunnel_protocol=self.manager.tunnel_protocol,
@@ -928,7 +929,7 @@ class MainWindow(QMainWindow):
             return self.manager.public_url
         if self.manager.is_active and self.manager.active_provider == PROVIDER_LOCAL:
             return self.manager.oauth_resource_url
-        return ""
+        return OAuthStore.latest_persistent_resource_url(self._oauth_store_path())
 
     def _execution_store(self) -> ExecutionApprovals | None:
         url = self._effective_oauth_url()
@@ -996,10 +997,9 @@ class MainWindow(QMainWindow):
                     return
             self.settings.default_access_profile = mode if mode in ACCESS_PROFILES else "safe"
             self._save_settings()
+            ExecutionApprovals.sync_default_profile(self._oauth_store_path(), profile=mode)
             if execution is not None:
                 execution.set_profile(mode)
-            else:
-                ExecutionApprovals.save_default_template(self._oauth_store_path(), profile=mode)
             get_logging_manager().info(
                 "oauth",
                 f"Default OAuth access profile updated: {current_mode} -> {mode}",
@@ -1020,7 +1020,14 @@ class MainWindow(QMainWindow):
                     self._oauth_store_path(),
                     default_profile=self._configured_default_profile(),
                 )
-            ExecutionPolicyDialog(execution, self).exec()
+            if ExecutionPolicyDialog(execution, self).exec() and execution.store.issuer != "__default__":
+                pol = execution.policy()
+                ExecutionApprovals.sync_default_allowlist(
+                    self._oauth_store_path(),
+                    windows="\n".join(pol["windows"]),
+                    hosts="\n".join(pol["hosts"]),
+                    ssh_commands="\n".join(pol["ssh_commands"]),
+                )
         except (ValueError, OSError, RuntimeError) as exc:
             SilentMessageBox.warning(self, "Белый список", f"Не удалось открыть: {type(exc).__name__}")
 
@@ -1066,30 +1073,43 @@ class MainWindow(QMainWindow):
         self._refresh_services()
 
     # ================================================================== token
+    def _update_token_warning(self, token: str) -> None:
+        c = self.connections_page
+        warn = token_store.weakness_warning(token, lang=self.settings.language)
+        if warn and not c.token_error.isVisible():
+            c.token_warning.setText(warn)
+            c.token_warning.show()
+        else:
+            c.token_warning.clear()
+            c.token_warning.hide()
+
     def _load_token_into_field(self) -> None:
         c = self.connections_page
         c.token_edit.setText(self.manager.token)
         c.token_save.hide()
-        self._set_field_error(c.token_edit, c.token_error, None)
+        storage_err = getattr(self.manager, "token_storage_error", "") or None
+        self._set_field_error(c.token_edit, c.token_error, storage_err)
+        self._update_token_warning(self.manager.token if not storage_err else "")
 
     def _on_token_edited(self, text: str) -> None:
         c = self.connections_page
-        token = text.strip()
+        token = text
         changed = token != self.manager.token
         c.token_save.setVisible(changed)
         problem = None
         if changed:
-            problem = token_store.problem(token) if token else "Токен не может быть пустым."
+            problem = token_store.problem(token) if token != "" else "Токен не может быть пустым."
         self._set_field_error(c.token_edit, c.token_error, problem)
+        self._update_token_warning(token if problem is None else "")
         c.token_save.setEnabled(problem is None)
 
     def _save_token(self) -> None:
         c = self.connections_page
-        token = c.token_edit.text().strip()
+        token = c.token_edit.text()
         if token == self.manager.token:
             c.token_save.hide()
             return
-        problem = token_store.problem(token) if token else "Токен не может быть пустым."
+        problem = token_store.problem(token) if token != "" else "Токен не может быть пустым."
         if problem:
             self._set_field_error(c.token_edit, c.token_error, problem)
             return

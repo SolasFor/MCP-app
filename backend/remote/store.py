@@ -12,7 +12,6 @@ import paramiko
 
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
-from app.platform import get_platform
 from backend.remote.models import DevicePermissions, DeviceProfile, validate_device_id
 
 _HOST_DIRECTIVE_RE = re.compile(r"^\s*Host\s+(.+)$", re.IGNORECASE)
@@ -90,9 +89,10 @@ class DeviceStore:
         *,
         secret_store: SecretStore | None = None,
     ) -> None:
+        from app.core.atomic_io import try_init_private_dir
+
         self.path = Path(config_path) if config_path is not None else (user_data_dir() / "remote" / "devices.json")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        get_platform().restrict_path_acl(self.path.parent, is_dir=True)
+        try_init_private_dir(self.path.parent)
         self._secrets = secret_store
         self._lock = threading.RLock()
 
@@ -103,10 +103,9 @@ class DeviceStore:
         return self._secrets
 
     def _atomic_write_json(self, payload: dict[str, Any]) -> None:
-        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
-        get_platform().restrict_path_acl(self.path, is_dir=False)
+        from app.core.atomic_io import atomic_write_json
+
+        atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
 
     def load_all(self) -> dict[str, DeviceProfile]:
         with self._lock:

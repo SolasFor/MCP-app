@@ -384,9 +384,6 @@ QFrame#CopyField {
     border: 1px solid $BORDER;
     border-radius: 7px;
 }
-QFrame#CopyField:hover {
-    border-color: $BORDER_STRONG;
-}
 QLineEdit#CopyFieldInput {
     background: transparent;
     border: none;
@@ -653,7 +650,7 @@ QPushButton#FilterPill {
     background: transparent;
     border: 1px solid $BORDER;
     border-radius: 6px;
-    padding: 4px 10px;
+    padding: 4px 12px;
     min-height: 20px;
     color: $TEXT_MUTED;
     font-size: 12px;
@@ -667,7 +664,6 @@ QPushButton#FilterPill:checked {
     background: $ACTIVE;
     border-color: $BORDER_STRONG;
     color: $TEXT_STRONG;
-    font-weight: 600;
 }
 
 /* ---------- inputs, spinboxes & combos ---------- */
@@ -691,8 +687,14 @@ QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QSpinBox:focus, QDoubleS
     border-color: $TEXT_MUTED;
 }
 QLineEdit:read-only, QTextEdit[readOnly="true"], QPlainTextEdit[readOnly="true"] { color: $TEXT_MUTED; }
+QLineEdit:read-only:hover, QTextEdit[readOnly="true"]:hover, QPlainTextEdit[readOnly="true"]:hover {
+    border-color: $BORDER;
+}
 QTextEdit[readOnly="true"]:focus, QPlainTextEdit[readOnly="true"]:focus {
     border-color: $BORDER;
+}
+QPlainTextEdit#Log:hover, QTextEdit#Log:hover {
+    border-color: $HAIRLINE;
 }
 QPlainTextEdit#ConsoleLog {
     font-family: $FONT_MONO;
@@ -720,10 +722,35 @@ QComboBox:hover { border-color: $BORDER_STRONG; }
 QComboBox:focus, QComboBox:on { border-color: $TEXT_MUTED; }
 QComboBox:disabled { color: $TEXT_FAINT; background: $SURFACE; border-color: $HAIRLINE; }
 QComboBox::drop-down {
-    subcontrol-origin: padding;
-    subcontrol-position: top right;
-    width: 22px;
+    subcontrol-origin: border;
+    subcontrol-position: center right;
+    width: 24px;
     border: none;
+    background: transparent;
+}
+QComboBox#TableCombo {
+    min-height: 0px;
+    padding: 3px 26px 3px 9px;
+    border-radius: 5px;
+    font-size: 12px;
+}
+QComboBox#TableCombo::drop-down {
+    width: 22px;
+}
+QPushButton#RowMenuBtn {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 2px 4px;
+    min-height: 0px;
+    min-width: 24px;
+}
+QPushButton#RowMenuBtn:hover {
+    background: $CONTROL;
+    border-color: $BORDER;
+}
+QPushButton#RowMenuBtn:pressed {
+    background: $CONTROL_PRESSED;
 }
 QComboBox::down-arrow {
     image: url("$CHEVRON_DOWN");

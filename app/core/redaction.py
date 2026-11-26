@@ -11,6 +11,7 @@ from typing import Any
 INTERNAL_SECRET_ENV_PREFIXES: tuple[str, ...] = ("MCP_",)
 INTERNAL_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "MCP_SECRET_TOKEN",
+    "MCP_OWNER_SECRET_B64",
     "MCP_ADMIN_TOKEN",
     "TUNNEL_TOKEN",
     "CLOUDFLARE_API_TOKEN",
@@ -65,7 +66,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"(?i)((?:MCP_SECRET_TOKEN|MCP_ADMIN_TOKEN|TUNNEL_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN|"
+            r"(?i)((?:MCP_SECRET_TOKEN|MCP_OWNER_SECRET_B64|MCP_ADMIN_TOKEN|TUNNEL_TOKEN|CLOUDFLARE_API_TOKEN|CF_API_TOKEN|"
             r"NGROK_AUTHTOKEN|OPENAI_API_KEY)\s*[:=]\s*)[^\s\"']+"
         ),
         r"\1[REDACTED]",
@@ -116,16 +117,21 @@ class SecretRedactor:
         for item in initial_secrets:
             self.register(item)
 
-    def register(self, secret: str) -> None:
-        if isinstance(secret, str):
-            val = secret.strip()
-            if len(val) >= 8:
+    def register(self, secret: str, *, allow_short: bool = False) -> None:
+        if isinstance(secret, str) and secret:
+            min_len = 3 if allow_short else 8
+            if len(secret) >= min_len:
                 with self._lock:
-                    self._secrets.add(val)
+                    self._secrets.add(secret)
+            trimmed = secret.strip()
+            if trimmed and len(trimmed) >= min_len and trimmed != secret:
+                with self._lock:
+                    self._secrets.add(trimmed)
 
     def unregister(self, secret: str) -> None:
         if isinstance(secret, str):
             with self._lock:
+                self._secrets.discard(secret)
                 self._secrets.discard(secret.strip())
 
     def redact_text(self, text: str) -> str:

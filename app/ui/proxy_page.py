@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -29,6 +28,7 @@ from app.core import proxy as px
 from app.core.logging_manager import get_logging_manager
 from app.ui.components.cards import FlowLayout
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import LANG_EN, i18n, tr
 
@@ -37,7 +37,6 @@ def _button(text: str, name: str | None = None) -> QPushButton:
     button = QPushButton(text)
     if name:
         button.setObjectName(name)
-    button.setCursor(Qt.CursorShape.PointingHandCursor)
     return button
 
 
@@ -72,7 +71,7 @@ class ProxyPage(QWidget):
         self.host_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.host_edit.setPlaceholderText("127.0.0.1 или proxy.corp.local")
 
-        self.port_spin = QSpinBox()
+        self.port_spin = SafeSpinBox()
         self.port_spin.setObjectName("UiInput")
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(1080)

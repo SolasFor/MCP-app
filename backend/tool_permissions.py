@@ -133,9 +133,13 @@ def make_tool_middleware(
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
             t0 = time.monotonic()
             try:
-                if name in EXEC_TOOLS and name not in allowed:
+                if isinstance(name, str) and name in registry.registered_names() and name not in allowed:
                     raise MCPError(
-                        code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
+                        code=FORBIDDEN_TOOL,
+                        message=(
+                            f"Execution of '{name}' is not available to this OAuth client "
+                            "(check client access scenario, Computer Use opt-in, or tool restrictions)."
+                        ),
                     )
                 if gateway_router is not None and isinstance(name, str):
                     await gateway_router.ensure_initialized()
@@ -155,8 +159,10 @@ def make_tool_middleware(
                         except Exception as exc:
                             raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
                         if metrics_registry is not None:
-                            is_err = bool(getattr(res, "isError", False)) or (
-                                isinstance(res, dict) and bool(res.get("isError"))
+                            is_err = (
+                                bool(getattr(res, "isError", False))
+                                or bool(getattr(res, "is_error", False))
+                                or (isinstance(res, dict) and bool(res.get("isError")))
                             )
                             metrics_registry.record_call(name, (time.monotonic() - t0) * 1000.0, error=is_err)
                         return res
@@ -168,8 +174,10 @@ def make_tool_middleware(
                     )
                 raise
             if metrics_registry is not None:
-                is_err = bool(getattr(res, "isError", False)) or (
-                    isinstance(res, dict) and bool(res.get("isError"))
+                is_err = (
+                    bool(getattr(res, "isError", False))
+                    or bool(getattr(res, "is_error", False))
+                    or (isinstance(res, dict) and bool(res.get("isError")))
                 )
                 metrics_registry.record_call(
                     str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=is_err

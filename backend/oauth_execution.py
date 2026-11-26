@@ -34,6 +34,25 @@ MAX_RULE_SIZE = 512
 MAX_FULL_COMMAND_SIZE = 65536  # transport/resource bound, not a command allowlist
 DEFAULT_WINDOWS_ALLOWLIST = ("ls", "pwd", "dir", "echo", "whoami", "ipconfig", "systeminfo")
 _SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,251}$")
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+
+
+def _normalize_tool_list(items: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    for raw in items:
+        if not isinstance(raw, str):
+            raise ValueError("Invalid tool name")
+        for part in re.split(r"[\s,]+", raw.strip()):
+            clean = part.strip()
+            if not clean:
+                continue
+            if not _TOOL_NAME_RE.fullmatch(clean):
+                raise ValueError(f"Invalid tool name: {clean!r}")
+            if clean not in out:
+                out.append(clean)
+            if len(out) > 128:
+                raise ValueError("Too many tool restriction entries")
+    return tuple(out)
 
 
 def _parse_rules(text: str, *, host: bool = False) -> tuple[str, ...]:
@@ -78,6 +97,12 @@ class ExecutionApprovals:
                     encrypted BLOB NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS exec_client_profiles(
+                    issuer TEXT NOT NULL,
+                    client_id TEXT NOT NULL,
+                    encrypted BLOB NOT NULL,
+                    PRIMARY KEY(issuer,client_id)
+                );
+                CREATE TABLE IF NOT EXISTS exec_client_policies(
                     issuer TEXT NOT NULL,
                     client_id TEXT NOT NULL,
                     encrypted BLOB NOT NULL,
@@ -146,6 +171,40 @@ class ExecutionApprovals:
             raise ValueError("Unknown access scenario")
         tmpl = cls.default_template(store_path, default_profile=profile)
         tmpl.set_profile(profile)
+
+    @classmethod
+    def sync_default_profile(cls, store_path: Path, *, profile: str) -> None:
+        """Update global default scenario across ``__default__`` and existing issuers without touching per-client overrides."""
+        if profile not in PROFILES:
+            raise ValueError("Unknown access scenario")
+        tmpl = cls.default_template(store_path, default_profile=profile)
+        tmpl.set_profile(profile)
+        store = tmpl.store
+        with store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute("SELECT issuer, encrypted FROM exec_policy").fetchall()
+            for issuer, enc in rows:
+                if issuer == DEFAULT_POLICY_ISSUER:
+                    continue
+                try:
+                    payload = store._decrypt(enc)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                payload["profile"] = profile
+                db.execute(
+                    "INSERT OR REPLACE INTO exec_policy(issuer, encrypted) VALUES (?,?)",
+                    (issuer, store._encrypt(payload)),
+                )
+
+    @classmethod
+    def sync_default_allowlist(
+        cls, store_path: Path, *, windows: str, hosts: str, ssh_commands: str
+    ) -> None:
+        """Keep ``__default__`` allowlist template synchronized with owner edits."""
+        tmpl = cls.default_template(store_path)
+        tmpl.set_policy(windows=windows, hosts=hosts, ssh_commands=ssh_commands)
 
     def policy(self) -> dict:
         with self.store._db() as db:
@@ -239,6 +298,36 @@ class ExecutionApprovals:
                     (self.store.issuer, client_id),
                 )
 
+    def client_profiles(self) -> dict[str, str]:
+        """Return mapping of client_id -> overridden profile for the active issuer."""
+        out: dict[str, str] = {}
+        with self.store._db() as db:
+            rows = db.execute(
+                "SELECT client_id, encrypted FROM exec_client_profiles WHERE issuer=?",
+                (self.store.issuer,),
+            ).fetchall()
+        for row in rows:
+            cid = str(row[0] or "")
+            if not cid:
+                continue
+            try:
+                stored = self.store._decrypt(row[1]).get("profile")
+            except Exception:  # noqa: BLE001
+                stored = PROFILE_SAFE
+            out[cid] = stored if stored in PROFILES else PROFILE_SAFE
+        return out
+
+    def clear_client_profile(self, client_id: str) -> bool:
+        """Remove any explicit per-client profile override so global default applies."""
+        if not isinstance(client_id, str) or not client_id:
+            return False
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_client_profiles WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            )
+            return cur.rowcount > 0
+
     def client_allowlist(self, client_id: str) -> dict | None:
         with self.store._db() as db:
             row = db.execute(
@@ -278,6 +367,73 @@ class ExecutionApprovals:
                 (self.store.issuer, client_id),
             )
             return cur.rowcount > 0
+
+    def client_tool_policy(self, client_id: str) -> dict[str, tuple[str, ...]]:
+        """Return per-client MCP tool restrictions (fail-closed on tampered ciphertext)."""
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT encrypted FROM exec_client_policies WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            ).fetchone()
+        if not row:
+            return {"denied_tools": (), "allowed_tools_only": ()}
+        try:
+            payload = self.store._decrypt(row[0])
+            if not isinstance(payload, dict):
+                return {"denied_tools": ("*",), "allowed_tools_only": ()}
+            denied = tuple(str(t) for t in payload.get("denied_tools", ()) if str(t).strip())
+            only = tuple(str(t) for t in payload.get("allowed_tools_only", ()) if str(t).strip())
+            return {"denied_tools": denied, "allowed_tools_only": only}
+        except Exception:  # noqa: BLE001
+            return {"denied_tools": ("*",), "allowed_tools_only": ()}
+
+    def set_client_tool_policy(
+        self,
+        client_id: str,
+        *,
+        denied_tools: tuple[str, ...] | list[str] = (),
+        allowed_tools_only: tuple[str, ...] | list[str] = (),
+    ) -> None:
+        if not self.client_approved(client_id):
+            raise ValueError("Cannot assign tool policy to unapproved or revoked client")
+        clean_denied = _normalize_tool_list(denied_tools)
+        clean_only = _normalize_tool_list(allowed_tools_only)
+        with self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not clean_denied and not clean_only:
+                db.execute(
+                    "DELETE FROM exec_client_policies WHERE issuer=? AND client_id=?",
+                    (self.store.issuer, client_id),
+                )
+                return
+            payload = {
+                "denied_tools": list(clean_denied),
+                "allowed_tools_only": list(clean_only),
+            }
+            db.execute(
+                "INSERT OR REPLACE INTO exec_client_policies (issuer,client_id,encrypted) VALUES (?,?,?)",
+                (self.store.issuer, client_id, self.store._encrypt(payload)),
+            )
+
+    def clear_client_tool_policy(self, client_id: str) -> bool:
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_client_policies WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            )
+            return cur.rowcount > 0
+
+    def has_client_overrides(self, client_id: str) -> bool:
+        if not isinstance(client_id, str) or not client_id:
+            return False
+        with self.store._db() as db:
+            for tbl in ("exec_client_profiles", "exec_client_allowlists", "exec_client_policies"):
+                if db.execute(
+                    f"SELECT 1 FROM {tbl} WHERE issuer=? AND client_id=?",
+                    (self.store.issuer, client_id),
+                ).fetchone():
+                    return True
+        return False
 
     def effective_policy_for(self, client_id: str) -> dict:
         base = self.policy()

@@ -30,9 +30,19 @@ class UnifiedHomeTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.path = Path(self.tmp.name) / "oauth" / "state.sqlite3"
-        self.store_patch = patch("app.ui.main_window.default_store_path", return_value=self.path)
-        self.store_patch.start()
+        self.root = Path(self.tmp.name)
+        self.path = self.root / "oauth" / "state.sqlite3"
+        self.patches = [
+            patch("app.ui.main_window.default_store_path", return_value=self.path),
+            patch("app.paths.user_data_dir", return_value=self.root),
+            patch("app.core.service_manager.user_data_dir", return_value=self.root),
+            patch("app.core.token_store.user_data_dir", return_value=self.root),
+            patch("app.core.domain_state.user_data_dir", return_value=self.root),
+            patch("app.ui.main_window.user_data_dir", return_value=self.root),
+            patch.object(Settings, "path", return_value=self.root / "settings.json"),
+        ]
+        for p in self.patches:
+            p.start()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.settings = Settings()
@@ -42,7 +52,8 @@ class UnifiedHomeTests(unittest.TestCase):
     def tearDown(self):
         self.window.allow_close()
         self.window.close()
-        self.store_patch.stop()
+        for p in reversed(self.patches):
+            p.stop()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()

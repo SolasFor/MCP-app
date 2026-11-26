@@ -237,6 +237,7 @@ class OAuthStore:
             "exec_requests",
             "exec_client_profiles",
             "exec_client_allowlists",
+            "exec_client_policies",
             "exec_temp_grants",
         )
         placeholders = ",".join("?" for _ in tables)
@@ -350,6 +351,34 @@ class OAuthStore:
                     db.execute("DELETE FROM meta WHERE issuer=?", (origin,))
                     db.execute("DELETE FROM runtime_control WHERE issuer=?", (origin,))
                     self._clear_exec_records(db, origin)
+
+    @classmethod
+    def latest_persistent_resource_url(cls, path: str | Path) -> str:
+        """Return the latest non-ephemeral resource URL with saved clients if the DB already exists."""
+        db_file = Path(path).expanduser()
+        if not db_file.is_file() or db_file.stat().st_size == 0:
+            return ""
+        try:
+            conn = sqlite3.connect(str(db_file), timeout=3)
+            try:
+                rows = conn.execute(
+                    """SELECT c.issuer, COALESCE(m.resource_url, ''), MAX(COALESCE(c.approved_at, c.registered_at)) AS ts
+                       FROM clients c
+                       LEFT JOIN meta m ON m.issuer = c.issuer
+                       GROUP BY c.issuer
+                       ORDER BY ts DESC"""
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return ""
+        for issuer, res_url, _ts in rows:
+            iss_str = str(issuer or "").strip()
+            host = (urlsplit(iss_str).hostname or "").lower()
+            if not iss_str or iss_str == "__default__" or host.endswith(".trycloudflare.com"):
+                continue
+            return str(res_url or f"{iss_str}/mcp")
+        return ""
 
     def count_clients(self) -> int:
         with self._db() as db:

@@ -6,8 +6,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialogButtonBox,
     QFileDialog,
@@ -17,7 +18,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QTabWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -28,7 +28,9 @@ from app import __version__
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui.components.cards import Divider, EmptyState, FlowLayout, Section
+from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.silent_dialog import SilentDialog
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
@@ -187,7 +189,7 @@ class ScheduleDialog(SilentDialog):
             self.trigger_combo.addItem(kind, kind)
         self.cron_edit = QLineEdit("*/5 * * * *")
         self.cron_edit.setObjectName("UiInput")
-        self.interval_spin = QSpinBox()
+        self.interval_spin = SafeSpinBox()
         self.interval_spin.setRange(5, 86400)
         self.interval_spin.setValue(300)
         self.event_edit = QLineEdit()
@@ -207,7 +209,7 @@ class ScheduleDialog(SilentDialog):
         for pol in ("forbid", "allow"):
             self.conc_combo.addItem(pol, pol)
         self.safe_retry_chk = QCheckBox(tr("automation.dlg.safe_retry"))
-        self.retries_spin = QSpinBox()
+        self.retries_spin = SafeSpinBox()
         self.retries_spin.setRange(0, 3)
 
         form.addRow(tr("automation.dlg.id"), self.id_edit)
@@ -304,22 +306,20 @@ class AutomationPage(PageScaffold):
         col.setContentsMargins(0, 10, 0, 0)
         col.setSpacing(12)
 
-        toolbar = FlowLayout(spacing=6)
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
         self.add_sched_btn = QPushButton(tr("automation.sched.add"))
         self.add_sched_btn.setObjectName("Accent")
         self.add_sched_btn.clicked.connect(self.open_add_schedule_dialog)
-        self.run_sched_btn = QPushButton(tr("automation.sched.run"))
-        self.run_sched_btn.setObjectName("Ghost")
-        self.run_sched_btn.clicked.connect(self.run_selected_schedule)
-        self.del_sched_btn = QPushButton(tr("automation.sched.delete"))
-        self.del_sched_btn.setObjectName("Danger")
-        self.del_sched_btn.clicked.connect(self.delete_selected_schedule)
         self.refresh_sched_btn = QPushButton(tr("automation.sched.refresh"))
         self.refresh_sched_btn.setObjectName("Ghost")
         self.refresh_sched_btn.clicked.connect(self.reload)
-        for btn in (self.add_sched_btn, self.run_sched_btn, self.del_sched_btn, self.refresh_sched_btn):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            toolbar.addWidget(btn)
+        self.list_menu_btn = make_toolbar_menu_button(tr("common.actions"), parent=self)
+        self.list_menu_btn.clicked.connect(self._open_sched_list_menu)
+        toolbar.addWidget(self.add_sched_btn)
+        toolbar.addWidget(self.refresh_sched_btn)
+        toolbar.addWidget(self.list_menu_btn)
+        toolbar.addStretch(1)
         col.addLayout(toolbar)
 
         sched_sec = Section(tr("automation.sched.table_title"), spacing=6)
@@ -331,8 +331,10 @@ class AutomationPage(PageScaffold):
             tr("automation.col.tool"),
             tr("automation.col.tz"),
             tr("automation.col.status"),
+            "",
         ])
         self.schedules_table.setMinimumHeight(130)
+        self.schedules_table.set_row_menu_provider(self._build_schedule_menu)
         sched_sec.body.addWidget(self.schedules_table, 1)
         self.empty_state = EmptyState(
             "automation", tr("automation.sched.empty_title"), tr("automation.sched.empty_desc")
@@ -373,11 +375,9 @@ class AutomationPage(PageScaffold):
         controls.addWidget(self.audit_filter_input, 1)
         self.mon_refresh_btn = QPushButton(tr("automation.mon.refresh"))
         self.mon_refresh_btn.setObjectName("Ghost")
-        self.mon_refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mon_refresh_btn.clicked.connect(self.refresh_monitoring)
         self.mon_export_btn = QPushButton(tr("automation.mon.export"))
         self.mon_export_btn.setObjectName("Accent")
-        self.mon_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.mon_export_btn.clicked.connect(lambda: self.export_diagnostics())
         controls.addWidget(self.mon_refresh_btn)
         controls.addWidget(self.mon_export_btn)
@@ -426,7 +426,6 @@ class AutomationPage(PageScaffold):
         self.playground_tool.currentIndexChanged.connect(self._update_playground_hint)
         self.playground_run_btn = QPushButton(tr("automation.playground.run"))
         self.playground_run_btn.setObjectName("Accent")
-        self.playground_run_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.playground_run_btn.clicked.connect(lambda: self.run_playground())
         row.addWidget(self.playground_profile)
         row.addWidget(self.playground_tool, 1)
@@ -470,11 +469,9 @@ class AutomationPage(PageScaffold):
         b_row = FlowLayout(spacing=6)
         self.backup_create_btn = QPushButton(tr("automation.backup.create"))
         self.backup_create_btn.setObjectName("Accent")
-        self.backup_create_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backup_create_btn.clicked.connect(self._on_create_backup_clicked)
         self.backup_restore_btn = QPushButton(tr("automation.backup.restore"))
         self.backup_restore_btn.setObjectName("Ghost")
-        self.backup_restore_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.backup_restore_btn.clicked.connect(self._on_restore_backup_clicked)
         b_row.addWidget(self.backup_create_btn)
         b_row.addWidget(self.backup_restore_btn)
@@ -497,7 +494,6 @@ class AutomationPage(PageScaffold):
         u_row.setSpacing(8)
         self.updater_check_btn = QPushButton(tr("automation.updater.check"))
         self.updater_check_btn.setObjectName("Ghost")
-        self.updater_check_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.updater_check_btn.clicked.connect(self.check_for_updates)
         u_row.addWidget(self.updater_check_btn)
         u_row.addStretch(1)
@@ -540,6 +536,7 @@ class AutomationPage(PageScaffold):
             ]
             for c, v in enumerate(vals):
                 self.schedules_table.setItem(r, c, QTableWidgetItem(v))
+            self.schedules_table.set_row_actions_cell(r, 6, tooltip=tr("common.actions"))
         self.schedules_table.resizeColumnsToContents()
         hist = self.scheduler.list_history(limit=25)
         self.history_view.setPlainText(
@@ -549,6 +546,52 @@ class AutomationPage(PageScaffold):
                 for h in hist
             )
         )
+
+    def _open_sched_list_menu(self) -> None:
+        specs = [
+            MenuActionSpec(
+                key="export_diag",
+                label=tr("automation.mon.export"),
+                callback=lambda: self.export_diagnostics(),
+                icon_name="export",
+            ),
+        ]
+        AppContextMenu.from_specs(specs, parent=self).exec_clamped(
+            self.list_menu_btn.mapToGlobal(self.list_menu_btn.rect().bottomLeft())
+        )
+
+    def _build_schedule_menu(self, row: int) -> list[MenuActionSpec]:
+        if not (0 <= row < len(self._schedules)):
+            return []
+        sid = str(self._schedules[row]["schedule_id"])
+        return [
+            MenuActionSpec(
+                key="run",
+                label=tr("automation.sched.run"),
+                callback=lambda s=sid: self._run_schedule(s),
+                icon_name="play",
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda s=sid: self._copy_schedule_id(s),
+                icon_name="copy",
+            ),
+            MenuActionSpec(
+                key="delete",
+                label=tr("automation.sched.delete"),
+                callback=lambda s=sid: self._delete_schedule(s),
+                icon_name="trash",
+                danger=True,
+                separator_before=True,
+            ),
+        ]
+
+    def _copy_schedule_id(self, sid: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(sid)
+        self.status_message.emit(tr("common.copied_id", item_id=sid), "info")
 
     def reload(self) -> None:
         self._reload_schedules_table()
@@ -571,21 +614,25 @@ class AutomationPage(PageScaffold):
             return str(self._schedules[row]["schedule_id"])
         return None
 
-    def run_selected_schedule(self) -> None:
-        sid = self._selected_schedule_id()
-        if not sid:
-            return
+    def _run_schedule(self, sid: str) -> None:
         res = self.scheduler.trigger_now(sid, trigger="manual_ui")
         self.status_message.emit(tr("automation.toast.ran", sid=sid, status=res.get("status", "")), "info")
         self.reload()
 
-    def delete_selected_schedule(self) -> None:
+    def run_selected_schedule(self) -> None:
         sid = self._selected_schedule_id()
-        if not sid:
-            return
+        if sid:
+            self._run_schedule(sid)
+
+    def _delete_schedule(self, sid: str) -> None:
         self.scheduler.remove_schedule(sid, actor_id="owner", actor_profile="full")
         self.status_message.emit(tr("automation.toast.deleted", sid=sid), "ok")
         self.reload()
+
+    def delete_selected_schedule(self) -> None:
+        sid = self._selected_schedule_id()
+        if sid:
+            self._delete_schedule(sid)
 
     def _read_audit_lines(self) -> list[str]:
         candidates = (
@@ -753,9 +800,8 @@ class AutomationPage(PageScaffold):
         self.tabs.setTabText(2, tr("automation.tab.playground"))
         self.tabs.setTabText(3, tr("automation.tab.backup"))
         self.add_sched_btn.setText(tr("automation.sched.add"))
-        self.run_sched_btn.setText(tr("automation.sched.run"))
-        self.del_sched_btn.setText(tr("automation.sched.delete"))
         self.refresh_sched_btn.setText(tr("automation.sched.refresh"))
+        self.list_menu_btn.setToolTip(tr("common.actions"))
         self._sched_hdr.set_texts(tr("automation.sched.table_title"))
         self._hist_hdr.set_texts(tr("automation.sched.history_title"))
         self.empty_state.set_content(tr("automation.sched.empty_title"), tr("automation.sched.empty_desc"))
@@ -766,6 +812,7 @@ class AutomationPage(PageScaffold):
             tr("automation.col.tool"),
             tr("automation.col.tz"),
             tr("automation.col.status"),
+            "",
         ])
         self._admin_notice_lbl.setText(tr("automation.mon.admin_notice"))
         self.audit_filter_input.setPlaceholderText(tr("automation.mon.audit_filter"))

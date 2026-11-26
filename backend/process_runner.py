@@ -218,6 +218,11 @@ class ProcessRunner:
         with self._lock:
             return self._emergency_stopped
 
+    def active_run_ids(self) -> frozenset[str]:
+        """Return run IDs with live controlled OS processes or active SSH channels."""
+        with self._lock:
+            return frozenset(self._active_commands.keys()) | frozenset(self._active_ssh.keys())
+
     def clear_emergency_stop(self) -> None:
         with self._lock:
             self._emergency_stopped = False

@@ -69,7 +69,6 @@ class Sidebar(QFrame):
 
         self._collapse_btn = QPushButton("")
         self._collapse_btn.setObjectName("IconBtn")
-        self._collapse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._collapse_btn.setFixedSize(24, 24)
         self._collapse_btn.setIconSize(QSize(14, 14))
         self._collapse_btn.clicked.connect(lambda: self.set_collapsed(not self._collapsed, emit=True))

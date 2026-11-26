@@ -28,7 +28,8 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
+from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -308,34 +309,23 @@ class WorkspacesPage(PageScaffold):
         top_bar.addWidget(self.search_edit, 1)
 
         self.add_btn = self._make_btn(self.add_workspace, obj="Accent")
-        self.edit_btn = self._make_btn(self.edit_selected)
-        self.delete_btn = self._make_btn(self.delete_selected, obj="Danger")
-        self.import_btn = self._make_btn(self.import_json)
-        self.export_btn = self._make_btn(self.export_json)
         self.run_task_btn = self._make_btn(self.run_selected_task, obj="Accent")
         self.refresh_btn = self._make_btn(self.reload)
+        self.list_menu_btn = make_toolbar_menu_button(tr("common.actions"), parent=self)
+        self.list_menu_btn.clicked.connect(self._open_list_menu)
         top_bar.addWidget(self.add_btn)
         top_bar.addWidget(self.refresh_btn)
+        top_bar.addWidget(self.list_menu_btn)
         self.content.addLayout(top_bar)
-
-        action_flow = FlowLayout(spacing=6)
-        for btn in (
-            self.edit_btn,
-            self.delete_btn,
-            self.import_btn,
-            self.export_btn,
-            self.run_task_btn,
-        ):
-            action_flow.addWidget(btn)
-        self.content.addLayout(action_flow)
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
         table_lay.setContentsMargins(0, 0, 0, 0)
         table_lay.setSpacing(0)
-        self.table = DataTable(["", "", "", "", "", ""])
+        self.table = DataTable(["", "", "", "", "", "", ""])
         self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._on_selected)
+        self.table.set_row_menu_provider(self._build_row_menu)
         table_lay.addWidget(self.table, 1)
         self.content.addWidget(self.table_card, 1)
 
@@ -370,6 +360,7 @@ class WorkspacesPage(PageScaffold):
         git_tools.addWidget(self.file_search_edit, 1)
         git_tools.addWidget(self.file_search_btn)
         git_tools.addWidget(self.cmd_combo)
+        git_tools.addWidget(self.run_task_btn)
         git_lay.addLayout(git_tools)
         self.details_view = QPlainTextEdit()
         self.details_view.setReadOnly(True)
@@ -388,7 +379,6 @@ class WorkspacesPage(PageScaffold):
         btn = QPushButton()
         if obj:
             btn.setObjectName(obj)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(slot)
         return btn
 
@@ -441,6 +431,7 @@ class WorkspacesPage(PageScaffold):
             self.table.setItem(idx, 3, QTableWidgetItem(git_text))
             self.table.setItem(idx, 4, QTableWidgetItem(perm_text))
             self.table.setItem(idx, 5, QTableWidgetItem(", ".join(sorted(prof.commands)) or "—"))
+            self.table.set_row_actions_cell(idx, 6, tooltip=tr("common.actions"))
             if selected and wid == selected:
                 restore_row = idx
 
@@ -449,12 +440,17 @@ class WorkspacesPage(PageScaffold):
             self.table.selectRow(restore_row)
         self._on_selected()
 
+    def _row_id(self, row: int) -> str | None:
+        item = self.table.item(row, 0) if 0 <= row < self.table.rowCount() else None
+        if item is None:
+            return None
+        val = item.data(Qt.ItemDataRole.UserRole)
+        return str(val) if val else None
+
     def _on_selected(self) -> None:
         wid = self._selected_id()
         prof = self._profiles.get(wid or "")
         has_sel = prof is not None
-        self.edit_btn.setEnabled(has_sel)
-        self.delete_btn.setEnabled(has_sel)
         self.cmd_combo.clear()
         if prof is not None:
             for cname in sorted(prof.commands):
@@ -462,6 +458,58 @@ class WorkspacesPage(PageScaffold):
         self.run_task_btn.setEnabled(has_sel and bool(prof and prof.commands))
         self.file_search_btn.setEnabled(has_sel)
         self._refresh_details()
+
+    def _open_list_menu(self) -> None:
+        specs = [
+            MenuActionSpec(
+                key="import",
+                label=tr("workspaces.btn.import"),
+                callback=self.import_json,
+                icon_name="import",
+            ),
+            MenuActionSpec(
+                key="export",
+                label=tr("workspaces.btn.export"),
+                callback=self.export_json,
+                icon_name="export",
+            ),
+        ]
+        AppContextMenu.from_specs(specs, parent=self).exec_clamped(
+            self.list_menu_btn.mapToGlobal(self.list_menu_btn.rect().bottomLeft())
+        )
+
+    def _build_row_menu(self, row: int) -> list[MenuActionSpec]:
+        wid = self._row_id(row)
+        if not wid or wid not in self._profiles:
+            return []
+        return [
+            MenuActionSpec(
+                key="edit",
+                label=tr("workspaces.btn.edit"),
+                callback=lambda w=wid: self._edit_workspace(w),
+                icon_name="edit",
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda w=wid: self._copy_workspace_id(w),
+                icon_name="copy",
+            ),
+            MenuActionSpec(
+                key="delete",
+                label=tr("workspaces.btn.delete"),
+                callback=lambda w=wid: self._delete_workspace(w),
+                icon_name="trash",
+                danger=True,
+                separator_before=True,
+            ),
+        ]
+
+    def _copy_workspace_id(self, wid: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(wid)
+        self.status_message.emit(tr("common.copied_id", item_id=wid), "info")
 
     def _refresh_details(self) -> None:
         wid = self._selected_id()
@@ -521,9 +569,8 @@ class WorkspacesPage(PageScaffold):
         self.status_message.emit(tr("workspaces.toast.saved", name=profile.name), "ok")
         self.reload()
 
-    def edit_selected(self) -> None:
-        wid = self._selected_id()
-        if not wid or wid not in self._profiles:
+    def _edit_workspace(self, wid: str) -> None:
+        if wid not in self._profiles:
             return
         dlg = WorkspaceProfileDialog(
             self.store, existing=self._profiles[wid], is_new=False, parent=self
@@ -531,10 +578,12 @@ class WorkspacesPage(PageScaffold):
         if dlg.exec() and dlg.saved_profile is not None:
             self.save_profile(dlg.saved_profile)
 
-    def delete_selected(self) -> None:
+    def edit_selected(self) -> None:
         wid = self._selected_id()
-        if not wid:
-            return
+        if wid:
+            self._edit_workspace(wid)
+
+    def _delete_workspace(self, wid: str) -> None:
         ans = SilentMessageBox.question(
             self,
             tr("workspaces.title"),
@@ -548,6 +597,11 @@ class WorkspacesPage(PageScaffold):
         self.config_changed.emit()
         self.status_message.emit(tr("workspaces.toast.deleted", name=wid), "info")
         self.reload()
+
+    def delete_selected(self) -> None:
+        wid = self._selected_id()
+        if wid:
+            self._delete_workspace(wid)
 
     def export_json(self) -> None:
         payload = self.store.export_redacted()
@@ -607,13 +661,10 @@ class WorkspacesPage(PageScaffold):
         self.set_header(tr("workspaces.title"), tr("workspaces.lead"))
         self.search_edit.setPlaceholderText(tr("workspaces.search"))
         self.add_btn.setText(tr("workspaces.btn.add"))
-        self.edit_btn.setText(tr("workspaces.btn.edit"))
-        self.delete_btn.setText(tr("workspaces.btn.delete"))
-        self.import_btn.setText(tr("workspaces.btn.import"))
-        self.export_btn.setText(tr("workspaces.btn.export"))
         self.run_task_btn.setText(tr("workspaces.btn.run_task"))
         self.file_search_btn.setText(tr("workspaces.btn.search_files"))
         self.refresh_btn.setText(tr("workspaces.btn.refresh"))
+        self.list_menu_btn.setToolTip(tr("common.actions"))
         self.file_search_edit.setPlaceholderText(tr("workspaces.details.file_search_ph"))
         self.table.setHorizontalHeaderLabels([
             tr("workspaces.col.name"),
@@ -622,6 +673,7 @@ class WorkspacesPage(PageScaffold):
             tr("workspaces.col.git"),
             tr("workspaces.col.perms"),
             tr("workspaces.col.commands"),
+            "",
         ])
         self.empty_state.set_content(tr("workspaces.empty.title"), tr("workspaces.empty.desc"))
         self.tree_header.set_texts(tr("workspaces.details.tree_title"))

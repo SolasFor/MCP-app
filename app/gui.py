@@ -161,6 +161,52 @@ def run_gui(argv: list[str]) -> int:
         return 0
     _create_installer_mutex()
 
+    data_root = user_data_dir()
+    from app.core.acl_recovery import diagnose_data_acls, repair_data_acls
+
+    acl_diag = diagnose_data_acls(data_root)
+    if acl_diag.has_issues:
+        # Apply default theme before showing early startup recovery dialog so UI stays legible.
+        theme.apply(app, "dark")
+        lm.warning(
+            "app",
+            f"Detected {len(acl_diag.issues)} damaged Windows ACL item(s) in {data_root}",
+            event_code="acl_damaged_detected",
+        )
+        details_text = "\n".join(
+            f"{item.path} [{item.reason}]"
+            + ("" if item.owned_by_current_user else " (not owned by current user)")
+            for item in acl_diag.issues
+        )
+        confirmed = SilentMessageBox.question(
+            None,
+            i18n.t("acl.recovery.title"),
+            i18n.t("acl.recovery.body", data_dir=str(data_root)),
+            detailed_text=details_text,
+        )
+        if confirmed == SilentMessageBox.StandardButton.Yes:
+            rep = repair_data_acls(data_root, isolate_unreadable=True)
+            lm.set_base_dir(default_logs_dir())
+            lm.info(
+                "app",
+                f"ACL recovery finished: repaired={len(rep.repaired_paths)} unrecoverable={len(rep.unrecoverable_paths)}",
+                event_code="acl_recovery_completed",
+            )
+            if rep.unrecoverable_paths:
+                unrec_details = "\n".join(f"{p} [{reason}]" for p, reason in rep.unrecoverable_paths)
+                if rep.backup_paths:
+                    unrec_details += "\n\nBackups:\n" + "\n".join(rep.backup_paths)
+                SilentMessageBox.warning(
+                    None,
+                    i18n.t("acl.recovery.unrecoverable_title"),
+                    i18n.t(
+                        "acl.recovery.unrecoverable_body",
+                        repaired=len(rep.repaired_paths),
+                        failed=len(rep.unrecoverable_paths),
+                    ),
+                    detailed_text=unrec_details,
+                )
+
     migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 
     settings = Settings.load()

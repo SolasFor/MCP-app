@@ -17,6 +17,11 @@ SENSITIVE_NAMES = frozenset({
     "id_rsa", "id_ed25519", "known_hosts", "config.yml",
 })
 SENSITIVE_SUFFIXES = frozenset({".pem", ".key", ".pfx", ".p12", ".ppk"})
+RESERVED_WIN_STEMS = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+})
 MAX_WRITE_BYTES = 128 * 1024
 
 
@@ -38,6 +43,10 @@ def _is_sensitive(part: str) -> bool:
     return lowered in SENSITIVE_NAMES or Path(lowered).suffix in SENSITIVE_SUFFIXES or lowered.startswith(".env.")
 
 
+def _is_reserved_win_part(part: str) -> bool:
+    return part.split(".", 1)[0].casefold() in RESERVED_WIN_STEMS
+
+
 def workspace_path(root: Path, relative_path: str) -> Path:
     """Resolve a relative workspace path while excluding credentials and symlink escapes.
 
@@ -45,21 +54,30 @@ def workspace_path(root: Path, relative_path: str) -> Path:
     sensitive files. Do not pass this as a security boundary against concurrent
     malicious local filesystem mutation (TOCTOU).
     """
-    if not isinstance(relative_path, str) or not relative_path or "\\x00" in relative_path:
-        raise ValueError("A non-empty relative path is required")
+    if (
+        not isinstance(relative_path, str)
+        or not relative_path
+        or "\x00" in relative_path
+        or "\\x00" in relative_path
+        or ":" in relative_path
+    ):
+        raise ValueError("A non-empty safe relative path without NUL or ADS stream is required")
     if "\\" in relative_path and os.name != "nt":
         raise ValueError("Backslash paths are not supported on this system")
     input_path = Path(relative_path)
     win_path = PureWindowsPath(relative_path)
     if input_path.is_absolute() or win_path.is_absolute() or bool(win_path.drive):
         raise ValueError("Absolute paths are forbidden")
-    if any(part in (".", "..") or _is_sensitive(part) for part in input_path.parts):
-        raise ValueError("Path traversal or credential file is forbidden")
+    if any(
+        part in (".", "..") or _is_sensitive(part) or _is_reserved_win_part(part)
+        for part in input_path.parts
+    ):
+        raise ValueError("Path traversal, reserved device name, or credential file is forbidden")
     root = root.resolve()
     target = (root / input_path).resolve()
     if not target.is_relative_to(root):
         raise ValueError("Path escapes the configured workspace")
-    if any(_is_sensitive(part) for part in target.relative_to(root).parts):
+    if any(_is_sensitive(part) or _is_reserved_win_part(part) for part in target.relative_to(root).parts):
         raise ValueError("Access to credentials or hidden configuration is forbidden")
     return target
 

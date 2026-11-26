@@ -124,7 +124,6 @@ class NavButton(QPushButton):
         self.setObjectName("Nav")
         self.setCheckable(True)
         self.setAutoExclusive(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(32)
         self.setIconSize(QSize(16, 16))
         self.setAccessibleName(text)

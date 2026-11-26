@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
@@ -88,7 +87,6 @@ class ProviderConfigDialog(SilentDialog):
             )
             self.authtoken_eye = QPushButton(tr("conn.token.show"))
             self.authtoken_eye.setObjectName("Ghost")
-            self.authtoken_eye.setCursor(Qt.CursorShape.PointingHandCursor)
             self.authtoken_eye.clicked.connect(self._toggle_ngrok_eye)
             tok_row.addWidget(self.authtoken_edit, 1)
             tok_row.addWidget(self.authtoken_eye)
@@ -145,18 +143,15 @@ class ProviderConfigDialog(SilentDialog):
         buttons.setSpacing(6)
         self.diag_btn = QPushButton("Проверить")
         self.diag_btn.setObjectName("Ghost")
-        self.diag_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.diag_btn.clicked.connect(self._run_diagnose)
         buttons.addWidget(self.diag_btn)
 
         buttons.addStretch(1)
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setObjectName("Ghost")
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.clicked.connect(self.reject)
         self.save_btn = QPushButton("Сохранить")
         self.save_btn.setObjectName("Accent")
-        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self._save)
         buttons.addWidget(cancel_btn)
         buttons.addWidget(self.save_btn)

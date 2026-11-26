@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
     QWidget,
 )
 
@@ -23,6 +22,7 @@ from app.paths import user_data_dir
 from app.ui import theme
 from app.ui.components.cards import Divider, Section, SettingRow
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.toggle_switch import ToggleSwitch
 from app.ui.i18n import LANG_EN, LANG_RU, tr
 from app.ui.pages.base import PageScaffold
@@ -65,7 +65,6 @@ class SettingsPage(PageScaffold):
             btn = QPushButton()
             btn.setObjectName("Segment")
             btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _c=False, m=mode: self.theme_mode_selected.emit(m))
             self._theme_group.addButton(btn)
             self.theme_buttons[mode] = btn
@@ -87,7 +86,6 @@ class SettingsPage(PageScaffold):
             btn = QPushButton()
             btn.setObjectName("Segment")
             btn.setCheckable(True)
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _c=False, code=lang: self.language_selected.emit(code))
             self._lang_group.addButton(btn)
             self.lang_buttons[lang] = btn
@@ -172,17 +170,17 @@ class SettingsPage(PageScaffold):
             self.logging_level_combo.addItem(lvl, lvl)
         self.logging_level_combo.currentIndexChanged.connect(lambda _i: self._emit_logging_settings())
 
-        self.logging_max_file_spin = QSpinBox()
+        self.logging_max_file_spin = SafeSpinBox()
         self.logging_max_file_spin.setRange(1, 512)
         self.logging_max_file_spin.setObjectName("UiInput")
         self.logging_max_file_spin.valueChanged.connect(lambda _v: self._emit_logging_settings())
 
-        self.logging_retention_spin = QSpinBox()
+        self.logging_retention_spin = SafeSpinBox()
         self.logging_retention_spin.setRange(1, 3650)
         self.logging_retention_spin.setObjectName("UiInput")
         self.logging_retention_spin.valueChanged.connect(lambda _v: self._emit_logging_settings())
 
-        self.logging_max_total_spin = QSpinBox()
+        self.logging_max_total_spin = SafeSpinBox()
         self.logging_max_total_spin.setRange(10, 10240)
         self.logging_max_total_spin.setObjectName("UiInput")
         self.logging_max_total_spin.valueChanged.connect(lambda _v: self._emit_logging_settings())
@@ -215,7 +213,6 @@ class SettingsPage(PageScaffold):
         log_path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         log_path_row.addWidget(log_path_lbl, 1)
         self.open_logs_folder_btn = QPushButton()
-        self.open_logs_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_logs_folder_btn.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(get_logging_manager().base_dir)))
         )
@@ -252,7 +249,6 @@ class SettingsPage(PageScaffold):
         data_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         data_row.addWidget(data_label, 1)
         self.open_folder_btn = QPushButton()
-        self.open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_folder_btn.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(data_dir))
         )

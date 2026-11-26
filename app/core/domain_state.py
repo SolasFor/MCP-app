@@ -123,9 +123,9 @@ def save(state: DomainState) -> None:
         "public_url": state.public_url,
         "tunnel_token_ref": ref,
     }
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(target)
+    from app.core.atomic_io import atomic_write_json
+
+    atomic_write_json(target, payload, indent=2, restrict_acl=False)
     token_store.restrict(target)
 
 

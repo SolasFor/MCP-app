@@ -468,11 +468,10 @@ def save(settings: ProxySettings) -> None:
         except (OSError, ValueError, RuntimeError):
             pass
 
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
     from app.core import token_store
+    from app.core.atomic_io import atomic_write_json
 
+    atomic_write_json(path, payload, indent=2, restrict_acl=False)
     token_store.restrict(path)
     _log_proxy("INFO", f"Saved proxy configuration mode={settings.mode}", event_code="proxy_save")
 

@@ -1,4 +1,4 @@
-# MCP-app v1.0.0 Complete Tool Reference
+# MCP-app v1.0.1 Complete Tool Reference
 
 All built-in MCP tools are centrally defined in `backend/tool_registry.py` (`DEFAULT_REGISTRY`) and enforced per-call by `backend/tool_permissions.py` (including dynamic Gateway upstream tools when enabled).
 
@@ -8,7 +8,7 @@ All built-in MCP tools are centrally defined in `backend/tool_registry.py` (`DEF
 | **OAuth Exec** | `oauth_windows_command` | `allowlist` | Allowlist enforces exact commands (built-in safe `dir`/`ls`/`pwd`/`echo` without shell); `full` runs arbitrary shell. |
 | **OAuth Exec** | `oauth_ssh_command` | `allowlist` | Allowlist enforces exact host + command; `full` permits arbitrary SSH commands on approved targets. |
 | **OAuth Exec** | `oauth_managed_server` | `full` | Direct legacy managed-server lifecycle control. |
-| **Tasks** | `task_start`, `task_status`, `task_list`, `task_output`, `task_result`, `task_cancel`, `task_restart`, `task_artifacts` | `allowlist` | Async job execution with spool ring buffers, disk quotas, idempotency keys, and live OAuth revoke checks. |
+| **Tasks** | `task_start`, `task_status`, `task_list`, `task_output`, `task_result`, `task_cancel`, `task_restart`, `task_artifacts` | `allowlist` | Async job execution with profile-aware default timeouts (`15s`/`12s` in `allowlist`, `60s` in `full`), 13 structured `TASK_*` MCP errors, spool ring buffers, disk quotas, idempotency keys, inactive purge, and live OAuth revoke checks. |
 | **Servers** | `server_list`, `server_start`, `server_stop`, `server_restart`, `server_status`, `server_logs`, `server_metrics`, `server_health` | `allowlist` | Local service manager with templates (`FastAPI`, `Flask`, `Node`, `Docker`), dependency DAGs, readiness probes, and redacted logs. |
 | **Workspaces** | `workspace_list`, `workspace_info`, `workspace_tree`, `workspace_read_file`, `workspace_write_file`, `workspace_search`, `workspace_apply_patch`, `workspace_move_file`, `workspace_delete_file`, `workspace_diff`, `workspace_history`, `workspace_run_task` | `allowlist` | Guarded per-project read/write/delete/execute/git permissions, canonical/junction/ADS protections, hash concurrency preconditions, and rollback history. |
 | **Git** | `git_status`, `git_diff`, `git_log`, `git_branches`, `git_checkout`, `git_commit` | `allowlist` | Non-shell Git operations respecting `trust_hooks=False` by default. |

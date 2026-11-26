@@ -47,10 +47,7 @@ redirect URL**, and the consent page does not set authentication cookies.
 `/oauth/consent` requires a **same-origin POST** (`Origin`, `Sec-Fetch-Site`, and double-submit `csrf_token` cookie+form check) and the owner's token.
 Pending requests expire after five minutes and wrong-owner-token attempts
 are limited to five per request (showing an inline retry form for attempts 1–4).
-Consent responses forbid caching and framing (`Cache-Control: no-store`, `X-Frame-Options: DENY`)
-and dynamically scope CSP `form-action 'self' <validated client callback origin>` only for the
-approved/pending client's redirect target so Chromium browsers (Chrome, Edge) cleanly complete
-cross-origin 303 redirects after form POST.
+Consent responses forbid caching and framing (`Cache-Control: no-store`, `X-Frame-Options: DENY`), adapt cleanly to Dark/Light `prefers-color-scheme` and RU/EN (`MCP_LANGUAGE` / `Accept-Language`), display a prominent high-risk notice when `full` access applies, accept exact arbitrary UTF-8 owner secrets (`MCP_OWNER_SECRET_B64`) without stripping whitespace while maintaining a separate HTTP-safe Bearer transport token (`MCP_SECRET_TOKEN`), and dynamically scope CSP `form-action 'self' <validated client callback origin>` only for the approved/pending client's redirect target so Chromium browsers (Chrome, Edge) cleanly complete cross-origin 303 redirects after form POST.
 
 ## Supported grant behavior
 

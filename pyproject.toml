@@ -1,6 +1,6 @@
 [project]
 name = "mcp-app"
-version = "1.0.0"
+version = "1.0.1"
 description = "Windows desktop MCP server, gateway, and tunnel manager"
 requires-python = ">=3.12"
 
@@ -24,6 +24,8 @@ check_untyped_defs = true
 disallow_untyped_defs = false
 files = [
     "app/platform",
+    "app/core/atomic_io.py",
+    "app/core/acl_recovery.py",
     "app/core/secret_store.py",
     "app/core/redaction.py",
     "app/core/logging_manager.py",

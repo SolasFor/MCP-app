@@ -12,7 +12,6 @@ from typing import Any
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import resource_dir, user_data_dir
-from app.platform import get_platform
 from backend.extensions.models import InstalledExtension, validate_extension_id
 
 _MAX_LOG_BYTES = 256 * 1024
@@ -35,26 +34,28 @@ class ExtensionStore:
         *,
         secret_store: SecretStore | None = None,
     ) -> None:
+        from app.core.atomic_io import try_init_private_dir
+
         self.base_dir = Path(base_dir) if base_dir is not None else (user_data_dir() / "extensions")
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        get_platform().restrict_path_acl(self.base_dir, is_dir=True)
+        try_init_private_dir(self.base_dir)
         self.installed_root = self.base_dir / "installed"
         self.backups_root = self.base_dir / "backups"
         self.data_root = self.base_dir / "data"
         self.logs_root = self.base_dir / "logs"
         for folder in (self.installed_root, self.backups_root, self.data_root, self.logs_root):
-            folder.mkdir(parents=True, exist_ok=True)
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         self.registry_path = self.base_dir / "registry.json"
         self.trusted_keys_path = self.base_dir / "trusted_keys.json"
         self._secrets = secret_store
         self._lock = threading.RLock()
 
     def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
-        get_platform().restrict_path_acl(path, is_dir=False)
+        from app.core.atomic_io import atomic_write_json
+
+        atomic_write_json(path, payload, indent=2, restrict_acl=True)
 
     def _load_json(self, path: Path, default: dict[str, Any]) -> dict[str, Any]:
         if not path.is_file():

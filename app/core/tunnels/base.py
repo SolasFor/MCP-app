@@ -143,12 +143,9 @@ class RouteOwnershipStore:
         }
 
     def _save(self, data: dict[str, Any]) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._platform.restrict_path_acl(self._path.parent, is_dir=True)
-        tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self._path)
-        self._platform.restrict_path_acl(self._path, is_dir=False)
+        from app.core.atomic_io import atomic_write_json
+
+        atomic_write_json(self._path, data, indent=2, restrict_acl=True)
 
     def record_process(self, provider_id: str, pid: int, executable: str = "") -> None:
         ident = self._platform.capture_process_identity(pid)

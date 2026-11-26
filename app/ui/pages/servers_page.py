@@ -9,16 +9,15 @@ from typing import Any
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
@@ -29,8 +28,10 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
+from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeDoubleSpinBox, SafeSpinBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
@@ -132,7 +133,7 @@ class ServerProfileDialog(SilentDialog):
         net_row = QHBoxLayout()
         self.host_edit = QLineEdit(self._base.host or "127.0.0.1")
         self.host_edit.setObjectName("UiInput")
-        self.port_spin = QSpinBox()
+        self.port_spin = SafeSpinBox()
         self.port_spin.setRange(0, 65535)
         self.port_spin.setSpecialValueText("—")
         self.port_spin.setValue(int(self._base.port or 0))
@@ -159,7 +160,7 @@ class ServerProfileDialog(SilentDialog):
         )
         self.health_path_edit = QLineEdit(self._base.readiness.http_path)
         self.health_path_edit.setObjectName("UiInput")
-        self.readiness_timeout_spin = QDoubleSpinBox()
+        self.readiness_timeout_spin = SafeDoubleSpinBox()
         self.readiness_timeout_spin.setRange(1.0, 300.0)
         self.readiness_timeout_spin.setValue(self._base.readiness.timeout_seconds)
         probe_row.addWidget(self.readiness_combo, 1)
@@ -172,10 +173,10 @@ class ServerProfileDialog(SilentDialog):
         for rp in RESTART_POLICIES:
             self.restart_combo.addItem(rp, rp)
         self.restart_combo.setCurrentIndex(max(self.restart_combo.findData(self._base.restart.policy), 0))
-        self.max_restarts_spin = QSpinBox()
+        self.max_restarts_spin = SafeSpinBox()
         self.max_restarts_spin.setRange(0, 50)
         self.max_restarts_spin.setValue(self._base.restart.max_attempts)
-        self.backoff_spin = QDoubleSpinBox()
+        self.backoff_spin = SafeDoubleSpinBox()
         self.backoff_spin.setRange(0.2, 60.0)
         self.backoff_spin.setValue(self._base.restart.base_backoff_seconds)
         restart_row.addWidget(self.restart_combo, 2)
@@ -359,7 +360,7 @@ class TemplateWizardDialog(SilentDialog):
         self.host_edit = QLineEdit("127.0.0.1")
         self.host_edit.setObjectName("UiInput")
         self.host_edit.textChanged.connect(self._update_preview)
-        self.port_spin = QSpinBox()
+        self.port_spin = SafeSpinBox()
         self.port_spin.setRange(0, 65535)
         self.port_spin.setSpecialValueText("—")
         self.port_spin.valueChanged.connect(self._update_preview)
@@ -470,39 +471,21 @@ class ServersPage(PageScaffold):
         top_bar.addWidget(self.search_edit, 1)
 
         self.add_btn = self._make_btn(self.add_server, obj="Accent")
-        self.template_btn = self._make_btn(self.add_from_template)
-        self.edit_btn = self._make_btn(self.edit_selected)
-        self.delete_btn = self._make_btn(self.delete_selected, obj="Danger")
-        self.import_btn = self._make_btn(self.import_legacy_json)
-        self.start_btn = self._make_btn(self.start_selected, obj="Accent")
-        self.stop_btn = self._make_btn(self.stop_selected, obj="Danger")
-        self.restart_btn = self._make_btn(self.restart_selected)
-        self.health_btn = self._make_btn(self.check_health_selected)
         self.refresh_btn = self._make_btn(self.reload)
-        for btn in (self.add_btn, self.template_btn, self.refresh_btn):
+        self.list_menu_btn = make_toolbar_menu_button(tr("common.actions"), parent=self)
+        self.list_menu_btn.clicked.connect(self._open_list_menu)
+        for btn in (self.add_btn, self.refresh_btn, self.list_menu_btn):
             top_bar.addWidget(btn)
         self.content.addLayout(top_bar)
-
-        action_flow = FlowLayout(spacing=6)
-        for btn in (
-            self.start_btn,
-            self.stop_btn,
-            self.restart_btn,
-            self.edit_btn,
-            self.delete_btn,
-            self.import_btn,
-            self.health_btn,
-        ):
-            action_flow.addWidget(btn)
-        self.content.addLayout(action_flow)
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
         table_lay.setContentsMargins(0, 0, 0, 0)
         table_lay.setSpacing(0)
-        self.table = DataTable(["", "", "", "", "", "", "", ""])
+        self.table = DataTable(["", "", "", "", "", "", "", "", ""])
         self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._on_selected)
+        self.table.set_row_menu_provider(self._build_row_menu)
         table_lay.addWidget(self.table, 1)
         self.content.addWidget(self.table_card, 1)
 
@@ -555,17 +538,18 @@ class ServersPage(PageScaffold):
         btn = QPushButton()
         if obj:
             btn.setObjectName(obj)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(slot)
         return btn
 
-    def _selected_name(self) -> str | None:
-        row = self.table.currentRow()
-        item = self.table.item(row, 0) if row >= 0 else None
+    def _row_name(self, row: int) -> str | None:
+        item = self.table.item(row, 0) if 0 <= row < self.table.rowCount() else None
         if item is None:
             return None
         val = item.data(Qt.ItemDataRole.UserRole)
         return str(val) if val else None
+
+    def _selected_name(self) -> str | None:
+        return self._row_name(self.table.currentRow())
 
     def _on_poll(self) -> None:
         if self.isVisible() or any(snap.get("running") or snap.get("status") == "restarting" for snap in self._snapshots.values()):
@@ -624,6 +608,7 @@ class ServersPage(PageScaffold):
             self.table.setItem(idx, 5, QTableWidgetItem(metrics_text))
             self.table.setItem(idx, 6, QTableWidgetItem(deps_text))
             self.table.setItem(idx, 7, QTableWidgetItem(access_text))
+            self.table.set_row_actions_cell(idx, 8, tooltip=tr("common.actions"))
             if selected_name and name == selected_name:
                 restore_row = idx
 
@@ -633,17 +618,89 @@ class ServersPage(PageScaffold):
         self._on_selected()
 
     def _on_selected(self) -> None:
-        name = self._selected_name()
-        has_sel = name is not None and name in self._profiles
-        snap = self._snapshots.get(name or "", {})
-        running = bool(snap.get("running"))
-        self.edit_btn.setEnabled(has_sel)
-        self.delete_btn.setEnabled(has_sel and not running)
-        self.start_btn.setEnabled(has_sel and not running)
-        self.stop_btn.setEnabled(has_sel and running)
-        self.restart_btn.setEnabled(has_sel)
-        self.health_btn.setEnabled(has_sel and running)
         self._refresh_details()
+
+    def _open_list_menu(self) -> None:
+        specs = [
+            MenuActionSpec(
+                key="template",
+                label=tr("servers.btn.template"),
+                callback=self.add_from_template,
+                icon_name="plus",
+            ),
+            MenuActionSpec(
+                key="import",
+                label=tr("servers.btn.import"),
+                callback=self.import_legacy_json,
+                icon_name="import",
+            ),
+        ]
+        AppContextMenu.from_specs(specs, parent=self).exec_clamped(
+            self.list_menu_btn.mapToGlobal(self.list_menu_btn.rect().bottomLeft())
+        )
+
+    def _build_row_menu(self, row: int) -> list[MenuActionSpec]:
+        name = self._row_name(row)
+        if not name or name not in self._profiles:
+            return []
+        running = bool(self._snapshots.get(name, {}).get("running"))
+        return [
+            MenuActionSpec(
+                key="start",
+                label=tr("servers.btn.start"),
+                callback=lambda n=name: self._start_server(n),
+                icon_name="play",
+                enabled=not running,
+            ),
+            MenuActionSpec(
+                key="stop",
+                label=tr("servers.btn.stop"),
+                callback=lambda n=name: self._stop_server(n),
+                icon_name="stop",
+                enabled=running,
+            ),
+            MenuActionSpec(
+                key="restart",
+                label=tr("servers.btn.restart"),
+                callback=lambda n=name: self._restart_server(n),
+                icon_name="refresh",
+            ),
+            MenuActionSpec(
+                key="health",
+                label=tr("servers.btn.health"),
+                callback=lambda n=name: self._check_health_server(n),
+                icon_name="shield",
+                enabled=running,
+            ),
+            MenuActionSpec(
+                key="edit",
+                label=tr("servers.btn.edit"),
+                callback=lambda n=name: self._edit_server(n),
+                icon_name="edit",
+                separator_before=True,
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda n=name: self._copy_server_id(n),
+                icon_name="copy",
+            ),
+            MenuActionSpec(
+                key="delete",
+                label=tr("servers.btn.delete"),
+                callback=lambda n=name: self._delete_server(n),
+                icon_name="trash",
+                enabled=not running,
+                danger=True,
+                separator_before=True,
+            ),
+        ]
+
+    def _copy_server_id(self, name: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(name)
+        self.status_message.emit(tr("common.copied_id", item_id=name), "info")
 
     def _refresh_details(self) -> None:
         name = self._selected_name()
@@ -700,9 +757,8 @@ class ServersPage(PageScaffold):
         self.status_message.emit(tr("servers.toast.saved", name=profile.name), "ok")
         self.reload()
 
-    def edit_selected(self) -> None:
-        name = self._selected_name()
-        if not name or name not in self._profiles:
+    def _edit_server(self, name: str) -> None:
+        if name not in self._profiles:
             return
         dlg = ServerProfileDialog(
             self.store, existing=self._profiles[name], is_new=False, parent=self
@@ -710,10 +766,12 @@ class ServersPage(PageScaffold):
         if dlg.exec() and dlg.saved_profile is not None:
             self.save_profile(dlg.saved_profile)
 
-    def delete_selected(self) -> None:
+    def edit_selected(self) -> None:
         name = self._selected_name()
-        if not name:
-            return
+        if name:
+            self._edit_server(name)
+
+    def _delete_server(self, name: str) -> None:
         answer = SilentMessageBox.question(
             self,
             tr("servers.title"),
@@ -731,6 +789,11 @@ class ServersPage(PageScaffold):
         except Exception as exc:
             SilentMessageBox.warning(self, tr("servers.title"), str(exc))
 
+    def delete_selected(self) -> None:
+        name = self._selected_name()
+        if name:
+            self._delete_server(name)
+
     def import_legacy_json(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, tr("servers.btn.import"), "", "JSON Files (*.json);;All Files (*)"
@@ -747,10 +810,7 @@ class ServersPage(PageScaffold):
         except Exception as exc:
             SilentMessageBox.warning(self, tr("servers.title"), str(exc))
 
-    def start_selected(self) -> None:
-        name = self._selected_name()
-        if not name:
-            return
+    def _start_server(self, name: str) -> None:
         try:
             self.server_manager.start_server(name, client_id="owner", wait_readiness=True)
             self.status_message.emit(tr("servers.toast.started", name=name), "ok")
@@ -758,10 +818,12 @@ class ServersPage(PageScaffold):
             SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
-    def stop_selected(self) -> None:
+    def start_selected(self) -> None:
         name = self._selected_name()
-        if not name:
-            return
+        if name:
+            self._start_server(name)
+
+    def _stop_server(self, name: str) -> None:
         try:
             res = self.server_manager.stop_server(name, client_id="owner")
             if res.get("lifecycle") == "independent":
@@ -772,10 +834,12 @@ class ServersPage(PageScaffold):
             SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
-    def restart_selected(self) -> None:
+    def stop_selected(self) -> None:
         name = self._selected_name()
-        if not name:
-            return
+        if name:
+            self._stop_server(name)
+
+    def _restart_server(self, name: str) -> None:
         try:
             self.server_manager.restart_server(name, client_id="owner", wait_readiness=True)
             self.status_message.emit(tr("servers.toast.restarted", name=name), "ok")
@@ -783,10 +847,12 @@ class ServersPage(PageScaffold):
             SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
 
-    def check_health_selected(self) -> None:
+    def restart_selected(self) -> None:
         name = self._selected_name()
-        if not name:
-            return
+        if name:
+            self._restart_server(name)
+
+    def _check_health_server(self, name: str) -> None:
         try:
             res = self.server_manager.health_server(name, client_id="owner", run_probe=True)
             lvl = "ok" if res.get("healthy") else "warn"
@@ -794,6 +860,11 @@ class ServersPage(PageScaffold):
         except Exception as exc:
             SilentMessageBox.warning(self, tr("servers.title"), self._redactor.redact_text(str(exc)))
         self.reload()
+
+    def check_health_selected(self) -> None:
+        name = self._selected_name()
+        if name:
+            self._check_health_server(name)
 
     def start_autostart_servers(self) -> None:
         self.server_manager.start_autostart_servers()
@@ -807,15 +878,8 @@ class ServersPage(PageScaffold):
         self.set_header(tr("servers.title"), tr("servers.lead"))
         self.search_edit.setPlaceholderText(tr("servers.search"))
         self.add_btn.setText(tr("servers.btn.add"))
-        self.template_btn.setText(tr("servers.btn.template"))
-        self.edit_btn.setText(tr("servers.btn.edit"))
-        self.delete_btn.setText(tr("servers.btn.delete"))
-        self.import_btn.setText(tr("servers.btn.import"))
-        self.start_btn.setText(tr("servers.btn.start"))
-        self.stop_btn.setText(tr("servers.btn.stop"))
-        self.restart_btn.setText(tr("servers.btn.restart"))
-        self.health_btn.setText(tr("servers.btn.health"))
         self.refresh_btn.setText(tr("servers.btn.refresh"))
+        self.list_menu_btn.setToolTip(tr("common.actions"))
         self.table.setHorizontalHeaderLabels(
             [
                 tr("servers.col.name"),
@@ -826,6 +890,7 @@ class ServersPage(PageScaffold):
                 tr("servers.col.metrics"),
                 tr("servers.col.deps"),
                 tr("servers.col.access"),
+                "",
             ]
         )
         self.empty_state.set_content(tr("servers.empty.title"), tr("servers.empty.desc"))

@@ -218,7 +218,7 @@ class PlaywrightOAuthBrowserE2ETests(unittest.TestCase):
         state = f"state-{label}"
         auth_url = self._authorize_url(client_id, state)
 
-        context = browser.new_context()
+        context = browser.new_context(locale="en-US")
         page = context.new_page()
         console_errors: list[str] = []
         page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
@@ -377,6 +377,189 @@ class PlaywrightOAuthBrowserE2ETests(unittest.TestCase):
                     self._run_full_oauth_in_browser(edge, "msedge")
                 finally:
                     edge.close()
+
+    def test_oauth_consent_localization_themes_full_warning_and_unicode_secret(self) -> None:
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_store import OAuthStore
+
+        cid = self._register_client("Localization & Full Client")
+        store = OAuthStore(self.root_dir / "oauth" / "connections.sqlite3", self.issuer, self.resource_url)
+        exec_approvals = ExecutionApprovals(store)
+        auth_url = self._authorize_url(cid, "loc-state")
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                # 1. Russian + Dark theme
+                ctx_ru = browser.new_context(locale="ru-RU", color_scheme="dark")
+                p_ru = ctx_ru.new_page()
+                try:
+                    resp = p_ru.goto(auth_url, wait_until="domcontentloaded")
+                    assert resp is not None
+                    self.assertEqual(resp.status, 200)
+                    html_ru = p_ru.content()
+                    for needle in (
+                        "Авторизация подключения",
+                        "Подключаемый клиент",
+                        "Сценарий доступа",
+                        "Белый список",
+                        "Токен владельца",
+                        "Разрешить доступ",
+                        "Отклонить",
+                        "MCP-app · Безопасное подключение OAuth",
+                        "<svg",
+                    ):
+                        self.assertIn(needle, html_ru)
+                finally:
+                    ctx_ru.close()
+
+                # 2. English + Light theme
+                ctx_en = browser.new_context(locale="en-US", color_scheme="light")
+                p_en = ctx_en.new_page()
+                try:
+                    resp = p_en.goto(auth_url, wait_until="domcontentloaded")
+                    assert resp is not None
+                    self.assertEqual(resp.status, 200)
+                    html_en = p_en.content()
+                    for needle in (
+                        "Authorize Connection",
+                        "Connecting client",
+                        "Allowlist",
+                        "Allow access",
+                        "MCP-app · Secure OAuth Connection",
+                    ):
+                        self.assertIn(needle, html_en)
+                finally:
+                    ctx_en.close()
+
+                # 3. Full access profile shows prominent high-risk warning in both RU and EN
+                exec_approvals.set_profile("full")
+                try:
+                    for loc, warn_needle in (("ru-RU", "Высокий риск"), ("en-US", "High risk")):
+                        ctx_f = browser.new_context(locale=loc, color_scheme="dark")
+                        pf = ctx_f.new_page()
+                        try:
+                            pf.goto(auth_url, wait_until="domcontentloaded")
+                            self.assertIn(warn_needle, pf.content())
+                        finally:
+                            ctx_f.close()
+                finally:
+                    exec_approvals.set_profile("allowlist")
+            finally:
+                browser.close()
+
+        # 4. Separate server with arbitrary spaced UTF-8 owner secret (MCP_OWNER_SECRET_B64)
+        import subprocess
+        from app.core.winjob import kill_process_tree
+
+        with tempfile.TemporaryDirectory() as u_tmp:
+            u_root = Path(u_tmp)
+            u_port = _free_port()
+            u_issuer = f"http://127.0.0.1:{u_port}"
+            u_resource = f"{u_issuer}/mcp"
+            utf8_secret = "  мой токен №1!  "
+            env = os.environ.copy()
+            env.update(
+                {
+                    "MCP_PUBLIC_URL": u_resource,
+                    "MCP_HOST": "127.0.0.1",
+                    "MCP_PORT": str(u_port),
+                    "MCP_SECRET_TOKEN": "ascii-transport-bearer-secret-123456",
+                    "MCP_OWNER_SECRET_B64": base64.b64encode(utf8_secret.encode("utf-8")).decode("ascii"),
+                    "MCP_ENABLE_OAUTH": "1",
+                    "MCP_JSON_RESPONSE": "1",
+                    "MCP_LANGUAGE": "ru",
+                    "MCP_LOGS_DIR": str(u_root / "logs"),
+                    "MCP_OAUTH_STORE_PATH": str(u_root / "oauth" / "connections.sqlite3"),
+                    "MCP_EXEC_AUDIT_PATH": str(u_root / "logs" / "mcp_execution_audit.jsonl"),
+                    "MCP_GATEWAY_CONFIG_PATH": str(u_root / "gateway" / "servers.json"),
+                    "MCP_MANAGED_SERVERS_PATH": str(u_root / "servers" / "managed_servers.json"),
+                    "MCP_WORKSPACES_CONFIG_PATH": str(u_root / "workspaces" / "workspaces.json"),
+                    "MCP_WORKSPACES_HISTORY_DIR": str(u_root / "workspaces" / "history"),
+                    "MCP_DESKTOP_POLICY_PATH": str(u_root / "desktop" / "policy.json"),
+                    "MCP_EXTENSIONS_DIR": str(u_root / "extensions"),
+                    "MCP_DEVICES_CONFIG_PATH": str(u_root / "remote" / "devices.json"),
+                    "MCP_AUTOMATION_DIR": str(u_root / "automation"),
+                    "MCP_SECRETS_DIR": str(u_root / "secrets"),
+                    "MCP_TASKS_DB_PATH": str(u_root / "tasks" / "tasks.sqlite3"),
+                    "MCP_TASKS_ARTIFACTS_DIR": str(u_root / "tasks" / "artifacts"),
+                    "MCP_SPOOL_DIR": str(u_root / "tasks" / "spool"),
+                }
+            )
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "backend.server:build_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(u_port),
+                    "--log-level",
+                    "warning",
+                ],
+                cwd=Path(__file__).resolve().parents[2],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                deadline = time.monotonic() + 12.0
+                while time.monotonic() < deadline:
+                    try:
+                        st_code, _, _ = _http_json(f"{u_issuer}/health")
+                        if st_code == 200:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.15)
+                reg_code, _, reg_body = _http_json(
+                    f"{u_issuer}/register",
+                    method="POST",
+                    payload={
+                        "client_name": "Unicode Secret Client",
+                        "redirect_uris": [self.cb_server.redirect_uri],
+                        "token_endpoint_auth_method": "none",
+                        "grant_types": ["authorization_code", "refresh_token"],
+                        "response_types": ["code"],
+                        "scope": "mcp:read",
+                    },
+                )
+                self.assertIn(reg_code, (200, 201), reg_body)
+                ucid = str(json.loads(reg_body)["client_id"])
+                u_auth = f"{u_issuer}/authorize?" + urllib.parse.urlencode(
+                    {
+                        "response_type": "code",
+                        "client_id": ucid,
+                        "redirect_uri": self.cb_server.redirect_uri,
+                        "code_challenge": CODE_CHALLENGE,
+                        "code_challenge_method": "S256",
+                        "scope": "mcp:read",
+                        "state": "utf8-state",
+                        "resource": u_resource,
+                    }
+                )
+                self.cb_server.hits.clear()
+                with sync_playwright() as pw:
+                    br = pw.chromium.launch(headless=True)
+                    ctx = br.new_context(locale="ru-RU")
+                    pg = ctx.new_page()
+                    try:
+                        pg.goto(u_auth, wait_until="domcontentloaded")
+                        # Exact spaces + Cyrillic MUST succeed without stripping!
+                        pg.fill("input[name='owner_token']", utf8_secret)
+                        pg.click("button[value='allow']")
+                        pg.wait_for_url(f"http://localhost:{self.cb_server.port}/oauth/callback**", timeout=8000)
+                        self.assertIn("code", self.cb_server.hits[0])
+                    finally:
+                        ctx.close()
+                        br.close()
+            finally:
+                if proc.poll() is None:
+                    kill_process_tree(proc.pid, include_parent=True)
+                    proc.wait(timeout=4.0)
 
 
 if __name__ == "__main__":

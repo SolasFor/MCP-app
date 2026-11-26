@@ -43,7 +43,6 @@ class _ToastItem(QFrame):
         close_btn.setObjectName("Ghost")
         close_btn.setIcon(icons.vector_icon("close", theme.TEXT_MUTED, 12))
         close_btn.setFixedSize(22, 22)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(lambda: on_close(self))
         row.addWidget(close_btn)
 
@@ -160,7 +159,6 @@ class SilentNotificationPopup(QFrame):
         close_btn.setObjectName("Ghost")
         close_btn.setIcon(icons.vector_icon("close", theme.TEXT_MUTED, 12))
         close_btn.setFixedSize(22, 22)
-        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.clicked.connect(self.dismiss)
         row.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
 

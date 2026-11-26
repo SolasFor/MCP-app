@@ -252,7 +252,6 @@ class CopyField(QFrame):
 
         self.copy_button = QPushButton(button_text)
         self.copy_button.setObjectName("CopyFieldBtn")
-        self.copy_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_button.clicked.connect(lambda: self.copy_clicked.emit(self._full_value, self.copy_button))
         row.addWidget(self.copy_button, 0)
 
@@ -342,7 +341,6 @@ class EmptyState(QFrame):
         layout.addWidget(self.desc_label)
 
         self.cta_button = QPushButton(cta_text)
-        self.cta_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cta_button.setVisible(bool(cta_text))
         layout.addWidget(self.cta_button, 0, Qt.AlignmentFlag.AlignCenter)
         self.apply_theme()

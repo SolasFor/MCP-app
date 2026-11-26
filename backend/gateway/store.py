@@ -46,10 +46,11 @@ class GatewayConfigStore:
     """Stores upstream MCP server profiles (non-secret JSON) + encrypted SecretStore entries."""
 
     def __init__(self, config_path: Path, secret_store: SecretStore | None = None) -> None:
+        from app.core.atomic_io import try_init_private_dir
+
         self.path = Path(config_path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._platform = get_platform()
-        self._platform.restrict_path_acl(self.path.parent, is_dir=True)
+        try_init_private_dir(self.path.parent)
         self.secrets = secret_store or SecretStore(self.path.parent.parent / "secrets")
         self._profiles: dict[str, UpstreamServerProfile] = {}
         self.load()
@@ -75,14 +76,13 @@ class GatewayConfigStore:
         self._profiles = loaded
 
     def save(self) -> None:
+        from app.core.atomic_io import atomic_write_json
+
         payload = {
             "version": 1,
             "servers": {sid: prof.to_dict() for sid, prof in sorted(self._profiles.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.path)
-        self._platform.restrict_path_acl(self.path, is_dir=False)
+        atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
 
     def list_profiles(self) -> list[UpstreamServerProfile]:
         return [self._profiles[k] for k in sorted(self._profiles)]

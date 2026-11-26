@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import threading
 from collections.abc import Mapping
@@ -144,8 +143,8 @@ class ServerConfigStore:
                 prof.validate()
             validate_dependencies(profiles)
 
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._platform.restrict_path_acl(self.path.parent, is_dir=True)
+            from app.core.atomic_io import atomic_write_json
+
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "servers": {
@@ -153,13 +152,7 @@ class ServerConfigStore:
                     for name in sorted(profiles)
                 },
             }
-            data = json.dumps(payload, indent=2, ensure_ascii=False)
-            tmp = self.path.with_suffix(".json.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(data)
-            os.replace(tmp, self.path)
-            self._platform.restrict_path_acl(self.path, is_dir=False)
+            atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
 
     def upsert_profile(self, profile: ServerProfile) -> None:
         profile.validate()

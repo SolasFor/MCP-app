@@ -95,6 +95,7 @@ class GatewayRouter:
             env=env,
             headers=headers,
             gateway_instance_id=self.instance_id,
+            self_urls=self._self_urls,
             redactor=self._redactor,
             client_id=client_id,
             on_tools_changed=self._mark_dirty,
@@ -248,6 +249,8 @@ class GatewayRouter:
         raw_tool_name: str,
         principal: Any,
         execution: ExecutionApprovals | None,
+        *,
+        namespaced_name: str = "",
     ) -> bool:
         if not profile.enabled or not profile.approved_by_owner:
             return False
@@ -270,6 +273,13 @@ class GatewayRouter:
             return False
         if profile.allowed_tools and raw_tool_name not in profile.allowed_tools:
             return False
+        tool_pol = execution.client_tool_policy(client_id)
+        denied = set(tool_pol.get("denied_tools", ()))
+        only = set(tool_pol.get("allowed_tools_only", ()))
+        if "*" in denied or raw_tool_name in denied or (namespaced_name and namespaced_name in denied):
+            return False
+        if only and raw_tool_name not in only and (not namespaced_name or namespaced_name not in only):
+            return False
         return True
 
     def list_authorized_tools(
@@ -282,7 +292,9 @@ class GatewayRouter:
             prof = self.store.get(entry.server_id)
             if prof is None:
                 continue
-            if self._is_authorized(prof, entry.raw_name, principal, execution):
+            if self._is_authorized(
+                prof, entry.raw_name, principal, execution, namespaced_name=entry.namespaced_name
+            ):
                 visible.append(
                     MCPTool(
                         name=entry.namespaced_name,
@@ -302,7 +314,9 @@ class GatewayRouter:
         if entry is None:
             raise PermissionError(f"Unknown gateway tool: {namespaced_name!r}")
         prof = self.store.get(entry.server_id)
-        if prof is None or not self._is_authorized(prof, entry.raw_name, principal, execution):
+        if prof is None or not self._is_authorized(
+            prof, entry.raw_name, principal, execution, namespaced_name=entry.namespaced_name
+        ):
             raise PermissionError("OAuth client is not authorized for this upstream gateway tool.")
         return entry
 

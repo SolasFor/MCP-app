@@ -29,12 +29,20 @@ class UiRedesignGuiTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.oauth_path = Path(self.tmp.name) / "oauth" / "state.sqlite3"
-        self.settings_path = Path(self.tmp.name) / "settings.json"
-        self.store_patch = patch("app.ui.main_window.default_store_path", return_value=self.oauth_path)
-        self.settings_patch = patch.object(Settings, "path", return_value=self.settings_path)
-        self.store_patch.start()
-        self.settings_patch.start()
+        self.root = Path(self.tmp.name)
+        self.oauth_path = self.root / "oauth" / "state.sqlite3"
+        self.settings_path = self.root / "settings.json"
+        self.patches = [
+            patch("app.ui.main_window.default_store_path", return_value=self.oauth_path),
+            patch("app.paths.user_data_dir", return_value=self.root),
+            patch("app.core.service_manager.user_data_dir", return_value=self.root),
+            patch("app.core.token_store.user_data_dir", return_value=self.root),
+            patch("app.core.domain_state.user_data_dir", return_value=self.root),
+            patch("app.ui.main_window.user_data_dir", return_value=self.root),
+            patch.object(Settings, "path", return_value=self.settings_path),
+        ]
+        for p in self.patches:
+            p.start()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.settings = Settings()
@@ -44,8 +52,8 @@ class UiRedesignGuiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.allow_close()
         self.window.close()
-        self.store_patch.stop()
-        self.settings_patch.stop()
+        for p in reversed(self.patches):
+            p.stop()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()

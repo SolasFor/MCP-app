@@ -158,12 +158,17 @@ class RemoteManagementIntegrationTests(unittest.TestCase):
 
     def test_oauth_cross_client_isolation_via_server_tools(self) -> None:
         from backend import server
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_store import OAuthStore
 
-        server.REMOTE_STORE = self.store
-        server.REMOTE_MANAGER = self.mgr
-        assert server.oauth_provider is not None and server.oauth_execution is not None
+        store = OAuthStore(
+            self.root / "srv_oauth.sqlite3",
+            issuer=server.BASE_URL,
+            resource_url=server.RESOURCE_URL,
+        )
+        exec_app = ExecutionApprovals(store, default_profile="safe")
         for cid in ("rm-allowed", "rm-denied"):
-            server.oauth_provider.store.save_client(
+            store.save_client(
                 OAuthClientInformationFull(
                     client_id=cid,
                     client_name=cid,
@@ -171,26 +176,32 @@ class RemoteManagementIntegrationTests(unittest.TestCase):
                     token_endpoint_auth_method="none",
                 )
             )
-            server.oauth_provider.store.mark_approved(cid)
-            server.oauth_execution.set_client_profile(cid, "allowlist")
+            store.mark_approved(cid)
+            exec_app.set_client_profile(cid, "allowlist")
 
-        tok_ok = AccessToken(token="t1", client_id="rm-allowed", scopes=["mcp:read"], resource=server.RESOURCE_URL)
-        with patch("backend.tool_permissions.get_access_token", return_value=tok_ok):
-            listed = asyncio.run(server.device_list())
-            self.assertEqual(len(listed["devices"]), 1)
-            res = asyncio.run(server.ssh_execute("box1", "echo ok"))
-            self.assertEqual(res["exit_code"], 0)
-            self.assertEqual(res["stdout"].strip(), "ok")
-            # Cross-check that secret is not present in output or device_info
-            info = asyncio.run(server.device_info("box1"))
-            self.assertNotIn("cipass-secret", str(info))
+        fake_prov = type("_P", (), {"store": store})()
+        with patch.object(server, "REMOTE_STORE", self.store), patch.object(
+            server, "REMOTE_MANAGER", self.mgr
+        ), patch.object(server, "oauth_provider", fake_prov), patch.object(
+            server, "oauth_execution", exec_app
+        ):
+            tok_ok = AccessToken(token="t1", client_id="rm-allowed", scopes=["mcp:read"], resource=server.RESOURCE_URL)
+            with patch("backend.tool_permissions.get_access_token", return_value=tok_ok):
+                listed = asyncio.run(server.device_list())
+                self.assertEqual(len(listed["devices"]), 1)
+                res = asyncio.run(server.ssh_execute("box1", "echo ok"))
+                self.assertEqual(res["exit_code"], 0)
+                self.assertEqual(res["stdout"].strip(), "ok")
+                # Cross-check that secret is not present in output or device_info
+                info = asyncio.run(server.device_info("box1"))
+                self.assertNotIn("cipass-secret", str(info))
 
-        tok_bad = AccessToken(token="t2", client_id="rm-denied", scopes=["mcp:read"], resource=server.RESOURCE_URL)
-        with patch("backend.tool_permissions.get_access_token", return_value=tok_bad):
-            denied_list = asyncio.run(server.device_list())
-            self.assertEqual(denied_list["devices"], [])
-            denied_exec = asyncio.run(server.ssh_execute("box1", "echo ok"))
-            self.assertIn("denied", denied_exec["error"].lower())
+            tok_bad = AccessToken(token="t2", client_id="rm-denied", scopes=["mcp:read"], resource=server.RESOURCE_URL)
+            with patch("backend.tool_permissions.get_access_token", return_value=tok_bad):
+                denied_list = asyncio.run(server.device_list())
+                self.assertEqual(denied_list["devices"], [])
+                denied_exec = asyncio.run(server.ssh_execute("box1", "echo ok"))
+                self.assertIn("denied", denied_exec["error"].lower())
 
     def test_headless_devices_gui_import_health_and_i18n(self) -> None:
         cfg = self.root / "ssh_config"

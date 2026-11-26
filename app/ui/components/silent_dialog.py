@@ -14,16 +14,27 @@ from PyQt6.QtWidgets import (
 )
 
 from app.ui import icons, theme
+from app.ui.i18n import LANG_EN, i18n
 
 StandardButton = QMessageBox.StandardButton
 
-_BUTTON_SPECS: tuple[tuple[StandardButton, str], ...] = (
-    (StandardButton.Yes, "Да"),
-    (StandardButton.No, "Нет"),
-    (StandardButton.Ok, "ОК"),
-    (StandardButton.Cancel, "Отмена"),
-    (StandardButton.Close, "Закрыть"),
-)
+
+def _button_specs() -> tuple[tuple[StandardButton, str], ...]:
+    if i18n.language == LANG_EN:
+        return (
+            (StandardButton.Yes, "Yes"),
+            (StandardButton.No, "No"),
+            (StandardButton.Ok, "OK"),
+            (StandardButton.Cancel, "Cancel"),
+            (StandardButton.Close, "Close"),
+        )
+    return (
+        (StandardButton.Yes, "Да"),
+        (StandardButton.No, "Нет"),
+        (StandardButton.Ok, "ОК"),
+        (StandardButton.Cancel, "Отмена"),
+        (StandardButton.Close, "Закрыть"),
+    )
 
 
 class SilentDialog(QDialog):
@@ -112,10 +123,9 @@ class SilentMessageBox(SilentDialog):
         self._btn_row.setSpacing(8)
         self._btn_row.addStretch(1)
 
-        for std_btn, label in _BUTTON_SPECS:
+        for std_btn, label in _button_specs():
             if buttons & std_btn:
                 btn = QPushButton(label)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 if std_btn in (StandardButton.Yes, StandardButton.Ok) and kind != "warning":
                     btn.setObjectName("Accent")
                 elif std_btn == StandardButton.Yes and kind == "warning":
@@ -197,6 +207,7 @@ class SilentMessageBox(SilentDialog):
         default_button: StandardButton = StandardButton.NoButton,
         *,
         informative_text: str = "",
+        detailed_text: str = "",
     ) -> StandardButton:
         return cls._show(
             kind="warning",
@@ -206,6 +217,7 @@ class SilentMessageBox(SilentDialog):
             buttons=buttons,
             default_button=default_button,
             informative_text=informative_text,
+            detailed_text=detailed_text,
         )
 
     @classmethod
@@ -241,6 +253,7 @@ class SilentMessageBox(SilentDialog):
         default_button: StandardButton = StandardButton.NoButton,
         *,
         informative_text: str = "",
+        detailed_text: str = "",
     ) -> StandardButton:
         return cls._show(
             kind="information",
@@ -250,6 +263,7 @@ class SilentMessageBox(SilentDialog):
             buttons=buttons,
             default_button=default_button,
             informative_text=informative_text,
+            detailed_text=detailed_text,
         )
 
     @classmethod
@@ -262,6 +276,7 @@ class SilentMessageBox(SilentDialog):
         default_button: StandardButton = StandardButton.No,
         *,
         informative_text: str = "",
+        detailed_text: str = "",
     ) -> StandardButton:
         return cls._show(
             kind="question",
@@ -271,6 +286,7 @@ class SilentMessageBox(SilentDialog):
             buttons=buttons,
             default_button=default_button,
             informative_text=informative_text,
+            detailed_text=detailed_text,
         )
 
     @classmethod
@@ -281,9 +297,11 @@ class SilentMessageBox(SilentDialog):
         headline: str,
         body: str,
         *,
-        accept_label: str = "Продолжить",
-        cancel_label: str = "Отмена",
+        accept_label: str | None = None,
+        cancel_label: str | None = None,
     ) -> bool:
+        eff_accept = accept_label or ("Continue" if i18n.language == LANG_EN else "Продолжить")
+        eff_cancel = cancel_label or ("Cancel" if i18n.language == LANG_EN else "Отмена")
         dlg = cls(
             kind="question",
             title=title,
@@ -294,11 +312,9 @@ class SilentMessageBox(SilentDialog):
             parent=parent,
         )
         accepted = {"ok": False}
-        accept_btn = QPushButton(accept_label)
+        accept_btn = QPushButton(eff_accept)
         accept_btn.setObjectName("Accent")
-        accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        cancel_btn = QPushButton(cancel_label)
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel_btn = QPushButton(eff_cancel)
         cancel_btn.setDefault(True)
 
         def on_accept() -> None:

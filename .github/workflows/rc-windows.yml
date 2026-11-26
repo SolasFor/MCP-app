@@ -55,6 +55,180 @@ jobs:
           }
           $selftest = Get-Content "build/selftest.txt" -Raw -Encoding UTF8
           if ($selftest -notmatch 'RESULT OK') { throw "Built EXE self-test failed" }
+      - name: Test MCPApp-Setup installer, upgrade, and uninstall in clean environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path app/__init__.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $SetupExe = (Resolve-Path "dist/MCPApp-Setup-$version.exe").Path
+
+          # 1. Verify SHA256SUMS.txt covers Setup EXE, portable ZIP, and SBOM accurately
+          $sumLines = Get-Content "dist/SHA256SUMS.txt" -Encoding ASCII | Where-Object { $_.Trim() }
+          if (-not ($sumLines | Where-Object { $_ -match ([regex]::Escape("MCPApp-Setup-$version.exe")) })) {
+            throw "MCPApp-Setup-$version.exe missing from dist/SHA256SUMS.txt"
+          }
+          foreach ($line in $sumLines) {
+            if ($line -notmatch '^([0-9a-f]{64})\s+(.+)$') { throw "Malformed SHA256SUMS line: $line" }
+            $expected = $matches[1].ToLowerInvariant()
+            $target = Join-Path "dist" $matches[2].Trim()
+            if (-not (Test-Path $target)) { throw "Missing checksum target: $target" }
+            $actual = (Get-FileHash -Path $target -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $expected) { throw "SHA-256 mismatch for $($matches[2]): expected $expected, got $actual" }
+          }
+
+          $OrigAppData = $env:APPDATA
+          $OrigLocalAppData = $env:LOCALAPPDATA
+          $WorkDir = Join-Path $env:RUNNER_TEMP ("mcpapp_setup_test_" + [guid]::NewGuid().ToString("N"))
+          $ProfileDir = Join-Path $WorkDir "profile"
+          New-Item -ItemType Directory -Force -Path "$ProfileDir\Roaming", "$ProfileDir\Local" | Out-Null
+
+          $InstallDir = Join-Path $OrigLocalAppData "Programs\MCP app"
+          $InstalledExe = Join-Path $InstallDir "MCPApp.exe"
+          $StartMenuLnk = Join-Path $OrigAppData "Microsoft\Windows\Start Menu\Programs\MCP app.lnk"
+          $UninstKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A71-4D5E-4B9A-9C61-2E7A1D0B5F43}_is1"
+          $DataDir = "$ProfileDir\Roaming\MCPApp"
+          $VenvPy = (Resolve-Path ".venv-build\Scripts\python.exe").Path
+
+          function Invoke-InstalledRuntimeCheck([string]$Tag, [int]$Port) {
+            $env:APPDATA = "$ProfileDir\Roaming"
+            $env:LOCALAPPDATA = "$ProfileDir\Local"
+            try {
+              $stReport = Join-Path $WorkDir "selftest-$Tag.txt"
+              $stProc = Start-Process -FilePath $InstalledExe -ArgumentList @("--selftest", "`"$stReport`"") -Wait -PassThru -WindowStyle Hidden
+              if ($stProc.ExitCode -ne 0) { throw "Installed selftest ($Tag) exited $($stProc.ExitCode)" }
+              $stText = Get-Content $stReport -Raw -Encoding UTF8
+              if ($stText -notmatch 'RESULT OK' -or $stText -notmatch 'WindowsPlatformAdapter') {
+                throw "Installed selftest ($Tag) unexpected output:`n$stText"
+              }
+
+              $env:MCP_PORT = "$Port"
+              $env:MCP_ADMIN_PORT = "$($Port + 1)"
+              $hlProc = Start-Process -FilePath $InstalledExe -ArgumentList @("--headless") -PassThru -WindowStyle Hidden
+              try {
+                $healthy = $false
+                for ($i = 0; $i -lt 30; $i++) {
+                  Start-Sleep -Milliseconds 400
+                  if ($hlProc.HasExited) { throw "Installed headless ($Tag) exited prematurely ($($hlProc.ExitCode))" }
+                  try {
+                    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/health" -UseBasicParsing -TimeoutSec 2
+                    if ($r.StatusCode -eq 200) { $healthy = $true; break }
+                  } catch {}
+                }
+                if (-not $healthy) { throw "Installed headless ($Tag) /health did not return 200" }
+                $unauthCode = 0
+                try {
+                  Invoke-WebRequest -Uri "http://127.0.0.1:$Port/mcp" -Method Post -Body '{}' -ContentType "application/json" -UseBasicParsing -TimeoutSec 2 | Out-Null
+                } catch {
+                  if ($_.Exception.Response) { $unauthCode = [int]$_.Exception.Response.StatusCode }
+                }
+                if ($unauthCode -ne 401) { throw "Expected HTTP 401 on unauthenticated /mcp ($Tag), got $unauthCode" }
+              } finally {
+                if (-not $hlProc.HasExited) {
+                  Stop-Process -Id $hlProc.Id -Force
+                  $hlProc.WaitForExit(5000) | Out-Null
+                }
+                Remove-Item Env:\MCP_PORT, Env:\MCP_ADMIN_PORT -ErrorAction SilentlyContinue
+              }
+            } finally {
+              $env:APPDATA = $OrigAppData
+              $env:LOCALAPPDATA = $OrigLocalAppData
+            }
+          }
+
+          try {
+            # 2. Clean per-user silent installation (no admin rights required)
+            $p1 = Start-Process -FilePath $SetupExe -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=`"$WorkDir\install1.log`"") -Wait -PassThru
+            if ($p1.ExitCode -ne 0) { throw "Initial silent install failed with exit code $($p1.ExitCode)" }
+
+            foreach ($req in @($InstalledExe, (Join-Path $InstallDir "_internal\bin\cloudflared.exe"), (Join-Path $InstallDir "unins000.exe"), $StartMenuLnk)) {
+              if (-not (Test-Path $req)) { throw "Missing post-install item: $req" }
+            }
+            if (-not (Test-Path $UninstKey)) { throw "Missing Uninstall registry key: $UninstKey" }
+            $regProps = Get-ItemProperty $UninstKey
+            if ($regProps.DisplayVersion -ne $version) { throw "Uninstall DisplayVersion mismatch: $($regProps.DisplayVersion) vs $version" }
+
+            # 3. Runtime checks, owner token creation, settings marker, and --repair-acl in isolated profile
+            Invoke-InstalledRuntimeCheck -Tag "fresh" -Port 18971
+            $TokenPath = Join-Path $DataDir "token.json"
+            $KeyPath = Join-Path $DataDir "secrets\secrets.key"
+            if (-not (Test-Path $TokenPath)) { throw "token.json not created after installed run" }
+            if (-not (Test-Path $KeyPath)) { throw "secrets.key not created after installed run" }
+            $TokenHash1 = (Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash
+            Set-Content -Path (Join-Path $DataDir "settings.json") -Value '{"port": 18971}' -Encoding UTF8
+
+            $StaleMarker = Join-Path $InstallDir "_internal\stale_old_version.marker"
+            Set-Content -Path $StaleMarker -Value "old-version-leftover" -Encoding ASCII
+
+            $DmgDir = Join-Path $DataDir "extensions\installed"
+            New-Item -ItemType Directory -Force -Path $DmgDir | Out-Null
+            & $VenvPy -c "import win32security; sd=win32security.SECURITY_DESCRIPTOR(); dacl=win32security.ACL(); sd.SetSecurityDescriptorDacl(1, dacl, 0); win32security.SetNamedSecurityInfo(r'$DmgDir', win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION, None, None, dacl, None)"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to simulate damaged DACL on $DmgDir" }
+
+            $env:APPDATA = "$ProfileDir\Roaming"
+            $env:LOCALAPPDATA = "$ProfileDir\Local"
+            try {
+              $RepJsonPath = Join-Path $WorkDir "acl-repair.json"
+              $repProc = Start-Process -FilePath $InstalledExe -ArgumentList @("--repair-acl", "`"$RepJsonPath`"") -Wait -PassThru -WindowStyle Hidden
+              if ($repProc.ExitCode -ne 0) { throw "Installed --repair-acl exited $($repProc.ExitCode)" }
+              $repObj = Get-Content $RepJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+              if (-not $repObj.ok) { throw "Installed --repair-acl failed: $(Get-Content $RepJsonPath -Raw)" }
+              if ((Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash -ne $TokenHash1) {
+                throw "token.json modified during --repair-acl"
+              }
+            } finally {
+              $env:APPDATA = $OrigAppData
+              $env:LOCALAPPDATA = $OrigLocalAppData
+            }
+
+            # 4. In-place upgrade install over existing installation
+            $p2 = Start-Process -FilePath $SetupExe -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/LOG=`"$WorkDir\install2.log`"") -Wait -PassThru
+            if ($p2.ExitCode -ne 0) { throw "Upgrade silent install failed with exit code $($p2.ExitCode)" }
+            if (Test-Path $StaleMarker) { throw "[InstallDelete] failed to remove stale _internal marker during upgrade" }
+            if ((Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash -ne $TokenHash1) {
+              throw "token.json changed during in-place upgrade"
+            }
+            if (-not (Test-Path (Join-Path $DataDir "settings.json")) -or -not (Test-Path $KeyPath)) {
+              throw "User profile data lost during upgrade"
+            }
+
+            Invoke-InstalledRuntimeCheck -Tag "upgrade" -Port 18973
+            if ((Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash -ne $TokenHash1) {
+              throw "token.json changed after post-upgrade headless run"
+            }
+
+            # 5. Clean uninstall preserves user profile data while removing binaries, shortcut & registry entry
+            $UninsExe = Join-Path $InstallDir "unins000.exe"
+            $uProc = Start-Process -FilePath $UninsExe -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$WorkDir\uninstall.log`"") -Wait -PassThru
+            if ($uProc.ExitCode -ne 0) { throw "Uninstall exited with code $($uProc.ExitCode)" }
+            $uninstalled = $false
+            for ($i = 0; $i -lt 50; $i++) {
+              if ((-not (Test-Path $InstalledExe)) -and (-not (Test-Path $UninstKey)) -and (-not (Test-Path $StartMenuLnk))) {
+                $uninstalled = $true
+                break
+              }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $uninstalled) {
+              throw "Uninstall did not clean binary/shortcut/registry within timeout"
+            }
+            if ((Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash -ne $TokenHash1 -or -not (Test-Path $KeyPath)) {
+              throw "Uninstall unexpectedly deleted or altered user data under APPDATA\MCPApp"
+            }
+            Write-Host "Clean-VM Setup install, --selftest, --headless, --repair-acl, upgrade, and uninstall: ALL PASSED"
+          } catch {
+            foreach ($logName in @("install1.log", "install2.log", "uninstall.log")) {
+              $lp = Join-Path $WorkDir $logName
+              if (Test-Path $lp) {
+                Write-Host "=== $logName ==="
+                Get-Content $lp -Tail 60
+              }
+            }
+            throw
+          } finally {
+            $env:APPDATA = $OrigAppData
+            $env:LOCALAPPDATA = $OrigLocalAppData
+            Remove-Item -Recurse -Force $WorkDir -ErrorAction SilentlyContinue
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

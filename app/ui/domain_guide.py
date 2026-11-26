@@ -120,7 +120,6 @@ def provider_guide_html(settings: Settings, cloudflared: str | None, provider_id
     if provider_id == PROVIDER_CF_NAMED:
         return guide_html(settings, cloudflared)
     endpoint = html.escape(settings.mcp_path)
-    local = html.escape(f"http://{settings.local_host()}:{settings.server_port}")
     if provider_id == PROVIDER_NGROK:
         intro = "Нужен аккаунт ngrok и установленный агент. Для OAuth желательно закрепить адрес."
         steps = [
@@ -148,7 +147,7 @@ def provider_guide_html(settings: Settings, cloudflared: str | None, provider_id
         steps = [
             ("Проверьте cloudflared", "Приложение использует встроенный cloudflared или установленный агент. Откройте ⋯ → Проверить."),
             ("Выберите транспорт", "Нажмите Выбрать в строке Quick Tunnel. Отдельная конфигурация домена не требуется."),
-            ("Запустите сервер", f"На главной странице запустите сервис. Туннель направит запросы на <code>{local}</code>."),
+            ("Запустите сервер", "На главной странице запустите сервис. Агент автоматически направляет запросы к локальному MCP-серверу. Внешнему клиенту передавайте только публичный HTTPS-адрес."),
             ("Подключите AI-клиент", f"Скопируйте выданный MCP URL (путь <code>{endpoint}</code>). Если адрес изменился, обновите подключение и авторизуйтесь повторно."),
         ]
         trouble = "Если туннель не запускается, проверьте интернет-соединение и журнал приложения. Для постоянного адреса используйте Named Tunnel или другой стабильный транспорт."

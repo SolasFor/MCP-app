@@ -47,14 +47,42 @@ from urllib.parse import urlsplit
 import psutil
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
-from app.config import TUNNEL_MODES, TUNNEL_NAMED, Settings, normalize_public_url
+from app.config import (
+    PROVIDER_CF_NAMED,
+    PROVIDER_CF_QUICK,
+    PROVIDER_LOCAL,
+    PROVIDER_NGROK,
+    PROVIDER_NONE,
+    PROVIDER_TAILSCALE,
+    REMOVED_PROVIDER_OPENAI,
+    TUNNEL_MODES,
+    TUNNEL_NAMED,
+    TUNNEL_QUICK,
+    Settings,
+    normalize_public_url,
+)
 from app.core import domain_state, token_store
 from app.core import proxy as px
 from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
+from app.core.logging_manager import get_logging_manager, infer_level
 from app.core.netcheck import Diagnosis, diagnose_quick_tunnel
-from app.core.tunnel_log import classify_tunnel_error
+from app.core.network_watch import SystemResilienceMonitor
 from app.core.process import ManagedProcess, ProcState
+from app.core.reconnect import BackoffPolicy
+from app.core.redaction import SecretRedactor
+from app.core.secret_store import SecretStore
+from app.core.tunnel_log import classify_tunnel_error, classify_tunnel_event
+from app.core.tunnels import (
+    ALL_PROVIDERS,
+    CloudflareNamedProvider,
+    ConnectionIdentity,
+    ConnectionManager,
+    IssuerTransitionWarning,
+    NgrokProvider,
+    TailscaleFunnelProvider,
+)
+from app.core.tunnels.ngrok import parse_ngrok_log_line
 from app.paths import (
     backend_command,
     default_backend_workdir,
@@ -163,14 +191,45 @@ class ServiceManager(QObject):
 
         self._restart_attempts = {name: 0 for name in self._procs}
         self._healthy_at: dict[str, float | None] = {name: None for name in self._procs}
+        self._backoff = BackoffPolicy(
+            base_seconds=2.0,
+            max_seconds=60.0,
+            jitter_ratio=0.25,
+            max_attempts=MAX_RESTARTS,
+            stable_uptime_seconds=STABLE_UPTIME_S,
+        )
+        self._redactor = SecretRedactor()
+        self._resilience = SystemResilienceMonitor(interval_ms=5000, parent=self)
+        self._resilience.system_resumed.connect(self._on_system_resumed)
+        self._resilience.network_changed.connect(self._on_network_changed)
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setSingleShot(True)
+        self._recovery_timer.setInterval(5000)
+        self._recovery_timer.timeout.connect(self._on_recovery_grace_timeout)
         self._want_running = False
         self._error = False
         self._overall = Overall.STOPPED
 
         self._quick_url = ""               # адрес текущего quick tunnel ('' — ещё не выдан)
+        self._runtime_provider_url = ""    # runtime URL от ngrok / tailscale
+        self._tailscale_active = False
         self._server_url = ""              # с каким адресом запущен текущий сервер
         self._server_restart_pending = False  # сервер останавливается, чтобы стартовать с новым адресом
         self._restart_all_pending = False     # после остановки всё запустить снова (новые настройки)
+
+        self._logging = get_logging_manager()
+        self.connections = ConnectionManager(user_data_dir())
+        if self.connections.migrated_from_provider in (REMOVED_PROVIDER_OPENAI, PROVIDER_LOCAL):
+            self.settings.migrated_from_provider = self.connections.migrated_from_provider
+            self.settings.active_provider = PROVIDER_NONE
+            self._save_settings()
+        if settings.active_provider in ALL_PROVIDERS or settings.active_provider in (PROVIDER_LOCAL, PROVIDER_NONE):
+            self.connections.set_active_provider(settings.active_provider)
+        self._sync_named_provider_config()
+
+        self._external_poll = QTimer(self)
+        self._external_poll.setInterval(1200)
+        self._external_poll.timeout.connect(self._poll_external_provider)
 
         # Диагностика сети при сбое выдачи временного адреса — один раз за запуск.
         self._run_id = 0                   # номер запуска: старые результаты игнорируются
@@ -180,6 +239,9 @@ class ServiceManager(QObject):
         self._diagnosis_ready.connect(self._on_diagnosis)
 
         self._token = self._load_or_create_token()
+        self._redactor.register(self._token)
+        for secret in self.connections.collect_secret_values():
+            self._redactor.register(secret)
 
     # ================================================================== состояние
     @property
@@ -192,17 +254,122 @@ class ServiceManager(QObject):
         return self._want_running
 
     @property
+    def active_provider(self) -> str:
+        return self.settings.active_provider
+
+    @property
     def is_quick(self) -> bool:
-        return self.settings.is_quick_tunnel
+        return self.settings.active_provider == PROVIDER_CF_QUICK
 
     @property
     def is_diagnosing(self) -> bool:
         return self._diagnosing
 
     @property
+    def connection_identity(self) -> ConnectionIdentity:
+        if self.active_provider == PROVIDER_NONE:
+            path = self.settings.mcp_path if self.settings.mcp_path.startswith("/") else f"/{self.settings.mcp_path}"
+            local_url = f"http://{self.settings.local_host()}:{self.settings.server_port}{path}"
+            return ConnectionIdentity(
+                provider_id=PROVIDER_NONE,
+                is_public_url=False,
+                public_url="",
+                local_url=local_url,
+                private_tunnel_id="",
+                oauth_issuer="",
+                oauth_resource_url="",
+                is_ephemeral=False,
+                supports_sse=False,
+            )
+        prov = self.connections.get(self.active_provider)
+        if self.active_provider == PROVIDER_CF_QUICK:
+            runtime_url = self._quick_url
+        elif self.active_provider == PROVIDER_CF_NAMED:
+            runtime_url = self.settings.public_url or str(prov.export_config().get("public_url") or "")
+        else:
+            runtime_url = self._runtime_provider_url
+        return prov.connection_identity(
+            local_host=self.settings.local_host(),
+            local_port=self.settings.server_port,
+            mcp_path=self.settings.mcp_path,
+            runtime_url=runtime_url,
+        )
+
+    @property
+    def private_tunnel_id(self) -> str:
+        return self.connection_identity.private_tunnel_id
+
+    @property
     def public_url(self) -> str:
-        """Адрес для клиентов. В режиме quick — '' до того, как Cloudflare его выдаст."""
-        return self._quick_url if self.is_quick else self.settings.public_url
+        """Публичный HTTPS-адрес для клиентов ('' для local_only / none)."""
+        return self.connection_identity.public_url
+
+    @property
+    def oauth_resource_url(self) -> str:
+        """Resource URL для локального OAuth-провайдера (включая local_only)."""
+        return self.public_url or self.connection_identity.oauth_resource_url
+
+    @property
+    def active_server_oauth_url(self) -> str:
+        """OAuth resource URL of the currently running backend, or configured provider URL."""
+        if self.server.is_alive() and self._server_url:
+            return self._server_url
+        return self.oauth_resource_url
+
+    @property
+    def oauth_store_path(self) -> Path:
+        return user_data_dir() / "oauth" / "connections.sqlite3"
+
+    @property
+    def migrated_from_openai_tunnel(self) -> bool:
+        return (
+            self.settings.migrated_from_provider == REMOVED_PROVIDER_OPENAI
+            or self.connections.migrated_from_provider == REMOVED_PROVIDER_OPENAI
+        )
+
+    @property
+    def migrated_from_local_only(self) -> bool:
+        return (
+            self.settings.migrated_from_provider == PROVIDER_LOCAL
+            or self.connections.migrated_from_provider == PROVIDER_LOCAL
+        )
+
+    def has_legacy_openai_secret(self) -> bool:
+        return self.connections.has_legacy_openai_secret()
+
+    def purge_legacy_openai_secret(self) -> bool:
+        return self.connections.purge_legacy_openai_secret()
+
+    def _sync_named_provider_config(self) -> None:
+        named = self.connections.get(PROVIDER_CF_NAMED)
+        if isinstance(named, CloudflareNamedProvider):
+            state = named.resolve_effective_state(mcp_path=self.settings.mcp_path)
+            merged_cfg = dict(named.export_config())
+            if state.hostname:
+                merged_cfg["hostname"] = state.hostname
+            if state.tunnel_id:
+                merged_cfg["tunnel_id"] = state.tunnel_id
+            if state.zone_name:
+                merged_cfg["zone_name"] = state.zone_name
+            if state.setup_mode:
+                merged_cfg["setup_mode"] = state.setup_mode
+            if state.public_url:
+                merged_cfg["public_url"] = state.public_url
+                if not self.settings.public_url:
+                    self.settings.public_url = state.public_url
+            elif self.settings.public_url:
+                merged_cfg["public_url"] = self.settings.public_url
+            merged_cfg["cloudflared_config"] = self.settings.cloudflared_config
+            if state.tunnel_token:
+                merged_cfg["tunnel_token_ref"] = SecretStore.secret_ref("tunnel", "cloudflare_named_token")
+            named.load_config(merged_cfg)
+        else:
+            named.load_config(
+                {
+                    "public_url": self.settings.public_url,
+                    "cloudflared_config": self.settings.cloudflared_config,
+                }
+            )
 
     @property
     def token(self) -> str:
@@ -217,14 +384,22 @@ class ServiceManager(QObject):
 
     # ------------------------------------------------------------------ свой домен
     def wizard_domain(self) -> domain_state.DomainState:
-        """Домен из мастера (пустой DomainState, если мастер не запускали)."""
-        return domain_state.load()
+        """Домен из мастера/ручного токена или сохранённой конфигурации cloudflare_named."""
+        state = domain_state.load()
+        if state.is_configured:
+            return state
+        named = self.connections.providers.get(PROVIDER_CF_NAMED)
+        if isinstance(named, CloudflareNamedProvider):
+            resolved = named.resolve_effective_state(mcp_path=self.settings.mcp_path)
+            if resolved.is_configured or resolved.hostname:
+                return resolved
+        return state
 
     def uses_wizard_domain(self) -> bool:
         return self.wizard_domain().is_configured
 
     def has_domain(self) -> bool:
-        """Свой домен настроен — мастером или вручную (config.yml). Тогда режим просто включается."""
+        """Свой домен настроен — мастером, токеном туннеля или вручную (config.yml)."""
         return self.uses_wizard_domain() or self.settings.has_named_tunnel_config()
 
     # ------------------------------------------------------------------ прокси
@@ -264,11 +439,35 @@ class ServiceManager(QObject):
             token_store.save(token)
         except OSError as exc:
             return f"Не удалось сохранить токен: {exc}"
+        self._redactor.unregister(self._token)
         self._token = token
+        self._redactor.register(token)
+        self._logging.register_secret(token)
+        self._bind_oauth_owner_token(token)
+        self._logging.info(
+            "oauth",
+            f"Owner token updated ({token_store.mask(token)}); OAuth tokens invalidated",
+            event_code="owner_token_rotated",
+        )
         self._log(f"✔ Токен изменён ({token_store.mask(token)}). Обновите его в подключённых клиентах.")
         self.token_changed.emit()
-        self._restart_if_running("новый токен")
+        self._restart_server_only("новый токен")
         return None
+
+    def _bind_oauth_owner_token(self, token: str) -> None:
+        url = self.active_server_oauth_url
+        if not url:
+            return
+        try:
+            from backend.oauth_store import OAuthStore, canonical_oauth_urls
+
+            issuer, canonical_res = canonical_oauth_urls(url)
+            if not issuer:
+                return
+            store = OAuthStore(self.oauth_store_path, issuer, canonical_res)
+            store.bind_owner(token)
+        except Exception:  # noqa: BLE001
+            pass
 
     def generate_token(self) -> str | None:
         return self.set_token(token_store.generate())
@@ -304,15 +503,37 @@ class ServiceManager(QObject):
         return None
 
     def apply_domain(self, state: domain_state.DomainState) -> str | None:
-        """Мастер настроил домен: включить режим «Свой домен» с его адресом. Ошибка или None."""
+        """Мастер/ручной ввод настроил домен: сохранить независимо и включить «Свой домен»."""
         url = normalize_public_url(state.hostname, self.settings.mcp_path)
         if not url or not state.is_configured:
-            return "Мастер не вернул адрес или ключ туннеля."
+            return "Не указан домен или ключ Cloudflare Tunnel Token."
+        state.public_url = url
         self.settings.public_url = url
         self.settings.tunnel_mode = TUNNEL_NAMED
+        self.settings.active_provider = PROVIDER_CF_NAMED
+        named_cfg = {
+            "hostname": state.hostname,
+            "public_url": url,
+            "tunnel_id": state.tunnel_id,
+            "zone_name": state.zone_name,
+            "setup_mode": state.setup_mode or ("api" if state.zone_name else "token"),
+            "cloudflared_config": self.settings.cloudflared_config,
+            "tunnel_token_ref": SecretStore.secret_ref("tunnel", "cloudflare_named_token"),
+        }
+        self.connections.get(PROVIDER_CF_NAMED).load_config(named_cfg)
+        self.connections.set_active_provider(PROVIDER_CF_NAMED)
         if not self._save_settings():
             return "Не удалось сохранить настройки (см. журнал)."
         self._quick_url = ""
+        self._runtime_provider_url = ""
+        self._tailscale_active = False
+        self._redactor.register(state.tunnel_token)
+        self._logging.register_secret(state.tunnel_token)
+        self._logging.info(
+            "tunnel",
+            f"Configured Cloudflare Named Tunnel domain={state.hostname} mode={named_cfg['setup_mode']}",
+            event_code="named_domain_configured",
+        )
         self._log(f"✔ Свой домен настроен: {url}")
         self.settings_changed.emit()
         self.public_url_changed.emit(self.public_url)
@@ -323,21 +544,77 @@ class ServiceManager(QObject):
         """Вкладка «Прокси» сохранила настройки: применить при следующем запуске туннеля."""
         self._bridge.settings = settings
         self._proxy_hint_shown = False
-        self._log("Прокси для хостов Cloudflare " + ("включён" if settings.enabled else "выключен"))
+        if settings.username:
+            self._redactor.register(settings.username)
+        if settings.password:
+            self._redactor.register(settings.password)
+        mode_labels = {
+            px.PROXY_MODE_NONE: "выключен (без прокси)",
+            px.PROXY_MODE_AUTO: "автоматическое определение",
+            px.PROXY_MODE_MANUAL: "ручная настройка",
+        }
+        label = mode_labels.get(settings.mode, settings.mode)
+        self._logging.info("proxy", f"Proxy mode applied: {settings.mode}", event_code="proxy_applied")
+        self._log(f"Прокси для хостов Cloudflare: {label}")
         self.settings_changed.emit()
         self._restart_if_running("новые настройки прокси")
 
     def set_tunnel_mode(self, mode: str) -> None:
-        if mode not in TUNNEL_MODES or mode == self.settings.tunnel_mode:
+        if mode not in TUNNEL_MODES:
             return
-        self.settings.tunnel_mode = mode
+        provider_id = PROVIDER_CF_NAMED if mode == TUNNEL_NAMED else PROVIDER_CF_QUICK
+        self.set_active_provider(provider_id)
+
+    def check_issuer_transition(self, next_provider_id: str) -> IssuerTransitionWarning:
+        return self.connections.check_issuer_transition(
+            previous_identity=self.connection_identity,
+            next_provider_id=next_provider_id,
+            local_host=self.settings.local_host(),
+            local_port=self.settings.server_port,
+            mcp_path=self.settings.mcp_path,
+        )
+
+    def set_active_provider(self, provider_id: str) -> None:
+        if (
+            (provider_id not in ALL_PROVIDERS and provider_id != PROVIDER_LOCAL)
+            or provider_id == self.settings.active_provider
+        ):
+            return
+        prev_provider = self.settings.active_provider
+        was_running = self._want_running
+        if was_running:
+            # Cleanly tear down previous transport before switching without touching persisted configs.
+            self._halt()
+            if prev_provider == PROVIDER_TAILSCALE and self._tailscale_active:
+                self.connections.get(PROVIDER_TAILSCALE).stop()
+                self._tailscale_active = False
+            self.tunnel.stop()
+            self.connections.ownership.clear_process(prev_provider)
+            self.server.stop()
+
+        self.settings.active_provider = provider_id
+        if provider_id == PROVIDER_CF_NAMED:
+            self.settings.tunnel_mode = TUNNEL_NAMED
+        elif provider_id == PROVIDER_CF_QUICK:
+            self.settings.tunnel_mode = TUNNEL_QUICK
+        # Preserve each provider's persisted settings and restore named domain if switching back.
+        self._sync_named_provider_config()
+        self.connections.set_active_provider(provider_id)
         self._save_settings()
         self._quick_url = ""
-        label = "временный адрес trycloudflare.com" if self.is_quick else "свой домен"
-        self._log(f"Режим туннеля: {label}")
+        self._runtime_provider_url = ""
+        self._tailscale_active = False
+        self._logging.info(
+            "tunnel",
+            f"Switched active transport {prev_provider} -> {provider_id}",
+            event_code="provider_switched",
+        )
+        self._log(f"Активный транспорт: {provider_id}")
         self.settings_changed.emit()
         self.public_url_changed.emit(self.public_url)
-        self._restart_if_running("другой режим туннеля")
+        if was_running:
+            self._restart_all_pending = True
+            self._recompute()
 
     def set_allow_query_token(self, enabled: bool) -> None:
         if enabled == self.settings.allow_query_token:
@@ -376,12 +653,22 @@ class ServiceManager(QObject):
         self._origin_hint_shown = False
         self._proxy_hint_shown = False
         self._set_quick_url("")
+        self._runtime_provider_url = ""
+        self._tailscale_active = False
+        self._set_oauth_emergency_stop(False)
+        for secret in self.connections.collect_secret_values():
+            self._redactor.register(secret)
         self.health.start()
-        if self.is_quick:
+        self._resilience.start()
+        if self.active_provider == PROVIDER_CF_QUICK:
             self._log("Запуск: сначала туннель — жду временный адрес от Cloudflare…")
             self._start_tunnel()
+        elif self.active_provider == PROVIDER_LOCAL:
+            self._log("Запуск локального MCP-сервера (режим Local only, без публичного туннеля)…")
+            self.health.check_tunnel = False
+            self._start_server()
         else:
-            self._log("Запуск сервисов…")
+            self._log(f"Запуск сервисов ({self.active_provider})…")
             self._start_server()
         self._recompute()
 
@@ -389,7 +676,11 @@ class ServiceManager(QObject):
         """Неблокирующая остановка (кнопка «Остановить»)."""
         self._halt()
         self._log("Остановка сервисов…")
+        if self._tailscale_active:
+            self.connections.get(PROVIDER_TAILSCALE).stop()
+            self._tailscale_active = False
         self.tunnel.stop()
+        self.connections.ownership.clear_process(self.active_provider)
         self.server.stop()
         self._recompute()
 
@@ -397,77 +688,233 @@ class ServiceManager(QObject):
         """Блокирующая остановка — только при выходе из приложения (до 2×3 с)."""
         self._restart_all_pending = False
         self._halt()
+        if self._tailscale_active:
+            self.connections.get(PROVIDER_TAILSCALE).stop()
+            self._tailscale_active = False
         self.tunnel.stop_blocking()
+        self.connections.ownership.clear_process(self.active_provider)
         self.server.stop_blocking()
 
     def preflight(self) -> list[str]:
         """Проверки до старта. Возвращает список блокирующих проблем (пусто = можно)."""
         s = self.settings
+        pid = self.active_provider
         problems: list[str] = []
 
         if not is_frozen() and not (project_root() / "backend" / "server.py").is_file():
             problems.append("Не найден backend/server.py.")
 
-        if self.cloudflared_path() is None:
-            problems.append(
-                "cloudflared.exe не найден. Установите его (winget install --id Cloudflare.cloudflared) "
-                "или укажите путь в настройках."
+        self._sync_named_provider_config()
+
+        if pid == PROVIDER_NONE:
+            msg = (
+                "Транспортный провайдер не выбран. Откройте вкладку «Подключения» и выберите один из "
+                "четырёх транспортов (Cloudflare Quick, Cloudflare Named, ngrok или Tailscale Funnel)."
             )
-        if not self.is_quick:
-            if not self.has_domain():
-                problems.append(
-                    f"Свой домен ещё не настроен. {DOMAIN_GUIDE_HINT} "
-                    "Без домена выберите режим «Временный адрес»."
-                )
-            elif not s.has_public_url:
-                problems.append(
-                    "Не указан адрес своего домена. Введите его в «Подключение» → «Публичный адрес» "
-                    "(тот же hostname, что в config.yml)."
-                )
-            else:
-                self._warn_if_not_in_config()
-        protocol = s.tunnel_protocol.strip().lower()
-        if protocol and protocol not in VALID_PROTOCOLS:
-            problems.append(f"tunnel_protocol='{s.tunnel_protocol}' — допустимо: http2, quic, auto или пусто.")
+            self._logging.warning("tunnel", msg, event_code="provider_none")
+            problems.append(msg)
+            return problems
 
-        self._bridge.settings = px.load()
-        if self._bridge.settings.enabled:
-            for error in self._bridge.settings.validate():
-                problems.append(f"Прокси: {error}. Исправьте во вкладке «Прокси» или выключите прокси.")
+        if pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED):
+            if self.cloudflared_path() is None:
+                msg = (
+                    "cloudflared.exe не найден. Установите его: winget install --id Cloudflare.cloudflared "
+                    "(https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) "
+                    "или укажите путь в настройках."
+                )
+                self._logging.error("tunnel", msg, event_code="agent_missing")
+                problems.append(msg)
+            if pid == PROVIDER_CF_NAMED:
+                named = self.connections.get(PROVIDER_CF_NAMED)
+                assert isinstance(named, CloudflareNamedProvider)
+                code, reason = named.diagnose_issue(mcp_path=s.mcp_path, check_binary=False)
+                if code:
+                    self._logging.error("tunnel", reason, event_code=code)
+                    problems.append(reason)
+                else:
+                    self._warn_if_not_in_config()
+            protocol = s.tunnel_protocol.strip().lower()
+            if protocol and protocol not in VALID_PROTOCOLS:
+                problems.append(f"tunnel_protocol='{s.tunnel_protocol}' — допустимо: http2, quic, auto или пусто.")
 
-        checks = ((s.local_host(), s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
+            self._bridge.settings = px.load()
+            if self._bridge.settings.enabled:
+                for error in self._bridge.settings.validate():
+                    msg = f"Прокси: {error}. Исправьте во вкладке «Прокси» или переключите режим «Без прокси»."
+                    self._logging.error("proxy", msg, event_code="proxy_invalid")
+                    problems.append(msg)
+
+            checks = ((s.local_host(), s.server_port, "MCP-сервера"), ("127.0.0.1", s.metrics_port, "метрик cloudflared"))
+            strays = _foreign_cloudflared()
+            if strays:
+                self._log(f"⚠ Уже запущен cloudflared вне приложения (PID {', '.join(map(str, strays))}).")
+        else:
+            prov = self.connections.get(pid)
+            det = prov.detect()
+            if not det.installed:
+                msg = det.detail or f"Клиент транспорта {pid} не установлен."
+                self._logging.error("tunnel", msg, event_code="agent_missing")
+                problems.append(msg)
+            for err in prov.validate_config():
+                self._logging.error("tunnel", err, event_code="provider_config_invalid")
+                problems.append(err)
+            if pid == PROVIDER_LOCAL and s.server_host not in ("127.0.0.1", "localhost", "::1"):
+                problems.append("В режиме Local only адрес сервера должен быть loopback (127.0.0.1 / localhost / ::1).")
+            checks = ((s.local_host(), s.server_port, "MCP-сервера"),)
+
         for host, port, what in checks:
             owner = _port_owner(host, port)
             if owner:
-                problems.append(f"Порт {port} ({what}) уже занят: {owner}. Закройте старое окно терминала.")
-
-        strays = _foreign_cloudflared()
-        if strays:
-            # Не блокируем: два коннектора одного туннеля допустимы, но это путает отладку.
-            self._log(f"⚠ Уже запущен cloudflared вне приложения (PID {', '.join(map(str, strays))}).")
+                msg = f"Порт {port} ({what}) уже занят: {owner}. Закройте старое окно терминала."
+                self._logging.error("tunnel", msg, event_code="port_in_use")
+                problems.append(msg)
 
         return problems
 
     # ================================================================== запуск процессов
     def _server_env(self) -> dict[str, str]:
         s = self.settings
+        ident = self.connection_identity
         return {
             "MCP_SECRET_TOKEN": self._token,
-            "MCP_PUBLIC_URL": self.public_url,
+            "MCP_PUBLIC_URL": ident.oauth_resource_url,
             "MCP_PATH": s.mcp_path,
-            "MCP_HOST": s.server_host,
+            "MCP_HOST": "127.0.0.1" if self.active_provider == PROVIDER_LOCAL else s.server_host,
             "MCP_PORT": str(s.server_port),
             "MCP_HEALTH_PATH": s.server_health_path,
             "MCP_ALLOW_QUERY_TOKEN": "0",
             "MCP_ENABLE_ADVANCED": "1" if s.enable_advanced_tools else "0",
             "MCP_ENABLE_EXECUTION": "1" if s.enable_advanced_tools and s.enable_execution_tools else "0",
             "MCP_ENABLE_OAUTH": "1" if s.enable_oauth else "0",
+            "MCP_DEFAULT_ACCESS_PROFILE": s.default_access_profile,
             "MCP_OAUTH_STORE_PATH": str(user_data_dir() / "oauth" / "connections.sqlite3"),
+            "MCP_GATEWAY_CONFIG_PATH": str(self.gateway_config_path()),
+            "MCP_MANAGED_SERVERS_PATH": str(self.managed_servers_path()),
+            "MCP_WORKSPACES_CONFIG_PATH": str(self.workspaces_config_path()),
+            "MCP_WORKSPACES_HISTORY_DIR": str(self.workspaces_history_dir()),
+            "MCP_DESKTOP_POLICY_PATH": str(self.desktop_policy_path()),
+            "MCP_EXTENSIONS_DIR": str(self.extensions_dir()),
+            "MCP_DEVICES_CONFIG_PATH": str(self.devices_config_path()),
+            "MCP_AUTOMATION_DIR": str(self.automation_dir()),
+            "MCP_SECRETS_DIR": str(user_data_dir() / "secrets"),
+            "MCP_TASKS_DB_PATH": str(self.tasks_db_path()),
+            "MCP_TASKS_ARTIFACTS_DIR": str(self.tasks_artifacts_dir()),
+            "MCP_SPOOL_DIR": str(self.tasks_spool_dir()),
+            "MCP_LOGS_DIR": str(self._logging.base_dir),
+            "MCP_LOG_LEVEL": s.logging_level,
+            "MCP_TRANSPORT_PROVIDER": self.active_provider,
             # Quick Tunnels не поддерживают SSE: отвечаем обычным JSON.
-            "MCP_JSON_RESPONSE": "1" if self.is_quick else "0",
+            "MCP_JSON_RESPONSE": "1" if not ident.supports_sse else "0",
         }
 
+    def gateway_config_path(self) -> Path:
+        return user_data_dir() / "gateway" / "servers.json"
+
+    def workspaces_config_path(self) -> Path:
+        return user_data_dir() / "workspaces" / "workspaces.json"
+
+    def workspaces_history_dir(self) -> Path:
+        return user_data_dir() / "workspaces" / "history"
+
+    def desktop_policy_path(self) -> Path:
+        return user_data_dir() / "desktop" / "policy.json"
+
+    def extensions_dir(self) -> Path:
+        return user_data_dir() / "extensions"
+
+    def devices_config_path(self) -> Path:
+        return user_data_dir() / "remote" / "devices.json"
+
+    def automation_dir(self) -> Path:
+        return user_data_dir() / "automation"
+
+    def managed_servers_path(self) -> Path:
+        target = user_data_dir() / "servers" / "managed_servers.json"
+        if not target.exists():
+            legacy = default_backend_workdir() / "managed_servers.json"
+            if legacy.is_file():
+                try:
+                    from app.core.secret_store import SecretStore
+                    from backend.servers.store import ServerConfigStore
+
+                    store = ServerConfigStore(target, secret_store=SecretStore())
+                    store.migrate_legacy_file(legacy, create_backup=False)
+                except Exception:
+                    pass
+        return target
+
+    def tasks_data_dir(self) -> Path:
+        return user_data_dir() / "tasks"
+
+    def tasks_db_path(self) -> Path:
+        return self.tasks_data_dir() / "tasks.sqlite3"
+
+    def tasks_artifacts_dir(self) -> Path:
+        return self.tasks_data_dir() / "artifacts"
+
+    def tasks_spool_dir(self) -> Path:
+        return self.tasks_data_dir() / "spool"
+
+    def refresh_gateway_secrets(self) -> None:
+        from backend.gateway.store import GatewayConfigStore
+
+        try:
+            store = GatewayConfigStore(self.gateway_config_path())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
+    def refresh_server_secrets(self) -> None:
+        from app.core.secret_store import SecretStore
+        from backend.servers.store import ServerConfigStore
+
+        try:
+            store = ServerConfigStore(self.managed_servers_path(), secret_store=SecretStore())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
+    def refresh_workspace_secrets(self) -> None:
+        from app.core.secret_store import SecretStore
+        from backend.workspaces.store import WorkspaceStore
+
+        try:
+            store = WorkspaceStore(self.workspaces_config_path(), secret_store=SecretStore())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
+    def refresh_extension_secrets(self) -> None:
+        from app.core.secret_store import SecretStore
+        from backend.extensions.store import ExtensionStore
+
+        try:
+            store = ExtensionStore(self.extensions_dir(), secret_store=SecretStore())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
+    def refresh_remote_secrets(self) -> None:
+        from app.core.secret_store import SecretStore
+        from backend.remote.store import DeviceStore
+
+        try:
+            store = DeviceStore(self.devices_config_path(), secret_store=SecretStore())
+            for secret in store.collect_secret_values():
+                self._redactor.register(secret)
+        except Exception:
+            pass
+
     def _start_server(self) -> None:
+        self.refresh_gateway_secrets()
+        self.refresh_server_secrets()
+        self.refresh_workspace_secrets()
+        self.refresh_extension_secrets()
+        self.refresh_remote_secrets()
         program, args = backend_command()
         workdir = self.settings.backend_workdir or str(default_backend_workdir())
         Path(workdir).mkdir(parents=True, exist_ok=True)
@@ -514,6 +961,84 @@ class ServiceManager(QObject):
         return {"TUNNEL_TOKEN": wizard.tunnel_token} if wizard.is_configured else {}
 
     def _start_tunnel(self) -> None:
+        pid = self.active_provider
+        if pid == PROVIDER_LOCAL:
+            self.health.check_tunnel = False
+            return
+        if pid == PROVIDER_TAILSCALE:
+            self.health.check_tunnel = False
+            proxy_cfg = px.load()
+            if proxy_cfg.enabled:
+                msg = (
+                    "Примечание о прокси: Tailscale Funnel использует системный сетевой сервис tailscaled "
+                    "и не маршрутизируется через прокси-мост Cloudflare в MCP-app."
+                )
+                self._logging.warning("proxy", msg, event_code="tailscale_proxy_unsupported")
+                self._log(f"ℹ {msg}")
+            ts = self.connections.get(PROVIDER_TAILSCALE)
+            assert isinstance(ts, TailscaleFunnelProvider)
+            ok, msg = ts.start(
+                local_host=self.settings.local_host(),
+                local_port=self.settings.server_port,
+                mcp_path=self.settings.mcp_path,
+            )
+            if not ok:
+                self._logging.error("tunnel", f"Tailscale Funnel start failed: {msg}", event_code="tailscale_start_failed")
+                self._log(f"✖ Tailscale Funnel: {msg}")
+                self._fail()
+                return
+            self._tailscale_active = True
+            self._runtime_provider_url = msg
+            self._logging.info("tunnel", f"Tailscale Funnel active: {msg}", event_code="tailscale_active")
+            self._log(f"✔ Tailscale Funnel активен: {msg}")
+            self.public_url_changed.emit(self.public_url)
+            if self.server.is_alive() and self._server_url != self.oauth_resource_url:
+                self._restart_server_only("обновлён публичный адрес Tailscale")
+            self._recompute()
+            return
+        if pid == PROVIDER_NGROK:
+            self.health.check_tunnel = False
+            prov = self.connections.get(pid)
+            spec = prov.build_launch_spec(
+                local_host=self.settings.local_host(),
+                local_port=self.settings.server_port,
+                mcp_path=self.settings.mcp_path,
+            )
+            if spec is None:
+                self._logging.error("tunnel", "ngrok binary not found", event_code="agent_missing")
+                self._log(f"✖ Транспорт {pid}: не удалось подготовить команду запуска.")
+                self._fail()
+                return
+            proxy_cfg = px.load()
+            launch_env = dict(spec.env)
+            if proxy_cfg.enabled:
+                try:
+                    ep = proxy_cfg.resolve_active_endpoint()
+                except (ValueError, OSError) as exc:
+                    msg = f"Прокси для ngrok недоступен: {exc}"
+                    self._logging.error("proxy", msg, event_code="ngrok_proxy_failed")
+                    self._log(f"✖ {msg}")
+                    self._fail()
+                    return
+                if ep is not None:
+                    if ep.scheme == "http":
+                        launch_env["HTTP_PROXY"] = ep.url
+                        launch_env["HTTPS_PROXY"] = ep.url
+                        self._logging.info("proxy", f"ngrok HTTP_PROXY configured via {ep.redacted_url}", event_code="ngrok_proxy_http")
+                        self._log(f"ℹ ngrok использует HTTP-прокси {ep.redacted_url}")
+                    else:
+                        msg = (
+                            f"Выбран прокси {ep.scheme.upper()}, но ngrok Agent поддерживает только HTTP-прокси (proxy_url/HTTP_PROXY); "
+                            "SOCKS5 для ngrok в этом режиме не поддерживается."
+                        )
+                        self._logging.warning("proxy", msg, event_code="ngrok_socks_unsupported")
+                        self._log(f"⚠ {msg}")
+            for secret in self.connections.collect_secret_values():
+                self._redactor.register(secret)
+            self.tunnel.start(spec.program, list(spec.args), workdir=spec.workdir or None, env=launch_env)
+            self._external_poll.start()
+            return
+
         if self.tunnel.is_alive():
             return  # мосты нельзя пересоздавать под живым процессом
         exe = self.cloudflared_path()
@@ -539,6 +1064,27 @@ class ServiceManager(QObject):
         if self.is_quick and not self._quick_url:
             self._quick_wait.start(QUICK_URL_TIMEOUT_MS)
 
+    def _poll_external_provider(self) -> None:
+        if not self._want_running or not self.tunnel.is_alive():
+            return
+        pid = self.active_provider
+        if pid == PROVIDER_NGROK:
+            ngrok = self.connections.get(PROVIDER_NGROK)
+            assert isinstance(ngrok, NgrokProvider)
+            url, warnings = ngrok.poll_active_endpoint()
+            if url:
+                self.tunnel.mark_health(True)
+                full = url.rstrip("/") + self.settings.mcp_path
+                if full != self._runtime_provider_url:
+                    self._runtime_provider_url = full
+                    self._log(f"✔ ngrok endpoint: {full}")
+                    for warn in warnings:
+                        self._log(f"⚠ {warn}")
+                    self.public_url_changed.emit(self.public_url)
+                    if self.server.is_alive() and self._server_url != self.oauth_resource_url:
+                        self._restart_server_only("обновлён публичный адрес ngrok")
+                    self._recompute()
+
     def _restart(self, name: str) -> None:
         if not self._want_running:
             return
@@ -548,6 +1094,19 @@ class ServiceManager(QObject):
         else:
             self._start_tunnel()
         self._recompute()
+
+    def _restart_server_only(self, reason: str) -> None:
+        """Перезапустить только MCP-сервер, сохраняя активный туннель и публичный адрес."""
+        if not self._want_running:
+            return
+        if not self.server.is_alive():
+            if not self._restart_timers[SERVER].isActive():
+                self._start_server()
+            return
+        self._log(f"↻ Перезапуск MCP-сервера: {reason}")
+        self._server_restart_pending = True
+        self._server_wait.stop()
+        self.server.stop()
 
     def _restart_if_running(self, reason: str) -> None:
         """Новые настройки применяются только при старте: остановить и запустить снова."""
@@ -599,13 +1158,24 @@ class ServiceManager(QObject):
     def _forward_log(self, name: str, line: str) -> None:
         if name == SERVER and self._health_log_marker in line:
             return  # свои же проверки раз в 2 с не засоряют лог
-        self.log_line.emit(name, line)
+        safe_line = self.redact_text(line)
+        self.log_line.emit(name, safe_line)
+        if name == TUNNEL:
+            self._logging.log("tunnel", infer_level(safe_line), safe_line, event_code="tunnel_stdout")
+        elif name == SERVER and " | backend " not in safe_line:
+            self._logging.log("backend", infer_level(safe_line), safe_line, event_code="backend_stdout")
         if name != TUNNEL:
+            return
+        if self.active_provider == PROVIDER_NGROK:
+            ngrok_err = parse_ngrok_log_line(line)
+            if ngrok_err:
+                self._log(f"✖ ngrok: {ngrok_err}")
             return
         low = line.lower()
         # Preserve raw cloudflared error lines. Provide one contextual hint
         # per kind; canceled requests and actual origin failures are different.
         issue = classify_tunnel_error(line)
+        event = classify_tunnel_event(line)
         if issue == "request_canceled" and not self._cancel_hint_shown:
             self._cancel_hint_shown = True
             if self.server.is_alive() and self.tunnel.is_alive() and self._want_running:
@@ -626,6 +1196,8 @@ class ServiceManager(QObject):
                 f"Проверьте http://127.0.0.1:{self.settings.server_port}"
                 f"{self.settings.server_health_path}, порт и журнал сервера."
             )
+        elif event is not None and event.category == "rate_limited":
+            self._log(f"⚠ {event.detail}")
         if self.is_quick and self._want_running:
             match = QUICK_URL_RE.search(line)
             if match:
@@ -670,8 +1242,14 @@ class ServiceManager(QObject):
         self.server.mark_health(ok)
         if ok and self._want_running and self.server.is_alive():
             self._server_wait.stop()
-            # named: туннель стартует только когда есть куда проксировать — иначе клиенты
-            # получат 502. quick: туннель уже работает, сервер запускался вторым.
+            pid = self.active_provider
+            if pid == PROVIDER_LOCAL:
+                return
+            if pid == PROVIDER_TAILSCALE:
+                if not self._tailscale_active and not self._restart_timers[TUNNEL].isActive():
+                    self._start_tunnel()
+                return
+            # named / ngrok / openai: туннель стартует только когда локальный сервер отвечает.
             if (not self.is_quick and not self.tunnel.is_alive()
                     and not self._restart_timers[TUNNEL].isActive()):
                 self._start_tunnel()
@@ -716,28 +1294,30 @@ class ServiceManager(QObject):
             return
 
         healthy_at = self._healthy_at[name]
-        if healthy_at is not None and time.monotonic() - healthy_at > STABLE_UPTIME_S:
+        if self._backoff.should_reset_attempts(healthy_at):
             self._restart_attempts[name] = 0  # долго работал — это не crash-loop
         self._healthy_at[name] = None
         self._restart_attempts[name] += 1
         attempt = self._restart_attempts[name]
-        if attempt > MAX_RESTARTS:
+        if self._backoff.exhausted(attempt):
             self._log(f"✖ {name} падает слишком часто — останавливаю всё")
             if name == TUNNEL and self.is_quick and not self._quick_url:
                 self._log(f"   • Временный адрес так и не выдан. Попробуйте позже или подключите свой домен. "
                           f"{DOMAIN_GUIDE_HINT}")
             self._fail()
             return
-        delay_s = min(2 ** attempt, 30)  # 2, 4, 8, 16, 30
-        self._log(f"⚠ {name} упал (код {exit_code}), перезапуск через {delay_s} с")
-        self._restart_timers[name].start(delay_s * 1000)
+        delay_s = self._backoff.next_delay(attempt)
+        self._log(f"⚠ {name} упал (код {exit_code}), перезапуск через {delay_s:.1f} с")
+        self._restart_timers[name].start(int(round(delay_s * 1000)))
         self._recompute()
 
     def _on_proc_state(self, name: str, state: ProcState) -> None:
+        if name == TUNNEL and state == ProcState.STARTING and self.tunnel.pid:
+            self.connections.ownership.record_process(self.active_provider, self.tunnel.pid)
         if state == ProcState.RUNNING:
             if self._healthy_at[name] is None:
                 self._healthy_at[name] = time.monotonic()
-            self._log("✔ Сервер отвечает" if name == SERVER else "✔ Туннель подключён к Cloudflare")
+            self._log("✔ Сервер отвечает" if name == SERVER else f"✔ Транспорт подключён ({self.active_provider})")
         self.service_state_changed.emit(name, state)
         self._recompute()
 
@@ -793,10 +1373,94 @@ class ServiceManager(QObject):
         self._diagnosing = False
         self._server_wait.stop()
         self._quick_wait.stop()
+        self._external_poll.stop()
         for timer in self._restart_timers.values():
             timer.stop()
         self.health.stop()
+        self._resilience.stop()
+        self._recovery_timer.stop()
         self._bridge.stop()
+
+    def _on_system_resumed(self, gap_seconds: float) -> None:
+        if not self._want_running:
+            return
+        self._log(f"↻ Выход из спящего режима (~{gap_seconds:.0f} с): проверяю соединение…")
+        self._restart_attempts = {name: 0 for name in self._procs}
+        self.health.probe_now()
+        self._recovery_timer.start()
+
+    def _on_network_changed(self, summary: str) -> None:
+        if not self._want_running:
+            return
+        self._log(f"↻ Изменение сети ({summary}): проверяю сервер и туннель…")
+        self._restart_attempts = {name: 0 for name in self._procs}
+        self.health.probe_now()
+        self._recovery_timer.start()
+
+    def _on_recovery_grace_timeout(self) -> None:
+        if self.active_provider in (PROVIDER_LOCAL, PROVIDER_TAILSCALE):
+            return
+        if not self._want_running or self._diagnosing or self._restart_timers[TUNNEL].isActive():
+            return
+        if self.tunnel.state != ProcState.RUNNING:
+            self._log("↻ Туннель не восстановился после смены сети/сна — переподключаю…")
+            if self.tunnel.is_alive():
+                self.tunnel.stop()
+            else:
+                self._start_tunnel()
+
+    def _set_oauth_emergency_stop(self, active: bool, reason: str = "") -> bool:
+        url = self.oauth_resource_url
+        if not url:
+            return False
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return False
+        issuer = f"{parts.scheme}://{parts.netloc}"
+        try:
+            from backend.oauth_store import OAuthStore, default_store_path
+
+            store = OAuthStore(default_store_path(), issuer, url)
+            store.set_emergency_stop(active, reason=reason)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def emergency_stop(self, reason: str = "Аварийная остановка владельцем") -> dict:
+        """Немедленно заблокировать новые вызовы и остановить контролируемые процессы."""
+        oauth_flagged = self._set_oauth_emergency_stop(True, reason=reason)
+        try:
+            from backend.desktop.models import DesktopPolicyStore
+
+            DesktopPolicyStore(self.desktop_policy_path()).set_emergency_stop(True, reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+        self._restart_all_pending = False
+        self._log(f"🛑 АВАРИЙНАЯ ОСТАНОВКА: {reason}")
+        self.stop_all()
+        return {
+            "stopped_services": ["tunnel", "server"],
+            "oauth_emergency_flag_set": oauth_flagged,
+            "reason": reason,
+            "warning": (
+                "Новые вызовы OAuth-инструментов заблокированы, а контролируемые сервисы "
+                "остановлены. Независимые GUI-программы или внешние процессы, запущенные "
+                "отдельно, не могут быть гарантированно остановлены автоматически."
+            ),
+        }
+
+    def clear_emergency_stop(self) -> None:
+        self._set_oauth_emergency_stop(False)
+
+    def redact_text(self, text: str) -> str:
+        wizard = self.wizard_domain()
+        if wizard.tunnel_token:
+            self._redactor.register(wizard.tunnel_token)
+        if self._token:
+            self._redactor.register(self._token)
+        for secret in self.connections.collect_secret_values():
+            self._redactor.register(secret)
+        return self._redactor.redact_text(text)
 
     def _fail(self) -> None:
         self._error = True
@@ -804,16 +1468,33 @@ class ServiceManager(QObject):
         self.stop_all()
 
     def _recompute(self) -> None:
-        states = {self.server.state, self.tunnel.state}
+        pid = self.active_provider
+        daemon_tunnel = pid in (PROVIDER_CF_QUICK, PROVIDER_CF_NAMED, PROVIDER_NGROK)
         if self._want_running:
-            if states == {ProcState.RUNNING}:
-                overall = Overall.RUNNING
-            elif (ProcState.FAILED in states or self._diagnosing
-                  or any(t.isActive() for t in self._restart_timers.values())):
-                overall = Overall.DEGRADED
+            if pid == PROVIDER_LOCAL:
+                if self.server.state == ProcState.RUNNING:
+                    overall = Overall.RUNNING
+                elif self.server.state == ProcState.FAILED or self._restart_timers[SERVER].isActive():
+                    overall = Overall.DEGRADED
+                else:
+                    overall = Overall.STARTING
+            elif pid == PROVIDER_TAILSCALE:
+                if self.server.state == ProcState.RUNNING and self._tailscale_active:
+                    overall = Overall.RUNNING
+                elif self.server.state == ProcState.FAILED or self._restart_timers[SERVER].isActive():
+                    overall = Overall.DEGRADED
+                else:
+                    overall = Overall.STARTING
             else:
-                overall = Overall.STARTING
-        elif self.server.is_alive() or self.tunnel.is_alive():
+                states = {self.server.state, self.tunnel.state}
+                if states == {ProcState.RUNNING}:
+                    overall = Overall.RUNNING
+                elif (ProcState.FAILED in states or self._diagnosing
+                      or any(t.isActive() for t in self._restart_timers.values())):
+                    overall = Overall.DEGRADED
+                else:
+                    overall = Overall.STARTING
+        elif self.server.is_alive() or (daemon_tunnel and self.tunnel.is_alive()):
             overall = Overall.STOPPING
         else:
             overall = Overall.ERROR if self._error else Overall.STOPPED
@@ -825,7 +1506,9 @@ class ServiceManager(QObject):
             QTimer.singleShot(0, self.start_all)
 
     def _log(self, text: str) -> None:
-        self.log_line.emit(APP, text)
+        safe = self.redact_text(text)
+        self._logging.log("app", infer_level(safe), safe, event_code="app_event")
+        self.log_line.emit(APP, safe)
 
 
 # ====================================================================== утилиты

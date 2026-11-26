@@ -11,11 +11,12 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QGuiApplication
-from PyQt6.QtWidgets import QDialog, QHBoxLayout, QPushButton, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QTextBrowser, QVBoxLayout, QWidget
 
 from app import APP_NAME
 from app.config import Settings
 from app.ui import theme
+from app.ui.components.silent_dialog import SilentDialog
 
 TUNNEL_NAME = "mcp-app"
 EXAMPLE_HOST = "mcp.example.com"
@@ -46,8 +47,11 @@ def guide_html(settings: Settings, cloudflared: str | None) -> str:
     config_path = html.escape(str(Path(settings.cloudflared_config).expanduser()))
     folder = html.escape(str(Path(settings.cloudflared_config).expanduser().parent))
     mono = theme.FONT_MONO.replace('"', "'")
-    code = (f"background:{theme.INPUT}; color:{theme.TEXT_STRONG}; font-family:{mono}; "
-            f"font-size:12px; padding:8px 10px; border:1px solid {theme.HAIRLINE};")
+    ui_font = theme.FONT_UI.replace('"', "'")
+    code = (
+        f"background:{theme.SURFACE}; color:{theme.TEXT_STRONG}; font-family:{mono}; "
+        f"font-size:12px; padding:8px 10px; border:1px solid {theme.HAIRLINE}; border-radius:6px;"
+    )
     step = f"color:{theme.TEXT_STRONG}; font-weight:600; margin-top:14px;"
     note = f"color:{theme.TEXT_MUTED};"
 
@@ -56,7 +60,7 @@ def guide_html(settings: Settings, cloudflared: str | None) -> str:
 
     template = html.escape(config_template(settings))
     return f"""
-<div style="color:{theme.TEXT}; font-size:13px;">
+<div style="color:{theme.TEXT}; font-family:{ui_font}; font-size:13px; line-height:1.45;">
 <p style="{note}">Свой домен даёт постоянный адрес вроде <b>https://{EXAMPLE_HOST}/mcp</b>: он не меняется
 при перезапуске, поддерживает SSE и не зависит от trycloudflare.com. Настройка делается один раз,
 минут за 10. Нужен домен и бесплатный аккаунт Cloudflare.</p>
@@ -105,26 +109,25 @@ NS-серверы на те, что покажет Cloudflare, и дождите
 """
 
 
-class DomainGuideDialog(QDialog):
+class DomainGuideDialog(SilentDialog):
     def __init__(self, settings: Settings, cloudflared: str | None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
+        self._cloudflared = cloudflared
         self.setWindowTitle(f"{APP_NAME} — как подключить свой домен")
         self.setModal(False)
-        self.resize(760, 680)
-        self.setStyleSheet(f"QDialog {{ background: {theme.SURFACE}; }}")
+        self.resize(740, 640)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
 
-        browser = QTextBrowser()
-        browser.setOpenExternalLinks(True)
-        browser.setFrameShape(QTextBrowser.Shape.NoFrame)
-        browser.setStyleSheet(f"QTextBrowser {{ background: {theme.SURFACE}; border: none; }}")
-        browser.document().setDocumentMargin(4)
-        browser.setHtml(guide_html(settings, cloudflared))
-        layout.addWidget(browser, 1)
+        self._browser = QTextBrowser()
+        self._browser.setOpenExternalLinks(True)
+        self._browser.setFrameShape(QTextBrowser.Shape.NoFrame)
+        self._browser.document().setDocumentMargin(4)
+        self.apply_theme()
+        layout.addWidget(self._browser, 1)
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -161,3 +164,6 @@ class DomainGuideDialog(QDialog):
         except OSError:
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def apply_theme(self) -> None:
+        self._browser.setHtml(guide_html(self.settings, self._cloudflared))

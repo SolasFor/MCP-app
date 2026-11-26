@@ -16,8 +16,18 @@ from mcp.types import ListToolsResult, Tool
 from backend.oauth_store import OAuthStore
 from backend.oauth_execution import ExecutionApprovals
 from backend.tool_permissions import (
-    BASIC_TOOLS, EXEC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
+    BASIC_TOOLS, OAUTH_TOOLS, FULL_TOOLS, EXEC_MANAGED, EXEC_WINDOWS, EXEC_SSH,
     allowed_tools, make_tool_middleware, require_execution_permission,
+)
+from backend.tool_registry import (
+    DESKTOP_TOOLS,
+    EXTENSION_ALLOWLIST_TOOLS,
+    EXTENSION_FULL_TOOLS,
+    GIT_TOOLS,
+    REMOTE_TOOLS,
+    SERVER_TOOLS,
+    TASK_TOOLS,
+    WORKSPACE_TOOLS,
 )
 
 BASE = "https://fixed.example.com"
@@ -50,6 +60,7 @@ class FixedOAuthToolsTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_three_profiles_change_tool_visibility_without_restart(self):
+        self.exec.set_profile("safe")
         self.assertEqual(allowed_tools(self.store, principal("alpha"), self.exec), BASIC_TOOLS)
         self.assertFalse(self.exec.can_request("alpha", "windows", command="whoami"))
         self.exec.set_profile("allowlist")
@@ -116,7 +127,12 @@ class FixedOAuthToolsTests(unittest.TestCase):
         middleware = make_tool_middleware(self.store, self.exec)
         all_tools = [
             Tool(name=name, input_schema={"type": "object", "properties": {}})
-            for name in ("server_info", EXEC_WINDOWS, EXEC_SSH, "shared_note_read")
+            for name in (
+                "server_info", EXEC_WINDOWS, EXEC_SSH,
+                *sorted(TASK_TOOLS), *sorted(SERVER_TOOLS),
+                *sorted(WORKSPACE_TOOLS), *sorted(GIT_TOOLS), *sorted(DESKTOP_TOOLS),
+                *sorted(EXTENSION_ALLOWLIST_TOOLS), *sorted(EXTENSION_FULL_TOOLS), *sorted(REMOTE_TOOLS), "shared_note_read",
+            )
         ]
         async def next_list(ctx):
             return ListToolsResult(tools=all_tools)
@@ -133,8 +149,16 @@ class FixedOAuthToolsTests(unittest.TestCase):
         middleware = make_tool_middleware(self.store, self.exec)
         async def next_list(ctx):
             return {"tools": [
-                {"name": "server_info"}, {"name": EXEC_WINDOWS},
-                {"name": EXEC_SSH}, {"name": "shared_notes_list"},
+                {"name": "server_info"}, {"name": EXEC_WINDOWS}, {"name": EXEC_SSH},
+                *({"name": n} for n in sorted(TASK_TOOLS)),
+                *({"name": n} for n in sorted(SERVER_TOOLS)),
+                *({"name": n} for n in sorted(WORKSPACE_TOOLS)),
+                *({"name": n} for n in sorted(GIT_TOOLS)),
+                *({"name": n} for n in sorted(DESKTOP_TOOLS)),
+                *({"name": n} for n in sorted(EXTENSION_ALLOWLIST_TOOLS)),
+                *({"name": n} for n in sorted(EXTENSION_FULL_TOOLS)),
+                *({"name": n} for n in sorted(REMOTE_TOOLS)),
+                {"name": "shared_notes_list"},
             ]}
         ctx = SimpleNamespace(method="tools/list", params={})
         self.exec.set_profile("allowlist")

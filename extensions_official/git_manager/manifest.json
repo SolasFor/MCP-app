@@ -1,0 +1,31 @@
+{
+  "id": "git_manager",
+  "name": "Git Manager",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "entrypoint": "main.py",
+  "description": "Safe read-only Git repository inspection with hook suppression.",
+  "author": "MCP-app",
+  "official": true,
+  "permissions": ["git_read", "workspace_read"],
+  "min_profile": "allowlist",
+  "tools": [
+    {
+      "name": "git_repo_status",
+      "description": "Inspect porcelain git status of a local repository path.",
+      "permission": "git_read",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {"repo_path": {"type": "string"}}, "required": ["repo_path"]}
+    },
+    {
+      "name": "git_repo_log",
+      "description": "Read recent commits from a local repository without executing hooks.",
+      "permission": "git_read",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {"repo_path": {"type": "string"}, "limit": {"type": "integer", "default": 10}}, "required": ["repo_path"]}
+    }
+  ],
+  "ui_components": [
+    {"id": "git_notice", "type": "notice", "title": "Hook Suppression Active", "description": "All git subprocesses run with core.hooksPath disabled."}
+  ]
+}

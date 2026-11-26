@@ -1,8 +1,6 @@
 """Persistent OAuth storage tests (SQLite + DPAPI or POSIX private key)."""
 from __future__ import annotations
 
-import os
-import sqlite3
 import sys
 import tempfile
 import time
@@ -101,8 +99,12 @@ class PersistentOAuthStoreTests(unittest.TestCase):
         self._seed_tokens()
         second = OAuthStore(self.path, URL, RESOURCE)
         second.bind_owner("different-owner-token")
-        self.assertEqual(second.list_clients(), [])
+        clients = second.list_clients()
+        self.assertEqual(len(clients), 1)
+        self.assertEqual(clients[0]["client_id"], "client-1")
+        self.assertIsNone(clients[0]["approved_at"])
         self.assertIsNone(second.get_token("opaque-access-token", "access"))
+        self.assertIsNone(second.get_token("opaque-refresh-token", "refresh"))
 
     def test_resource_path_change_invalidates_grants(self):
         self._seed_tokens()

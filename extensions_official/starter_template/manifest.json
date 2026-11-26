@@ -1,0 +1,24 @@
+{
+  "id": "starter_template",
+  "name": "Starter Extension Template",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "entrypoint": "main.py",
+  "description": "Minimal SDK v1.0 starter template for authoring out-of-process MCP-app extensions.",
+  "author": "MCP-app",
+  "official": false,
+  "permissions": ["read_metrics"],
+  "min_profile": "allowlist",
+  "tools": [
+    {
+      "name": "ping",
+      "description": "Simple health/echo tool demonstrating SDK usage.",
+      "permission": "read_metrics",
+      "read_only": true,
+      "input_schema": {"type": "object", "properties": {"note": {"type": "string"}}}
+    }
+  ],
+  "ui_components": [
+    {"id": "hello_card", "type": "status_card", "title": "Starter Extension", "tool": "ping"}
+  ]
+}

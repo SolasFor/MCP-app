@@ -6,6 +6,8 @@ __pycache__/
 venv/
 .venv-build/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # --- PyInstaller / Inno Setup (spec и installer.iss лежат в packaging/ и коммитятся) ---
 /build/
@@ -31,6 +33,8 @@ workspace/
 
 # --- Логи ---
 *.log
+*.jsonl
+spool/
 
 # --- IDE / OS ---
 .idea/

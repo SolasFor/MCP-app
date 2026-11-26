@@ -47,6 +47,19 @@ def _ensure_std_streams() -> None:
 
 def run_backend() -> None:
     _ensure_std_streams()
-    from backend.server import main as server_main
+    from app.core.logging_manager import LogConfig, configure_logging
+    import os
 
-    server_main()
+    level = os.environ.get("MCP_LOG_LEVEL", "INFO")
+    lm = configure_logging(config=LogConfig(level=level))
+    lm.install_exception_hooks()
+    lm.info("backend", "MCP backend child process starting", event_code="backend_boot")
+    try:
+        from backend.server import main as server_main
+
+        server_main()
+    except Exception as exc:  # noqa: BLE001
+        lm.log_crash(type(exc), exc, exc.__traceback__, context="backend_entry")
+        raise
+    finally:
+        lm.shutdown(timeout=1.5)

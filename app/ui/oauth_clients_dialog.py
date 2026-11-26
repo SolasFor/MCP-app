@@ -10,15 +10,18 @@ from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QLabel, QMessageBox,
+    QAbstractItemView, QHBoxLayout, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from app.ui.components.cards import EmptyState
+from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from backend.oauth_store import OAuthStore, default_store_path
 from backend.oauth_execution import ExecutionApprovals
 
 
-class OAuthClientsDialog(QDialog):
+class OAuthClientsDialog(SilentDialog):
     def __init__(self, public_url: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         parts = urlsplit(public_url)
@@ -28,12 +31,12 @@ class OAuthClientsDialog(QDialog):
         self.store = OAuthStore(default_store_path(), issuer, public_url)
         self.execution = ExecutionApprovals(self.store)
         self.setWindowTitle("OAuth-клиенты MCP app")
-        self.setMinimumSize(700, 420)
-        self.resize(820, 490)
+        self.setMinimumSize(680, 400)
+        self.resize(780, 470)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(12)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
         title = QLabel("OAuth-клиенты")
         title.setObjectName("SectionTitle")
         root.addWidget(title)
@@ -45,6 +48,7 @@ class OAuthClientsDialog(QDialog):
             "клиента не выбран свой. Команды из белого списка и полного "
             "доступа выполняются без отдельного подтверждения."
         )
+        explanation.setObjectName("Hint")
         explanation.setWordWrap(True)
         root.addWidget(explanation)
 
@@ -55,19 +59,37 @@ class OAuthClientsDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         root.addWidget(self.table, 1)
 
+        self.empty_state = EmptyState(
+            "clients",
+            "Нет зарегистрированных OAuth-клиентов",
+            "Клиенты появятся здесь после регистрации и подтверждения доступа.",
+        )
+        self.empty_state.hide()
+        root.addWidget(self.empty_state, 1)
+
         footer = QHBoxLayout()
+        footer.setSpacing(6)
         self.refresh_button = QPushButton("Обновить")
+        self.refresh_button.setObjectName("Ghost")
+        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.reload)
         self.revoke_button = QPushButton("Отозвать OAuth-доступ")
+        self.revoke_button.setObjectName("Danger")
+        self.revoke_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
         close_button = QPushButton("Закрыть")
+        close_button.setObjectName("Ghost")
+        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         close_button.clicked.connect(self.accept)
         for btn in (
             self.refresh_button, self.revoke_button,
@@ -82,10 +104,13 @@ class OAuthClientsDialog(QDialog):
         try:
             clients = self.store.list_clients()
         except Exception as exc:
-            QMessageBox.warning(
+            SilentMessageBox.warning(
                 self, "OAuth", f"Не удалось прочитать хранилище: {type(exc).__name__}"
             )
             return
+        has_clients = bool(clients)
+        self.table.setVisible(has_clients)
+        self.empty_state.setVisible(not has_clients)
         self.table.setRowCount(len(clients))
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
@@ -102,8 +127,9 @@ class OAuthClientsDialog(QDialog):
                 idx, 1, QTableWidgetItem("Разрешён" if approved else "Зарегистрирован")
             )
             if approved:
-                selector = QComboBox(self.table)
-                selector.setMinimumWidth(225)
+                selector = SafeComboBox(self.table)
+                selector.setMinimumWidth(205)
+                selector.setFixedHeight(26)
                 selector.addItem("Безопасный", "safe")
                 selector.addItem("Белый список", "allowlist")
                 selector.addItem("Полный доступ", "full")
@@ -122,28 +148,29 @@ class OAuthClientsDialog(QDialog):
                 self.table.setItem(idx, 2, QTableWidgetItem("Нет доступа"))
             self.table.setItem(idx, 3, QTableWidgetItem(when))
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(2, max(245, self.table.columnWidth(2)))
+        self.table.setColumnWidth(0, min(260, max(140, self.table.columnWidth(0))))
+        self.table.setColumnWidth(2, max(230, self.table.columnWidth(2)))
         self._selection_changed()
 
-    def _change_client_profile(self, client_id: str, combo: QComboBox) -> None:
+    def _change_client_profile(self, client_id: str, combo: SafeComboBox) -> None:
         try:
             previous = self.execution.profile_for(client_id)
             selected = combo.currentData()
             if selected == previous:
                 return
             if selected == "full":
-                answer = QMessageBox.warning(
+                answer = SilentMessageBox.warning(
                     self,
                     "Полный доступ для OAuth-клиента",
                     "Вы даёте выбранному клиенту возможность сразу выполнять "
                     "произвольные Windows-команды и SSH-команды без "
                     "подтверждения каждого запуска. Это высокий риск: "
                     "действия выполняются с правами пользователя Windows "
-                    "или SSH-учётной записи.\\n\\nПродолжить?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
+                    "или SSH-учётной записи.\n\nПродолжить?",
+                    SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.No,
                 )
-                if answer != QMessageBox.StandardButton.Yes:
+                if answer != SilentMessageBox.StandardButton.Yes:
                     combo.blockSignals(True)
                     combo.setCurrentIndex(combo.findData(previous))
                     combo.blockSignals(False)
@@ -153,7 +180,7 @@ class OAuthClientsDialog(QDialog):
             combo.blockSignals(True)
             combo.setCurrentIndex(max(combo.findData(self.execution.profile_for(client_id)), 0))
             combo.blockSignals(False)
-            QMessageBox.warning(
+            SilentMessageBox.warning(
                 self, "Права OAuth-клиента",
                 f"Не удалось сохранить сценарий доступа: {type(exc).__name__}"
             )
@@ -169,18 +196,18 @@ class OAuthClientsDialog(QDialog):
         if item is None:
             return
         client_id = item.data(Qt.ItemDataRole.UserRole)
-        if QMessageBox.question(
+        if SilentMessageBox.question(
             self, "Отозвать OAuth-доступ?",
             f"Удалить регистрацию «{item.text()}» и все её OAuth-токены?\n"
             "Для повторного подключения потребуется новая авторизация.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
+            SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+            SilentMessageBox.StandardButton.No,
+        ) != SilentMessageBox.StandardButton.Yes:
             return
         try:
             self.store.revoke_client(client_id)
         except Exception as exc:
-            QMessageBox.warning(
+            SilentMessageBox.warning(
                 self, "OAuth", f"Не удалось отозвать доступ: {type(exc).__name__}"
             )
             return

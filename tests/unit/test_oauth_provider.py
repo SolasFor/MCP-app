@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
-import time
 import unittest
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -14,7 +13,7 @@ from pydantic import AnyUrl
 from starlette.requests import Request
 
 from backend.oauth_provider import (
-    LocalConsentOAuthProvider, READ_SCOPE, MAX_CLIENTS, token_digest,
+    LocalConsentOAuthProvider, READ_SCOPE, MAX_CLIENTS,
 )
 
 ISSUER = "https://current.trycloudflare.com"

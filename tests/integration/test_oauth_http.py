@@ -21,6 +21,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from backend.tool_registry import (
+    EXTENSION_ALLOWLIST_TOOLS,
+    GIT_TOOLS,
+    REMOTE_TOOLS,
+    SERVER_TOOLS,
+    TASK_TOOLS,
+    WORKSPACE_TOOLS,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 OWNER = "ci-owner-token-not-for-production"
 VERIFIER = "code-verifier-with-entropy-aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -106,7 +115,9 @@ class OAuthHttpTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if getattr(cls, "proc", None) is not None:
-            cls.proc.terminate()
+            from app.core.winjob import kill_process_tree
+
+            kill_process_tree(cls.proc.pid, include_parent=True)
             try:
                 cls.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -199,7 +210,8 @@ class OAuthHttpTests(unittest.TestCase):
         # Real backend restart with the same issuer: registration and access
         # token must remain valid with no new browser consent.
         cls = type(self)
-        cls.proc.terminate()
+        from app.core.winjob import kill_process_tree
+        kill_process_tree(cls.proc.pid, include_parent=True)
         cls.proc.wait(timeout=5)
         cls._start_child()
         status, _, _ = req(self.url + "/token", "POST", data=grant)
@@ -232,10 +244,13 @@ class OAuthHttpTests(unittest.TestCase):
         status, _, body = req(self.url + "/mcp", "POST", data=tool_request,
             content_type="application/json", headers=base_headers)
         self.assertEqual(status, 200, body.decode(errors="replace"))
-        # New/updated installations must fail closed: only server_info
-        # appears until the owner deliberately selects a stronger profile.
+        # Default scenario on first launch is allowlist (Computer Use stays hidden while disabled).
         tools = json.loads(body)["result"]["tools"]
-        self.assertEqual({tool["name"] for tool in tools}, {"server_info"})
+        expected_allowlist = (
+            {"server_info", "oauth_windows_command", "oauth_ssh_command"}
+            | TASK_TOOLS | SERVER_TOOLS | WORKSPACE_TOOLS | GIT_TOOLS | EXTENSION_ALLOWLIST_TOOLS | REMOTE_TOOLS
+        )
+        self.assertEqual({tool["name"] for tool in tools}, expected_allowlist)
         call_request = {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                         "params": {"name": "server_info", "arguments": {}}}
         status, _, body = req(self.url + "/mcp", "POST", data=call_request,
@@ -254,7 +269,8 @@ class OAuthHttpTests(unittest.TestCase):
                         "params": {"name": "oauth_windows_command",
                                    "arguments": {"command": executable}}}
 
-        # Direct calls to a hidden tool must be blocked before dispatch.
+        # Explicit safe mode hides elevated tools and blocks direct execution before dispatch.
+        profiles.set_profile("safe")
         status, _, body = req(self.url + "/mcp", "POST", data=exec_request,
             content_type="application/json", headers=base_headers)
         self.assertIn("not available", body.decode(errors="replace"))
@@ -266,7 +282,7 @@ class OAuthHttpTests(unittest.TestCase):
         self.assertEqual(status, 200, body.decode(errors="replace"))
         self.assertEqual(
             {t["name"] for t in json.loads(body)["result"]["tools"]},
-            {"server_info", "oauth_windows_command", "oauth_ssh_command"},
+            expected_allowlist,
         )
 
         # In allowlist mode the command runs IMMEDIATELY: no approval_id.

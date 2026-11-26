@@ -1,2 +1,6 @@
-# Только для сборки (packaging/build.ps1), в .exe не попадает.
-pyinstaller>=6.10
+# Build-only dependency (packaging/build.ps1), not bundled into runtime app.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3; sys_platform == "win32"

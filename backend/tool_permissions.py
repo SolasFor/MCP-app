@@ -1,32 +1,74 @@
 """OAuth tool capability: Windows, SSH and Full-only managed servers.
 
-Each OAuth client can have an owner-selected profile overriding the global
-default. Safe hides command/SSH tools; whitelist/full expose both.
-There are no note/file tools and no network-accessible permission controls.
-Exact command/host allowlists apply only to allowlist clients.
+Delegates discovery and per-call authorization to `backend.tool_registry.ToolRegistry`.
+Each OAuth client can have an owner-selected profile overriding the global default.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.shared.exceptions import MCPError
 from mcp.types import ListToolsResult
 
-try:
-    from .oauth_store import OAuthStore
+if __package__:
     from .oauth_execution import ExecutionApprovals
-except ImportError:
-    from oauth_store import OAuthStore
+    from .oauth_store import OAuthStore
+    from .tool_registry import (
+        ALL_REGISTERED_OAUTH_TOOLS,
+        BASIC_TOOLS,
+        DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
+        EXEC_MANAGED,
+        EXEC_SSH,
+        EXEC_TOOLS,
+        EXEC_WINDOWS,
+        FULL_TOOLS,
+        OAUTH_TOOLS,
+        ToolRegistry,
+    )
+else:
     from oauth_execution import ExecutionApprovals
+    from oauth_store import OAuthStore
+    from tool_registry import (
+        ALL_REGISTERED_OAUTH_TOOLS,
+        BASIC_TOOLS,
+        DEFAULT_REGISTRY,
+        DESKTOP_CONTROL_TOOLS,
+        DESKTOP_TOOLS,
+        DESKTOP_VIEW_TOOLS,
+        EXEC_MANAGED,
+        EXEC_SSH,
+        EXEC_TOOLS,
+        EXEC_WINDOWS,
+        FULL_TOOLS,
+        OAUTH_TOOLS,
+        ToolRegistry,
+    )
 
-EXEC_WINDOWS = "oauth_windows_command"
-EXEC_SSH = "oauth_ssh_command"
-EXEC_MANAGED = "oauth_managed_server"
-EXEC_TOOLS = frozenset({EXEC_WINDOWS, EXEC_SSH, EXEC_MANAGED})
-BASIC_TOOLS = frozenset({"server_info"})
-OAUTH_TOOLS = BASIC_TOOLS | {EXEC_WINDOWS, EXEC_SSH}
-FULL_TOOLS = OAUTH_TOOLS | {EXEC_MANAGED}
+__all__ = [
+    "ALL_REGISTERED_OAUTH_TOOLS",
+    "BASIC_TOOLS",
+    "DEFAULT_REGISTRY",
+    "DESKTOP_CONTROL_TOOLS",
+    "DESKTOP_TOOLS",
+    "DESKTOP_VIEW_TOOLS",
+    "EXEC_MANAGED",
+    "EXEC_SSH",
+    "EXEC_TOOLS",
+    "EXEC_WINDOWS",
+    "FORBIDDEN_TOOL",
+    "FULL_TOOLS",
+    "OAUTH_TOOLS",
+    "ToolRegistry",
+    "allowed_tools",
+    "make_tool_middleware",
+    "require_execution_permission",
+]
+
 FORBIDDEN_TOOL = -32602
 
 
@@ -34,58 +76,129 @@ def allowed_tools(
     store: OAuthStore | None,
     principal: Any,
     execution: ExecutionApprovals | None = None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
+    *,
+    desktop_policy_store: Any = None,
 ) -> frozenset[str]:
-    """An approved OAuth principal gets both capabilities; never cache approval."""
-    if store is None or execution is None or principal is None:
-        return BASIC_TOOLS
-    client_id = getattr(principal, "client_id", None)
-    scopes = getattr(principal, "scopes", None) or []
-    if not isinstance(client_id, str) or "mcp:read" not in scopes:
-        return BASIC_TOOLS
-    if not execution.client_approved(client_id):
-        return BASIC_TOOLS
-    # Live read from SQLite on every tools/list and tools/call. Upgrading to
-    # full mode never makes stale, unapproved bearer tokens privileged.
-    profile = execution.profile_for(client_id)
-    if profile == "full":
-        return FULL_TOOLS
-    return OAUTH_TOOLS if profile == "allowlist" else BASIC_TOOLS
+    """Return tools permitted for this OAuth principal; never caches approval."""
+    return registry.allowed_tools(
+        store, principal, execution, desktop_policy_store=desktop_policy_store
+    )
 
 
 def require_execution_permission(
-    tool: str, store: OAuthStore | None,
+    tool: str,
+    store: OAuthStore | None,
     execution: ExecutionApprovals | None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
+    *,
+    desktop_policy_store: Any = None,
 ) -> str:
     principal = get_access_token()
-    if tool not in EXEC_TOOLS or tool not in allowed_tools(store, principal, execution):
+    if tool not in EXEC_TOOLS:
         raise PermissionError("OAuth client is not authorized to request execution")
-    return principal.client_id
+    return registry.authorize_call(
+        tool, store, principal, execution, desktop_policy_store=desktop_policy_store
+    )
 
 
 def make_tool_middleware(
-    store: OAuthStore | None, execution: ExecutionApprovals | None = None,
+    store: OAuthStore | None,
+    execution: ExecutionApprovals | None = None,
+    registry: ToolRegistry = DEFAULT_REGISTRY,
+    gateway_router: Any = None,
+    metrics_registry: Any = None,
+    desktop_policy_store: Any = None,
+    session_tracker: Any = None,
 ):
     async def restrict_tools(ctx, call_next):
         if ctx.method not in ("tools/list", "tools/call"):
             return await call_next(ctx)
-        allowed = allowed_tools(store, get_access_token(), execution)
+        principal = get_access_token()
+        allowed = allowed_tools(
+            store, principal, execution, registry, desktop_policy_store=desktop_policy_store
+        )
+        if session_tracker is not None and getattr(ctx, "session", None) is not None:
+            gw_names: frozenset[str] = frozenset()
+            if gateway_router is not None:
+                try:
+                    gw_names = frozenset(
+                        t.name for t in gateway_router.list_authorized_tools(principal, execution)
+                    )
+                except Exception:  # noqa: BLE001
+                    gw_names = frozenset()
+            session_tracker.observe(ctx.session, principal, allowed | gw_names)
         if ctx.method == "tools/call":
             params = ctx.params
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
-            if name in EXEC_TOOLS and name not in allowed:
-                raise MCPError(code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client")
-            return await call_next(ctx)
+            t0 = time.monotonic()
+            try:
+                if name in EXEC_TOOLS and name not in allowed:
+                    raise MCPError(
+                        code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
+                    )
+                if gateway_router is not None and isinstance(name, str):
+                    await gateway_router.ensure_initialized()
+                    await gateway_router.sync_dirty()
+                    if gateway_router.is_gateway_tool(name):
+                        arguments = (
+                            params.get("arguments")
+                            if isinstance(params, dict)
+                            else getattr(params, "arguments", None)
+                        )
+                        try:
+                            res = await gateway_router.call_authorized_tool(
+                                name, arguments, principal, execution
+                            )
+                        except PermissionError as exc:
+                            raise MCPError(code=FORBIDDEN_TOOL, message=str(exc)) from exc
+                        except Exception as exc:
+                            raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
+                        if metrics_registry is not None:
+                            is_err = bool(getattr(res, "isError", False)) or (
+                                isinstance(res, dict) and bool(res.get("isError"))
+                            )
+                            metrics_registry.record_call(name, (time.monotonic() - t0) * 1000.0, error=is_err)
+                        return res
+                res = await call_next(ctx)
+            except Exception:
+                if metrics_registry is not None:
+                    metrics_registry.record_call(
+                        str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=True
+                    )
+                raise
+            if metrics_registry is not None:
+                is_err = bool(getattr(res, "isError", False)) or (
+                    isinstance(res, dict) and bool(res.get("isError"))
+                )
+                metrics_registry.record_call(
+                    str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=is_err
+                )
+            return res
         result = await call_next(ctx)
+        extra_tools = []
+        if gateway_router is not None:
+            await gateway_router.ensure_initialized()
+            await gateway_router.sync_dirty()
+            extra_tools = gateway_router.list_authorized_tools(principal, execution)
         if isinstance(result, ListToolsResult):
-            return result.model_copy(update={
-                "tools": [tool for tool in result.tools if tool.name in allowed],
-            })
+            filtered = [tool for tool in result.tools if tool.name in allowed]
+            return result.model_copy(
+                update={
+                    "tools": [*filtered, *extra_tools],
+                }
+            )
         if isinstance(result, dict) and isinstance(result.get("tools"), list):
-            return {**result, "tools": [
-                tool for tool in result["tools"]
-                if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None)) in allowed
-            ]}
-        # Avoid leaking unexpected SDK registry types.
+            filtered = [
+                tool
+                for tool in result["tools"]
+                if (tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", None))
+                in allowed
+            ]
+            return {
+                **result,
+                "tools": [*filtered, *extra_tools],
+            }
         raise MCPError(code=-32603, message="Unrecognized tools/list response type")
 
     return restrict_tools

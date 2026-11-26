@@ -532,3 +532,8 @@
 - Servers, Workspaces, Extensions, Tasks, and Gateway share compact action panels, resizable list/inspector areas and translated full-width detail tabs.
 - Fixed duplicate inspector headings after language change and provider menu cursor regression.
 - Validation: 45 targeted integration tests, Ruff and mypy; offscreen geometry and RU/EN checks. Manual visual acceptance pending.
+
+### Compact Devices and Extensions UI
+- Devices now uses the shared management toolbar and resizable registry/diagnostics panels.
+- Devices and Extensions use compact 28px action buttons and separate localized instruction dialogs instead of page lead text; original security notices are preserved in the guides.
+- Validation: Ruff, mypy (74 files), 31 targeted integration tests including RU/EN guide content, remote management and extension workflows. Manual visual acceptance pending.

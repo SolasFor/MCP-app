@@ -412,6 +412,20 @@ QPushButton#OwnerTokenIcon:hover, QPushButton#LogAction:hover, QPushButton#LogCl
 }
 QPushButton#OwnerTokenIcon:focus, QPushButton#LogAction:focus, QPushButton#LogClearAction:focus,
 QPushButton#ProviderMenu:focus, QPushButton#ProviderSelect:focus { border-color: $TEXT_MUTED; }
+QPushButton#ManagementAction, QPushButton#ManagementPrimary {
+    background: $CONTROL;
+    border: 1px solid $BORDER;
+    border-radius: 5px;
+    color: $TEXT;
+    font-size: 12px;
+    padding: 2px 8px;
+    min-height: 0;
+    min-width: 0;
+}
+QPushButton#ManagementPrimary { color: $ACCENT; border-color: $ACCENT_SOFT_BORDER; background: $ACCENT_SOFT_BG; }
+QPushButton#ManagementAction:hover, QPushButton#ManagementPrimary:hover { background: $CONTROL_HOVER; border-color: $BORDER_STRONG; }
+QPushButton#ManagementAction:focus, QPushButton#ManagementPrimary:focus { border-color: $TEXT_MUTED; }
+QPushButton#ManagementAction:disabled, QPushButton#ManagementPrimary:disabled { color: $TEXT_FAINT; border-color: $HAIRLINE; background: transparent; }
 QPushButton#ProviderSelect {
     background: $CONTROL;
     border: 1px solid $BORDER;

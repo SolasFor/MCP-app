@@ -78,6 +78,36 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
+    def test_compact_device_and_extension_guides(self) -> None:
+        from PyQt6.QtWidgets import QSplitter
+        from app.ui.components.management_layout import ManagementGuideDialog, ManagementPanel
+        from app.ui.i18n import LANG_EN, tr
+
+        w = self.window
+        for lang in (LANG_RU, LANG_EN):
+            w.set_language(lang)
+            for topic, page, buttons, notice in (
+                ("devices", w.devices_page, (w.devices_page.add_btn,
+                 w.devices_page.import_btn, w.devices_page.refresh_btn), "devices.security_notice"),
+                ("extensions", w.extensions_page, (w.extensions_page.install_zip_btn,
+                 w.extensions_page.install_official_btn, w.extensions_page.refresh_btn), "extensions.isolation_notice"),
+            ):
+                self.assertTrue(page.lead_label.isHidden())
+                self.assertEqual(page.guide_btn.text(), tr("management.guide.open"))
+                self.assertTrue(page.search_input.isClearButtonEnabled())
+                self.assertEqual(page.search_input.minimumHeight(), 36)
+                for btn in (*buttons, page.guide_btn):
+                    self.assertEqual(btn.minimumHeight(), 28)
+                    self.assertIn(btn.objectName(), ("ManagementAction", "ManagementPrimary"))
+                dialog = ManagementGuideDialog(topic, page)
+                self.assertIn(tr(notice), dialog.browser.toPlainText())
+                self.assertIn(tr(f"{topic}.guide.purpose"), dialog.browser.toPlainText())
+                dialog.close()
+            self.assertIsInstance(w.devices_page.table.parentWidget(), ManagementPanel)
+            self.assertIsInstance(w.devices_page.output_view.parentWidget(), ManagementPanel)
+            self.assertTrue(w.devices_page.findChildren(QSplitter))
+        w.set_language(LANG_RU)
+
     def test_management_page_inspectors_and_translation(self) -> None:
         from PyQt6.QtWidgets import QSplitter
         from app.ui.i18n import LANG_EN, tr

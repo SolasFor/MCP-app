@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -27,8 +26,10 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import theme
-from app.ui.components.cards import Divider, EmptyState, SectionHeader
-from app.ui.components.management_layout import ManagementPanel, ManagementTabs, management_split, management_toolbar
+from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import (
+    ManagementPanel, ManagementTabs, management_guide_button, management_split, management_toolbar,
+)
 from app.ui.components.context_menu import MenuActionSpec
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -155,13 +156,10 @@ class ExtensionsPage(PageScaffold):
         self._catalog_cache: list[dict[str, Any]] = []
         self._selected_id: str | None = None
 
-        self.set_header(tr("extensions.title"), tr("extensions.lead"))
+        self.set_header(tr("extensions.title"), "")
 
-        self._notice_lbl = QLabel(tr("extensions.isolation_notice"))
-        self._notice_lbl.setWordWrap(True)
-        self._notice_lbl.setObjectName("Hint")
-        self.content.addWidget(self._notice_lbl)
-        self.content.addWidget(Divider())
+        self.guide_btn = management_guide_button("extensions", self)
+        self.header_actions.addWidget(self.guide_btn)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("UiInput")
@@ -179,7 +177,7 @@ class ExtensionsPage(PageScaffold):
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_all)
         self.content.addWidget(management_toolbar(
-            self.search_input, (self.install_zip_btn, self.install_official_btn, self.refresh_btn)
+            self.search_input, (self.install_zip_btn, self.install_official_btn, self.refresh_btn), compact=True
         ))
 
         self.collection_tabs = ManagementTabs()
@@ -532,8 +530,8 @@ class ExtensionsPage(PageScaffold):
         self.manager.shutdown_all()
 
     def retranslate(self) -> None:
-        self.set_header(tr("extensions.title"), tr("extensions.lead"))
-        self._notice_lbl.setText(tr("extensions.isolation_notice"))
+        self.set_header(tr("extensions.title"), "")
+        self.guide_btn.setText(tr("management.guide.open"))
         self.search_input.setPlaceholderText(tr("extensions.search"))
         self.install_zip_btn.setText(tr("extensions.btn.install_zip"))
         self.install_official_btn.setText(tr("extensions.btn.install_official"))

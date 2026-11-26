@@ -19,6 +19,41 @@
 
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
+## Комплексный технический аудит после v1.0.1 (2026-11-26)
+- Статус: **VERIFIED** локально (ветка `fix_cursor_and_context_menus`, версия `v1.0.1`; внешние гейты владельца — `BLOCKED`/`NOT_RUN` ниже).
+- **P0-1 — Windows ACL, атомарный I/O, упаковка `pywin32` и восстановление при запуске**:
+  - `app/platform/windows.py`: добавлена `is_reparse_point()` (`GetFileAttributesW` / `FILE_ATTRIBUTE_REPARSE_POINT`), нормализация путей и жёсткий отказ применять DACL к symlink/junction; сохранён расчёт DACL строго по SID `TokenUser` без короткого `USERNAME`, без `Everyone` и без снятия наследования до создания валидного дескриптора безопасности.
+  - `app/core/atomic_io.py`: единая потокобезопасная атомарная запись (`.name.pid.tid.tmp`, `fsync`, повтор `os.replace` при кратковременных Win32 `ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION`, гарантированное удаление `.tmp` при `ENOSPC`/ошибках) и безопасная инициализация каталогов (`try_init_private_dir`) во всех хранилищах (`secret_store`, `config`, `domain_state`, `proxy`, `token_store`, `tunnels`, `extensions`, `gateway`, `servers`, `workspaces`, `desktop`, `remote`).
+  - `app/core/acl_recovery.py`, `main.py`, `app/gui.py`, `app/selftest.py`, `packaging/{mcp_app.spec,build.ps1}`: неразрушающая диагностика `diagnose_data_acls` и подтверждаемое владельцем восстановление `repair_data_acls` / `--repair-acl` (только для объектов с `OWNER == TokenUser` SID, с пропуском reparse-точек и сохранностью `secrets.key`, `secrets.vault.enc`, `token.json` и SQLite-баз); проверка ACL и DPAPI `SecretStore` в `--selftest`; явные `hiddenimports` `pywin32` в `mcp_app.spec`; корректная обработка путей к Python с пробелами в `packaging/build.ps1`.
+- **P0-2 — Сохранность `MCP Owner Token` и гранулярные права AI-клиентов**:
+  - `app/core/token_store.py`, `app/core/service_manager.py`, `app/backend_entry.py`, `backend/{oauth_provider,server}.py`: разделены состояния первого запуска и ошибки чтения/DPAPI/ACL (`TokenLoadStatus`, `TokenStorageError`), исключена тихая перегенерация/перезапись существующего `MCP Owner Token` при недоступном хранилище или в режиме `--headless`, добавлена блокировка `preflight()` с подсказкой `--repair-acl` и защита `OAuthStore` от сброса при прямом импорте `backend/server.py` без `MCP_SECRET_TOKEN` (`bind_owner=TOKEN_FROM_ENV`).
+  - `backend/{oauth_store,oauth_execution,tool_registry}.py`, `backend/desktop/{models,manager}.py`, `app/ui/{oauth_execution_dialogs,main_window,pages/clients_page}.py`: сохранена схема `OAuthStore.SCHEMA_VERSION == 3`, расширен `CLIENT_ID_RE` для RFC 6749 / CIMD URL `client_id`, добавлены пер-клиентские политики инструментов (`exec_client_policies`: `denied_tools`, `allowed_tools_only`) и индивидуальные переопределения Computer Use (`DesktopPolicy.client_overrides`: `inherit`/`disabled`/`view`/`control`), синхронизация профиля и шаблона белого списка по умолчанию между `__default__` и существующими issuers без затирания клиентских правил, выбор актуального `latest_persistent_resource_url` и диалог `ClientPermissionsDialog` в контекстном меню `ClientsPage`.
+- **P1 / P2 — Безопасность путей, Gateway SSRF redirect guard, утечки ресурсов, производительность и UI**:
+  - `backend/security_policy.py`: исправлена проверка реального NUL-байта (`"\x00"` вместо литерала `"\\x00"`), добавлена блокировка NTFS ADS (`:`) и зарезервированных имён устройств Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+  - `backend/gateway/{upstream_client,router}.py`: добавлен перехватчик HTTP `3xx` редиректов с повторной проверкой `validate_upstream_url` (защита от обхода SSRF на loopback/link-local/metadata IP) и блокировкой cross-origin редиректов при наличии секретных заголовков/токенов.
+  - `backend/extensions/runtime.py`: устранена утечка pipe/фоновых потоков при перезапуске упавшего воркера расширения и при ошибке/таймауте RPC `initialize`.
+  - `app/core/tunnels/tailscale.py`: добавлено кэширование `tailscale status --json` (`30s` TTL) и быстрый возврат принадлежащего маршрута без блокировки GUI-потока частыми запусками CLI.
+  - `app/ui/components/silent_dialog.py`, `app/ui/i18n.py`: локализованы кнопки `SilentMessageBox` (`RU`/`EN`), добавлена передача `detailed_text`, синхронизированы `728` ключей локализации.
+  - `tests/integration/test_{desktop_computer_use,extensions,remote_management,ui_redesign_gui,unified_home_gui}.py`: полностью изолированы `APPDATA`, `LOCALAPPDATA` и тестовые `OAuthStore`.
+- **Результаты проверок (Windows 11 Pro 25H2 x64, Python 3.13.15)**:
+  - `compileall`, `ruff check app backend tests tools main.py`: **PASS** (0 замечаний).
+  - `mypy` (`win32`) и `mypy --platform linux`: **PASS** (`Success: no issues found in 74 source files`).
+  - `i18n` RU/EN parity: **PASS** (`728` ключей); `tools/check_licenses.py`: **PASS** (`38/38`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (0 уязвимостей).
+  - `tests/unit`: **PASS** (**206/206** за `13.367s`, включая новые `test_windows_acl.py`, `test_client_and_token_persistence.py`, `test_security_and_resource_hardening.py`).
+  - `tests/integration`: **PASS** (**76/76** за `43.8s`).
+  - `tests/e2e` (Playwright): **PASS** (**2/2** за `11.666s` — Chromium, Firefox, Google Chrome, Microsoft Edge).
+  - `tools/capture_ui_screenshots.py`: **PASS** (`DPI check` `1.0`, `1.25`, `1.5`, `1.75`, `2.0` — OK; 13 скриншотов Dark/Light RU/EN).
+  - `packaging\build.ps1`: **PASS**:
+    - `dist\MCPApp\MCPApp.exe` (`8,417,419` Б, SHA-256 `6c3ca62594722d9c7bcaaa5f5b86dc5ec0a3a7f87e2120a51e46eed9d70c907a`); `_internal`: `167` файлов (`137,437,868` Б).
+    - `dist\MCPApp\MCPApp.exe --selftest`: **PASS** (`Qt 6.12.1`, `WindowsPlatformAdapter`, `cloudflared 2026.11.2`, `Starlette`, `RESULT OK`).
+    - Живой запуск `MCPApp.exe` на одноразовом неадминистративном профиле: GUI `--minimized` (**PASS**, процесс активен, `crash.log` пуст, созданы `token.json` и `secrets.key`), `--headless` (**PASS**, `/health` HTTP `200`, `/mcp` без токена HTTP `401`, `token.json` неизменен), `--repair-acl` (**PASS**, `ok=true`, повреждённый DACL восстановлен с сохранением `token.json` и `secrets.key`).
+    - `dist\MCPApp-1.0.1-portable.zip`: `58,302,631` Б, SHA-256 `a233b5e9fa9cb77f1c573f1e91f18d0e092032c5a4fd950799a21c74da3ee268`; `dist\SBOM.cdx.json`: `12,195` Б (`38` компонентов), SHA-256 `62be61e19f16dc6458d11572594e0b311e134f823ba8137faf012c56e6dde401`.
+- **BLOCKED / NOT_RUN (без имитации прохождения)**:
+  - SonarQube Cloud MCP и `sonar` CLI (`1.13.1`): **BLOCKED** (`sonar auth status` — нет сохранённой сессии; удалённый `sonarqube-cloud` MCP не видит организацию/проект `SolasFor_MCP-app` без завершённой OAuth-привязки владельца; исходники наружу не отправлялись).
+  - Локальная сборка `MCPApp-Setup-1.0.1.exe` и локальный прогон installer upgrade: **NOT_RUN локально** (`ISCC.exe` / Inno Setup 6 отсутствует на локальной машине; собирается и проверяется в GitHub Actions `build.yml` / `rc-windows.yml`).
+  - Доверенный сертификат Authenticode (`.pfx`): **BLOCKED** (не настроен; EXE не подписан, `StagedUpdater.auto_install_enabled = False`).
+  - Внешние live SaaS AI-клиенты, платные/доменные туннели и восстановление реального профиля на ПК `SOLAS`: **BLOCKED / NOT_RUN** (реальный профиль `%APPDATA%\MCPApp` и облачные DNS/туннели не затрагивались по правилам безопасности).
+
 ## Аудит после v1.0.0 — исправление Windows ACL (2026-11-26)
 - Статус: IN_PROGRESS. Подтверждено использование короткого USERNAME в icacls, создающее риск блокировки данных при совпадении имени ПК и пользователя.
 - DACL устанавливается через Windows API по SID токена процесса; добавлены два регрессионных теста. ACL реального профиля и существующие секреты не изменялись.

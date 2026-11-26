@@ -20,9 +20,10 @@ This document summarizes the security architecture, trust boundaries, verified m
    - **CRITICAL NON-GUARANTEE**: **Full access is NOT an OS sandbox.** Arbitrary code executed under `full` runs with the full privileges of the signed-in Windows user (including access to user files and DPAPI-protected data). Do not enable `full` for untrusted clients.
    - Emergency Stop (`runtime_control` in SQLite + `DesktopPolicyStore`) immediately blocks all non-`server_info` OAuth discovery and live/queued execution fail-closed.
 
-3. **Third-Party MCP Gateway Upstreams & Extensions (`v0.9.2`, `v0.9.7`)**:
-   - Gateway enforces loop guards, SecretStore-isolated env/headers, `session_isolation`, and per-client authorization.
+3. **Third-Party MCP Gateway Upstreams & Extensions (`v0.9.2`, `v0.9.7`, `v1.0.1`)**:
+   - Gateway enforces loop guards, SecretStore-isolated env/headers, `session_isolation`, per-client tool authorization (`exec_client_policies` + `GatewayRouter`), and HTTP redirect validation (`validate_upstream_url` re-applied on `3xx` targets plus cross-origin redirect rejection whenever upstream credentials/secret headers are configured).
    - Extensions run out-of-process over JSON-RPC (`--run-extension`), verified by **Ed25519 signature** or owner-pinned **SHA-256** (`allow_unsigned_sha256` explicit confirmation).
+   - Local application data and DPAPI keys under `%APPDATA%\MCPApp` use protected `TokenUser`-SID Windows DACLs (refusing symlinks/junctions via `FILE_ATTRIBUTE_REPARSE_POINT`), atomic temp-file replacement, and owner-verified `--repair-acl` recovery without `Everyone` grants or destructive resets.
    - **CRITICAL NON-GUARANTEE**: Running an extension or upstream MCP server in a separate child process isolates core crashes and strips unrelated environment secrets (`sanitize_child_env`), **not** untrusted OS code execution under the user account. Only install extensions from trusted sources.
 
 4. **Computer Use (`v0.9.6`) & Windows Session 0**:

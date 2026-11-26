@@ -78,6 +78,85 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
+    def test_compact_device_and_extension_guides(self) -> None:
+        from PyQt6.QtWidgets import QSplitter
+        from app.ui.components.management_layout import ManagementGuideDialog, ManagementPanel
+        from app.ui.i18n import LANG_EN, tr
+
+        w = self.window
+        for lang in (LANG_RU, LANG_EN):
+            w.set_language(lang)
+            for topic, page, buttons, notice in (
+                ("devices", w.devices_page, (w.devices_page.add_btn,
+                 w.devices_page.import_btn, w.devices_page.refresh_btn), "devices.security_notice"),
+                ("extensions", w.extensions_page, (w.extensions_page.install_zip_btn,
+                 w.extensions_page.install_official_btn, w.extensions_page.refresh_btn), "extensions.isolation_notice"),
+            ):
+                self.assertTrue(page.lead_label.isHidden())
+                self.assertEqual(page.guide_btn.text(), tr("management.guide.open"))
+                self.assertTrue(page.search_input.isClearButtonEnabled())
+                self.assertEqual(page.search_input.minimumHeight(), 36)
+                for btn in (*buttons, page.guide_btn):
+                    self.assertEqual(btn.minimumHeight(), 28)
+                    self.assertIn(btn.objectName(), ("ManagementAction", "ManagementPrimary"))
+                dialog = ManagementGuideDialog(topic, page)
+                self.assertIn(tr(notice), dialog.browser.toPlainText())
+                self.assertIn(tr(f"{topic}.guide.purpose"), dialog.browser.toPlainText())
+                dialog.close()
+            self.assertIsInstance(w.devices_page.table.parentWidget(), ManagementPanel)
+            self.assertIsInstance(w.devices_page.output_view.parentWidget(), ManagementPanel)
+            self.assertTrue(w.devices_page.findChildren(QSplitter))
+        w.set_language(LANG_RU)
+
+    def test_management_page_inspectors_and_translation(self) -> None:
+        from PyQt6.QtWidgets import QSplitter
+        from app.ui.i18n import LANG_EN, tr
+
+        w = self.window
+        cases = (
+            (w.servers_page, w.servers_page.logs_view, w.servers_page.info_view,
+             "servers.details.logs_title", "servers.details.info_title"),
+            (w.workspaces_page, w.workspaces_page.tree_widget, w.workspaces_page.details_view,
+             "workspaces.details.tree_title", "workspaces.details.git_title"),
+            (w.extensions_page, w.extensions_page.ui_preview, w.extensions_page.logs_view,
+             "extensions.details.ui", "extensions.details.logs"),
+            (w.tasks_page, w.tasks_page.logs_view, w.tasks_page.artifact_view,
+             "tasks.details.output_title", "tasks.details.artifacts_title"),
+            (w.gateway_page, w.gateway_page.tools_table, w.gateway_page.logs_view,
+             "gateway.details.tools_title", "gateway.details.logs_title"),
+        )
+        w.resize(1100, 780)
+        w.show()
+        for lang in (LANG_RU, LANG_EN):
+            w.set_language(lang)
+            for page, first, second, key1, key2 in cases:
+                tabs = page.detail_tabs
+                self.assertEqual(tabs.count(), 2)
+                self.assertIsInstance(tabs.parentWidget(), QSplitter)
+                self.assertEqual(tabs.tabText(0), tr(key1))
+                self.assertEqual(tabs.tabText(1), tr(key2))
+                self.assertTrue(tabs.widget(0).isAncestorOf(first))
+                self.assertTrue(tabs.widget(1).isAncestorOf(second))
+                w._stack.setCurrentWidget(page)
+                for index in (0, 1):
+                    tabs.setCurrentIndex(index)
+                    self.app.processEvents()
+                    self.assertGreater(tabs.currentWidget().width(), 0)
+                    self.assertGreater(tabs.currentWidget().height(), 0)
+                search = page.search_input if page is w.extensions_page else page.search_edit
+                self.assertTrue(search.isClearButtonEnabled())
+            self.assertTrue(w.tasks_page.logs_header.title_label.isHidden())
+            self.assertTrue(w.tasks_page.art_header.title_label.isHidden())
+            self.assertTrue(w.servers_page.logs_header.title_label.isHidden())
+            self.assertEqual(w.extensions_page.collection_tabs.count(), 2)
+            self.assertTrue(w.extensions_page.collection_tabs.widget(0).isAncestorOf(
+                w.extensions_page.installed_table
+            ))
+            self.assertTrue(w.extensions_page.collection_tabs.widget(1).isAncestorOf(
+                w.extensions_page.catalog_table
+            ))
+        w.set_language(LANG_RU)
+
     def test_unnecessary_notifications_removed_on_theme_and_tray(self) -> None:
         self.assertFalse(hasattr(self.window, "hidden_to_tray"))
         with patch.object(self.window.toasts, "show_toast") as toast_mock:
@@ -126,6 +205,69 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         c.token_paste.click()
         self.assertEqual(c.token_edit.text(), "  custom-pasted-owner-token-987654  ")
         self.assertFalse(c.token_save.isHidden())
+
+    def test_reference_connection_and_log_layout(self) -> None:
+        from PyQt6.QtWidgets import QFrame
+
+        page = self.window.connections_page
+        self.assertEqual(page.connection_panel.objectName(), "ConnectionPanel")
+        self.assertEqual(len(page.connection_panel.findChildren(QFrame, "ProviderRow")), 4)
+        self.assertTrue(page.token_header.subtitle_label.isHidden())
+        self.assertFalse(page.token_eye.icon().isNull())
+        self.assertFalse(page.token_copy.icon().isNull())
+        self.assertEqual(page.token_eye.size(), page.token_copy.size())
+        page.set_token_visible(True)
+        self.assertEqual(page.token_eye.toolTip(), "Скрыть")
+        page.set_token_visible(False)
+        self.assertEqual(page.token_eye.toolTip(), "Показать")
+        viewer = self.window.logs_page.viewer
+        for control in (viewer.search_edit, viewer.component_combo, viewer.level_combo):
+            self.assertEqual(control.minimumHeight(), 36)
+        self.assertEqual(viewer.errors_badge.objectName(), "LogCount")
+        self.assertFalse(viewer._search_icon.icon().isNull())
+
+    def test_provider_context_menus_and_guides(self) -> None:
+        from app.config import PROVIDER_CF_NAMED
+        from app.ui.pages.connections_page import ConnectionsPage
+
+        page = ConnectionsPage()
+        selected: list[tuple[str, str]] = []
+        page.provider_configure_requested.connect(lambda pid: selected.append(("configure", pid)))
+        page.provider_diagnose_requested.connect(lambda pid: selected.append(("diagnose", pid)))
+        page.provider_guide_requested.connect(lambda pid: selected.append(("guide", pid)))
+        for pid, (_, _, _, _, button, menu) in page.provider_rows.items():
+            self.assertIs(button.menu(), menu)
+            actions = [action for action in menu.actions() if not action.isSeparator()]
+            self.assertEqual([action.text() for action in actions], ["Настроить…", "Проверить", "Инструкция"])
+            for action in actions:
+                action.trigger()
+            self.assertEqual(selected[-3:], [("configure", pid), ("diagnose", pid), ("guide", pid)])
+        page.close()
+
+        for pid, marker in (
+            (PROVIDER_NGROK, "Authtoken"),
+            (PROVIDER_TAILSCALE, "MagicDNS"),
+            (PROVIDER_CF_QUICK, "Quick Tunnel"),
+            (PROVIDER_CF_NAMED, "config.yml"),
+        ):
+            self.window.connections_page.provider_rows[pid][-1].actions()[-1].trigger()
+            dialog = self.window._domain_guide
+            self.assertIsNotNone(dialog)
+            assert dialog is not None
+            self.assertEqual(dialog._provider_id, pid)
+            self.assertIn(marker, dialog._browser.toPlainText())
+            self.assertEqual(dialog._copy_template.isHidden(), pid != PROVIDER_CF_NAMED)
+            self.assertEqual(dialog._open_folder.isHidden(), pid != PROVIDER_CF_NAMED)
+        self.window.show_provider_guide(PROVIDER_NGROK)
+        self.assertFalse(hasattr(self.window.connections_page, "guide_btn"))
+        self.assertTrue(self.window.connections_page.lead_label.isHidden())
+        self.assertTrue(self.window.connections_page.providers_header.subtitle_label.isHidden())
+        self.window.connections_page.provider_rows[PROVIDER_CF_NAMED][-1].actions()[-1].trigger()
+        assert self.window._domain_guide is not None
+        self.assertEqual(self.window._domain_guide._provider_id, PROVIDER_CF_NAMED)
+        self.window._open_provider_config(PROVIDER_CF_QUICK)
+        self.assertEqual(self.window._domain_guide._provider_id, PROVIDER_CF_QUICK)
+        self.window._domain_guide.close()
 
     def test_security_page_toggle_switches_autosave_and_rollback(self) -> None:
         from app.ui.i18n import LANG_EN, tr
@@ -253,9 +395,9 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
             self.assertTrue(warn_mock.called)
         self.assertTrue(sec.desktop_control_sw.isChecked())
 
-    def test_settings_and_logs_page_persistent_logs_and_plain_export(self) -> None:
+    def test_settings_and_logs_page_persistent_logs_and_toolbar(self) -> None:
         from app.core.diagnostics_bundle import export_diagnostics_zip
-        from app.ui.i18n import LANG_EN, _STRINGS, keys_for
+        from app.ui.i18n import LANG_EN, _STRINGS, keys_for, tr
 
         st = self.window.settings_page
         idx = st.logging_level_combo.findData("DEBUG")
@@ -284,13 +426,13 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         viewer.log_view.append_line("oauth", "Redacted sample Bearer another-secret-abc")
         viewer.log_view.flush_now()
 
-        # Plain log export from UI (no diagnostic ZIP export in Logs tab)
-        log_out = self.root / "exported.log"
-        with patch("app.ui.components.log_viewer.QFileDialog.getSaveFileName", return_value=(str(log_out), "")):
-            viewer.export_log()
-        self.assertTrue(log_out.is_file())
-        exported_txt = log_out.read_text(encoding="utf-8")
-        self.assertNotIn("another-secret-abc", exported_txt)
+        # The Logs toolbar no longer offers export; filtering and copy remain.
+        self.assertFalse(hasattr(viewer, "export_btn"))
+        self.assertTrue(viewer.search_edit.isClearButtonEnabled())
+        self.assertEqual(viewer.source_label.text(), tr("logs.filter.source"))
+        self.assertEqual(viewer.level_label.text(), tr("logs.filter.level"))
+        viewer.search_edit.setText("Redacted sample")
+        self.assertIn("Redacted sample", viewer.log_view.plain_text())
 
         # Internal diagnostics bundle remains functional for programmatic callers
         zip_out = self.root / "internal_diag.zip"

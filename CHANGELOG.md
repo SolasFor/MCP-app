@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2] - 2026-11-27 (Compact management UI and contextual guides)
+- Connections: provider-specific Configure / Diagnose / Instructions context menus; aligned transport rows and compact owner-token controls.
+- Logs: unified search/source/level panel, compact actions, separate counters and no direct export button; persistent logs and protected audit remain.
+- Servers, Workspaces, Tasks, Gateway and Extensions: shared compact management layouts with resizable list/inspector areas and translated detail tabs.
+- Devices and Extensions: compact action buttons and localized instruction dialogs replacing long header descriptions; security guidance remains accessible.
+- Fixes: standard cursor on provider menu, duplicate detail headings after language changes; regression tests for RU/EN, context menus and layout.
+- Documentation: updated installation/version links, navigation guide and release notes. No new credential-storage migration.
+
 ## [1.0.1] - 2026-11-26 (UX Polish, Context Menus, Gateway Onboarding, OAuth Redesign & Task Error Handling)
 - **Cursor Audit & Read-Only Surface Cleanup (`app/ui/**`)**:
   - Removed ubiquitous `PointingHandCursor` from button factories, cards, tables, combos, toggles, sliders, nav items, and dialogs, leaving the pointer strictly on genuine hyperlinks (`#Link` / `#SubtleLink`), standard arrow cursors on UI controls, I-beam cursors on selectable/editable text, and splitters on resize handles. No global override cursor is used.

@@ -90,7 +90,7 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             app.processEvents()
 
             # Sample redacted logs for logs screenshot
-            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v1.0.1 UI initialized")
+            win.logs_page.viewer.log_view.append_line("app", "✔ MCP-app v1.0.2 UI initialized")
             win.logs_page.viewer.log_view.append_line("server", "Uvicorn running on http://127.0.0.1:8000")
             win.logs_page.viewer.log_view.append_line("tunnel", f"Connected token={mgr.token}")
             win.logs_page.viewer.log_view.append_line("tunnel", "WRN edge reconnect in 2s")

@@ -9,12 +9,10 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFileDialog,
-    QHBoxLayout,
     QHeaderView,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -25,6 +23,7 @@ from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import ManagementTabs, management_list, management_split, management_toolbar
 from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentMessageBox
@@ -62,6 +61,7 @@ class TasksPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         base_dir = user_data_dir() / "tasks"
         self._db_path = db_path or (base_dir / "tasks.sqlite3")
         self._spool_dir = spool_dir or (base_dir / "spool")
@@ -72,9 +72,7 @@ class TasksPage(PageScaffold):
         self._row_task_ids: list[str] = []
         self._known_statuses: dict[str, str] = {}
 
-        # Clean top bar: scope filter, status combo, search, refresh, global list menu
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(6)
+        # Search and status are separate from scope and task actions.
 
         self._scope_group = QButtonGroup(self)
         self._scope_group.setExclusive(True)
@@ -82,8 +80,6 @@ class TasksPage(PageScaffold):
         self.scope_active_btn = self._make_scope_btn("active")
         self.scope_history_btn = self._make_scope_btn("history")
         self.scope_all_btn.setChecked(True)
-        for btn in (self.scope_all_btn, self.scope_active_btn, self.scope_history_btn):
-            top_bar.addWidget(btn)
 
         self.status_combo = SafeComboBox()
         self.status_combo.addItem("", "")
@@ -97,19 +93,15 @@ class TasksPage(PageScaffold):
         ):
             self.status_combo.addItem(st, st)
         self.status_combo.currentIndexChanged.connect(lambda *_: self.reload())
-        top_bar.addWidget(self.status_combo)
 
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
         self.search_edit.textChanged.connect(lambda q: self.table.filter_rows(q))
-        top_bar.addWidget(self.search_edit, 1)
 
         self.refresh_btn = self._make_action_btn(self.reload, obj="Ghost")
         self.list_menu_btn = make_toolbar_menu_button(parent=self)
         self.list_menu_btn.clicked.connect(self._open_list_menu)
-        top_bar.addWidget(self.refresh_btn)
-        top_bar.addWidget(self.list_menu_btn)
-        self.content.addLayout(top_bar)
+        self.content.addWidget(management_toolbar(self.search_edit, (self.scope_all_btn, self.scope_active_btn, self.scope_history_btn, self.refresh_btn, self.list_menu_btn), filters=(self.status_combo,)))
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
@@ -120,17 +112,16 @@ class TasksPage(PageScaffold):
         self.table.set_row_menu_provider(self._build_row_menu)
         self.table.itemSelectionChanged.connect(self._on_selected)
         table_lay.addWidget(self.table, 1)
-        self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("tasks")
-        self.content.addWidget(self.empty_state, 1)
+        list_panel = management_list(self.table_card, self.empty_state)
 
         # Bottom splitter: live redacted spool logs + artifact inspector
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.detail_tabs = ManagementTabs()
 
         logs_pane = QWidget()
         logs_lay = QVBoxLayout(logs_pane)
-        logs_lay.setContentsMargins(0, 4, 8, 0)
+        logs_lay.setContentsMargins(10, 10, 10, 10)
         logs_lay.setSpacing(6)
         self.logs_header = SectionHeader()
         self.stream_combo = SafeComboBox()
@@ -140,13 +131,14 @@ class TasksPage(PageScaffold):
         self.logs_header.right_box.addWidget(self.stream_combo)
         logs_lay.addWidget(self.logs_header)
         self.logs_view = QPlainTextEdit()
+        self.logs_view.setObjectName("ConsoleLog")
         self.logs_view.setReadOnly(True)
         logs_lay.addWidget(self.logs_view, 1)
-        splitter.addWidget(logs_pane)
+        self.detail_tabs.add_section(logs_pane, "tasks.details.output_title", self.logs_header, controls=True)
 
         art_pane = QWidget()
         art_lay = QVBoxLayout(art_pane)
-        art_lay.setContentsMargins(8, 4, 0, 0)
+        art_lay.setContentsMargins(10, 10, 10, 10)
         art_lay.setSpacing(6)
         self.art_header = SectionHeader()
         self.artifact_combo = SafeComboBox()
@@ -154,12 +146,11 @@ class TasksPage(PageScaffold):
         self.art_header.right_box.addWidget(self.artifact_combo)
         art_lay.addWidget(self.art_header)
         self.artifact_view = QPlainTextEdit()
+        self.artifact_view.setObjectName("ConsoleLog")
         self.artifact_view.setReadOnly(True)
         art_lay.addWidget(self.artifact_view, 1)
-        splitter.addWidget(art_pane)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        self.content.addWidget(splitter, 1)
+        self.detail_tabs.add_section(art_pane, "tasks.details.artifacts_title", self.art_header, controls=True)
+        self.content.addWidget(management_split(list_panel, self.detail_tabs), 1)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1500)
@@ -685,6 +676,7 @@ class TasksPage(PageScaffold):
         self.empty_state.set_content(tr("tasks.empty.title"), tr("tasks.empty.desc"))
         self.logs_header.set_texts(tr("tasks.details.output_title"))
         self.art_header.set_texts(tr("tasks.details.artifacts_title"))
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

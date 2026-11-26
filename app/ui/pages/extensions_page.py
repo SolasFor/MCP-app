@@ -14,11 +14,9 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -28,7 +26,10 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import theme
-from app.ui.components.cards import Divider, EmptyState, SectionHeader
+from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import (
+    ManagementPanel, ManagementTabs, management_guide_button, management_split, management_toolbar,
+)
 from app.ui.components.context_menu import MenuActionSpec
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
@@ -142,6 +143,7 @@ class ExtensionsPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         self._base_dir = extensions_dir or (user_data_dir() / "extensions")
         self._redactor = redactor or SecretRedactor()
         self._store = ExtensionStore(
@@ -154,21 +156,15 @@ class ExtensionsPage(PageScaffold):
         self._catalog_cache: list[dict[str, Any]] = []
         self._selected_id: str | None = None
 
-        self.set_header(tr("extensions.title"), tr("extensions.lead"))
+        self.set_header(tr("extensions.title"), "")
 
-        self._notice_lbl = QLabel(tr("extensions.isolation_notice"))
-        self._notice_lbl.setWordWrap(True)
-        self._notice_lbl.setObjectName("Hint")
-        self.content.addWidget(self._notice_lbl)
-        self.content.addWidget(Divider())
+        self.guide_btn = management_guide_button("extensions", self)
+        self.header_actions.addWidget(self.guide_btn)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
         self.search_input = QLineEdit()
         self.search_input.setObjectName("UiInput")
         self.search_input.setPlaceholderText(tr("extensions.search"))
         self.search_input.textChanged.connect(self.refresh_all)
-        toolbar.addWidget(self.search_input, 1)
 
         self.install_zip_btn = QPushButton(tr("extensions.btn.install_zip"))
         self.install_zip_btn.setObjectName("Accent")
@@ -176,20 +172,19 @@ class ExtensionsPage(PageScaffold):
         self.install_official_btn = QPushButton(tr("extensions.btn.install_official"))
         self.install_official_btn.setObjectName("Ghost")
         self.install_official_btn.clicked.connect(self.install_selected_catalog)
+        self.install_official_btn.setEnabled(False)
         self.refresh_btn = QPushButton(tr("extensions.btn.refresh"))
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_all)
-        toolbar.addWidget(self.install_zip_btn)
-        toolbar.addWidget(self.install_official_btn)
-        toolbar.addWidget(self.refresh_btn)
-        self.content.addLayout(toolbar)
+        self.content.addWidget(management_toolbar(
+            self.search_input, (self.install_zip_btn, self.install_official_btn, self.refresh_btn), compact=True
+        ))
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.collection_tabs = ManagementTabs()
+        self.detail_tabs = ManagementTabs()
 
-        top_widget = QWidget()
-        top_lay = QVBoxLayout(top_widget)
-        top_lay.setContentsMargins(0, 0, 0, 6)
-        top_lay.setSpacing(6)
+        top_widget = ManagementPanel()
+        top_lay = top_widget.body
 
         self._installed_hdr = SectionHeader(tr("extensions.installed.title"))
         top_lay.addWidget(self._installed_hdr)
@@ -212,7 +207,9 @@ class ExtensionsPage(PageScaffold):
         top_lay.addWidget(self.empty_state)
 
         self._catalog_hdr = SectionHeader(tr("extensions.catalog.title"))
-        top_lay.addWidget(self._catalog_hdr)
+        self.collection_tabs.add_section(top_widget, "extensions.installed.title", self._installed_hdr)
+        catalog_panel = ManagementPanel()
+        catalog_panel.body.addWidget(self._catalog_hdr)
         self.catalog_table = DataTable([
             tr("extensions.col.id"),
             tr("extensions.col.name"),
@@ -223,17 +220,12 @@ class ExtensionsPage(PageScaffold):
         ])
         self.catalog_table.setMinimumHeight(88)
         self.catalog_table.set_row_menu_provider(self._build_catalog_row_menu)
-        top_lay.addWidget(self.catalog_table, 1)
-        splitter.addWidget(top_widget)
+        self.catalog_table.itemSelectionChanged.connect(self._sync_catalog_action)
+        catalog_panel.body.addWidget(self.catalog_table, 1)
+        self.collection_tabs.add_section(catalog_panel, "extensions.catalog.title", self._catalog_hdr)
 
-        bottom_pane = QWidget()
-        bottom_row = QHBoxLayout(bottom_pane)
-        bottom_row.setContentsMargins(0, 6, 0, 0)
-        bottom_row.setSpacing(12)
-
-        ui_col = QVBoxLayout()
-        ui_col.setContentsMargins(0, 0, 0, 0)
-        ui_col.setSpacing(4)
+        ui_panel = ManagementPanel()
+        ui_col = ui_panel.body
         self._ui_hdr = SectionHeader(tr("extensions.details.ui"))
         ui_col.addWidget(self._ui_hdr)
         self.ui_preview = QPlainTextEdit()
@@ -242,9 +234,8 @@ class ExtensionsPage(PageScaffold):
         self.ui_preview.setMinimumHeight(64)
         ui_col.addWidget(self.ui_preview, 1)
 
-        logs_col = QVBoxLayout()
-        logs_col.setContentsMargins(0, 0, 0, 0)
-        logs_col.setSpacing(4)
+        logs_panel = ManagementPanel()
+        logs_col = logs_panel.body
         self._logs_hdr = SectionHeader(tr("extensions.details.logs"))
         logs_col.addWidget(self._logs_hdr)
         self.logs_view = QPlainTextEdit()
@@ -253,14 +244,10 @@ class ExtensionsPage(PageScaffold):
         self.logs_view.setMinimumHeight(64)
         logs_col.addWidget(self.logs_view, 1)
 
-        bottom_row.addLayout(ui_col, 1)
-        bottom_row.addLayout(logs_col, 1)
-        splitter.addWidget(bottom_pane)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([360, 120])
-
-        self.content.addWidget(splitter, 1)
+        self.collection_tabs.currentChanged.connect(self._sync_catalog_action)
+        self.detail_tabs.add_section(ui_panel, "extensions.details.ui", self._ui_hdr)
+        self.detail_tabs.add_section(logs_panel, "extensions.details.logs", self._logs_hdr)
+        self.content.addWidget(management_split(self.collection_tabs, self.detail_tabs), 1)
         self.refresh_all()
 
     def apply_theme(self) -> None:
@@ -309,6 +296,7 @@ class ExtensionsPage(PageScaffold):
                 self.catalog_table.setItem(row, col, QTableWidgetItem(text))
             self.catalog_table.set_row_actions_cell(row, 5, tooltip=tr("common.actions"))
         self.catalog_table.resizeColumnsToContents()
+        self._sync_catalog_action()
         self._refresh_details()
 
     def _installed_at(self, row: int) -> dict[str, Any] | None:
@@ -449,6 +437,11 @@ class ExtensionsPage(PageScaffold):
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
+    def _sync_catalog_action(self) -> None:
+        self.install_official_btn.setEnabled(
+            self.collection_tabs.currentIndex() == 1 and self.catalog_table.currentRow() >= 0
+        )
+
     def install_selected_catalog(self) -> None:
         cat = self._catalog_at(self.catalog_table.currentRow())
         if cat:
@@ -537,8 +530,8 @@ class ExtensionsPage(PageScaffold):
         self.manager.shutdown_all()
 
     def retranslate(self) -> None:
-        self.set_header(tr("extensions.title"), tr("extensions.lead"))
-        self._notice_lbl.setText(tr("extensions.isolation_notice"))
+        self.set_header(tr("extensions.title"), "")
+        self.guide_btn.setText(tr("management.guide.open"))
         self.search_input.setPlaceholderText(tr("extensions.search"))
         self.install_zip_btn.setText(tr("extensions.btn.install_zip"))
         self.install_official_btn.setText(tr("extensions.btn.install_official"))
@@ -565,4 +558,6 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.desc"),
             "",
         ])
+        self.collection_tabs.retranslate()
+        self.detail_tabs.retranslate()
         self.refresh_all()

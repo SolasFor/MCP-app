@@ -5,18 +5,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
-    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -25,8 +23,11 @@ from PyQt6.QtWidgets import (
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
-from app.ui.components.cards import Divider, EmptyState, SectionHeader
+from app.ui.components.cards import EmptyState, SectionHeader
 from app.ui.components.context_menu import MenuActionSpec
+from app.ui.components.management_layout import (
+    ManagementPanel, management_guide_button, management_split, management_toolbar,
+)
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
@@ -218,27 +219,22 @@ class DevicesPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         self._redactor = redactor or SecretRedactor()
         sec_store = SecretStore(secrets_dir) if secrets_dir is not None else None
         self.store = DeviceStore(config_path or (user_data_dir() / "remote" / "devices.json"), secret_store=sec_store)
         self.manager = RemoteManager(self.store, redactor=self._redactor)
         self._devices: list[dict[str, Any]] = []
 
-        self.set_header(tr("devices.title"), tr("devices.lead"))
+        self.set_header(tr("devices.title"), "")
 
-        self._notice_lbl = QLabel(tr("devices.security_notice"))
-        self._notice_lbl.setWordWrap(True)
-        self._notice_lbl.setObjectName("Hint")
-        self.content.addWidget(self._notice_lbl)
-        self.content.addWidget(Divider())
+        self.guide_btn = management_guide_button("devices", self)
+        self.header_actions.addWidget(self.guide_btn)
 
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
         self.search_input = QLineEdit()
         self.search_input.setObjectName("UiInput")
         self.search_input.setPlaceholderText(tr("devices.search"))
         self.search_input.textChanged.connect(self.refresh_all)
-        toolbar.addWidget(self.search_input, 1)
 
         self.add_btn = QPushButton(tr("devices.btn.add"))
         self.add_btn.setObjectName("Accent")
@@ -249,16 +245,12 @@ class DevicesPage(PageScaffold):
         self.refresh_btn = QPushButton(tr("devices.btn.refresh"))
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_all)
-        toolbar.addWidget(self.add_btn)
-        toolbar.addWidget(self.import_btn)
-        toolbar.addWidget(self.refresh_btn)
-        self.content.addLayout(toolbar)
+        self.content.addWidget(management_toolbar(
+            self.search_input, (self.add_btn, self.import_btn, self.refresh_btn), compact=True
+        ))
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        top_pane = QWidget()
-        top_lay = QVBoxLayout(top_pane)
-        top_lay.setContentsMargins(0, 0, 0, 6)
-        top_lay.setSpacing(6)
+        top_pane = ManagementPanel()
+        top_lay = top_pane.body
         self._table_hdr = SectionHeader(tr("devices.table.title"))
         top_lay.addWidget(self._table_hdr)
         self.table = DataTable([
@@ -276,24 +268,15 @@ class DevicesPage(PageScaffold):
         top_lay.addWidget(self.table, 1)
         self.empty_state = EmptyState("devices", tr("devices.empty.title"), tr("devices.empty.desc"))
         top_lay.addWidget(self.empty_state)
-        splitter.addWidget(top_pane)
-
-        bottom_pane = QWidget()
-        bottom_lay = QVBoxLayout(bottom_pane)
-        bottom_lay.setContentsMargins(0, 6, 0, 0)
-        bottom_lay.setSpacing(6)
+        bottom_pane = ManagementPanel()
+        bottom_lay = bottom_pane.body
         self._output_hdr = SectionHeader(tr("devices.details.output"))
         bottom_lay.addWidget(self._output_hdr)
         self.output_view = QPlainTextEdit()
         self.output_view.setObjectName("ConsoleLog")
         self.output_view.setReadOnly(True)
         bottom_lay.addWidget(self.output_view, 1)
-        splitter.addWidget(bottom_pane)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([280, 160])
-
-        self.content.addWidget(splitter, 1)
+        self.content.addWidget(management_split(top_pane, bottom_pane), 1)
         self.refresh_all()
 
     def apply_theme(self) -> None:
@@ -463,8 +446,8 @@ class DevicesPage(PageScaffold):
         self.manager.close()
 
     def retranslate(self) -> None:
-        self.set_header(tr("devices.title"), tr("devices.lead"))
-        self._notice_lbl.setText(tr("devices.security_notice"))
+        self.set_header(tr("devices.title"), "")
+        self.guide_btn.setText(tr("management.guide.open"))
         self.search_input.setPlaceholderText(tr("devices.search"))
         self.add_btn.setText(tr("devices.btn.add"))
         self.import_btn.setText(tr("devices.btn.import"))

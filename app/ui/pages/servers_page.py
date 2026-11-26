@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -29,6 +28,7 @@ from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import ManagementTabs, management_list, management_split, management_toolbar
 from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.safe_spin import SafeDoubleSpinBox, SafeSpinBox
@@ -449,6 +449,7 @@ class ServersPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         self._config_path = config_path or (user_data_dir() / "servers" / "managed_servers.json")
         secret_store = SecretStore(secrets_dir) if secrets_dir is not None else None
         self._redactor = redactor or SecretRedactor()
@@ -463,20 +464,15 @@ class ServersPage(PageScaffold):
         self._profiles: dict[str, ServerProfile] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
 
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(6)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
         self.search_edit.textChanged.connect(lambda q: self.table.filter_rows(q))
-        top_bar.addWidget(self.search_edit, 1)
 
         self.add_btn = self._make_btn(self.add_server, obj="Accent")
         self.refresh_btn = self._make_btn(self.reload)
         self.list_menu_btn = make_toolbar_menu_button(tr("common.actions"), parent=self)
         self.list_menu_btn.clicked.connect(self._open_list_menu)
-        for btn in (self.add_btn, self.refresh_btn, self.list_menu_btn):
-            top_bar.addWidget(btn)
-        self.content.addLayout(top_bar)
+        self.content.addWidget(management_toolbar(self.search_edit, (self.add_btn, self.refresh_btn, self.list_menu_btn)))
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
@@ -487,16 +483,15 @@ class ServersPage(PageScaffold):
         self.table.itemSelectionChanged.connect(self._on_selected)
         self.table.set_row_menu_provider(self._build_row_menu)
         table_lay.addWidget(self.table, 1)
-        self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("servers")
-        self.content.addWidget(self.empty_state, 1)
+        list_panel = management_list(self.table_card, self.empty_state)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.detail_tabs = ManagementTabs()
 
         logs_pane = QWidget()
         logs_lay = QVBoxLayout(logs_pane)
-        logs_lay.setContentsMargins(0, 4, 8, 0)
+        logs_lay.setContentsMargins(10, 10, 10, 10)
         logs_lay.setSpacing(6)
         self.logs_header = SectionHeader()
         self.stream_combo = SafeComboBox()
@@ -506,24 +501,24 @@ class ServersPage(PageScaffold):
         self.logs_header.right_box.addWidget(self.stream_combo)
         logs_lay.addWidget(self.logs_header)
         self.logs_view = QPlainTextEdit()
+        self.logs_view.setObjectName("ConsoleLog")
         self.logs_view.setReadOnly(True)
         logs_lay.addWidget(self.logs_view, 1)
-        splitter.addWidget(logs_pane)
+        self.detail_tabs.add_section(logs_pane, "servers.details.logs_title", self.logs_header, controls=True)
 
         info_pane = QWidget()
         info_lay = QVBoxLayout(info_pane)
-        info_lay.setContentsMargins(8, 4, 0, 0)
+        info_lay.setContentsMargins(10, 10, 10, 10)
         info_lay.setSpacing(6)
         self.info_header = SectionHeader()
         info_lay.addWidget(self.info_header)
         self.info_view = QPlainTextEdit()
+        self.info_view.setObjectName("ConsoleLog")
         self.info_view.setReadOnly(True)
         info_lay.addWidget(self.info_view, 1)
-        splitter.addWidget(info_pane)
+        self.detail_tabs.add_section(info_pane, "servers.details.info_title", self.info_header)
 
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        self.content.addWidget(splitter, 1)
+        self.content.addWidget(management_split(list_panel, self.detail_tabs), 1)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(1500)
@@ -896,6 +891,7 @@ class ServersPage(PageScaffold):
         self.empty_state.set_content(tr("servers.empty.title"), tr("servers.empty.desc"))
         self.logs_header.set_texts(tr("servers.details.logs_title"))
         self.info_header.set_texts(tr("servers.details.info_title"))
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

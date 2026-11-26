@@ -511,3 +511,29 @@
 - Риски / ограничения / блокеры:
 - PR / релиз:
 - Следующий точный шаг:
+
+## Справка и контекстные меню транспортов (2026-11-27)
+- Ветка: `feat/provider-guide-menus`. Отдельные инструкции для четырёх транспортов; меню Настроить / Проверить / Инструкция; ссылка «Как это работает» закреплена за Named Tunnel.
+- Локальные проверки: Ruff PASS, штатный mypy PASS (74 файла), GUI Wave 2 PASS (6 тестов), transport GUI PASS (2), acceptance GUI PASS (7). Добавлен тест маршрутизации меню и переключения справки.
+- Визуальная приёмка на экране, реальные ngrok/Funnel, сборка EXE и CI: NOT_RUN. Действующие настройки, токены и запущенный сервер не менялись.
+
+## Компактные панели подключения и журналов (2026-11-27)
+- Удалены дублирующая справка Named Tunnel и два подзаголовка подключения; выровнены кнопки выбора, статусы и меню провайдеров.
+- Журналы: единая панель с подписанными фильтрами, очисткой поля поиска, действиями и счётчиками; экспорт из вкладки удалён. Внутренняя диагностика и защищённый аудит сохранены.
+- Ruff, штатный mypy (74 файла), GUI Wave 2 (6), transport GUI (2), acceptance GUI (7): PASS. Визуальная приёмка: NOT_RUN.
+
+### Reference layout polish — Connections and Logs
+- Matched the supplied visual references with compact provider rows, token icon actions, aligned log filters and a compact action/count area.
+- Preserved token generation/paste in the token context menu and existing log filtering/actions.
+- Validation: Ruff, mypy (74 files), 16 targeted GUI tests (offscreen); visual acceptance pending.
+
+### Unified management UI redesign
+- Integrated the provider guide, compact connection/log layout, and management redesign branches.
+- Servers, Workspaces, Extensions, Tasks, and Gateway share compact action panels, resizable list/inspector areas and translated full-width detail tabs.
+- Fixed duplicate inspector headings after language change and provider menu cursor regression.
+- Validation: 45 targeted integration tests, Ruff and mypy; offscreen geometry and RU/EN checks. Manual visual acceptance pending.
+
+### Compact Devices and Extensions UI
+- Devices now uses the shared management toolbar and resizable registry/diagnostics panels.
+- Devices and Extensions use compact 28px action buttons and separate localized instruction dialogs instead of page lead text; original security notices are preserved in the guides.
+- Validation: Ruff, mypy (74 files), 31 targeted integration tests including RU/EN guide content, remote management and extension workflows. Manual visual acceptance pending.

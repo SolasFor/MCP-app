@@ -369,6 +369,31 @@ QLabel#Pill[variant="err"] {
 }
 
 /* ---------- surfaces, cards, copy field & banners ---------- */
+QFrame#ProviderRow, QFrame#LogToolbar {
+    background: $SURFACE;
+    border: 1px solid $HAIRLINE;
+    border-radius: 8px;
+}
+QPushButton#ProviderSelect {
+    background: $CONTROL;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    min-height: 22px;
+    padding: 3px 6px;
+}
+QPushButton#ProviderSelect:hover { background: $CONTROL_HOVER; }
+QPushButton#ProviderSelect:disabled { color: $TEXT_FAINT; background: transparent; border-color: $HAIRLINE; }
+QPushButton#ProviderMenu {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    min-height: 0px;
+    min-width: 0px;
+    padding: 0px;
+    font-size: 17px;
+}
+QPushButton#ProviderMenu:hover { background: $CONTROL; border-color: $BORDER; }
+QPushButton#ProviderMenu::menu-indicator { image: none; width: 0px; }
 QFrame#Card {
     background: $SURFACE;
     border: 1px solid $HAIRLINE;

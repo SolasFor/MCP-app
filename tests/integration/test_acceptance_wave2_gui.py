@@ -160,7 +160,10 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
             self.assertEqual(dialog._copy_template.isHidden(), pid != PROVIDER_CF_NAMED)
             self.assertEqual(dialog._open_folder.isHidden(), pid != PROVIDER_CF_NAMED)
         self.window.show_provider_guide(PROVIDER_NGROK)
-        self.window.connections_page.guide_btn.click()
+        self.assertFalse(hasattr(self.window.connections_page, "guide_btn"))
+        self.assertTrue(self.window.connections_page.lead_label.isHidden())
+        self.assertTrue(self.window.connections_page.providers_header.subtitle_label.isHidden())
+        self.window.connections_page.provider_rows[PROVIDER_CF_NAMED][-1].actions()[-1].trigger()
         assert self.window._domain_guide is not None
         self.assertEqual(self.window._domain_guide._provider_id, PROVIDER_CF_NAMED)
         self.window._open_provider_config(PROVIDER_CF_QUICK)
@@ -293,9 +296,9 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
             self.assertTrue(warn_mock.called)
         self.assertTrue(sec.desktop_control_sw.isChecked())
 
-    def test_settings_and_logs_page_persistent_logs_and_plain_export(self) -> None:
+    def test_settings_and_logs_page_persistent_logs_and_toolbar(self) -> None:
         from app.core.diagnostics_bundle import export_diagnostics_zip
-        from app.ui.i18n import LANG_EN, _STRINGS, keys_for
+        from app.ui.i18n import LANG_EN, _STRINGS, keys_for, tr
 
         st = self.window.settings_page
         idx = st.logging_level_combo.findData("DEBUG")
@@ -324,13 +327,13 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         viewer.log_view.append_line("oauth", "Redacted sample Bearer another-secret-abc")
         viewer.log_view.flush_now()
 
-        # Plain log export from UI (no diagnostic ZIP export in Logs tab)
-        log_out = self.root / "exported.log"
-        with patch("app.ui.components.log_viewer.QFileDialog.getSaveFileName", return_value=(str(log_out), "")):
-            viewer.export_log()
-        self.assertTrue(log_out.is_file())
-        exported_txt = log_out.read_text(encoding="utf-8")
-        self.assertNotIn("another-secret-abc", exported_txt)
+        # The Logs toolbar no longer offers export; filtering and copy remain.
+        self.assertFalse(hasattr(viewer, "export_btn"))
+        self.assertTrue(viewer.search_edit.isClearButtonEnabled())
+        self.assertEqual(viewer.source_label.text(), tr("logs.filter.source"))
+        self.assertEqual(viewer.level_label.text(), tr("logs.filter.level"))
+        viewer.search_edit.setText("Redacted sample")
+        self.assertIn("Redacted sample", viewer.log_view.plain_text())
 
         # Internal diagnostics bundle remains functional for programmatic callers
         zip_out = self.root / "internal_diag.zip"

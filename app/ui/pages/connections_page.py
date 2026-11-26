@@ -4,6 +4,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QGuiApplication
 from PyQt6.QtWidgets import (
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -46,7 +47,6 @@ _PROVIDER_SPEC = (
 class ConnectionsPage(PageScaffold):
     """Transport provider selector/diagnostics, owner Bearer token editor, and proxy settings."""
 
-    domain_guide_requested = pyqtSignal()
     provider_selected = pyqtSignal(str)
     provider_configure_requested = pyqtSignal(str)
     provider_diagnose_requested = pyqtSignal(str)
@@ -68,7 +68,7 @@ class ConnectionsPage(PageScaffold):
         self.migration_banner.hide()
         self.content.addWidget(self.migration_banner)
 
-        # --- Section 1: Transport providers (flat hairline list)
+        # --- Section 1: Compact, aligned transport rows
         self.providers_section = Section(spacing=6)
         self.providers_header = self.providers_section.header
 
@@ -78,15 +78,14 @@ class ConnectionsPage(PageScaffold):
             tuple[str, QLabel, Badge, QPushButton, QPushButton, QMenu],
         ] = {}
         list_col = QVBoxLayout()
-        list_col.setContentsMargins(0, 4, 0, 0)
-        list_col.setSpacing(0)
-        for idx, (pid, key) in enumerate(_PROVIDER_SPEC):
-            if idx > 0:
-                list_col.addWidget(Divider())
-            row_w = QWidget()
-            row_w.setMinimumHeight(38)
+        list_col.setContentsMargins(0, 2, 0, 0)
+        list_col.setSpacing(5)
+        for pid, key in _PROVIDER_SPEC:
+            row_w = QFrame()
+            row_w.setObjectName('ProviderRow')
+            row_w.setMinimumHeight(42)
             row = QHBoxLayout(row_w)
-            row.setContentsMargins(0, 4, 0, 4)
+            row.setContentsMargins(10, 5, 8, 5)
             row.setSpacing(8)
 
             name = QLabel()
@@ -94,11 +93,18 @@ class ConnectionsPage(PageScaffold):
             name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             active_badge = Badge("", variant="ok")
             active_badge.hide()
+            badge_slot = QWidget()
+            badge_slot.setFixedWidth(88)
+            badge_layout = QHBoxLayout(badge_slot)
+            badge_layout.setContentsMargins(0, 0, 0, 0)
+            badge_layout.addStretch(1)
+            badge_layout.addWidget(active_badge)
 
-            select_btn = _button("")
+            select_btn = _button("", "ProviderSelect")
+            select_btn.setFixedWidth(90)
             select_btn.clicked.connect(lambda _c=False, p=pid: self.provider_selected.emit(p))
-            menu_btn = _button("⋯", "Ghost")
-            menu_btn.setFixedWidth(44)
+            menu_btn = _button("⋯", "ProviderMenu")
+            menu_btn.setFixedSize(32, 30)
             menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             menu = QMenu(menu_btn)
             configure = QAction(menu)
@@ -118,18 +124,13 @@ class ConnectionsPage(PageScaffold):
             )
 
             row.addWidget(name, 1)
-            row.addWidget(active_badge, 0)
+            row.addWidget(badge_slot, 0)
             row.addWidget(select_btn, 0)
             row.addWidget(menu_btn, 0)
             list_col.addWidget(row_w)
             self.provider_rows[pid] = (key, name, active_badge, select_btn, menu_btn, menu)
         self.providers_section.body.addLayout(list_col)
 
-        transport_actions = FlowLayout(spacing=10)
-        self.guide_btn = _button("", "SubtleLink")
-        self.guide_btn.clicked.connect(self.domain_guide_requested.emit)
-        transport_actions.addWidget(self.guide_btn)
-        self.providers_section.body.addLayout(transport_actions)
         self.content.addWidget(self.providers_section)
 
         self.content.addWidget(Divider())
@@ -249,7 +250,7 @@ class ConnectionsPage(PageScaffold):
         self.migration_banner.message_label.setText(tr(banner_key))
 
     def retranslate(self) -> None:
-        self.set_header(tr("conn.title"), tr("conn.lead"))
+        self.set_header(tr("conn.title"), "")
         banner_key = (
             "conn.local_removed.banner"
             if self._migration_source == "local_only"
@@ -257,7 +258,7 @@ class ConnectionsPage(PageScaffold):
         )
         self.migration_banner.message_label.setText(tr(banner_key))
         self.purge_openai_secret_btn.setText(tr("conn.openai_removed.purge_btn"))
-        self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
+        self.providers_header.set_texts(tr("conn.providers.title"))
         for _pid, (key, name, active_badge, select_btn, menu_btn, menu) in self.provider_rows.items():
             text = tr(f"conn.provider.{key}")
             name.setText(text)
@@ -270,7 +271,6 @@ class ConnectionsPage(PageScaffold):
             configure.setText(tr("conn.btn.configure"))
             diagnose.setText(tr("conn.btn.diagnose"))
             guide.setText(tr("conn.btn.guide"))
-        self.guide_btn.setText(f"Cloudflare Named Tunnel — {tr('home.guide.open')}")
         self.token_header.set_texts(tr("conn.token.title"), tr("conn.token.hint"))
         self.token_edit.setPlaceholderText(tr("conn.token.placeholder"))
         visible = self.token_edit.echoMode() == QLineEdit.EchoMode.Normal

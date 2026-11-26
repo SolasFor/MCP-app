@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime
-from pathlib import Path
 
 from PyQt6.QtCore import QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
-    QFileDialog,
+    QFrame,
+    QLabel,
     QHBoxLayout,
     QLineEdit,
     QPushButton,
@@ -19,10 +18,8 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.logging_manager import LOG_COMPONENTS, LOG_LEVELS, get_logging_manager
-from app.paths import user_data_dir
-from app.ui.components.cards import Badge, FlowLayout
+from app.ui.components.cards import Badge, Divider, FlowLayout
 from app.ui.components.safe_combo import SafeComboBox
-from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.i18n import tr
 from app.ui.widgets import LogView
 
@@ -31,7 +28,6 @@ class LogViewerWidget(QWidget):
     """Compact structured log viewer maximizing vertical space for log output."""
 
     copy_requested = pyqtSignal(str, object)
-    exported = pyqtSignal(str)
     _page_loaded = pyqtSignal(int, list, int, bool)  # token, records, next_offset, has_more
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -44,32 +40,61 @@ class LogViewerWidget(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
 
-        # Compact search + filter controls
+        # One compact toolbar with distinct filter and action groups.
+        toolbar = QFrame()
+        toolbar.setObjectName("LogToolbar")
+        toolbar_layout = QVBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(10, 9, 10, 9)
+        toolbar_layout.setSpacing(8)
+        root.addWidget(toolbar)
         top = QHBoxLayout()
         top.setSpacing(6)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
-        self.search_edit.setMinimumWidth(140)
+        self.search_edit.setMinimumWidth(100)
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.search_edit.textChanged.connect(lambda txt: self.log_view.set_filters(query=txt))
-        top.addWidget(self.search_edit, 1)
+        search_group = QVBoxLayout()
+        search_group.setSpacing(3)
+        self.search_label = QLabel()
+        self.search_label.setObjectName("Hint")
+        self.search_label.setBuddy(self.search_edit)
+        search_group.addWidget(self.search_label)
+        search_group.addWidget(self.search_edit)
+        top.addLayout(search_group, 1)
 
         self.component_combo = SafeComboBox()
-        self.component_combo.setMinimumWidth(140)
+        self.component_combo.setMinimumWidth(125)
         self.component_combo.addItem("", "all")
         for comp in LOG_COMPONENTS:
             self.component_combo.addItem(f"{comp}.log", comp)
         self.component_combo.currentIndexChanged.connect(self._on_component_changed)
-        top.addWidget(self.component_combo)
+        source_group = QVBoxLayout()
+        source_group.setSpacing(3)
+        self.source_label = QLabel()
+        self.source_label.setObjectName("Hint")
+        self.source_label.setBuddy(self.component_combo)
+        source_group.addWidget(self.source_label)
+        source_group.addWidget(self.component_combo)
+        top.addLayout(source_group)
 
         self.level_combo = SafeComboBox()
-        self.level_combo.setMinimumWidth(115)
+        self.level_combo.setMinimumWidth(100)
         self.level_combo.addItem("", "ALL")
         for lvl in LOG_LEVELS:
             self.level_combo.addItem(lvl, lvl)
         self.level_combo.currentIndexChanged.connect(self._on_level_changed)
-        top.addWidget(self.level_combo)
-        root.addLayout(top)
+        level_group = QVBoxLayout()
+        level_group.setSpacing(3)
+        self.level_label = QLabel()
+        self.level_label.setObjectName("Hint")
+        self.level_label.setBuddy(self.level_combo)
+        level_group.addWidget(self.level_label)
+        level_group.addWidget(self.level_combo)
+        top.addLayout(level_group)
+        toolbar_layout.addLayout(top)
+        toolbar_layout.addWidget(Divider())
 
         # Compact actions + counts row (wraps cleanly at 800px)
         actions_bar = QHBoxLayout()
@@ -79,7 +104,6 @@ class LogViewerWidget(QWidget):
         self.auto_scroll_check = QCheckBox()
         self.auto_scroll_check.setChecked(True)
         self.auto_scroll_check.toggled.connect(self.log_view_auto_scroll)
-        actions.addWidget(self.auto_scroll_check)
 
         self.open_folder_btn = QPushButton()
         self.open_folder_btn.setObjectName("Ghost")
@@ -90,12 +114,9 @@ class LogViewerWidget(QWidget):
         self.copy_btn.clicked.connect(
             lambda: self.copy_requested.emit(self.log_view.plain_text(), self.copy_btn)
         )
-        self.export_btn = QPushButton()
-        self.export_btn.setObjectName("Ghost")
-        self.export_btn.clicked.connect(self.export_log)
 
         self.clear_btn = QPushButton()
-        self.clear_btn.setObjectName("Ghost")
+        self.clear_btn.setObjectName("Danger")
         self.clear_btn.clicked.connect(self.clear_logs)
 
         self.load_more_btn = QPushButton()
@@ -106,11 +127,11 @@ class LogViewerWidget(QWidget):
         for btn in (
             self.open_folder_btn,
             self.copy_btn,
-            self.export_btn,
             self.clear_btn,
             self.load_more_btn,
         ):
             actions.addWidget(btn)
+        actions.addWidget(self.auto_scroll_check)
         actions_bar.addLayout(actions, 1)
 
         badges = QHBoxLayout()
@@ -120,7 +141,7 @@ class LogViewerWidget(QWidget):
         badges.addWidget(self.errors_badge)
         badges.addWidget(self.count_badge)
         actions_bar.addLayout(badges, 0)
-        root.addLayout(actions_bar)
+        toolbar_layout.addLayout(actions_bar)
 
         self.log_view = LogView()
         self.log_view.counts_changed.connect(self._update_count)
@@ -205,32 +226,14 @@ class LogViewerWidget(QWidget):
         get_logging_manager().clear_normal_logs(comp)
         self.log_view.clear_log()
 
-    def export_log(self) -> None:
-        comp = str(self.component_combo.currentData() or "all")
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"mcp-app-{comp if comp != 'all' else 'logs'}-{stamp}.log"
-        default_path = str(user_data_dir() / default_name)
-        dest, _ = QFileDialog.getSaveFileName(
-            self,
-            tr("logs.export"),
-            default_path,
-            "Log (*.log *.txt);;All Files (*)",
-        )
-        if not dest:
-            return
-        try:
-            Path(dest).write_text(self.log_view.plain_text(), encoding="utf-8")
-        except OSError as exc:
-            SilentMessageBox.warning(self, tr("logs.export"), f"{type(exc).__name__}: {exc}")
-            return
-        self.exported.emit(tr("toast.exported"))
-
     def retranslate(self) -> None:
+        self.search_label.setText(tr("logs.filter.search"))
+        self.source_label.setText(tr("logs.filter.source"))
+        self.level_label.setText(tr("logs.filter.level"))
         self.search_edit.setPlaceholderText(tr("logs.search"))
         self.auto_scroll_check.setText(tr("logs.autoscroll"))
         self.open_folder_btn.setText(tr("logs.open_folder"))
         self.copy_btn.setText(tr("logs.copy"))
-        self.export_btn.setText(tr("logs.export"))
         self.clear_btn.setText(tr("logs.clear"))
         self.load_more_btn.setText(tr("logs.load_more"))
         if self.component_combo.count() > 0:

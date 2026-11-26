@@ -315,7 +315,6 @@ class MainWindow(QMainWindow):
         h.copy_requested.connect(self._handle_copy_request)
 
         c = self.connections_page
-        c.domain_guide_requested.connect(self.show_domain_guide)
         c.provider_selected.connect(self._on_provider_selected)
         c.provider_configure_requested.connect(self._open_provider_config)
         c.provider_diagnose_requested.connect(self._open_provider_diagnose)
@@ -356,7 +355,6 @@ class MainWindow(QMainWindow):
         s.desktop_policy_changed.connect(self._on_desktop_policy_changed)
 
         self.logs_page.viewer.copy_requested.connect(self._copy)
-        self.logs_page.viewer.exported.connect(lambda msg: self.toasts.show_toast(msg, "ok"))
 
         st = self.settings_page
         st.theme_mode_selected.connect(self.set_theme_mode)

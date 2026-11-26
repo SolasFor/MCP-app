@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -62,6 +63,499 @@ SECURITY_HEADERS = {
         "base-uri 'none'; frame-ancestors 'none'"
     ),
 }
+
+_OAUTH_TEXT: dict[str, dict[str, str]] = {
+    "ru": {
+        "page_title": "MCP-app — Авторизация подключения",
+        "heading": "Авторизация подключения",
+        "subtitle": "{client} запрашивает доступ к вашему MCP-серверу.",
+        "client_label": "Подключаемый клиент",
+        "server_label": "Адрес MCP-сервера",
+        "return_label": "Адрес возврата",
+        "scenario_label": "Сценарий доступа",
+        "mode_safe_title": "Безопасный режим",
+        "mode_safe_desc": "Только чтение состояния и диагностика без выполнения команд.",
+        "mode_allowlist_title": "Белый список",
+        "mode_allowlist_desc": "Выполнение только разрешённых владельцем команд.",
+        "mode_full_title": "Полный доступ",
+        "mode_full_desc": "Произвольные команды CMD, PowerShell и SSH с правами текущей учётной записи.",
+        "full_risk_warning": (
+            "Высокий риск: клиент сможет выполнять произвольные команды и скрипты "
+            "от имени вашего пользователя Windows без подтверждения каждого вызова."
+        ),
+        "token_label": "Токен владельца",
+        "token_placeholder": "Введите ваш MCP-токен",
+        "token_hint": "Токен доступен в настройках MCP-app.",
+        "trust_notice": "Разрешайте доступ только доверенным приложениям. Вы сможете отозвать его в любое время.",
+        "allow_btn": "Разрешить доступ",
+        "deny_btn": "Отклонить",
+        "footer": "MCP-app · Безопасное подключение OAuth",
+        "err_bad_token_retry": "Неверный токен владельца MCP-app (осталось попыток: {remaining}).",
+        "err_expired_title": "Запрос авторизации истёк",
+        "err_expired_heading": "Запрос авторизации истёк",
+        "err_expired_msg": "Эта ссылка авторизации устарела, уже использовалась или MCP-сервер был перезапущен.",
+        "err_expired_hint": "Вернитесь в ваш AI-клиент и нажмите «Переподключить» (Reconnect), чтобы начать авторизацию заново.",
+        "err_origin_title": "Ошибка проверки безопасности",
+        "err_origin_heading": "Проверка безопасности не пройдена (Origin)",
+        "err_origin_msg": "Форма авторизации отклонила запрос, так как заголовок Origin не совпадает с активным MCP-сервером.",
+        "err_origin_hint": "Ожидаемый источник: {origin}. Запустите подключение повторно из AI-клиента.",
+        "err_csrf_site_title": "Ошибка проверки безопасности",
+        "err_csrf_site_heading": "Межсайтовая отправка формы заблокирована",
+        "err_csrf_site_msg": "Заголовок безопасности браузера Sec-Fetch-Site указывает на внешний источник запроса.",
+        "err_form_title": "Некорректный запрос",
+        "err_form_heading": "Ошибка данных формы",
+        "err_form_msg": "Не удалось прочитать отправленные данные формы авторизации.",
+        "err_csrf_title": "Некорректный запрос",
+        "err_csrf_heading": "Ошибка маркера безопасности (CSRF)",
+        "err_csrf_msg": "Маркер сессии формы авторизации не совпадает. Обновите страницу или начните подключение заново.",
+        "err_decision_title": "Некорректный запрос",
+        "err_decision_heading": "Неизвестное действие",
+        "err_decision_msg": "Передан недопустимый вариант подтверждения доступа.",
+        "err_revoked_title": "Доступ клиента отозван",
+        "err_revoked_heading": "Регистрация клиента отозвана",
+        "err_revoked_msg": "Этот клиент был отозван в MCP-app и больше не может запрашивать токены.",
+        "err_revoked_hint": "Переподключите сервер в вашем AI-клиенте, чтобы выполнить регистрацию заново.",
+        "err_attempts_title": "Превышено число попыток",
+        "err_attempts_heading": "Токен введён неверно",
+        "err_attempts_msg": "Авторизация отменена после 5 неверных попыток ввода токена владельца.",
+        "err_attempts_hint": "Проверьте токен владельца во вкладке «Подключение» в MCP-app и повторите подключение.",
+        "err_authorize_title": "Ошибка авторизации",
+        "err_authorize_heading": "Не удалось начать авторизацию ({code})",
+        "err_authorize_hint_client": "Обычно это означает, что MCP-сервер перезапустился или сменил адрес после регистрации клиента. Нажмите «Переподключить» (Reconnect) в AI-клиенте.",
+        "err_authorize_hint_generic": "Проверьте публичный адрес MCP-сервера и перезапустите подключение из вашего AI-клиента.",
+    },
+    "en": {
+        "page_title": "MCP-app — Authorize Connection",
+        "heading": "Authorize Connection",
+        "subtitle": "{client} is requesting access to your MCP server.",
+        "client_label": "Connecting client",
+        "server_label": "MCP server URL",
+        "return_label": "Return URL",
+        "scenario_label": "Access scenario",
+        "mode_safe_title": "Safe (Read-only)",
+        "mode_safe_desc": "Read-only server info and diagnostics with no command execution.",
+        "mode_allowlist_title": "Allowlist",
+        "mode_allowlist_desc": "Executes only owner-approved commands and allowlisted tools.",
+        "mode_full_title": "Full Access",
+        "mode_full_desc": "Arbitrary CMD, PowerShell, and SSH commands under the current user account.",
+        "full_risk_warning": (
+            "High risk: this client can run arbitrary Windows and SSH commands with your user "
+            "privileges immediately without per-command confirmation."
+        ),
+        "token_label": "Owner token",
+        "token_placeholder": "Enter your MCP token",
+        "token_hint": "Available in MCP-app → Connections.",
+        "trust_notice": "Grant access only to trusted applications. You can revoke it at any time in MCP-app.",
+        "allow_btn": "Allow access",
+        "deny_btn": "Deny",
+        "footer": "MCP-app · Secure OAuth Connection",
+        "err_bad_token_retry": "Incorrect MCP Owner Token ({remaining} attempts remaining).",
+        "err_expired_title": "Authorization expired",
+        "err_expired_heading": "Authorization request expired",
+        "err_expired_msg": "This authorization link has expired, was already used, or the MCP server restarted.",
+        "err_expired_hint": "Return to your AI client and click Reconnect to start a fresh authorization.",
+        "err_origin_title": "Invalid request",
+        "err_origin_heading": "Security check failed (Origin)",
+        "err_origin_msg": "This consent form rejected the request because its Origin header does not match the active MCP server.",
+        "err_origin_hint": "Expected origin: {origin}. Restart authorization from your AI client.",
+        "err_csrf_site_title": "Invalid request",
+        "err_csrf_site_heading": "Cross-site form submission blocked",
+        "err_csrf_site_msg": "Browser security header Sec-Fetch-Site indicated a cross-site submission.",
+        "err_form_title": "Invalid request",
+        "err_form_heading": "Invalid form submission",
+        "err_form_msg": "The submitted form payload could not be decoded.",
+        "err_csrf_title": "Invalid request",
+        "err_csrf_heading": "Security token mismatch",
+        "err_csrf_msg": "The consent form session token did not match. Reload the consent page or reconnect.",
+        "err_decision_title": "Invalid request",
+        "err_decision_heading": "Invalid decision",
+        "err_decision_msg": "Unknown consent action.",
+        "err_revoked_title": "Client revoked",
+        "err_revoked_heading": "Client access revoked",
+        "err_revoked_msg": "This client registration was revoked in MCP-app.",
+        "err_revoked_hint": "Reconnect from your AI client to register a new OAuth client.",
+        "err_attempts_title": "Too many attempts",
+        "err_attempts_heading": "Owner token incorrect (attempts exhausted)",
+        "err_attempts_msg": "Authorization cancelled after 5 incorrect attempts.",
+        "err_attempts_hint": "Check the MCP Owner Token in Connections and restart authorization in your AI client.",
+        "err_authorize_title": "Authorization failed",
+        "err_authorize_heading": "Authorization failed ({code})",
+        "err_authorize_hint_client": "This usually means the MCP server restarted or switched URL/provider after the client registered. Return to your AI client and click Reconnect to register and authorize cleanly.",
+        "err_authorize_hint_generic": "Verify the server public URL and restart authorization from your AI client.",
+    },
+}
+
+
+def resolve_oauth_language(
+    request: Request | None = None,
+    configured_lang: str | None = None,
+) -> str:
+    """Resolve UI language ('ru' or 'en') for OAuth browser pages.
+
+    Order:
+    1. Explicit ``?lang=ru|en`` query parameter if valid.
+    2. Configured app language (``configured_lang`` or ``MCP_LANGUAGE`` env var).
+    3. HTTP ``Accept-Language`` header preference.
+    4. Default ``'en'`` when neither app language nor Accept-Language is supplied
+       (preserves headless non-browser HTTP diagnostics), or ``'ru'`` for ru-* browsers.
+    """
+    if request is not None:
+        qp_lang = (request.query_params.get("lang") or "").strip().lower()
+        if qp_lang in ("ru", "en"):
+            return qp_lang
+
+    cfg = (configured_lang if configured_lang is not None else os.environ.get("MCP_LANGUAGE", "")).strip().lower()
+    if cfg in ("ru", "en"):
+        return cfg
+
+    if request is not None:
+        accept = (request.headers.get("accept-language") or "").strip().lower()
+        if accept:
+            ru_pos = accept.find("ru")
+            en_pos = accept.find("en")
+            if ru_pos >= 0 and (en_pos < 0 or ru_pos <= en_pos):
+                return "ru"
+            if en_pos >= 0:
+                return "en"
+    return "en"
+
+
+def oauth_t(lang: str, key: str, **kwargs: object) -> str:
+    table = _OAUTH_TEXT["ru" if lang == "ru" else "en"]
+    text = table.get(key) or _OAUTH_TEXT["en"].get(key, key)
+    return text.format(**kwargs) if kwargs else text
+
+
+def _base_oauth_css() -> str:
+    return """
+  :root {
+    color-scheme: dark light;
+    --bg: #151617;
+    --card: #202124;
+    --card-border: #2E3136;
+    --inset: #161719;
+    --inset-border: #25282D;
+    --emblem-bg: #161719;
+    --emblem-border: #2B2E33;
+    --text-strong: #F2F3F5;
+    --text-body: #D2D5DB;
+    --text-muted: #90959E;
+    --text-faint: #6D727C;
+    --divider: #2A2D32;
+    --input-bg: #151618;
+    --input-border: #32363D;
+    --input-focus: #5E6AD2;
+    --btn-primary: #5E6AD2;
+    --btn-primary-hover: #6D79DE;
+    --btn-primary-text: #FFFFFF;
+    --btn-ghost-hover: rgba(255,255,255,0.06);
+    --ok: #2EA043;
+    --info: #58A6FF;
+    --err: #E5534B;
+    --err-bg: rgba(229,83,75,0.10);
+    --err-border: rgba(229,83,75,0.38);
+    --warn: #D97706;
+    --warn-bg: rgba(217,119,6,0.11);
+    --warn-border: rgba(217,119,6,0.42);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F5F6F8;
+      --card: #FFFFFF;
+      --card-border: #DFE2E7;
+      --inset: #F4F5F7;
+      --inset-border: #E4E7EC;
+      --emblem-bg: #ECEEF2;
+      --emblem-border: #DCE0E6;
+      --text-strong: #161719;
+      --text-body: #343841;
+      --text-muted: #616670;
+      --text-faint: #7E848F;
+      --divider: #E6E8ED;
+      --input-bg: #FFFFFF;
+      --input-border: #CDD2DA;
+      --input-focus: #4F5BD5;
+      --btn-primary: #4F5BD5;
+      --btn-primary-hover: #4450C7;
+      --btn-primary-text: #FFFFFF;
+      --btn-ghost-hover: rgba(22,23,25,0.05);
+      --ok: #1A7F37;
+      --info: #0969DA;
+      --err: #CF222E;
+      --err-bg: rgba(207,34,46,0.08);
+      --err-border: rgba(207,34,46,0.32);
+      --warn: #B45309;
+      --warn-bg: rgba(180,83,9,0.08);
+      --warn-border: rgba(180,83,9,0.34);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 28px 16px;
+    background: var(--bg);
+    color: var(--text-body);
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+    font-size: 13.5px;
+    line-height: 1.45;
+  }
+  main.card {
+    width: 100%;
+    max-width: 416px;
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 26px 24px 20px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  }
+  .brand {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    margin-bottom: 18px;
+  }
+  .emblem {
+    width: 44px;
+    height: 44px;
+    border-radius: 11px;
+    background: var(--emblem-bg);
+    border: 1px solid var(--emblem-border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-strong);
+    margin-bottom: 10px;
+  }
+  .brand-name {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-strong);
+    letter-spacing: -0.01em;
+    margin: 0 0 4px;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-size: 16.5px;
+    font-weight: 600;
+    color: var(--text-strong);
+    letter-spacing: -0.01em;
+  }
+  .subtitle {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12.5px;
+    line-height: 1.45;
+  }
+  .panel {
+    background: var(--inset);
+    border: 1px solid var(--inset-border);
+    border-radius: 10px;
+    padding: 13px 14px;
+    margin-bottom: 16px;
+  }
+  .field-label {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    margin: 0 0 3px;
+  }
+  .client-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-strong);
+    word-break: break-word;
+  }
+  .meta-list {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .meta-row {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .meta-key {
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  .meta-val {
+    font-family: "Cascadia Mono", "Consolas", ui-monospace, monospace;
+    font-size: 11.5px;
+    color: var(--text-body);
+    word-break: break-all;
+  }
+  .sep {
+    height: 1px;
+    background: var(--divider);
+    margin: 11px 0;
+  }
+  .scenario-row {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text-strong);
+    margin: 2px 0 4px;
+  }
+  .scenario-safe { color: var(--info); }
+  .scenario-allowlist { color: var(--ok); }
+  .scenario-full { color: var(--err); }
+  .scenario-desc {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--text-muted);
+  }
+  .callout-danger {
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border-radius: 9px;
+    border: 1px solid var(--err-border);
+    background: var(--err-bg);
+    color: var(--text-strong);
+    font-size: 12px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .callout-danger svg { color: var(--err); flex-shrink: 0; margin-top: 1px; }
+  .alert-err {
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border-radius: 9px;
+    border: 1px solid var(--err-border);
+    background: var(--err-bg);
+    color: var(--err);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  label.tok-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-body);
+    margin-bottom: 7px;
+  }
+  input[type="password"] {
+    width: 100%;
+    height: 38px;
+    padding: 0 14px;
+    border-radius: 19px;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text-strong);
+    font-size: 13px;
+    outline: none;
+  }
+  input[type="password"]::placeholder {
+    color: var(--text-faint);
+  }
+  input[type="password"]:focus {
+    border-color: var(--input-focus);
+  }
+  .hint {
+    margin: 6px 0 0;
+    font-size: 11.5px;
+    color: var(--text-muted);
+  }
+  .trust-box {
+    margin: 14px 0 16px;
+    padding: 10px 12px;
+    border-radius: 9px;
+    border: 1px solid var(--inset-border);
+    background: transparent;
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    line-height: 1.45;
+  }
+  .trust-box svg { flex-shrink: 0; margin-top: 1px; color: var(--text-muted); }
+  .actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  button[type="submit"] {
+    width: 100%;
+    border: 0;
+    border-radius: 9px;
+    font-size: 13.5px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: default;
+  }
+  button[value="allow"] {
+    height: 38px;
+    background: var(--btn-primary);
+    color: var(--btn-primary-text);
+  }
+  button[value="allow"]:hover {
+    background: var(--btn-primary-hover);
+  }
+  button[value="deny"] {
+    height: 32px;
+    background: transparent;
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 12.5px;
+  }
+  button[value="deny"]:hover {
+    background: var(--btn-ghost-hover);
+    color: var(--text-strong);
+  }
+  .footer {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--divider);
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  .err-heading {
+    margin: 0 0 8px;
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--err);
+  }
+  .err-msg {
+    margin: 0 0 10px;
+    color: var(--text-body);
+    line-height: 1.5;
+  }
+"""
+
+
+_SVG_HUB = (
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="12" cy="5" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="18" r="2.2"/>'
+    '<path d="M12 7.2v4.3m0 0-4.8 4.6m4.8-4.6 4.8 4.6"/></svg>'
+)
+_SVG_SHIELD_CHECK = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3z"/>'
+    '<path d="M9 12l2 2 4-4"/></svg>'
+)
+_SVG_SHIELD_OUTLINE = (
+    '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6l7-3z"/></svg>'
+)
+_SVG_ALERT = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
+    '<path d="M12 9v4m0 4h.01"/></svg>'
+)
 
 
 def token_digest(token: str) -> str:
@@ -135,36 +629,32 @@ def _render_error_html(
     *,
     hint: str = "",
     retry_form_html: str = "",
+    lang: str = "en",
 ) -> str:
     safe_title = html.escape(title)
     safe_heading = html.escape(heading)
     safe_msg = html.escape(message)
-    hint_block = f"<p class='hint'>{html.escape(hint)}</p>" if hint else ""
+    safe_lang = "ru" if lang == "ru" else "en"
+    hint_block = f"<div class='trust-box'>{_SVG_SHIELD_OUTLINE}<span>{html.escape(hint)}</span></div>" if hint else ""
+    footer_text = html.escape(oauth_t(safe_lang, "footer"))
     return f"""<!doctype html>
-<html lang="en">
+<html lang="{safe_lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{safe_title}</title>
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; background:#0f1115; color:#e6e8ec; margin:0; padding:32px 16px; }}
-  main {{ max-width:520px; margin:0 auto; background:#171a21; border:1px solid #2b313d; border-radius:12px; padding:24px; }}
-  h1 {{ margin:0 0 12px; font-size:20px; color:#ff7b72; }}
-  p {{ line-height:1.5; color:#c9d1d9; }}
-  .hint {{ font-size:13px; color:#8b949e; }}
-  label {{ display:block; margin:14px 0 8px; font-weight:600; }}
-  input[type=password] {{ width:100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #30363d; background:#0d1117; color:#f0f6fc; }}
-  .actions {{ margin-top:14px; display:flex; gap:10px; }}
-  button {{ padding:9px 16px; border-radius:8px; border:0; cursor:pointer; font-weight:600; }}
-  button[value=allow] {{ background:#238636; color:#fff; }}
-  button[value=deny] {{ background:#30363d; color:#e6e8ec; }}
-</style>
+<style>{_base_oauth_css()}</style>
 </head>
-<body><main>
-<h1>{safe_heading}</h1>
-<p>{safe_msg}</p>
-{hint_block}
-{retry_form_html}
+<body><main class="card">
+  <div class="brand">
+    <div class="emblem">{_SVG_HUB}</div>
+    <div class="brand-name">MCP-app</div>
+  </div>
+  <h1 class="err-heading">{safe_heading}</h1>
+  <p class="err-msg">{safe_msg}</p>
+  {hint_block}
+  {retry_form_html}
+  <div class="footer">{footer_text}</div>
 </main></body></html>"""
 
 
@@ -180,9 +670,11 @@ class PendingConsent:
 class LocalConsentOAuthProvider(
     OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
 ):
-    """No automatic approval: owner must type the existing app token to consent.
+    """No automatic approval: owner must type the owner token to consent.
 
-    Tokens issued to OAuth clients have only mcp:read.
+    OAuth access/refresh tokens belong strictly to their registered client and access profile;
+    bearer transport authentication can use an HTTP-safe transport secret distinct from Unicode
+    or whitespace-containing owner consent passwords.
     """
 
     def __init__(
@@ -192,7 +684,12 @@ class LocalConsentOAuthProvider(
         owner_secret: str,
         store_path: str | Path | None = None,
         default_profile: str | None = None,
+        *,
+        transport_secret: str | None = None,
+        language: str | None = None,
     ) -> None:
+        if not owner_secret:
+            raise ValueError("owner_secret must not be empty")
         canon_issuer, canon_resource = canonical_oauth_urls(resource_url or issuer)
         if canon_issuer and (not issuer or canonical_oauth_urls(issuer)[0] == canon_issuer):
             self.issuer = canon_issuer
@@ -202,6 +699,8 @@ class LocalConsentOAuthProvider(
             self.resource_url = resource_url.rstrip("/")
         self._canonical_issuer_origin = _canonical_origin(self.issuer)
         self._owner_secret = owner_secret
+        self._transport_secret = transport_secret if transport_secret is not None else owner_secret
+        self._configured_language = (language or "").strip().lower()
         self._default_profile = default_profile
         self.clients: dict[str, OAuthClientInformationFull] = {}
         self.pending: dict[str, PendingConsent] = {}
@@ -214,6 +713,9 @@ class LocalConsentOAuthProvider(
             self.store.remove_old_quick_tunnels()
             self.store.bind_owner(owner_secret)
             self.store.prune_expired()
+
+    def _lang_for_request(self, request: Request | None = None) -> str:
+        return resolve_oauth_language(request, self._configured_language or None)
 
     @staticmethod
     def _log_oauth(level: str, event_code: str, message: str, *, req_id: str = "-") -> None:
@@ -314,12 +816,16 @@ class LocalConsentOAuthProvider(
         ticket: str,
         *,
         error_note: str = "",
+        lang: str = "ru",
     ) -> str:
-        display_name = html.escape(pending.client.client_name or pending.client.client_id or "Unknown client")
+        safe_lang = "ru" if lang == "ru" else "en"
+        raw_client = pending.client.client_name or pending.client.client_id or "MCP Client"
+        display_name = html.escape(raw_client)
+        display_server = html.escape(self.resource_url or self.issuer)
         display_uri = html.escape(str(pending.params.redirect_uri))
         safe_ticket = html.escape(ticket, quote=True)
         safe_csrf = html.escape(pending.csrf_token, quote=True)
-        mode = "safe"
+        mode = self._default_profile or "safe"
         if self.store:
             try:
                 from .oauth_execution import ExecutionApprovals
@@ -331,52 +837,76 @@ class LocalConsentOAuthProvider(
                 if profiles.client_approved(pending.client.client_id)
                 else profiles.profile()
             )
-        descriptions = {
-            "safe": "Safe: only server_info; no command execution.",
-            "allowlist": (
-                "Allowlist: Windows and SSH commands matching the owner's "
-                "exact allowlists run immediately without confirmation."
-            ),
-            "full": (
-                "FULL ACCESS: arbitrary Windows and SSH commands can run "
-                "immediately with the user's privileges. HIGH RISK."
-            ),
-        }
-        mode_description = html.escape(descriptions.get(mode, descriptions["safe"]))
-        err_html = f"<p style='color:#ff7b72;font-weight:600'>{html.escape(error_note)}</p>" if error_note else ""
+        if mode not in ("safe", "allowlist", "full"):
+            mode = "safe"
+
+        mode_title = html.escape(oauth_t(safe_lang, f"mode_{mode}_title"))
+        mode_desc = html.escape(oauth_t(safe_lang, f"mode_{mode}_desc"))
+        mode_icon = _SVG_ALERT if mode == "full" else (_SVG_SHIELD_CHECK if mode == "allowlist" else _SVG_SHIELD_OUTLINE)
+        mode_cls = f"scenario-{mode}"
+
+        err_html = f"<div class='alert-err' role='alert'>{html.escape(error_note)}</div>" if error_note else ""
+        full_warning_html = (
+            f"<div class='callout-danger'>{_SVG_ALERT}<span>{html.escape(oauth_t(safe_lang, 'full_risk_warning'))}</span></div>"
+            if mode == "full"
+            else ""
+        )
+
         return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Authorize MCP app</title>
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; background:#0f1115; color:#e6e8ec; margin:0; padding:32px 16px; }}
-  main {{ max-width:540px; margin:0 auto; background:#171a21; border:1px solid #2b313d; border-radius:12px; padding:24px; }}
-  h1 {{ margin:0 0 12px; font-size:20px; }}
-  p {{ line-height:1.5; color:#c9d1d9; }}
-  code {{ background:#0d1117; padding:2px 6px; border-radius:4px; word-break:break-all; }}
-  label {{ display:block; margin:14px 0 8px; font-weight:600; }}
-  input[type=password] {{ width:100%; box-sizing:border-box; padding:10px; border-radius:8px; border:1px solid #30363d; background:#0d1117; color:#f0f6fc; margin-top:6px; }}
-  .actions {{ margin-top:14px; display:flex; gap:10px; }}
-  button {{ padding:9px 16px; border-radius:8px; border:0; cursor:pointer; font-weight:600; }}
-  button[value=allow] {{ background:#238636; color:#fff; }}
-  button[value=deny] {{ background:#30363d; color:#e6e8ec; }}
-</style></head>
-<body><main><h1>Authorize MCP app access</h1>
-{err_html}
-<p>Client: <strong>{display_name}</strong></p>
-<p>Return address: <code>{display_uri}</code></p>
-<p>OAuth compatibility scope: <strong>mcp:read</strong>.</p>
-<p>Current access scenario: <strong>{mode_description}</strong></p>
-<p>The owner can change this scenario for the client in the Windows app later. Only authorize
-clients you trust; never share the owner token with them.</p>
-<p>Type the owner token shown in your MCP app. Never share this token with the requesting client.</p>
-<form method="post" action="/oauth/consent">
-<input type="hidden" name="request_id" value="{safe_ticket}">
-<input type="hidden" name="csrf_token" value="{safe_csrf}">
-<label>Owner token <input type="password" name="owner_token" autocomplete="off" required></label>
-<div class="actions">
-<button type="submit" name="decision" value="allow">Allow access</button>
-<button type="submit" name="decision" value="deny" formnovalidate>Deny</button>
-</div>
-</form></main></body></html>"""
+<html lang="{safe_lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(oauth_t(safe_lang, "page_title"))}</title>
+<style>{_base_oauth_css()}</style>
+</head>
+<body>
+<main class="card">
+  <div class="brand">
+    <div class="emblem">{_SVG_HUB}</div>
+    <div class="brand-name">MCP-app</div>
+    <h1>{html.escape(oauth_t(safe_lang, "heading"))}</h1>
+    <p class="subtitle">{html.escape(oauth_t(safe_lang, "subtitle", client=raw_client))}</p>
+  </div>
+  {err_html}
+  <section class="panel" aria-label="{html.escape(oauth_t(safe_lang, 'scenario_label'))}">
+    <div class="field-label">{html.escape(oauth_t(safe_lang, "client_label"))}</div>
+    <div class="client-name">{display_name}</div>
+    <div class="meta-list">
+      <div class="meta-row">
+        <span class="meta-key">{html.escape(oauth_t(safe_lang, "server_label"))}</span>
+        <span class="meta-val">{display_server}</span>
+      </div>
+      <div class="meta-row">
+        <span class="meta-key">{html.escape(oauth_t(safe_lang, "return_label"))}</span>
+        <span class="meta-val">{display_uri}</span>
+      </div>
+    </div>
+    <div class="sep"></div>
+    <div class="field-label">{html.escape(oauth_t(safe_lang, "scenario_label"))}</div>
+    <div class="scenario-row {mode_cls}">{mode_icon}<span>{mode_title}</span></div>
+    <p class="scenario-desc">{mode_desc}</p>
+  </section>
+  {full_warning_html}
+  <form method="post" action="/oauth/consent">
+    <input type="hidden" name="request_id" value="{safe_ticket}">
+    <input type="hidden" name="csrf_token" value="{safe_csrf}">
+    <label class="tok-label" for="owner_token">{html.escape(oauth_t(safe_lang, "token_label"))}</label>
+    <input id="owner_token" type="password" name="owner_token" autocomplete="current-password" placeholder="{html.escape(oauth_t(safe_lang, 'token_placeholder'), quote=True)}" required autofocus>
+    <p class="hint">{html.escape(oauth_t(safe_lang, "token_hint"))}</p>
+    <div class="trust-box">
+      {_SVG_SHIELD_OUTLINE}
+      <span>{html.escape(oauth_t(safe_lang, "trust_notice"))}</span>
+    </div>
+    <div class="actions">
+      <button type="submit" name="decision" value="allow">{html.escape(oauth_t(safe_lang, "allow_btn"))}</button>
+      <button type="submit" name="decision" value="deny" formnovalidate>{html.escape(oauth_t(safe_lang, "deny_btn"))}</button>
+    </div>
+  </form>
+  <div class="footer">{html.escape(oauth_t(safe_lang, "footer"))}</div>
+</main>
+</body>
+</html>"""
 
     async def consent(self, request: Request) -> Response:
         """HTTP consent route registered through MCPServer.custom_route.
@@ -385,6 +915,7 @@ clients you trust; never share the owner token with them.</p>
         single validated OAuth client ``redirect_uri`` in CSP ``form-action`` so Chromium browsers
         (Chrome/Edge) follow the cross-origin 303 redirect after consent form POST.
         """
+        lang = self._lang_for_request(request)
         if request.method == "GET":
             ticket = request.query_params.get("request_id", "")
             req_prefix = token_digest(ticket)[:12] if ticket else "-"
@@ -393,15 +924,16 @@ clients you trust; never share the owner token with them.</p>
             if not pending or pending.expires_at < time.time():
                 self._log_oauth("WARNING", "oauth_consent_expired", "Consent GET rejected: expired or unknown request_id", req_id=req_prefix)
                 expired_html = _render_error_html(
-                    "Authorization expired",
-                    "Authorization request expired",
-                    "This authorization link has expired, was already used, or the MCP server restarted.",
-                    hint="Return to your AI client and click Reconnect to start a fresh authorization.",
+                    oauth_t(lang, "err_expired_title"),
+                    oauth_t(lang, "err_expired_heading"),
+                    oauth_t(lang, "err_expired_msg"),
+                    hint=oauth_t(lang, "err_expired_hint"),
+                    lang=lang,
                 )
                 return HTMLResponse(expired_html, status_code=410, headers=SECURITY_HEADERS)
             target_uri = str(pending.params.redirect_uri)
             headers = consent_security_headers(target_uri)
-            resp = HTMLResponse(self._consent_form_html(pending, ticket), headers=headers)
+            resp = HTMLResponse(self._consent_form_html(pending, ticket, lang=lang), headers=headers)
             resp.set_cookie(
                 CSRF_COOKIE_NAME,
                 pending.csrf_token,
@@ -425,10 +957,11 @@ clients you trust; never share the owner token with them.</p>
                 f"Consent POST rejected: origin mismatch got={canon_req_origin or origin_hdr!r} expected={self._canonical_issuer_origin!r}",
             )
             err_html = _render_error_html(
-                "Invalid request",
-                "Security check failed (Origin)",
-                "This consent form rejected the request because its Origin header does not match the active MCP server.",
-                hint=f"Expected origin: {self._canonical_issuer_origin}. Restart authorization from your AI client.",
+                oauth_t(lang, "err_origin_title"),
+                oauth_t(lang, "err_origin_heading"),
+                oauth_t(lang, "err_origin_msg"),
+                hint=oauth_t(lang, "err_origin_hint", origin=self._canonical_issuer_origin),
+                lang=lang,
             )
             return HTMLResponse(err_html, status_code=403, headers=SECURITY_HEADERS)
 
@@ -440,9 +973,10 @@ clients you trust; never share the owner token with them.</p>
                 f"Consent POST rejected: Sec-Fetch-Site={sec_fetch_site!r}",
             )
             err_html = _render_error_html(
-                "Invalid request",
-                "Cross-site form submission blocked",
-                "Browser security header Sec-Fetch-Site indicated a cross-site submission.",
+                oauth_t(lang, "err_csrf_site_title"),
+                oauth_t(lang, "err_csrf_site_heading"),
+                oauth_t(lang, "err_csrf_site_msg"),
+                lang=lang,
             )
             return HTMLResponse(err_html, status_code=403, headers=SECURITY_HEADERS)
 
@@ -459,9 +993,10 @@ clients you trust; never share the owner token with them.</p>
             self._log_oauth("WARNING", "oauth_malformed_form", "Consent POST rejected: malformed form encoding")
             return HTMLResponse(
                 _render_error_html(
-                    "Invalid request",
-                    "Invalid form submission",
-                    "The submitted form payload could not be decoded.",
+                    oauth_t(lang, "err_form_title"),
+                    oauth_t(lang, "err_form_heading"),
+                    oauth_t(lang, "err_form_msg"),
+                    lang=lang,
                 ),
                 status_code=400,
                 headers=SECURITY_HEADERS,
@@ -476,10 +1011,11 @@ clients you trust; never share the owner token with them.</p>
             self._log_oauth("WARNING", "oauth_consent_expired", "Consent POST rejected: expired or missing pending request", req_id=req_prefix)
             return HTMLResponse(
                 _render_error_html(
-                    "Authorization expired",
-                    "Authorization request expired",
-                    "Authorization request expired or was already completed.",
-                    hint="Click Reconnect in your AI client to obtain a fresh authorization link.",
+                    oauth_t(lang, "err_expired_title"),
+                    oauth_t(lang, "err_expired_heading"),
+                    oauth_t(lang, "err_expired_msg"),
+                    hint=oauth_t(lang, "err_expired_hint"),
+                    lang=lang,
                 ),
                 status_code=410,
                 headers=SECURITY_HEADERS,
@@ -498,9 +1034,10 @@ clients you trust; never share the owner token with them.</p>
                 self._log_oauth("WARNING", "oauth_csrf_rejected", "Consent POST rejected: CSRF mismatch", req_id=req_prefix)
                 return HTMLResponse(
                     _render_error_html(
-                        "Invalid request",
-                        "Security token mismatch",
-                        "The consent form session token did not match. Reload the consent page or reconnect.",
+                        oauth_t(lang, "err_csrf_title"),
+                        oauth_t(lang, "err_csrf_heading"),
+                        oauth_t(lang, "err_csrf_msg"),
+                        lang=lang,
                     ),
                     status_code=403,
                     headers=resp_headers,
@@ -518,7 +1055,12 @@ clients you trust; never share the owner token with them.</p>
             )
         if decision != "allow":
             return HTMLResponse(
-                _render_error_html("Invalid request", "Invalid decision", "Unknown consent action."),
+                _render_error_html(
+                    oauth_t(lang, "err_decision_title"),
+                    oauth_t(lang, "err_decision_heading"),
+                    oauth_t(lang, "err_decision_msg"),
+                    lang=lang,
+                ),
                 status_code=400,
                 headers=resp_headers,
             )
@@ -527,17 +1069,18 @@ clients you trust; never share the owner token with them.</p>
             self._log_oauth("WARNING", "oauth_client_revoked", f"Consent POST rejected: client revoked client_id={pending.client.client_id}", req_id=req_prefix)
             return HTMLResponse(
                 _render_error_html(
-                    "Client revoked",
-                    "Client access revoked",
-                    "This client registration was revoked in MCP-app.",
-                    hint="Reconnect from your AI client to register a new OAuth client.",
+                    oauth_t(lang, "err_revoked_title"),
+                    oauth_t(lang, "err_revoked_heading"),
+                    oauth_t(lang, "err_revoked_msg"),
+                    hint=oauth_t(lang, "err_revoked_hint"),
+                    lang=lang,
                 ),
                 status_code=403,
                 headers=resp_headers,
             )
 
         candidate = (fields.get("owner_token") or [""])[0]
-        if not hmac.compare_digest(candidate.encode(), self._owner_secret.encode()):
+        if not hmac.compare_digest(candidate.encode("utf-8"), self._owner_secret.encode("utf-8")):
             pending.attempts += 1
             remaining = max(0, 5 - pending.attempts)
             self._log_oauth(
@@ -550,10 +1093,11 @@ clients you trust; never share the owner token with them.</p>
                 del self.pending[digest]
                 return HTMLResponse(
                     _render_error_html(
-                        "Too many attempts",
-                        "Owner token incorrect (attempts exhausted)",
-                        "Authorization cancelled after 5 incorrect attempts.",
-                        hint="Check the MCP Owner Token in Connections and restart authorization in your AI client.",
+                        oauth_t(lang, "err_attempts_title"),
+                        oauth_t(lang, "err_attempts_heading"),
+                        oauth_t(lang, "err_attempts_msg"),
+                        hint=oauth_t(lang, "err_attempts_hint"),
+                        lang=lang,
                     ),
                     status_code=403,
                     headers=resp_headers,
@@ -561,7 +1105,8 @@ clients you trust; never share the owner token with them.</p>
             retry_html = self._consent_form_html(
                 pending,
                 ticket,
-                error_note=f"Incorrect MCP Owner Token ({remaining} attempts remaining).",
+                error_note=oauth_t(lang, "err_bad_token_retry", remaining=remaining),
+                lang=lang,
             )
             return HTMLResponse(retry_html, status_code=403, headers=resp_headers)
 
@@ -629,7 +1174,7 @@ clients you trust; never share the owner token with them.</p>
         return self._issue_tokens(client.client_id, original.scopes, secrets.token_urlsafe(16))
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        if hmac.compare_digest(token.encode(), self._owner_secret.encode()):
+        if hmac.compare_digest(token.encode("utf-8"), self._transport_secret.encode("utf-8")):
             return AccessToken(
                 token=token, client_id="mcp-app-user", scopes=[READ_SCOPE],
                 resource=self.resource_url, subject="local-owner",

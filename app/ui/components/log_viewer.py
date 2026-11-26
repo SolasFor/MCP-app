@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -78,34 +78,28 @@ class LogViewerWidget(QWidget):
 
         self.auto_scroll_check = QCheckBox()
         self.auto_scroll_check.setChecked(True)
-        self.auto_scroll_check.setCursor(Qt.CursorShape.PointingHandCursor)
         self.auto_scroll_check.toggled.connect(self.log_view_auto_scroll)
         actions.addWidget(self.auto_scroll_check)
 
         self.open_folder_btn = QPushButton()
         self.open_folder_btn.setObjectName("Ghost")
-        self.open_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.open_folder_btn.clicked.connect(self.open_logs_folder)
 
         self.copy_btn = QPushButton()
         self.copy_btn.setObjectName("Ghost")
-        self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_btn.clicked.connect(
             lambda: self.copy_requested.emit(self.log_view.plain_text(), self.copy_btn)
         )
         self.export_btn = QPushButton()
         self.export_btn.setObjectName("Ghost")
-        self.export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.export_btn.clicked.connect(self.export_log)
 
         self.clear_btn = QPushButton()
         self.clear_btn.setObjectName("Ghost")
-        self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.clear_btn.clicked.connect(self.clear_logs)
 
         self.load_more_btn = QPushButton()
         self.load_more_btn.setObjectName("Ghost")
-        self.load_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.load_more_btn.clicked.connect(self.load_more)
         self.load_more_btn.hide()
 

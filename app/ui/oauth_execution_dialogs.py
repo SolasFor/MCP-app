@@ -5,7 +5,6 @@ Windows user's encrypted OAuth database and not exposed through Cloudflare.
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -55,7 +54,6 @@ class ExecutionPolicyDialog(SilentDialog):
         reset_row = QHBoxLayout()
         self.reset_windows = QPushButton("Восстановить базовые команды")
         self.reset_windows.setObjectName("Ghost")
-        self.reset_windows.setCursor(Qt.CursorShape.PointingHandCursor)
         self.reset_windows.setToolTip(
             "ls, pwd, dir, echo, whoami, ipconfig, systeminfo. "
             "Изменение сохранится только после нажатия «Сохранить»."
@@ -79,11 +77,9 @@ class ExecutionPolicyDialog(SilentDialog):
         footer.addStretch(1)
         cancel_btn = QPushButton("Отмена")
         cancel_btn.setObjectName("Ghost")
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.clicked.connect(self.reject)
         save_btn = QPushButton("Сохранить")
         save_btn.setObjectName("Accent")
-        save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         save_btn.setDefault(True)
         save_btn.clicked.connect(self.save)
         footer.addWidget(cancel_btn)

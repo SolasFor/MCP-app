@@ -115,7 +115,6 @@ class SilentMessageBox(SilentDialog):
         for std_btn, label in _BUTTON_SPECS:
             if buttons & std_btn:
                 btn = QPushButton(label)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 if std_btn in (StandardButton.Yes, StandardButton.Ok) and kind != "warning":
                     btn.setObjectName("Accent")
                 elif std_btn == StandardButton.Yes and kind == "warning":
@@ -296,9 +295,7 @@ class SilentMessageBox(SilentDialog):
         accepted = {"ok": False}
         accept_btn = QPushButton(accept_label)
         accept_btn.setObjectName("Accent")
-        accept_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn = QPushButton(cancel_label)
-        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.setDefault(True)
 
         def on_accept() -> None:

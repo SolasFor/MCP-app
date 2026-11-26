@@ -169,6 +169,38 @@ class DomainPersistenceAndTokensTests(unittest.TestCase):
         self.assertEqual(s.active_provider, PROVIDER_NONE)
         self.assertEqual(s.migrated_from_provider, "local_only")
 
+    def test_arbitrary_owner_tokens_short_spaced_and_unicode_are_preserved(self) -> None:
+        from app.core import token_store
+
+        for secret, exp_http_compat in (
+            ("abc", True),
+            ("  padded secret 123  ", False),
+            ("мой-секрет-№1!", False),
+            ("p@ss word/with+symbols=yes!", False),
+            ("p@ss/with+symbols=yes!", True),
+        ):
+            self.assertIsNone(token_store.problem(secret))
+            self.assertEqual(token_store.is_http_bearer_compatible(secret), exp_http_compat)
+            token_store.save(secret)
+            self.assertEqual(token_store.load(), secret)
+            self.assertIsNotNone(token_store.mask(secret))
+            self.assertNotEqual(token_store.mask(secret), secret)
+
+        # Short secrets mask safely without leaking characters
+        self.assertEqual(token_store.mask("ab"), "••••")
+        self.assertEqual(token_store.mask("abcdefgh"), "••••••••")
+        self.assertTrue(len(token_store.mask("мой-секрет-№1!")) >= 8)
+
+        # Non-ASCII secret creates separate ASCII HTTP transport bearer secret without overwriting owner secret
+        mgr = ServiceManager(Settings(active_provider=PROVIDER_NONE))
+        err = mgr.set_token("мой-секрет-№1!")
+        self.assertIsNone(err)
+        self.assertEqual(mgr.token, "мой-секрет-№1!")
+        transport = mgr.bearer_transport_token
+        self.assertTrue(transport)
+        self.assertNotEqual(transport, "мой-секрет-№1!")
+        self.assertTrue(token_store.is_http_bearer_compatible(transport))
+
 
 if __name__ == "__main__":
     unittest.main()

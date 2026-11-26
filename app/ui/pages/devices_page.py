@@ -7,6 +7,7 @@ from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialogButtonBox,
     QFormLayout,
@@ -15,7 +16,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QSplitter,
     QTableWidgetItem,
     QVBoxLayout,
@@ -25,8 +25,10 @@ from PyQt6.QtWidgets import (
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
-from app.ui.components.cards import Divider, EmptyState, FlowLayout, SectionHeader
+from app.ui.components.cards import Divider, EmptyState, SectionHeader
+from app.ui.components.context_menu import MenuActionSpec
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
@@ -76,7 +78,7 @@ class DeviceProfileDialog(SilentDialog):
         self.group_edit.setObjectName("UiInput")
         self.host_edit = QLineEdit(self._base.host if existing else "")
         self.host_edit.setObjectName("UiInput")
-        self.port_spin = QSpinBox()
+        self.port_spin = SafeSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(self._base.port)
         self.user_edit = QLineEdit(self._base.username)
@@ -241,38 +243,16 @@ class DevicesPage(PageScaffold):
         self.add_btn = QPushButton(tr("devices.btn.add"))
         self.add_btn.setObjectName("Accent")
         self.add_btn.clicked.connect(self.add_device)
-        self.edit_btn = QPushButton(tr("devices.btn.edit"))
-        self.edit_btn.setObjectName("Ghost")
-        self.edit_btn.clicked.connect(self.edit_selected)
         self.import_btn = QPushButton(tr("devices.btn.import"))
         self.import_btn.setObjectName("Ghost")
         self.import_btn.clicked.connect(lambda: self.import_from_ssh_config(None))
-        self.health_btn = QPushButton(tr("devices.btn.health"))
-        self.health_btn.setObjectName("Ghost")
-        self.health_btn.clicked.connect(self.check_selected_health)
-        self.metrics_btn = QPushButton(tr("devices.btn.metrics"))
-        self.metrics_btn.setObjectName("Ghost")
-        self.metrics_btn.clicked.connect(self.fetch_selected_metrics)
-        self.delete_btn = QPushButton(tr("devices.btn.delete"))
-        self.delete_btn.setObjectName("Danger")
-        self.delete_btn.clicked.connect(self.delete_selected)
-        for btn in (
-            self.add_btn,
-            self.edit_btn,
-            self.import_btn,
-            self.health_btn,
-            self.metrics_btn,
-            self.delete_btn,
-        ):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn = QPushButton(tr("devices.btn.refresh"))
+        self.refresh_btn.setObjectName("Ghost")
+        self.refresh_btn.clicked.connect(self.refresh_all)
         toolbar.addWidget(self.add_btn)
         toolbar.addWidget(self.import_btn)
+        toolbar.addWidget(self.refresh_btn)
         self.content.addLayout(toolbar)
-
-        action_flow = FlowLayout(spacing=6)
-        for btn in (self.edit_btn, self.health_btn, self.metrics_btn, self.delete_btn):
-            action_flow.addWidget(btn)
-        self.content.addLayout(action_flow)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         top_pane = QWidget()
@@ -288,9 +268,11 @@ class DevicesPage(PageScaffold):
             tr("devices.col.group"),
             tr("devices.col.auth"),
             tr("devices.col.perms"),
+            "",
         ])
         self.table.setMinimumHeight(130)
         self.table.itemSelectionChanged.connect(self._refresh_details)
+        self.table.set_row_menu_provider(self._build_row_menu)
         top_lay.addWidget(self.table, 1)
         self.empty_state = EmptyState("devices", tr("devices.empty.title"), tr("devices.empty.desc"))
         top_lay.addWidget(self.empty_state)
@@ -341,14 +323,63 @@ class DevicesPage(PageScaffold):
             ]
             for col, val in enumerate(cells):
                 self.table.setItem(row, col, QTableWidgetItem(val))
+            self.table.set_row_actions_cell(row, 6, tooltip=tr("common.actions"))
         self.table.resizeColumnsToContents()
         self._refresh_details()
 
-    def _selected_id(self) -> str | None:
-        row = self.table.currentRow()
+    def _row_id(self, row: int) -> str | None:
         if 0 <= row < len(self._devices):
             return str(self._devices[row]["device_id"])
         return None
+
+    def _selected_id(self) -> str | None:
+        return self._row_id(self.table.currentRow())
+
+    def _build_row_menu(self, row: int) -> list[MenuActionSpec]:
+        dev_id = self._row_id(row)
+        if not dev_id:
+            return []
+        return [
+            MenuActionSpec(
+                key="health",
+                label=tr("devices.btn.health"),
+                callback=lambda d=dev_id: self._check_device_health(d),
+                icon_name="shield",
+            ),
+            MenuActionSpec(
+                key="metrics",
+                label=tr("devices.btn.metrics"),
+                callback=lambda d=dev_id: self._fetch_device_metrics(d),
+                icon_name="eye",
+            ),
+            MenuActionSpec(
+                key="edit",
+                label=tr("devices.btn.edit"),
+                callback=lambda d=dev_id: self._edit_device(d),
+                icon_name="edit",
+                separator_before=True,
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda d=dev_id: self._copy_device_id(d),
+                icon_name="copy",
+            ),
+            MenuActionSpec(
+                key="delete",
+                label=tr("devices.btn.delete"),
+                callback=lambda d=dev_id: self._delete_device(d),
+                icon_name="trash",
+                danger=True,
+                separator_before=True,
+            ),
+        ]
+
+    def _copy_device_id(self, dev_id: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(dev_id)
+        self.toast_requested.emit(tr("common.copied_id", item_id=dev_id))
 
     def _refresh_details(self) -> None:
         dev_id = self._selected_id()
@@ -367,10 +398,7 @@ class DevicesPage(PageScaffold):
             self.toast_requested.emit(tr("devices.toast.saved", name=dlg.saved_profile.name))
             self.refresh_all()
 
-    def edit_selected(self) -> None:
-        dev_id = self._selected_id()
-        if not dev_id:
-            return
+    def _edit_device(self, dev_id: str) -> None:
         existing = self.store.get(dev_id)
         if existing is None:
             return
@@ -380,6 +408,11 @@ class DevicesPage(PageScaffold):
             self.manager._register_secrets()
             self.toast_requested.emit(tr("devices.toast.saved", name=dlg.saved_profile.name))
             self.refresh_all()
+
+    def edit_selected(self) -> None:
+        dev_id = self._selected_id()
+        if dev_id:
+            self._edit_device(dev_id)
 
     def import_from_ssh_config(self, config_path: Path | None = None) -> int:
         imported = import_ssh_config(config_path)
@@ -392,33 +425,39 @@ class DevicesPage(PageScaffold):
         self.refresh_all()
         return count
 
-    def check_selected_health(self) -> None:
-        dev_id = self._selected_id()
-        if not dev_id:
-            return
+    def _check_device_health(self, dev_id: str) -> None:
         try:
             res = self.manager.device_health(dev_id)
             self.output_view.setPlainText(json.dumps(res, indent=2, ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001
             self.output_view.setPlainText(f"Health probe denied/failed: {exc}")
 
-    def fetch_selected_metrics(self) -> None:
+    def check_selected_health(self) -> None:
         dev_id = self._selected_id()
-        if not dev_id:
-            return
+        if dev_id:
+            self._check_device_health(dev_id)
+
+    def _fetch_device_metrics(self, dev_id: str) -> None:
         try:
             res = self.manager.remote_metrics(dev_id)
             self.output_view.setPlainText(json.dumps(res, indent=2, ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001
             self.output_view.setPlainText(f"Metrics denied/failed: {exc}")
 
-    def delete_selected(self) -> None:
+    def fetch_selected_metrics(self) -> None:
         dev_id = self._selected_id()
-        if not dev_id:
-            return
+        if dev_id:
+            self._fetch_device_metrics(dev_id)
+
+    def _delete_device(self, dev_id: str) -> None:
         self.store.remove(dev_id)
         self.toast_requested.emit(tr("devices.toast.deleted", name=dev_id))
         self.refresh_all()
+
+    def delete_selected(self) -> None:
+        dev_id = self._selected_id()
+        if dev_id:
+            self._delete_device(dev_id)
 
     def shutdown(self) -> None:
         self.manager.close()
@@ -428,11 +467,8 @@ class DevicesPage(PageScaffold):
         self._notice_lbl.setText(tr("devices.security_notice"))
         self.search_input.setPlaceholderText(tr("devices.search"))
         self.add_btn.setText(tr("devices.btn.add"))
-        self.edit_btn.setText(tr("devices.btn.edit"))
         self.import_btn.setText(tr("devices.btn.import"))
-        self.health_btn.setText(tr("devices.btn.health"))
-        self.metrics_btn.setText(tr("devices.btn.metrics"))
-        self.delete_btn.setText(tr("devices.btn.delete"))
+        self.refresh_btn.setText(tr("devices.btn.refresh"))
         self._table_hdr.set_texts(tr("devices.table.title"))
         self._output_hdr.set_texts(tr("devices.details.output"))
         self.empty_state.set_content(tr("devices.empty.title"), tr("devices.empty.desc"))
@@ -443,5 +479,6 @@ class DevicesPage(PageScaffold):
             tr("devices.col.group"),
             tr("devices.col.auth"),
             tr("devices.col.perms"),
+            "",
         ])
         self.refresh_all()

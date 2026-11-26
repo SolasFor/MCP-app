@@ -121,10 +121,10 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         self.assertFalse(c.migration_banner.isHidden())
         self.assertIn("Loopback", c.migration_banner.message_label.text())
 
-        # Owner token paste + manual entry
-        QApplication.clipboard().setText("  custom-pasted-owner-token-987654  ")
+        # Owner token paste preserves exact spaces and strips only CR/LF newlines
+        QApplication.clipboard().setText("  custom-pasted-owner-token-987654  \r\n")
         c.token_paste.click()
-        self.assertEqual(c.token_edit.text(), "custom-pasted-owner-token-987654")
+        self.assertEqual(c.token_edit.text(), "  custom-pasted-owner-token-987654  ")
         self.assertFalse(c.token_save.isHidden())
 
     def test_security_page_toggle_switches_autosave_and_rollback(self) -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QUrl
+from PyQt6.QtCore import QTimer, QUrl
 from PyQt6.QtGui import QDesktopServices, QGuiApplication
 from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QTextBrowser, QVBoxLayout, QWidget
 
@@ -148,7 +148,6 @@ class DomainGuideDialog(SilentDialog):
         button = QPushButton(text)
         if name:
             button.setObjectName(name)
-        button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
 
     def _on_copy_template(self) -> None:

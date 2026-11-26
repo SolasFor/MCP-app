@@ -10,13 +10,13 @@ from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QLabel,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from app.ui.components.cards import EmptyState
-from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
+from app.ui.components.table import TableCellCombo
 from backend.oauth_store import OAuthStore, default_store_path
 from backend.oauth_execution import ExecutionApprovals
 
@@ -64,7 +64,9 @@ class OAuthClientsDialog(SilentDialog):
         self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(34)
+        fm_h = self.table.fontMetrics().height()
+        self.table.verticalHeader().setMinimumSectionSize(max(32, fm_h + 16))
+        self.table.verticalHeader().setDefaultSectionSize(max(38, fm_h + 22))
         self.table.itemSelectionChanged.connect(self._selection_changed)
         root.addWidget(self.table, 1)
 
@@ -80,16 +82,13 @@ class OAuthClientsDialog(SilentDialog):
         footer.setSpacing(6)
         self.refresh_button = QPushButton("Обновить")
         self.refresh_button.setObjectName("Ghost")
-        self.refresh_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_button.clicked.connect(self.reload)
         self.revoke_button = QPushButton("Отозвать OAuth-доступ")
         self.revoke_button.setObjectName("Danger")
-        self.revoke_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.revoke_button.setEnabled(False)
         self.revoke_button.clicked.connect(self.revoke_selected)
         close_button = QPushButton("Закрыть")
         close_button.setObjectName("Ghost")
-        close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         close_button.clicked.connect(self.accept)
         for btn in (
             self.refresh_button, self.revoke_button,
@@ -111,6 +110,15 @@ class OAuthClientsDialog(SilentDialog):
         has_clients = bool(clients)
         self.table.setVisible(has_clients)
         self.empty_state.setVisible(not has_clients)
+        for r in range(self.table.rowCount()):
+            for c in range(self.table.columnCount()):
+                w = self.table.cellWidget(r, c)
+                if w is not None:
+                    self.table.removeCellWidget(r, c)
+                    w.hide()
+                    w.setParent(None)
+                    w.deleteLater()
+        self.table.setRowCount(0)
         self.table.setRowCount(len(clients))
         for idx, entry in enumerate(clients):
             approved = entry["approved_at"]
@@ -126,10 +134,9 @@ class OAuthClientsDialog(SilentDialog):
             self.table.setItem(
                 idx, 1, QTableWidgetItem("Разрешён" if approved else "Зарегистрирован")
             )
+            self.table.setItem(idx, 2, QTableWidgetItem(""))
             if approved:
-                selector = SafeComboBox(self.table)
-                selector.setMinimumWidth(205)
-                selector.setFixedHeight(26)
+                selector = TableCellCombo()
                 selector.addItem("Безопасный", "safe")
                 selector.addItem("Белый список", "allowlist")
                 selector.addItem("Полный доступ", "full")
@@ -149,10 +156,12 @@ class OAuthClientsDialog(SilentDialog):
             self.table.setItem(idx, 3, QTableWidgetItem(when))
         self.table.resizeColumnsToContents()
         self.table.setColumnWidth(0, min(260, max(140, self.table.columnWidth(0))))
-        self.table.setColumnWidth(2, max(230, self.table.columnWidth(2)))
+        col2_w = max(210, self.table.fontMetrics().horizontalAdvance("Полный доступ") + 64)
+        self.table.setColumnWidth(2, col2_w)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self._selection_changed()
 
-    def _change_client_profile(self, client_id: str, combo: SafeComboBox) -> None:
+    def _change_client_profile(self, client_id: str, combo: TableCellCombo) -> None:
         try:
             previous = self.execution.profile_for(client_id)
             selected = combo.currentData()

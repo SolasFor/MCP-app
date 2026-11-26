@@ -239,6 +239,36 @@ class ExecutionApprovals:
                     (self.store.issuer, client_id),
                 )
 
+    def client_profiles(self) -> dict[str, str]:
+        """Return mapping of client_id -> overridden profile for the active issuer."""
+        out: dict[str, str] = {}
+        with self.store._db() as db:
+            rows = db.execute(
+                "SELECT client_id, encrypted FROM exec_client_profiles WHERE issuer=?",
+                (self.store.issuer,),
+            ).fetchall()
+        for row in rows:
+            cid = str(row[0] or "")
+            if not cid:
+                continue
+            try:
+                stored = self.store._decrypt(row[1]).get("profile")
+            except Exception:  # noqa: BLE001
+                stored = PROFILE_SAFE
+            out[cid] = stored if stored in PROFILES else PROFILE_SAFE
+        return out
+
+    def clear_client_profile(self, client_id: str) -> bool:
+        """Remove any explicit per-client profile override so global default applies."""
+        if not isinstance(client_id, str) or not client_id:
+            return False
+        with self.store._db() as db:
+            cur = db.execute(
+                "DELETE FROM exec_client_profiles WHERE issuer=? AND client_id=?",
+                (self.store.issuer, client_id),
+            )
+            return cur.rowcount > 0
+
     def client_allowlist(self, client_id: str) -> dict | None:
         with self.store._db() as db:
             row = db.execute(

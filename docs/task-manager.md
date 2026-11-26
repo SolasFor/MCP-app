@@ -14,6 +14,12 @@ MCP-app provides a durable background **Task Manager** built on SQLite (`WAL`), 
 
 - `TaskRecord.to_mcp_task_dict()` aligns task status states (`working` / `completed` / `failed` / `cancelled`) and ISO timestamps with the `mcp==2.3.0` Tasks schema (`mcp.types.Task`), exposed alongside stable custom `task_*` tools so all MCP clients—even those without experimental `tasks/*` client capabilities—work reliably.
 
+## Validation, Timeouts & Structured Errors (`v1.0.1`)
+
+- `task_start(..., timeout: int | None = None)` resolves its default timeout dynamically from the caller's active profile (`15s` Windows / `12s` SSH in `allowlist`; `60s` in `full`) instead of failing `allowlist` calls with a hardcoded `60s` default. Explicit out-of-range timeouts continue to fail closed cleanly.
+- All 8 `task_*` tools return structured `CallToolResult(is_error=True, structured_content=...)` errors with 13 documented `TASK_*` error codes (`backend/tasks/errors.py`), secret/path redaction, `TASK_NOT_FOUND` masking for cross-client task IDs, and redacted diagnostics in `tasks.log` / `errors.log`.
+- Inactive tasks (`succeeded`, `failed`, `cancelled`, `interrupted`) can be deleted individually or purged in batches (`>7d`, `>30d`, `>90d`, all inactive) from `TasksPage` / `TaskManager` / `TaskStore`; active, cancelling, or live worker tasks are never deleted, and cleanup strictly targets internal `spool` and `artifacts` subdirectories.
+
 ## Security & Operational Boundaries
 
 1. **Per-Client Ownership**: Every `task_status`, `task_list`, `task_output`, `task_result`, `task_cancel`, `task_restart`, and `task_artifacts` call checks `owner_client_id == caller_client_id`. Cross-client access fails closed.

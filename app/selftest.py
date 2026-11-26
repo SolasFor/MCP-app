@@ -60,10 +60,13 @@ def _check_qt() -> str:
     from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
     from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog  # noqa: F401
     from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
+    from app.ui.components.context_menu import AppContextMenu  # noqa: F401
     from app.ui.components.safe_combo import SafeComboBox  # noqa: F401
+    from app.ui.components.safe_spin import SafeDoubleSpinBox, SafeSpinBox  # noqa: F401
     from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox  # noqa: F401
     from app.ui.components.toggle_switch import ToggleSwitch  # noqa: F401
     from app.ui.domain_wizard import DomainWizard  # noqa: F401
+    from app.ui.gateway_add_wizard import AddMcpServerWizard  # noqa: F401
     from app.ui.proxy_page import ProxyPage  # noqa: F401
     from app.ui.pages.servers_page import ServersPage  # noqa: F401
     from app.ui.pages.workspaces_page import WorkspacesPage  # noqa: F401
@@ -123,6 +126,8 @@ def _check_backend() -> str:
             from app import platform as _platform  # noqa: F401
             from app.core import diagnostics_bundle as _diag, logging_manager as _lm_mod, redaction as _redaction, secret_store as _secret_store  # noqa: F401
             from backend import oauth_provider as _op, output_stream as _out, process_runner as _pr, server, tool_registry as _tr  # noqa: F401
+            from backend.gateway import client_configs as _gcc, discovery as _gdisc, templates as _gtpl  # noqa: F401
+            from backend.tasks import errors as _task_err  # noqa: F401
 
             for dist_name in ("mcp", "pydantic", "paramiko", "cryptography"):
                 _ = importlib.metadata.version(dist_name)

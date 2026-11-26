@@ -1,4 +1,4 @@
-"""MCP Gateway page: manage upstream stdio / Streamable HTTP / SSE MCP servers and permissions."""
+"""MCP Gateway page: automated server onboarding wizard, upstream health, schemas & context menus."""
 from __future__ import annotations
 
 import asyncio
@@ -6,16 +6,17 @@ import json
 import shlex
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -28,10 +29,13 @@ from PyQt6.QtWidgets import (
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui import tokens
-from app.ui.components.cards import EmptyState, FlowLayout, SectionHeader
+from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
+from app.ui.components.safe_spin import SafeDoubleSpinBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
+from app.ui.gateway_add_wizard import AddMcpServerWizard
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
 from backend.gateway.models import (
@@ -187,7 +191,7 @@ class GatewayServerDialog(SilentDialog):
         self.denied_tools_edit.setObjectName("UiInput")
         form.addRow(tr("gateway.dlg.denied_tools"), self.denied_tools_edit)
 
-        self.timeout_spin = QDoubleSpinBox()
+        self.timeout_spin = SafeDoubleSpinBox()
         self.timeout_spin.setRange(1.0, 600.0)
         self.timeout_spin.setValue(float(self._base.timeout_seconds))
         form.addRow(tr("gateway.dlg.timeout"), self.timeout_spin)
@@ -340,6 +344,7 @@ class GatewayPage(PageScaffold):
         self.store = GatewayConfigStore(self._config_path)
         self._statuses: dict[str, GatewayServerStatus] = {}
         self._catalog_by_server: dict[str, list[UpstreamToolEntry]] = {}
+        self._row_server_ids: list[str] = []
 
         toolbar = QHBoxLayout()
         toolbar.setSpacing(6)
@@ -348,36 +353,28 @@ class GatewayPage(PageScaffold):
         self.search_edit.textChanged.connect(lambda q: self.server_table.filter_rows(q))
         toolbar.addWidget(self.search_edit, 1)
 
-        self.add_btn = self._make_btn(self._open_add_dialog, obj="Accent")
-        self.solidworks_btn = self._make_btn(self._open_solidworks_preset)
-        self.import_btn = self._make_btn(self._open_import_flow)
-        self.export_btn = self._make_btn(self._export_redacted)
-        self.refresh_btn = self._make_btn(lambda: self.refresh_servers_sync())
+        self.add_btn = self._make_btn(self._open_add_wizard, obj="Accent")
+        self.refresh_btn = self._make_btn(lambda: self.refresh_servers_sync(), obj="Ghost")
+        self.list_menu_btn = make_toolbar_menu_button(parent=self)
+        self.list_menu_btn.clicked.connect(self._open_list_menu)
         toolbar.addWidget(self.add_btn)
         toolbar.addWidget(self.refresh_btn)
+        toolbar.addWidget(self.list_menu_btn)
         self.content.addLayout(toolbar)
-
-        action_flow = FlowLayout(spacing=6)
-        self.edit_btn = self._make_btn(self._open_edit_dialog)
-        self.toggle_btn = self._make_btn(self._toggle_selected)
-        self.delete_btn = self._make_btn(self._delete_selected, obj="Danger")
-        for btn in (self.edit_btn, self.toggle_btn, self.delete_btn):
-            btn.setEnabled(False)
-        for btn in (self.solidworks_btn, self.import_btn, self.export_btn, self.edit_btn, self.toggle_btn, self.delete_btn):
-            action_flow.addWidget(btn)
-        self.content.addLayout(action_flow)
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
         table_lay.setContentsMargins(0, 0, 0, 0)
         table_lay.setSpacing(0)
-        self.server_table = DataTable(["", "", "", "", "", ""])
+        self.server_table = DataTable(["", "", "", "", "", "", ""])
         self.server_table.setMinimumHeight(130)
+        self.server_table.set_row_menu_provider(self._build_row_menu)
         self.server_table.itemSelectionChanged.connect(self._on_server_selected)
         table_lay.addWidget(self.server_table, 1)
         self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("gateway")
+        self.empty_state.cta_button.clicked.connect(self._open_add_wizard)
         self.content.addWidget(self.empty_state, 1)
 
         # Details splitter: Tools/Schemas on left, Logs/Health on right
@@ -419,7 +416,6 @@ class GatewayPage(PageScaffold):
         btn = QPushButton()
         if obj:
             btn.setObjectName(obj)
-        btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.clicked.connect(slot)
         return btn
 
@@ -431,9 +427,93 @@ class GatewayPage(PageScaffold):
         val = item.data(Qt.ItemDataRole.UserRole)
         return str(val) if val else None
 
+    def _build_list_menu_specs(self) -> list[MenuActionSpec]:
+        return [
+            MenuActionSpec(
+                key="add_wizard",
+                label=tr("gateway.btn.add"),
+                icon_name="plus",
+                callback=self._open_add_wizard,
+            ),
+            MenuActionSpec(
+                key="import",
+                label=tr("gateway.btn.import"),
+                icon_name="import",
+                callback=self._open_import_flow,
+            ),
+            MenuActionSpec(
+                key="solidworks",
+                label=tr("gateway.btn.solidworks"),
+                icon_name="gateway",
+                callback=self._open_solidworks_preset,
+            ),
+            MenuActionSpec(
+                key="manual",
+                label=tr("gateway.wizard.mode.manual"),
+                icon_name="edit",
+                callback=self._open_add_dialog,
+            ),
+            MenuActionSpec(
+                key="export",
+                label=tr("gateway.btn.export"),
+                icon_name="export",
+                separator_before=True,
+                callback=self._export_redacted,
+            ),
+        ]
+
+    def _open_list_menu(self) -> None:
+        menu = AppContextMenu.from_specs(self._build_list_menu_specs(), self)
+        pos = self.list_menu_btn.mapToGlobal(QPoint(self.list_menu_btn.width(), self.list_menu_btn.height()))
+        menu.exec_clamped(pos)
+
+    def _build_row_menu(self, row: int) -> list[MenuActionSpec]:
+        if not (0 <= row < len(self._row_server_ids)):
+            return []
+        sid = self._row_server_ids[row]
+        prof = self.store.get(sid)
+        if prof is None:
+            return []
+        return [
+            MenuActionSpec(
+                key="discover",
+                label=tr("gateway.menu.discover"),
+                icon_name="refresh",
+                callback=lambda s=sid: self.refresh_servers_sync(s),
+            ),
+            MenuActionSpec(
+                key="toggle",
+                label=tr("gateway.menu.disable" if prof.enabled else "gateway.menu.enable"),
+                icon_name="power",
+                callback=lambda s=sid: self._toggle_server(s),
+            ),
+            MenuActionSpec(
+                key="edit",
+                label=tr("gateway.btn.edit"),
+                icon_name="edit",
+                callback=lambda s=sid: self._edit_server(s),
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("gateway.menu.copy_id"),
+                icon_name="copy",
+                separator_before=True,
+                callback=lambda s=sid: self._copy_server_id(s),
+            ),
+            MenuActionSpec(
+                key="delete",
+                label=tr("gateway.btn.delete"),
+                icon_name="trash",
+                danger=True,
+                separator_before=True,
+                callback=lambda s=sid: self._delete_server(s),
+            ),
+        ]
+
     def reload(self) -> None:
         self.store.load()
         profiles = self.store.list_profiles()
+        self._row_server_ids = [p.server_id for p in profiles]
         if not profiles:
             self.table_card.hide()
             self.empty_state.show()
@@ -471,9 +551,14 @@ class GatewayPage(PageScaffold):
             self.server_table.setItem(
                 row, 5, QTableWidgetItem(tr(f"gateway.isolation.{prof.session_isolation}"))
             )
+            self.server_table.set_row_actions_cell(row, 6, tooltip=tr("common.actions"))
             if selected_id and prof.server_id == selected_id:
                 restore_row = row
 
+        hdr = self.server_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.server_table.setColumnWidth(6, 42)
         self.server_table.filter_rows(self.search_edit.text())
         if self.server_table.rowCount() > 0:
             self.server_table.selectRow(restore_row)
@@ -481,10 +566,6 @@ class GatewayPage(PageScaffold):
 
     def _on_server_selected(self) -> None:
         sid = self._selected_server_id()
-        has_sel = sid is not None
-        self.edit_btn.setEnabled(has_sel)
-        self.toggle_btn.setEnabled(has_sel)
-        self.delete_btn.setEnabled(has_sel)
         if not sid:
             self.tools_table.setRowCount(0)
             self.schema_view.setPlainText(tr("gateway.details.schema_placeholder"))
@@ -523,6 +604,17 @@ class GatewayPage(PageScaffold):
         schema = item.data(Qt.ItemDataRole.UserRole) or {}
         self.schema_view.setPlainText(json.dumps(schema, indent=2, ensure_ascii=False))
 
+    def _open_add_wizard(self) -> None:
+        wiz = AddMcpServerWizard(self.store, parent=self)
+        if wiz.exec() == QDialog.DialogCode.Accepted and wiz.saved_server_ids:
+            self.reload()
+            self.config_changed.emit()
+            for sid in wiz.saved_server_ids:
+                try:
+                    self.refresh_servers_sync(sid)
+                except Exception:  # noqa: BLE001
+                    pass
+
     def _open_add_dialog(self) -> None:
         dlg = GatewayServerDialog(self.store, is_new=True, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -536,9 +628,8 @@ class GatewayPage(PageScaffold):
             self.reload()
             self.config_changed.emit()
 
-    def _open_edit_dialog(self) -> None:
-        sid = self._selected_server_id()
-        prof = self.store.get(sid) if sid else None
+    def _edit_server(self, sid: str) -> None:
+        prof = self.store.get(sid)
         if prof is None:
             return
         dlg = GatewayServerDialog(self.store, existing=prof, is_new=False, parent=self)
@@ -546,9 +637,13 @@ class GatewayPage(PageScaffold):
             self.reload()
             self.config_changed.emit()
 
-    def _toggle_selected(self) -> None:
+    def _open_edit_dialog(self) -> None:
         sid = self._selected_server_id()
-        prof = self.store.get(sid) if sid else None
+        if sid:
+            self._edit_server(sid)
+
+    def _toggle_server(self, sid: str) -> None:
+        prof = self.store.get(sid)
         if prof is None:
             return
         updated = UpstreamServerProfile.from_dict({**prof.to_dict(), "enabled": not prof.enabled})
@@ -556,9 +651,19 @@ class GatewayPage(PageScaffold):
         self.reload()
         self.config_changed.emit()
 
-    def _delete_selected(self) -> None:
+    def _toggle_selected(self) -> None:
         sid = self._selected_server_id()
-        prof = self.store.get(sid) if sid else None
+        if sid:
+            self._toggle_server(sid)
+
+    def _copy_server_id(self, sid: str) -> None:
+        cb = QGuiApplication.clipboard()
+        if cb is not None:
+            cb.setText(sid)
+        self.status_message.emit(tr("toast.copied"), "ok")
+
+    def _delete_server(self, sid: str) -> None:
+        prof = self.store.get(sid)
         if prof is None:
             return
         answer = SilentMessageBox.question(
@@ -575,6 +680,11 @@ class GatewayPage(PageScaffold):
         self._catalog_by_server.pop(prof.server_id, None)
         self.reload()
         self.config_changed.emit()
+
+    def _delete_selected(self) -> None:
+        sid = self._selected_server_id()
+        if sid:
+            self._delete_server(sid)
 
     def import_json_with_preview(self, raw_json: str) -> list[str]:
         """Parse standard MCP JSON, require owner confirmation, and persist."""
@@ -679,13 +789,7 @@ class GatewayPage(PageScaffold):
         self.set_header(tr("gateway.title"), tr("gateway.lead"))
         self.search_edit.setPlaceholderText(tr("gateway.search"))
         self.add_btn.setText(tr("gateway.btn.add"))
-        self.solidworks_btn.setText(tr("gateway.btn.solidworks"))
-        self.import_btn.setText(tr("gateway.btn.import"))
-        self.export_btn.setText(tr("gateway.btn.export"))
         self.refresh_btn.setText(tr("gateway.btn.refresh"))
-        self.edit_btn.setText(tr("gateway.btn.edit"))
-        self.toggle_btn.setText(tr("gateway.btn.toggle"))
-        self.delete_btn.setText(tr("gateway.btn.delete"))
         self.server_table.setHorizontalHeaderLabels(
             [
                 tr("gateway.col.name"),
@@ -694,9 +798,14 @@ class GatewayPage(PageScaffold):
                 tr("gateway.col.tools"),
                 tr("gateway.col.profile"),
                 tr("gateway.col.isolation"),
+                "",
             ]
         )
-        self.empty_state.set_content(tr("gateway.empty.title"), tr("gateway.empty.desc"))
+        self.empty_state.set_content(
+            tr("gateway.empty.title"),
+            tr("gateway.empty.desc"),
+            tr("gateway.btn.add"),
+        )
         self.tools_header.set_texts(tr("gateway.details.tools_title"))
         self.logs_header.set_texts(tr("gateway.details.logs_title"))
         self.tools_table.setHorizontalHeaderLabels(

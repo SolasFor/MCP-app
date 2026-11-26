@@ -7,6 +7,7 @@ from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -27,7 +28,8 @@ from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import theme
-from app.ui.components.cards import Divider, EmptyState, FlowLayout, SectionHeader
+from app.ui.components.cards import Divider, EmptyState, SectionHeader
+from app.ui.components.context_menu import MenuActionSpec
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
@@ -174,44 +176,13 @@ class ExtensionsPage(PageScaffold):
         self.install_official_btn = QPushButton(tr("extensions.btn.install_official"))
         self.install_official_btn.setObjectName("Ghost")
         self.install_official_btn.clicked.connect(self.install_selected_catalog)
-        self.toggle_btn = QPushButton(tr("extensions.btn.toggle"))
-        self.toggle_btn.setObjectName("Ghost")
-        self.toggle_btn.clicked.connect(self.toggle_selected)
-        self.perms_btn = QPushButton(tr("extensions.btn.perms"))
-        self.perms_btn.setObjectName("Ghost")
-        self.perms_btn.clicked.connect(self.edit_permissions_selected)
-        self.update_btn = QPushButton(tr("extensions.btn.update"))
-        self.update_btn.setObjectName("Ghost")
-        self.update_btn.clicked.connect(self.update_selected_zip)
-        self.rollback_btn = QPushButton(tr("extensions.btn.rollback"))
-        self.rollback_btn.setObjectName("Ghost")
-        self.rollback_btn.clicked.connect(self.rollback_selected)
-        self.uninstall_btn = QPushButton(tr("extensions.btn.uninstall"))
-        self.uninstall_btn.setObjectName("Danger")
-        self.uninstall_btn.clicked.connect(self.uninstall_selected)
         self.refresh_btn = QPushButton(tr("extensions.btn.refresh"))
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_all)
-        for btn in (
-            self.install_zip_btn,
-            self.install_official_btn,
-            self.toggle_btn,
-            self.perms_btn,
-            self.update_btn,
-            self.rollback_btn,
-            self.uninstall_btn,
-            self.refresh_btn,
-        ):
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
         toolbar.addWidget(self.install_zip_btn)
         toolbar.addWidget(self.install_official_btn)
         toolbar.addWidget(self.refresh_btn)
         self.content.addLayout(toolbar)
-
-        action_flow = FlowLayout(spacing=6)
-        for btn in (self.toggle_btn, self.perms_btn, self.update_btn, self.rollback_btn, self.uninstall_btn):
-            action_flow.addWidget(btn)
-        self.content.addLayout(action_flow)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -229,9 +200,11 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.status"),
             tr("extensions.col.trust"),
             tr("extensions.col.perms"),
+            "",
         ])
         self.installed_table.setMinimumHeight(88)
         self.installed_table.itemSelectionChanged.connect(self._on_installed_selected)
+        self.installed_table.set_row_menu_provider(self._build_installed_row_menu)
         top_lay.addWidget(self.installed_table, 1)
 
         self.empty_state = EmptyState("extensions", tr("extensions.empty.title"), tr("extensions.empty.desc"))
@@ -246,8 +219,10 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.version"),
             tr("extensions.col.perms"),
             tr("extensions.col.desc"),
+            "",
         ])
         self.catalog_table.setMinimumHeight(88)
+        self.catalog_table.set_row_menu_provider(self._build_catalog_row_menu)
         top_lay.addWidget(self.catalog_table, 1)
         splitter.addWidget(top_widget)
 
@@ -317,6 +292,7 @@ class ExtensionsPage(PageScaffold):
                     color = theme.OK if st == "running" else (theme.ERR if st == "crashed" else theme.IDLE)
                     cell.setData(Qt.ItemDataRole.UserRole, color)
                 self.installed_table.setItem(row, col, cell)
+            self.installed_table.set_row_actions_cell(row, 6, tooltip=tr("common.actions"))
         self.installed_table.resizeColumnsToContents()
 
         self.catalog_table.setRowCount(len(self._catalog_cache))
@@ -331,16 +307,102 @@ class ExtensionsPage(PageScaffold):
             ]
             for col, text in enumerate(cells):
                 self.catalog_table.setItem(row, col, QTableWidgetItem(text))
+            self.catalog_table.set_row_actions_cell(row, 5, tooltip=tr("common.actions"))
         self.catalog_table.resizeColumnsToContents()
         self._refresh_details()
 
-    def _selected_installed(self) -> dict[str, Any] | None:
-        row = self.installed_table.currentRow()
+    def _installed_at(self, row: int) -> dict[str, Any] | None:
         if 0 <= row < len(self._installed_cache):
             return self._installed_cache[row]
+        return None
+
+    def _catalog_at(self, row: int) -> dict[str, Any] | None:
+        if 0 <= row < len(self._catalog_cache):
+            return self._catalog_cache[row]
+        return None
+
+    def _selected_installed(self) -> dict[str, Any] | None:
+        item = self._installed_at(self.installed_table.currentRow())
+        if item is not None:
+            return item
         if self._selected_id:
             return next((x for x in self._installed_cache if x["id"] == self._selected_id), None)
         return None
+
+    def _copy_ext_id(self, ext_id: str) -> None:
+        cb = QApplication.clipboard()
+        if cb is not None:
+            cb.setText(ext_id)
+        self.toast_requested.emit(tr("common.copied_id", item_id=ext_id))
+
+    def _build_installed_row_menu(self, row: int) -> list[MenuActionSpec]:
+        item = self._installed_at(row)
+        if not item:
+            return []
+        ext_id = str(item["id"])
+        enabled = bool(item.get("enabled"))
+        return [
+            MenuActionSpec(
+                key="toggle",
+                label=tr("extensions.btn.disable") if enabled else tr("extensions.btn.enable"),
+                callback=lambda i=item: self._toggle_extension(i),
+                icon_name="power",
+            ),
+            MenuActionSpec(
+                key="perms",
+                label=tr("extensions.btn.perms"),
+                callback=lambda i=item: self._edit_permissions_extension(i),
+                icon_name="shield",
+            ),
+            MenuActionSpec(
+                key="update",
+                label=tr("extensions.btn.update"),
+                callback=lambda i=item: self._update_zip_extension(i),
+                icon_name="refresh",
+            ),
+            MenuActionSpec(
+                key="rollback",
+                label=tr("extensions.btn.rollback"),
+                callback=lambda eid=ext_id: self._rollback_extension(eid),
+                icon_name="refresh",
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda eid=ext_id: self._copy_ext_id(eid),
+                icon_name="copy",
+                separator_before=True,
+            ),
+            MenuActionSpec(
+                key="uninstall",
+                label=tr("extensions.btn.uninstall"),
+                callback=lambda i=item: self._uninstall_extension(i),
+                icon_name="trash",
+                danger=True,
+                separator_before=True,
+            ),
+        ]
+
+    def _build_catalog_row_menu(self, row: int) -> list[MenuActionSpec]:
+        cat = self._catalog_at(row)
+        if not cat:
+            return []
+        ext_id = str(cat["id"])
+        return [
+            MenuActionSpec(
+                key="install",
+                label=tr("extensions.btn.install_official"),
+                callback=lambda eid=ext_id: self._install_catalog_id(eid),
+                icon_name="import",
+                enabled=not bool(cat.get("installed")),
+            ),
+            MenuActionSpec(
+                key="copy_id",
+                label=tr("common.copy_id"),
+                callback=lambda eid=ext_id: self._copy_ext_id(eid),
+                icon_name="copy",
+            ),
+        ]
 
     def _on_installed_selected(self) -> None:
         item = self._selected_installed()
@@ -378,11 +440,7 @@ class ExtensionsPage(PageScaffold):
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
-    def install_selected_catalog(self) -> None:
-        row = self.catalog_table.currentRow()
-        if not (0 <= row < len(self._catalog_cache)):
-            return
-        ext_id = self._catalog_cache[row]["id"]
+    def _install_catalog_id(self, ext_id: str) -> None:
         try:
             res = self.manager.install_official(ext_id, enable_after_install=False)
             self._selected_id = res["id"]
@@ -391,10 +449,12 @@ class ExtensionsPage(PageScaffold):
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
-    def toggle_selected(self) -> None:
-        item = self._selected_installed()
-        if not item:
-            return
+    def install_selected_catalog(self) -> None:
+        cat = self._catalog_at(self.catalog_table.currentRow())
+        if cat:
+            self._install_catalog_id(str(cat["id"]))
+
+    def _toggle_extension(self, item: dict[str, Any]) -> None:
         try:
             if item["enabled"]:
                 self.manager.disable(item["id"])
@@ -404,10 +464,12 @@ class ExtensionsPage(PageScaffold):
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
-    def edit_permissions_selected(self) -> None:
+    def toggle_selected(self) -> None:
         item = self._selected_installed()
-        if not item:
-            return
+        if item:
+            self._toggle_extension(item)
+
+    def _edit_permissions_extension(self, item: dict[str, Any]) -> None:
         dlg = ExtensionPermissionsDialog(item, parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -420,10 +482,12 @@ class ExtensionsPage(PageScaffold):
         self.toast_requested.emit(tr("extensions.toast.saved"))
         self.refresh_all()
 
-    def update_selected_zip(self) -> None:
+    def edit_permissions_selected(self) -> None:
         item = self._selected_installed()
-        if not item:
-            return
+        if item:
+            self._edit_permissions_extension(item)
+
+    def _update_zip_extension(self, item: dict[str, Any]) -> None:
         dlg = InstallZipDialog(parent=self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -439,25 +503,35 @@ class ExtensionsPage(PageScaffold):
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
-    def rollback_selected(self) -> None:
+    def update_selected_zip(self) -> None:
         item = self._selected_installed()
-        if not item:
-            return
+        if item:
+            self._update_zip_extension(item)
+
+    def _rollback_extension(self, ext_id: str) -> None:
         try:
-            res = self.manager.rollback(item["id"])
+            res = self.manager.rollback(ext_id)
             self.toast_requested.emit(tr("extensions.toast.rolled_back", name=res["name"]))
             self.refresh_all()
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("extensions.title"), str(exc))
 
-    def uninstall_selected(self) -> None:
+    def rollback_selected(self) -> None:
         item = self._selected_installed()
-        if not item:
-            return
+        if item:
+            self._rollback_extension(item["id"])
+
+    def _uninstall_extension(self, item: dict[str, Any]) -> None:
         self.manager.uninstall(item["id"], keep_data=True)
-        self._selected_id = None
+        if self._selected_id == item["id"]:
+            self._selected_id = None
         self.toast_requested.emit(tr("extensions.toast.removed", name=item["name"]))
         self.refresh_all()
+
+    def uninstall_selected(self) -> None:
+        item = self._selected_installed()
+        if item:
+            self._uninstall_extension(item)
 
     def shutdown(self) -> None:
         self.manager.shutdown_all()
@@ -468,11 +542,6 @@ class ExtensionsPage(PageScaffold):
         self.search_input.setPlaceholderText(tr("extensions.search"))
         self.install_zip_btn.setText(tr("extensions.btn.install_zip"))
         self.install_official_btn.setText(tr("extensions.btn.install_official"))
-        self.toggle_btn.setText(tr("extensions.btn.toggle"))
-        self.perms_btn.setText(tr("extensions.btn.perms"))
-        self.update_btn.setText(tr("extensions.btn.update"))
-        self.rollback_btn.setText(tr("extensions.btn.rollback"))
-        self.uninstall_btn.setText(tr("extensions.btn.uninstall"))
         self.refresh_btn.setText(tr("extensions.btn.refresh"))
         self._installed_hdr.set_texts(tr("extensions.installed.title"))
         self._catalog_hdr.set_texts(tr("extensions.catalog.title"))
@@ -486,6 +555,7 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.status"),
             tr("extensions.col.trust"),
             tr("extensions.col.perms"),
+            "",
         ])
         self.catalog_table.setHorizontalHeaderLabels([
             tr("extensions.col.id"),
@@ -493,5 +563,6 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.version"),
             tr("extensions.col.perms"),
             tr("extensions.col.desc"),
+            "",
         ])
         self.refresh_all()

@@ -239,7 +239,8 @@ class ServiceManager(QObject):
         self._diagnosis_ready.connect(self._on_diagnosis)
 
         self._token = self._load_or_create_token()
-        self._redactor.register(self._token)
+        self._redactor.register(self._token, allow_short=True)
+        self._redactor.register(self.bearer_transport_token, allow_short=True)
         for secret in self.connections.collect_secret_values():
             self._redactor.register(secret)
 
@@ -375,6 +376,10 @@ class ServiceManager(QObject):
     def token(self) -> str:
         return self._token
 
+    @property
+    def bearer_transport_token(self) -> str:
+        return token_store.transport_bearer_token(self._token)
+
     def url_with_token(self) -> str:
         """Deprecated compatibility helper: never expose owner Bearer in a URL."""
         return self.public_url
@@ -427,22 +432,27 @@ class ServiceManager(QObject):
     # ================================================================== изменение настроек
     def set_token(self, token: str) -> str | None:
         """Сохранить свой токен. Вернёт текст ошибки или None."""
-        token = token.strip()
-        if not token:
+        if not isinstance(token, str) or token == "":
             return "Токен не может быть пустым. Нажмите «Сгенерировать», чтобы получить случайный."
         problem = token_store.problem(token)
         if problem:
             return problem
         if token == self._token:
             return None
+        old_transport = self.bearer_transport_token
         try:
             token_store.save(token)
         except OSError as exc:
             return f"Не удалось сохранить токен: {exc}"
         self._redactor.unregister(self._token)
+        self._redactor.unregister(old_transport)
         self._token = token
-        self._redactor.register(token)
+        new_transport = self.bearer_transport_token
+        self._redactor.register(token, allow_short=True)
+        self._redactor.register(new_transport, allow_short=True)
         self._logging.register_secret(token)
+        if new_transport != token:
+            self._logging.register_secret(new_transport)
         self._bind_oauth_owner_token(token)
         self._logging.info(
             "oauth",
@@ -773,10 +783,15 @@ class ServiceManager(QObject):
 
     # ================================================================== запуск процессов
     def _server_env(self) -> dict[str, str]:
+        import base64
+
         s = self.settings
         ident = self.connection_identity
+        owner_b64 = base64.b64encode(self._token.encode("utf-8")).decode("ascii")
         return {
-            "MCP_SECRET_TOKEN": self._token,
+            "MCP_SECRET_TOKEN": self.bearer_transport_token,
+            "MCP_OWNER_SECRET_B64": owner_b64,
+            "MCP_LANGUAGE": str(getattr(s, "language", "ru") or "ru"),
             "MCP_PUBLIC_URL": ident.oauth_resource_url,
             "MCP_PATH": s.mcp_path,
             "MCP_HOST": "127.0.0.1" if self.active_provider == PROVIDER_LOCAL else s.server_host,

@@ -155,8 +155,10 @@ def make_tool_middleware(
                         except Exception as exc:
                             raise MCPError(code=-32603, message=f"Gateway tool call failed: {exc}") from exc
                         if metrics_registry is not None:
-                            is_err = bool(getattr(res, "isError", False)) or (
-                                isinstance(res, dict) and bool(res.get("isError"))
+                            is_err = (
+                                bool(getattr(res, "isError", False))
+                                or bool(getattr(res, "is_error", False))
+                                or (isinstance(res, dict) and bool(res.get("isError")))
                             )
                             metrics_registry.record_call(name, (time.monotonic() - t0) * 1000.0, error=is_err)
                         return res
@@ -168,8 +170,10 @@ def make_tool_middleware(
                     )
                 raise
             if metrics_registry is not None:
-                is_err = bool(getattr(res, "isError", False)) or (
-                    isinstance(res, dict) and bool(res.get("isError"))
+                is_err = (
+                    bool(getattr(res, "isError", False))
+                    or bool(getattr(res, "is_error", False))
+                    or (isinstance(res, dict) and bool(res.get("isError")))
                 )
                 metrics_registry.record_call(
                     str(name or "unknown"), (time.monotonic() - t0) * 1000.0, error=is_err

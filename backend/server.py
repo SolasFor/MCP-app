@@ -26,6 +26,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.auth import OAuthClientInformationFull
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.datastructures import Headers
+from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 if __package__:
@@ -35,6 +36,8 @@ if __package__:
         LocalConsentOAuthProvider,
         READ_SCOPE,
         _render_error_html,
+        oauth_t,
+        resolve_oauth_language,
     )
     from .oauth_store import canonical_oauth_urls, default_store_path
     from .oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
@@ -44,7 +47,27 @@ if __package__:
     from .managed_servers import ManagedServers
     from .output_stream import decode_process_bytes
     from .process_runner import CommandResult, ProcessRunner
-    from .tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from .tasks import (
+        TERMINAL_STATUSES,
+        TaskManager,
+        TaskRecord,
+        TaskSpec,
+        TaskStore,
+        TaskToolError,
+        build_task_error_result,
+        classify_task_exception,
+        log_task_tool_error,
+    )
+    from .tasks.errors import (
+        TASK_ACCESS_DENIED,
+        TASK_COMMAND_NOT_ALLOWED,
+        TASK_EXECUTABLE_NOT_FOUND,
+        TASK_INVALID_ARGUMENT,
+        TASK_INVALID_STATE,
+        TASK_INVALID_TIMEOUT,
+        TASK_NOT_FOUND,
+        TASK_QUEUE_FULL,
+    )
     from .workspaces import (
         FileVersionConflictError,
         PathSecurityError,
@@ -157,6 +180,8 @@ else:
         LocalConsentOAuthProvider,
         READ_SCOPE,
         _render_error_html,
+        oauth_t,
+        resolve_oauth_language,
     )
     from oauth_store import canonical_oauth_urls, default_store_path
     from oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
@@ -166,7 +191,27 @@ else:
     from managed_servers import ManagedServers
     from output_stream import decode_process_bytes
     from process_runner import CommandResult, ProcessRunner
-    from tasks import TaskManager, TaskRecord, TaskSpec, TaskStore
+    from tasks import (
+        TERMINAL_STATUSES,
+        TaskManager,
+        TaskRecord,
+        TaskSpec,
+        TaskStore,
+        TaskToolError,
+        build_task_error_result,
+        classify_task_exception,
+        log_task_tool_error,
+    )
+    from tasks.errors import (
+        TASK_ACCESS_DENIED,
+        TASK_COMMAND_NOT_ALLOWED,
+        TASK_EXECUTABLE_NOT_FOUND,
+        TASK_INVALID_ARGUMENT,
+        TASK_INVALID_STATE,
+        TASK_INVALID_TIMEOUT,
+        TASK_NOT_FOUND,
+        TASK_QUEUE_FULL,
+    )
     from workspaces import (
         FileVersionConflictError,
         PathSecurityError,
@@ -310,14 +355,29 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _load_owner_secret(fallback_transport_token: str) -> str:
+    raw_b64 = os.environ.get("MCP_OWNER_SECRET_B64", "")
+    if raw_b64:
+        try:
+            decoded = base64.b64decode(raw_b64.encode("ascii")).decode("utf-8")
+            if decoded:
+                return decoded
+        except Exception:  # noqa: BLE001
+            pass
+    return fallback_transport_token
+
+
 SECRET_TOKEN = os.environ.get("MCP_SECRET_TOKEN", "").strip()
 TOKEN_FROM_ENV = bool(SECRET_TOKEN)
 if not SECRET_TOKEN:
     SECRET_TOKEN = secrets.token_urlsafe(24)
     # Только при ручном запуске без GUI: иначе временный токен негде узнать.
     logger.warning("MCP_SECRET_TOKEN not set: temporary token generated (never logged). Set a token before remote use.")
+OWNER_SECRET = _load_owner_secret(SECRET_TOKEN)
 
-REDACTOR = SecretRedactor([SECRET_TOKEN])
+REDACTOR = SecretRedactor()
+REDACTOR.register(SECRET_TOKEN, allow_short=True)
+REDACTOR.register(OWNER_SECRET, allow_short=True)
 _REDACT_FILTER = RedactingLogFilter(REDACTOR)
 logger.addFilter(_REDACT_FILTER)
 for _handler in logging.getLogger().handlers:
@@ -609,7 +669,8 @@ class HybridAuthMiddleware:
                         k.decode("latin-1").lower(): v.decode("latin-1")
                         for k, v in message.get("headers", [])
                     }
-                    if "application/json" in resp_headers.get("content-type", "").lower():
+                    ctype = resp_headers.get("content-type", "").lower()
+                    if "application/json" in ctype or "text/plain" in ctype:
                         buffered_start = message
                         return
             elif message["type"] == "http.response.body" and buffered_start is not None:
@@ -618,30 +679,33 @@ class HybridAuthMiddleware:
                     return
                 err_code = "invalid_request"
                 err_desc = "Invalid OAuth authorization request."
+                raw_text = buffered_body.decode("utf-8", errors="replace").strip()
                 try:
-                    parsed = json.loads(buffered_body.decode("utf-8", errors="replace"))
+                    parsed = json.loads(raw_text)
                     if isinstance(parsed, dict):
                         err_code = str(parsed.get("error") or err_code)
                         err_desc = REDACTOR.redact_text(str(parsed.get("error_description") or err_desc))
                 except Exception:  # noqa: BLE001
-                    pass
+                    if raw_text:
+                        err_desc = REDACTOR.redact_text(raw_text)
                 _LOGGING_MGR.warning(
                     "oauth",
                     f"Browser /authorize error {buffered_start['status']} ({err_code}): {err_desc}",
                     event_code="oauth_authorize_browser_error",
                 )
-                hint = (
-                    "This usually means the MCP server restarted or switched URL/provider after the client registered. "
-                    "Return to your AI client and click Reconnect to register and authorize cleanly."
+                req_lang = resolve_oauth_language(Request(scope))
+                hint_key = (
+                    "err_authorize_hint_client"
                     if "not found" in err_desc.lower() or "client" in err_desc.lower()
-                    else "Verify the server public URL and restart authorization from your AI client."
+                    else "err_authorize_hint_generic"
                 )
                 html_resp = HTMLResponse(
                     _render_error_html(
-                        "Authorization failed",
-                        f"Authorization failed ({err_code})",
+                        oauth_t(req_lang, "err_authorize_title"),
+                        oauth_t(req_lang, "err_authorize_heading", code=err_code),
                         err_desc,
-                        hint=hint,
+                        hint=oauth_t(req_lang, hint_key),
+                        lang=req_lang,
                     ),
                     status_code=buffered_start["status"],
                     headers=SECURITY_HEADERS,
@@ -708,9 +772,10 @@ DEFAULT_ACCESS_PROFILE = (
 
 oauth_provider = (
     LocalConsentOAuthProvider(
-        BASE_URL, RESOURCE_URL, SECRET_TOKEN,
+        BASE_URL, RESOURCE_URL, OWNER_SECRET,
         store_path=os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path(),
         default_profile=DEFAULT_ACCESS_PROFILE,
+        transport_secret=SECRET_TOKEN,
     )
     if OAUTH_ENABLED else None
 )
@@ -2862,61 +2927,276 @@ TASK_MANAGER = TaskManager(
 )
 
 
+def _task_tool_error_response(
+    exc: BaseException,
+    *,
+    tool_name: str,
+    task_id: str | None = None,
+    profile: str | None = None,
+    lookup_operation: bool = False,
+) -> Any:
+    """Convert task tool failures into structured MCP CallToolResult(isError=True) with safe logging."""
+    err = classify_task_exception(
+        exc,
+        tool_name=tool_name,
+        task_id=task_id,
+        profile=profile,
+        lookup_operation=lookup_operation,
+    )
+    log_task_tool_error(
+        err,
+        tool_name=tool_name,
+        task_id=task_id,
+        exc=exc,
+        redactor=REDACTOR,
+        logging_mgr=_LOGGING_MGR,
+    )
+    return build_task_error_result(err, redactor=REDACTOR)
+
+
+def _resolve_windows_shell_executable(shell: str) -> str:
+    """Resolve full path to cmd.exe or powershell.exe cleanly even under minimal frozen PATH."""
+    import shutil
+
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    if shell == "powershell":
+        candidates = [
+            str(system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"),
+            shutil.which("powershell") or "",
+            shutil.which("pwsh") or "",
+        ]
+    else:
+        candidates = [
+            str(system_root / "System32" / "cmd.exe"),
+            shutil.which("cmd") or "",
+        ]
+    for cand in candidates:
+        if cand and Path(cand).is_file():
+            return cand
+    raise TaskToolError(
+        code=TASK_EXECUTABLE_NOT_FOUND,
+        message=f"Не найден исполняемый файл оболочки '{shell}'.",
+        details={"shell": shell},
+        suggestion="Проверьте наличие системной оболочки Windows или выберите другой поддерживаемый shell.",
+        internal_reason=f"Missing Windows shell executable for {shell!r}",
+    )
+
+
 @_conditional_tool(OAUTH_ENABLED)
 async def task_start(
     command: str,
     kind: Literal["windows", "ssh"] = "windows",
     shell: Literal["cmd", "powershell"] = "cmd",
-    timeout: int = 60,
+    timeout: int | None = None,
     host: str = "",
     user: str = "",
     port: int = 22,
     priority: int = 0,
     idempotency_key: str = "",
     title: str = "",
-) -> dict:
+) -> dict[str, Any]:
     """Queue a durable background task whose execution continues across client disconnects."""
-    client_id = require_execution_permission(
-        TASK_START, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    spec = TaskSpec(
-        kind=kind, command=command, shell=shell, timeout=timeout,
-        host=host, user=user, port=port,
-    )
-    spec.validate()
-    profile = _authorize_task_spec(client_id, spec)
-    rec, deduplicated = await TASK_MANAGER.submit(
-        owner_client_id=client_id,
-        profile=profile,
-        spec=spec,
-        priority=priority,
-        idempotency_key=idempotency_key,
-        title=title,
-    )
-    EXEC_AUDIT.record(
-        client_id=client_id, kind=kind, profile=profile,
-        event="started", command=command, host=host or None, port=port if host else None,
-        action_id=rec.task_id,
-    )
-    return {**rec.to_public_dict(REDACTOR), "deduplicated": deduplicated, "mcp_task": rec.to_mcp_task_dict(REDACTOR)}
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_START, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        if oauth_provider is None or oauth_execution is None:
+            raise TaskToolError(
+                code=TASK_ACCESS_DENIED,
+                message="Менеджер задач OAuth недоступен в текущей конфигурации сервера.",
+                suggestion="Включите OAuth-авторизацию в настройках MCP-app.",
+            )
+        if oauth_execution.emergency_stopped():
+            raise TaskToolError(
+                code=TASK_ACCESS_DENIED,
+                message="Запуск фоновых задач заблокирован активной аварийной остановкой.",
+                details={"emergency_stop": True},
+                suggestion="Снимите аварийную остановку в приложении MCP-app во вкладке «Безопасность».",
+            )
+        if not oauth_execution.client_approved(client_id):
+            raise TaskToolError(
+                code=TASK_ACCESS_DENIED,
+                message="OAuth-клиент не подтверждён владельцем.",
+                suggestion="Пройдите подтверждение доступа в браузере или в приложении MCP-app.",
+            )
+        profile = oauth_execution.profile_for(client_id)
+        if profile not in ("allowlist", "full"):
+            raise TaskToolError(
+                code=TASK_ACCESS_DENIED,
+                message="Запуск фоновых задач запрещён в безопасном режиме (safe).",
+                details={"profile": profile},
+                suggestion="Переключите сценарий доступа клиента на «Белый список» (allowlist) или «Полный доступ» (full).",
+            )
+        if kind not in ("windows", "ssh"):
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message=f"Неподдерживаемый тип задачи kind={kind!r}.",
+                details={"kind": kind, "allowed_kinds": ["windows", "ssh"]},
+                suggestion="Укажите kind='windows' или kind='ssh'.",
+            )
+        if not isinstance(command, str) or not command.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Команда задачи не может быть пустой.",
+                details={"kind": kind},
+                suggestion="Передайте непустую команду в параметре command.",
+            )
+        if len(command) > 32000:
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Длина команды превышает лимит 32000 символов.",
+                details={"length": len(command), "max_length": 32000},
+                suggestion="Сократите команду или вынесите логику в скрипт внутри рабочего каталога.",
+            )
+        if shell not in ("cmd", "powershell"):
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message=f"Неподдерживаемая оболочка shell={shell!r}.",
+                details={"shell": shell, "allowed_shells": ["cmd", "powershell"]},
+                suggestion="Укажите shell='cmd' или shell='powershell'.",
+            )
+        if profile != "full" and kind == "windows" and shell != "cmd":
+            raise TaskToolError(
+                code=TASK_COMMAND_NOT_ALLOWED,
+                message="Оболочка PowerShell в фоновых задачах доступна только при полном доступе (full).",
+                details={"profile": profile, "shell": shell},
+                suggestion="Используйте shell='cmd' с разрешённой командой или переключите клиента в режим full.",
+            )
+        max_to = 600 if profile == "full" else (12 if kind == "ssh" else 15)
+        if timeout is None:
+            resolved_timeout = 60 if profile == "full" else max_to
+        else:
+            if isinstance(timeout, bool) or not isinstance(timeout, int):
+                raise TaskToolError(
+                    code=TASK_INVALID_TIMEOUT,
+                    message="Параметр timeout должен быть целым числом секунд.",
+                    details={"profile": profile, "max_timeout": max_to},
+                    suggestion=f"Передайте целое число от 1 до {max_to} или не указывайте timeout.",
+                )
+            resolved_timeout = timeout
+            if not (1 <= resolved_timeout <= max_to):
+                raise TaskToolError(
+                    code=TASK_INVALID_TIMEOUT,
+                    message=f"Значение timeout={resolved_timeout} сек. выходит за допустимый диапазон 1–{max_to} сек. для профиля '{profile}'.",
+                    details={
+                        "requested_timeout": resolved_timeout,
+                        "min_timeout": 1,
+                        "max_timeout": max_to,
+                        "profile": profile,
+                        "kind": kind,
+                    },
+                    suggestion=f"Укажите timeout от 1 до {max_to} сек. либо опустите параметр, чтобы использовать значение по умолчанию ({max_to if profile != 'full' else 60} сек.).",
+                )
+        if kind == "ssh":
+            if not isinstance(host, str) or not host.strip():
+                raise TaskToolError(
+                    code=TASK_INVALID_ARGUMENT,
+                    message="Для SSH-задачи требуется непустой параметр host.",
+                    details={"kind": kind},
+                    suggestion="Укажите имя или адрес SSH-хоста из настроенного списка.",
+                )
+            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+                raise TaskToolError(
+                    code=TASK_INVALID_ARGUMENT,
+                    message="SSH-порт должен быть целым числом в диапазоне 1–65535.",
+                    details={"port": port},
+                    suggestion="Укажите корректный TCP-порт (обычно 22).",
+                )
+        if kind == "windows" and os.name == "nt" and profile == "full":
+            _resolve_windows_shell_executable(shell)
+        spec = TaskSpec(
+            kind=kind,
+            command=command,
+            shell=shell,
+            timeout=resolved_timeout,
+            host=host,
+            user=user,
+            port=port,
+        )
+        spec.validate()
+        profile = _authorize_task_spec(client_id, spec)
+        try:
+            rec, deduplicated = await TASK_MANAGER.submit(
+                owner_client_id=client_id,
+                profile=profile,
+                spec=spec,
+                priority=priority,
+                idempotency_key=idempotency_key,
+                title=title,
+            )
+        except RuntimeError as exc:
+            if "quota exceeded" in str(exc).lower():
+                raise TaskToolError(
+                    code=TASK_QUEUE_FULL,
+                    message="Превышена квота активных и ожидающих задач для текущего клиента.",
+                    details={"max_queued_per_client": TASK_MANAGER.max_queued_per_client},
+                    suggestion="Дождитесь завершения текущих задач или отмените ненужные через task_cancel.",
+                    internal_reason=str(exc),
+                ) from exc
+            raise
+        try:
+            EXEC_AUDIT.record(
+                client_id=client_id, kind=kind, profile=profile,
+                event="started", command=command, host=host or None, port=port if host else None,
+                action_id=rec.task_id,
+            )
+            _LOGGING_MGR.info(
+                "tasks",
+                f"Task queued task_id={rec.task_id} kind={kind} profile={profile} timeout={resolved_timeout}s deduplicated={deduplicated}",
+                event_code="task_queued",
+            )
+        except Exception as log_exc:  # noqa: BLE001
+            # Never turn an already-queued task into a failed tool response because of telemetry I/O.
+            logger.warning("Post-submit task audit/log failed for %s: %s", rec.task_id, type(log_exc).__name__)
+        return {**rec.to_public_dict(REDACTOR), "deduplicated": deduplicated, "mcp_task": rec.to_mcp_task_dict(REDACTOR)}
+    except BaseException as exc:
+        return _task_tool_error_response(exc, tool_name=TASK_START, profile=profile)
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def task_status(task_id: str) -> dict:
+async def task_status(task_id: str) -> dict[str, Any]:
     """Inspect status, elapsed time, and optional known progress for an owned background task."""
-    client_id = require_execution_permission(
-        TASK_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return TASK_MANAGER.status_dict(task_id, owner_client_id=client_id)
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор задачи, полученный от task_start или task_list.",
+            )
+        return TASK_MANAGER.status_dict(task_id.strip(), owner_client_id=client_id)
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_STATUS, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def task_list(status: str = "", limit: int = 50) -> dict:
+async def task_list(status: str = "", limit: int = 50) -> dict[str, Any]:
     """List durable background tasks owned by this OAuth client."""
-    client_id = require_execution_permission(
-        TASK_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return {"tasks": TASK_MANAGER.list_dicts(owner_client_id=client_id, status=status or None, limit=limit)}
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if status:
+            from .tasks.models import ALL_STATUSES
+            if status not in ALL_STATUSES:
+                raise TaskToolError(
+                    code=TASK_INVALID_ARGUMENT,
+                    message=f"Недопустимый фильтр status={status!r}.",
+                    details={"status": status, "allowed_statuses": sorted(ALL_STATUSES)},
+                    suggestion="Передайте пустую строку или один из допустимых статусов: queued, running, succeeded, failed, cancelled, interrupted.",
+                )
+        return {"tasks": TASK_MANAGER.list_dicts(owner_client_id=client_id, status=status or None, limit=limit)}
+    except BaseException as exc:
+        return _task_tool_error_response(exc, tool_name=TASK_LIST, profile=profile)
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -2925,45 +3205,127 @@ async def task_output(
     stream: Literal["stdout", "stderr"] = "stdout",
     offset: int = 0,
     limit: int = 8000,
-) -> dict:
+) -> dict[str, Any]:
     """Read paginated, redacted stdout or stderr output from disk spool for an owned task."""
-    client_id = require_execution_permission(
-        TASK_OUTPUT, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return TASK_MANAGER.read_output(
-        task_id, owner_client_id=client_id, stream=stream, offset=offset, limit=limit,
-    )
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_OUTPUT, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор задачи, полученный от task_start или task_list.",
+            )
+        if stream not in ("stdout", "stderr"):
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message=f"Недопустимый поток вывода stream={stream!r}.",
+                details={"stream": stream},
+                suggestion="Используйте stream='stdout' или stream='stderr'.",
+            )
+        return TASK_MANAGER.read_output(
+            task_id.strip(), owner_client_id=client_id, stream=stream, offset=offset, limit=limit,
+        )
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_OUTPUT, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def task_result(task_id: str) -> dict:
+async def task_result(task_id: str) -> dict[str, Any]:
     """Return final outcome, exit code, and redacted summary artifact for an owned task."""
-    client_id = require_execution_permission(
-        TASK_RESULT, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return TASK_MANAGER.result_dict(task_id, owner_client_id=client_id)
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_RESULT, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор задачи, полученный от task_start или task_list.",
+            )
+        return TASK_MANAGER.result_dict(task_id.strip(), owner_client_id=client_id)
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_RESULT, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def task_cancel(task_id: str) -> dict:
+async def task_cancel(task_id: str) -> dict[str, Any]:
     """Cancel an owned queued or running task, terminating its controlled process tree."""
-    client_id = require_execution_permission(
-        TASK_CANCEL, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return TASK_MANAGER.cancel(task_id, owner_client_id=client_id)
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_CANCEL, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор активной задачи из task_list.",
+            )
+        clean_id = task_id.strip()
+        cur = TASK_MANAGER._require_owned_task(clean_id, client_id)
+        if cur.status in TERMINAL_STATUSES:
+            raise TaskToolError(
+                code=TASK_INVALID_STATE,
+                message=f"Задачу нельзя отменить в состоянии '{cur.status}'.",
+                details={"task_id": clean_id, "status": cur.status},
+                suggestion="Отменять можно только задачи в состоянии queued или running.",
+            )
+        return TASK_MANAGER.cancel(clean_id, owner_client_id=client_id)
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_CANCEL, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def task_restart(task_id: str) -> dict:
+async def task_restart(task_id: str) -> dict[str, Any]:
     """Explicitly re-enqueue an owned completed, failed, cancelled, or interrupted task."""
-    client_id = require_execution_permission(
-        TASK_RESTART, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    spec = TASK_STORE.get_spec(task_id)
-    if spec is None:
-        raise KeyError(f"Unknown task: {task_id!r}")
-    profile = _authorize_task_spec(client_id, spec)
-    return await TASK_MANAGER.restart(task_id, owner_client_id=client_id, new_profile=profile)
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_RESTART, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор завершённой задачи из task_list.",
+            )
+        clean_id = task_id.strip()
+        old = TASK_MANAGER._require_owned_task(clean_id, client_id)
+        if old.status not in TERMINAL_STATUSES:
+            raise TaskToolError(
+                code=TASK_INVALID_STATE,
+                message=f"Нельзя перезапустить задачу в состоянии '{old.status}'.",
+                details={"task_id": clean_id, "status": old.status},
+                suggestion="Дождитесь завершения задачи или сначала остановите её через task_cancel.",
+            )
+        spec = TASK_STORE.get_spec(clean_id)
+        if spec is None:
+            raise TaskToolError(
+                code=TASK_NOT_FOUND,
+                message="Спецификация задачи не найдена.",
+                details={"task_id": clean_id},
+                suggestion="Запустите задачу заново через task_start.",
+            )
+        profile = _authorize_task_spec(client_id, spec)
+        return await TASK_MANAGER.restart(clean_id, owner_client_id=client_id, new_profile=profile)
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_RESTART, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -2972,14 +3334,37 @@ async def task_artifacts(
     artifact_name: str = "",
     offset: int = 0,
     limit: int = 16000,
-) -> dict:
+) -> dict[str, Any]:
     """List or read paginated redacted output artifacts for an owned background task."""
-    client_id = require_execution_permission(
-        TASK_ARTIFACTS, oauth_provider.store if oauth_provider else None, oauth_execution
-    )
-    return TASK_MANAGER.read_artifacts(
-        task_id, owner_client_id=client_id, artifact_name=artifact_name, offset=offset, limit=limit,
-    )
+    profile: str | None = None
+    try:
+        client_id = require_execution_permission(
+            TASK_ARTIFACTS, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        profile = oauth_execution.profile_for(client_id) if oauth_execution else None
+        if not isinstance(task_id, str) or not task_id.strip():
+            raise TaskToolError(
+                code=TASK_INVALID_ARGUMENT,
+                message="Параметр task_id не может быть пустым.",
+                suggestion="Укажите идентификатор задачи, полученный от task_start или task_list.",
+            )
+        clean_id = task_id.strip()
+        try:
+            return TASK_MANAGER.read_artifacts(
+                clean_id, owner_client_id=client_id, artifact_name=artifact_name, offset=offset, limit=limit,
+            )
+        except FileNotFoundError as exc:
+            raise TaskToolError(
+                code=TASK_NOT_FOUND,
+                message="Запрошенный артефакт задачи не найден.",
+                details={"task_id": clean_id, "artifact_name": artifact_name},
+                suggestion="Вызовите task_artifacts без artifact_name, чтобы увидеть список доступных артефактов.",
+                internal_reason=str(exc),
+            ) from exc
+    except BaseException as exc:
+        return _task_tool_error_response(
+            exc, tool_name=TASK_ARTIFACTS, task_id=task_id if isinstance(task_id, str) else None, profile=profile, lookup_operation=True
+        )
 
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_EXECUTABLES))
@@ -3336,7 +3721,7 @@ async def invoke_playground_tool(
     try:
         res = await mcp.call_tool(tool_name, dict(arguments or {}))
         elapsed = (time.monotonic() - t0) * 1000.0
-        is_err = bool(getattr(res, "isError", False))
+        is_err = bool(getattr(res, "isError", False) or getattr(res, "is_error", False))
         METRICS_REGISTRY.record_call(tool_name, elapsed, error=is_err)
         raw_items = getattr(res, "content", None)
         if raw_items is None and isinstance(res, list):
@@ -3354,7 +3739,7 @@ async def invoke_playground_tool(
                 })
             else:
                 items_out.append({"type": "raw", "value": REDACTOR.redact_text(str(item))})
-        structured = getattr(res, "structuredContent", None)
+        structured = getattr(res, "structuredContent", None) or getattr(res, "structured_content", None)
         if structured is None and isinstance(res, dict):
             structured = res
         return {
@@ -3433,8 +3818,9 @@ def main() -> None:
     query = "разрешён" if ALLOW_QUERY_TOKEN else "выключен"
     logger.info(f"Ответы: {mode}; токен в ссылке: {query}")
     if TOKEN_FROM_ENV:
-        # Токен целиком не пишем: лог уходит в mcp_audit.log и в окно GUI.
-        logger.info(f"Токен: из MCP_SECRET_TOKEN (…{SECRET_TOKEN[-4:]})")
+        # Токен целиком не пишем: короткий токен маскируем полностью без раскрытия символов.
+        masked = "•" * max(4, len(SECRET_TOKEN)) if len(SECRET_TOKEN) <= 8 else f"…{SECRET_TOKEN[-4:]}"
+        logger.info(f"Токен: из MCP_SECRET_TOKEN ({masked})")
 
     import uvicorn
     try:

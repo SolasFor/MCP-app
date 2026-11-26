@@ -276,7 +276,6 @@ class MainWindow(QMainWindow):
 
         self._desktop_indicator_btn = QPushButton("")
         self._desktop_indicator_btn.setObjectName("Danger")
-        self._desktop_indicator_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._desktop_indicator_btn.clicked.connect(lambda: self.show_page("security"))
         self._desktop_indicator_btn.hide()
         row.addWidget(self._desktop_indicator_btn)
@@ -288,7 +287,6 @@ class MainWindow(QMainWindow):
         self._palette_top_btn.setIconSize(QSize(14, 14))
         self._palette_top_btn.setToolTip(tr("topbar.palette"))
         self._palette_top_btn.setAccessibleName(tr("topbar.palette"))
-        self._palette_top_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._palette_top_btn.clicked.connect(self.open_command_palette)
         row.addWidget(self._palette_top_btn)
 
@@ -296,7 +294,6 @@ class MainWindow(QMainWindow):
         self._theme_combo.setObjectName("ThemeCombo")
         self._theme_combo.setMinimumWidth(116)
         self._theme_combo.setIconSize(QSize(13, 13))
-        self._theme_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         self._theme_combo.addItem("", theme.THEME_LIGHT)
         self._theme_combo.addItem("", theme.THEME_DARK)
         self._theme_combo.addItem("", theme.THEME_SYSTEM)
@@ -869,7 +866,7 @@ class MainWindow(QMainWindow):
             url,
             self.settings.server_port,
             self.settings.server_health_path,
-            self.manager.token,
+            getattr(self.manager, "bearer_transport_token", self.manager.token),
             self,
             tunnel_mode=self.manager.active_provider,
             tunnel_protocol=self.manager.tunnel_protocol,
@@ -1066,30 +1063,42 @@ class MainWindow(QMainWindow):
         self._refresh_services()
 
     # ================================================================== token
+    def _update_token_warning(self, token: str) -> None:
+        c = self.connections_page
+        warn = token_store.weakness_warning(token, lang=self.settings.language)
+        if warn and not c.token_error.isVisible():
+            c.token_warning.setText(warn)
+            c.token_warning.show()
+        else:
+            c.token_warning.clear()
+            c.token_warning.hide()
+
     def _load_token_into_field(self) -> None:
         c = self.connections_page
         c.token_edit.setText(self.manager.token)
         c.token_save.hide()
         self._set_field_error(c.token_edit, c.token_error, None)
+        self._update_token_warning(self.manager.token)
 
     def _on_token_edited(self, text: str) -> None:
         c = self.connections_page
-        token = text.strip()
+        token = text
         changed = token != self.manager.token
         c.token_save.setVisible(changed)
         problem = None
         if changed:
-            problem = token_store.problem(token) if token else "Токен не может быть пустым."
+            problem = token_store.problem(token) if token != "" else "Токен не может быть пустым."
         self._set_field_error(c.token_edit, c.token_error, problem)
+        self._update_token_warning(token if problem is None else "")
         c.token_save.setEnabled(problem is None)
 
     def _save_token(self) -> None:
         c = self.connections_page
-        token = c.token_edit.text().strip()
+        token = c.token_edit.text()
         if token == self.manager.token:
             c.token_save.hide()
             return
-        problem = token_store.problem(token) if token else "Токен не может быть пустым."
+        problem = token_store.problem(token) if token != "" else "Токен не может быть пустым."
         if problem:
             self._set_field_error(c.token_edit, c.token_error, problem)
             return

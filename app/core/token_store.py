@@ -20,11 +20,10 @@ from app.paths import user_data_dir
 from app.platform import get_platform
 
 TOKEN_FILE = "token.json"
-MIN_LENGTH = 16
-# Символы, допустимые в заголовке Authorization и в URL без кодирования.
-_ALLOWED_EXTRA = "-._~+/="
+RECOMMENDED_MIN_LENGTH = 12
 _SECRET_NS = "owner"
 _SECRET_KEY = "bearer_token"
+_TRANSPORT_KEY = "transport_bearer_token"
 
 
 def path() -> Path:
@@ -41,6 +40,11 @@ def generate(nbytes: int = 24) -> str:
     return secrets.token_urlsafe(nbytes)
 
 
+def is_http_bearer_compatible(token: str) -> bool:
+    """True, если токен состоит только из видимых ASCII-символов без пробелов и управляющих символов."""
+    return bool(token) and all(0x21 <= ord(ch) <= 0x7E for ch in token)
+
+
 def load() -> str:
     target = path()
     store = _store(target.parent)
@@ -51,18 +55,17 @@ def load() -> str:
 
     if isinstance(data, dict):
         legacy_token = data.get("token")
-        if isinstance(legacy_token, str) and legacy_token.strip():
-            clean = legacy_token.strip()
+        if isinstance(legacy_token, str) and legacy_token != "":
             try:
-                store.set_secret(_SECRET_NS, _SECRET_KEY, clean)
+                store.set_secret(_SECRET_NS, _SECRET_KEY, legacy_token)
                 _write_marker(target)
             except OSError:
                 pass
-            return clean
+            return legacy_token
 
     try:
         stored = store.get_secret(_SECRET_NS, _SECRET_KEY)
-        return stored.strip() if isinstance(stored, str) else ""
+        return stored if isinstance(stored, str) else ""
     except (OSError, ValueError, RuntimeError):
         return ""
 
@@ -80,23 +83,81 @@ def _write_marker(target: Path) -> None:
 
 
 def save(token: str) -> None:
+    if not isinstance(token, str) or token == "":
+        raise ValueError("Owner token must not be empty")
     target = path()
     store = _store(target.parent)
     store.set_secret(_SECRET_NS, _SECRET_KEY, token)
+    # Rotate separate HTTP Bearer transport secret whenever the owner secret changes.
+    if is_http_bearer_compatible(token):
+        store.set_secret(_SECRET_NS, _TRANSPORT_KEY, token)
+    else:
+        store.set_secret(_SECRET_NS, _TRANSPORT_KEY, generate())
     _write_marker(target)
 
 
+def transport_bearer_token(owner_token: str | None = None) -> str:
+    """Return an HTTP-safe ASCII Bearer token corresponding to the active owner token.
+
+    For standard visible-ASCII owner tokens, this equals the owner token for full
+    compatibility. When the owner sets a token with Unicode, Cyrillic, spaces, or
+    arbitrary control characters, HTTP Authorization headers use a separate DPAPI-stored
+    ASCII transport token while /oauth/consent verifies the exact UTF-8 owner token.
+    """
+    tok = load() if owner_token is None else owner_token
+    if is_http_bearer_compatible(tok):
+        return tok
+    target = path()
+    store = _store(target.parent)
+    try:
+        stored = store.get_secret(_SECRET_NS, _TRANSPORT_KEY)
+        if isinstance(stored, str) and is_http_bearer_compatible(stored) and stored != tok:
+            return stored
+    except (OSError, ValueError, RuntimeError):
+        pass
+    fresh = generate()
+    try:
+        store.set_secret(_SECRET_NS, _TRANSPORT_KEY, fresh)
+    except OSError:
+        pass
+    return fresh
+
+
 def problem(token: str) -> str | None:
-    """Почему такой токен нельзя сохранить, или None. Пустой допустим."""
+    """Почему такой токен нельзя сохранить, или None. Непустой токен допустим в любом виде."""
+    if not isinstance(token, str) or token == "":
+        return "Токен не может быть пустым."
+    return None
+
+
+def weakness_warning(token: str, lang: str = "ru") -> str | None:
+    """Необязательное предупреждение о слабом токене (не блокирует сохранение)."""
     if not token:
         return None
-    if any(ch.isspace() for ch in token):
-        return "В токене не должно быть пробелов и переводов строки."
-    if len(token) < MIN_LENGTH:
-        return f"Слишком короткий токен: нужно не менее {MIN_LENGTH} символов (сейчас {len(token)})."
-    if any(not (ch.isalnum() and ch.isascii()) and ch not in _ALLOWED_EXTRA for ch in token):
-        return "Допустимы только латинские буквы, цифры и символы - . _ ~ + / ="
-    return None
+    is_en = str(lang).lower().startswith("en")
+    notes: list[str] = []
+    if len(token) < RECOMMENDED_MIN_LENGTH:
+        notes.append(
+            f"short token ({len(token)} chars; 12+ recommended)"
+            if is_en
+            else f"короткий токен ({len(token)} симв.; рекомендуется 12+)"
+        )
+    elif len(set(token)) < 4:
+        notes.append(
+            "low character variety"
+            if is_en
+            else "однообразные символы"
+        )
+    if not is_http_bearer_compatible(token):
+        notes.append(
+            "OAuth consent uses your exact token; direct Bearer clients should use the ASCII transport token from Diagnostics"
+            if is_en
+            else "форма OAuth использует ваш точный токен; для прямого заголовка Bearer применяйте ASCII-токен из «Диагностики»"
+        )
+    if not notes:
+        return None
+    prefix = "Notice: " if is_en else "Примечание: "
+    return prefix + "; ".join(notes) + "."
 
 
 def mask(token: str) -> str:
@@ -104,7 +165,7 @@ def mask(token: str) -> str:
     if not token:
         return "не задан"
     if len(token) <= 8:
-        return "•" * len(token)
+        return "•" * max(4, len(token))
     return f"{token[:4]}…{token[-4:]} ({len(token)} симв.)"
 
 

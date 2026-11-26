@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -117,16 +117,13 @@ class ConnectionDiagnosticsDialog(SilentDialog):
         footer.setSpacing(6)
         self.start_button = QPushButton("Запустить проверки")
         self.start_button.setObjectName("Accent")
-        self.start_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.start_button.clicked.connect(self.start_checks)
         self.save_report_button = QPushButton("Сохранить отчёт…")
         self.save_report_button.setObjectName("Ghost")
-        self.save_report_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_report_button.setEnabled(False)
         self.save_report_button.clicked.connect(self.save_report)
         self.close_button = QPushButton("Закрыть")
         self.close_button.setObjectName("Ghost")
-        self.close_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_button.clicked.connect(self.accept)
         footer.addWidget(self.start_button)
         footer.addWidget(self.save_report_button)

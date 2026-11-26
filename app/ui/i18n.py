@@ -664,6 +664,76 @@ _STRINGS: dict[str, dict[str, str]] = {
         "sidebar.server.error": "Ошибка",
         "status.tunnel.connected": "Подключён",
         "common.copy": "Копировать",
+        "common.actions": "Действия",
+        "common.copy_id": "Копировать ID",
+        "common.copied_id": "ID скопирован: {item_id}",
+        "clients.details.body": (
+            "Клиент: {name}\n"
+            "ID: {client_id}\n"
+            "Статус: {status}\n"
+            "Сценарий доступа: {role}\n"
+            "Подтверждён: {approved_at}"
+        ),
+        "clients.details.redirects": "Redirect URI:\n{uris}",
+        "clients.menu.copy_id": "Копировать ID клиента",
+        "clients.menu.details": "Сведения о клиенте",
+        "clients.menu.reset_custom": "Сбросить индивидуальные права",
+        "clients.toast.reset_custom": "Индивидуальные права сброшены для {name}",
+        "devices.btn.refresh": "Обновить",
+        "extensions.btn.enable": "Включить",
+        "extensions.btn.disable": "Отключить",
+        "gateway.menu.copy_id": "Копировать ID сервера",
+        "gateway.menu.discover": "Обновить список инструментов",
+        "gateway.wizard.title": "Подключение MCP-сервера",
+        "gateway.wizard.lead": "Подключите готовый шаблон, URL, JSON или сервер из другого AI-клиента.",
+        "gateway.wizard.mode.template": "Каталог шаблонов",
+        "gateway.wizard.mode.url": "По URL (HTTP / SSE / OAuth)",
+        "gateway.wizard.mode.json": "Вставить JSON",
+        "gateway.wizard.mode.file": "Файл конфигурации",
+        "gateway.wizard.mode.client": "Из AI-клиента",
+        "gateway.wizard.mode.manual": "Ручной ввод STDIO",
+        "gateway.wizard.optional_auto": "необязательно — определяется автоматически",
+        "gateway.wizard.bearer_optional": "необязательный Bearer-токен",
+        "gateway.wizard.preview_placeholder": "Нажмите «Проверить» или «Обнаружить», чтобы увидеть URL, инструменты и предупреждения.",
+        "gateway.wizard.json_hint": "Поддерживаются mcpServers, servers и прямой объект сервера.",
+        "gateway.wizard.btn.verify": "Проверить",
+        "gateway.wizard.btn.oauth": "Войти через OAuth",
+        "gateway.wizard.btn.connect": "Подключить",
+        "gateway.wizard.approve_chk": "Разрешить запуск локальной команды и подключение сервера",
+        "gateway.wizard.probing": "Проверка подключения и возможностей сервера…",
+        "gateway.wizard.need_url": "Укажите URL MCP-сервера.",
+        "gateway.wizard.oauth_waiting": "Откройте браузер и завершите OAuth-авторизацию…",
+        "gateway.wizard.client_no_file": "У выбранного клиента не найден файл конфигурации.",
+        "gateway.wizard.file_missing": "Выберите существующий файл конфигурации.",
+        "gateway.wizard.need_approval": "Подтвердите подключение перед сохранением сервера.",
+        "tasks.delete.confirm": "Удалить неактивную задачу {task_id} и её внутренние временные файлы?",
+        "tasks.details.popup_body": (
+            "ID задачи: {task_id}\n"
+            "Название: {title}\n"
+            "Тип: {kind}\n"
+            "Статус: {status}\n"
+            "Клиент: {client}\n"
+            "Профиль: {profile}\n"
+            "Создана: {created}\n"
+            "Завершена: {finished}\n"
+            "Код выхода: {exit_code}\n"
+            "Ошибка: {error}"
+        ),
+        "tasks.menu.details": "Подробности",
+        "tasks.menu.view_log": "Просмотреть журнал",
+        "tasks.menu.copy_id": "Копировать ID задачи",
+        "tasks.menu.delete": "Удалить задачу",
+        "tasks.purge.menu": "Очистить старые задачи",
+        "tasks.purge.7d": "Удалить старше 7 дней",
+        "tasks.purge.30d": "Удалить старше 30 дней",
+        "tasks.purge.90d": "Удалить старше 90 дней",
+        "tasks.purge.all": "Удалить все неактивные задачи",
+        "tasks.purge.scope_all": "все неактивные задачи",
+        "tasks.purge.scope_days": "неактивные задачи старше {days} дн.",
+        "tasks.purge.none": "Неактивных задач по выбранному условию не найдено.",
+        "tasks.purge.confirm": "Удалить {scope} ({count} шт.) и их временные файлы?",
+        "tasks.purge.refused_active": "Нельзя удалить выполняющуюся или ожидающую задачу.",
+        "tasks.toast.deleted": "Удалено задач: {count}",
     },
     LANG_EN: {
         "nav.section.primary": "CORE",
@@ -1321,6 +1391,76 @@ _STRINGS: dict[str, dict[str, str]] = {
         "sidebar.server.error": "Error",
         "status.tunnel.connected": "Connected",
         "common.copy": "Copy",
+        "common.actions": "Actions",
+        "common.copy_id": "Copy ID",
+        "common.copied_id": "Copied ID: {item_id}",
+        "clients.details.body": (
+            "Client: {name}\n"
+            "ID: {client_id}\n"
+            "Status: {status}\n"
+            "Access scenario: {role}\n"
+            "Approved: {approved_at}"
+        ),
+        "clients.details.redirects": "Redirect URIs:\n{uris}",
+        "clients.menu.copy_id": "Copy client ID",
+        "clients.menu.details": "Client details",
+        "clients.menu.reset_custom": "Reset custom overrides",
+        "clients.toast.reset_custom": "Custom tool overrides reset for {name}",
+        "devices.btn.refresh": "Refresh",
+        "extensions.btn.enable": "Enable",
+        "extensions.btn.disable": "Disable",
+        "gateway.menu.copy_id": "Copy server ID",
+        "gateway.menu.discover": "Discover tools",
+        "gateway.wizard.title": "Connect MCP Server",
+        "gateway.wizard.lead": "Connect a template, URL, JSON snippet, or import from another AI client.",
+        "gateway.wizard.mode.template": "Template catalog",
+        "gateway.wizard.mode.url": "By URL (HTTP / SSE / OAuth)",
+        "gateway.wizard.mode.json": "Paste JSON",
+        "gateway.wizard.mode.file": "Config file",
+        "gateway.wizard.mode.client": "From AI client",
+        "gateway.wizard.mode.manual": "Manual STDIO",
+        "gateway.wizard.optional_auto": "optional — auto-detected",
+        "gateway.wizard.bearer_optional": "optional Bearer token",
+        "gateway.wizard.preview_placeholder": "Click Verify or Discover to preview URL, tools, and warnings.",
+        "gateway.wizard.json_hint": "Supports mcpServers, servers, and single-server objects.",
+        "gateway.wizard.btn.verify": "Verify",
+        "gateway.wizard.btn.oauth": "Sign in via OAuth",
+        "gateway.wizard.btn.connect": "Connect",
+        "gateway.wizard.approve_chk": "Approve local command execution and connect server",
+        "gateway.wizard.probing": "Probing server connectivity and capabilities…",
+        "gateway.wizard.need_url": "Enter the MCP server URL.",
+        "gateway.wizard.oauth_waiting": "Open the browser to complete OAuth authorization…",
+        "gateway.wizard.client_no_file": "No config file found for the selected client.",
+        "gateway.wizard.file_missing": "Select an existing configuration file.",
+        "gateway.wizard.need_approval": "Confirm connection approval before saving.",
+        "tasks.delete.confirm": "Delete inactive task {task_id} and its internal temporary files?",
+        "tasks.details.popup_body": (
+            "Task ID: {task_id}\n"
+            "Title: {title}\n"
+            "Kind: {kind}\n"
+            "Status: {status}\n"
+            "Client: {client}\n"
+            "Profile: {profile}\n"
+            "Created: {created}\n"
+            "Finished: {finished}\n"
+            "Exit code: {exit_code}\n"
+            "Error: {error}"
+        ),
+        "tasks.menu.details": "Details",
+        "tasks.menu.view_log": "View log",
+        "tasks.menu.copy_id": "Copy task ID",
+        "tasks.menu.delete": "Delete task",
+        "tasks.purge.menu": "Purge old tasks",
+        "tasks.purge.7d": "Delete older than 7 days",
+        "tasks.purge.30d": "Delete older than 30 days",
+        "tasks.purge.90d": "Delete older than 90 days",
+        "tasks.purge.all": "Delete all inactive tasks",
+        "tasks.purge.scope_all": "all inactive tasks",
+        "tasks.purge.scope_days": "inactive tasks older than {days} days",
+        "tasks.purge.none": "No inactive tasks matched the selected filter.",
+        "tasks.purge.confirm": "Delete {scope} ({count}) and their temporary files?",
+        "tasks.purge.refused_active": "Cannot delete a running or queued task.",
+        "tasks.toast.deleted": "Deleted tasks: {count}",
     },
 }
 

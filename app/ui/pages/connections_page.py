@@ -29,7 +29,8 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
     btn = QPushButton(text)
     if obj_name:
         btn.setObjectName(obj_name)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    if obj_name in ("Link", "SubtleLink"):
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
     return btn
 
 
@@ -160,6 +161,12 @@ class ConnectionsPage(PageScaffold):
         self.token_error.setWordWrap(True)
         self.token_error.hide()
         self.token_section.body.addWidget(self.token_error)
+
+        self.token_warning = QLabel("")
+        self.token_warning.setObjectName("Hint")
+        self.token_warning.setWordWrap(True)
+        self.token_warning.hide()
+        self.token_section.body.addWidget(self.token_warning)
         self.content.addWidget(self.token_section)
 
         self.content.addWidget(Divider())
@@ -176,8 +183,8 @@ class ConnectionsPage(PageScaffold):
 
     def _paste_token(self) -> None:
         clip = QGuiApplication.clipboard()
-        raw = clip.text().strip() if clip is not None else ""
-        if not raw:
+        raw = clip.text().rstrip("\r\n") if clip is not None else ""
+        if raw == "":
             return
         self.token_edit.setText(raw)
         self.token_edited.emit(raw)

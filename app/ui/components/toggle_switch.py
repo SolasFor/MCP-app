@@ -19,7 +19,6 @@ class ToggleSwitch(QAbstractButton):
         super().__init__(parent)
         self.setText(text)
         self.setCheckable(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -60,9 +59,6 @@ class ToggleSwitch(QAbstractButton):
     def changeEvent(self, event: QEvent) -> None:  # noqa: N802
         super().changeEvent(event)
         if event.type() == QEvent.Type.EnabledChange:
-            self.setCursor(
-                Qt.CursorShape.PointingHandCursor if self.isEnabled() else Qt.CursorShape.ArrowCursor
-            )
             self.update()
 
     def sizeHint(self) -> QSize:  # noqa: N802

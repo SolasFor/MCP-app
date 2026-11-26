@@ -20,6 +20,31 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
+- Дата, ветка, версия: 2026-11-26, ветка `fix_cursor_and_context_menus` (поверх `main` / `v1.0.0` `542989a` с PR #32/#33/#34), релиз-обновление `v1.0.1` (`VERIFIED` локально).
+- **UI/UX, Gateway Onboarding, OAuth & Task Manager (`v1.0.1`)**:
+  - Курсор и hover: аудит `app/ui/**`, удаление `PointingHandCursor` со стандартных контролов (оставлен только на `#Link`/`#SubtleLink`), удаление ложного hover на `#CopyField`/`#Log`/read-only полях, `SafeSpinBox`/`SafeDoubleSpinBox` во всех диалогах и страницах.
+  - Таблица «AI-клиенты»: `TableCellCombo` с вертикальным/горизонтальным центрированием, адаптивной высотой строк и шириной столбца без обрезания при `100%–200%` DPI и RU/EN (`clients_page.py`, `oauth_clients_dialog.py`, `table.py`, `theme.py`), с очисткой виджетов ячеек при перезагрузке.
+  - Единые контекстные меню `AppContextMenu` + кнопки `⋯` и ПКМ для конкретной строки + глобальное меню `⋯` в `ClientsPage` (убрана кнопка отзыва с панели, подтверждение отзыва сохранено), `TasksPage`, `GatewayPage`, `ServersPage`, `WorkspacesPage`, `DevicesPage`, `ExtensionsPage`, `AutomationPage`.
+  - Полноценное удаление неактивных задач (`succeeded`/`failed`/`cancelled`/`interrupted`) и пакетная очистка (`>7/30/90 дней`, все неактивные) в `TaskStore`/`TaskManager`/`TasksPage` с запретом удаления `queued`/`running`/cancelling/живых процессов и строгой проверкой путей `spool`/`artifacts`.
+  - Автоматизированное подключение MCP-серверов в Gateway: `AddMcpServerWizard` (URL Streamable HTTP/SSE + OAuth PKCE, JSON, файл, автопоиск конфигов AI-клиентов включая Codex TOML, 7-категорный каталог шаблонов, ручной STDIO без автозапуска), с исправлением `mcp==2.3.0` извлечения `server_info`/`protocol_version`.
+  - Свободный токен владельца без искусственных ограничений (`MCP_OWNER_SECRET_B64` для точного UTF-8/пробельного пароля согласия + ASCII `MCP_SECRET_TOKEN` Bearer для прямого заголовка) и переработанная RU/EN Dark/Light OAuth-форма (`/oauth/consent`, `/authorize`) с предупреждением для `full`.
+  - Исправлен `task_start` по умолчанию в `allowlist` (динамический `timeout=15s`/`12s`, `60s` в `full` с сохранением жёстких лимитов) и добавлены структурированные MCP-ошибки `CallToolResult(is_error=True, structured_content=...)` с 13 кодами `TASK_*` и редактированием секретов/путей.
+- Проверки `v1.0.1` (после финальных правок, Windows 11 Pro, Python 3.13.15, `.venv`):
+  - `compileall`, `ruff check`: **PASS** (0 ошибок).
+  - `mypy` (`win32`) и `mypy --platform linux`: **PASS** (`Success: no issues found in 72 source files`).
+  - `tools/check_licenses.py`: **PASS** (38/38); `pip_audit -r requirements.txt`: **PASS** (0 уязвимостей).
+  - `tests/unit`: **PASS** (**187/187** за 20.114s, включая `test_task_errors_and_purge.py`, `test_gateway_onboarding.py`, `test_domain_and_tokens.py`).
+  - `tests/integration`: **PASS** (**76/76** за 80.968s, включая `test_v1_0_1_ui_and_menus.py` и `test_acceptance_wave2_gui.py`).
+  - `tests/e2e` (Playwright): **PASS** (**2/2** за 11.398s — Chromium, Firefox, Google Chrome, Microsoft Edge; RU Dark, EN Light, `full`-предупреждение, токен с пробелами и кириллицей `MCP_OWNER_SECRET_B64`).
+  - `tools/capture_ui_screenshots.py`: **PASS** (`DPI check` `1.0`, `1.25`, `1.5`, `1.75`, `2.0` — OK; обновлены `docs/screenshots/*.png`, визуально проверены `clients-dark.png`, `clients-light.png`, `gateway-wizard-dark.png`, `tasks-dark.png`, `oauth-consent-dark-ru.png`, `oauth-consent-light-en.png`).
+  - Сборка Windows (`packaging\build.ps1`): **PASS**:
+    - Frozen smoke (`dist\MCPApp\MCPApp.exe --headless` → `/health` HTTP 200): **PASS**
+    - Скопировано в `D:\Coding\MCP App\dist` (`MCPApp\`, `MCPApp-1.0.1-portable.zip`, `SBOM.cdx.json`, `SHA256SUMS.txt` с сохранением исторических архивов `0.8.6–1.0.0`)
+    - `"D:\Coding\MCP App\dist\MCPApp\MCPApp.exe" --selftest`: **PASS** (`Qt 6.12.1`, `cloudflared 2026.11.2`, `Starlette`, `RESULT OK`)
+    - `MCPApp-1.0.1-portable.zip`: `58,205,914` Б (`55.5 MB`), SHA-256 `9e979be735a2024692ffedf8a96a8987bb4027e6671726ab648cb2241e89bb83`; `SBOM.cdx.json` SHA-256 `20461f63e108a385f093ea8737135515b3ce0539aa72b888cff39ecda0e52a65`.
+  - Локально пропущено (ожидаемо): `Setup.exe` (`ISCC.exe` / Inno Setup 6 не установлен локально; собирается в GitHub Actions CI), внешние SaaS AI-клиенты и доверенная Authenticode-подпись.
+
+## Предыдущая сессия (v1.0.0)
 - Дата, ветка, основа: 2026-11-26, ветка `feat/minimalist-compact-ui-redesign` (поверх `fix/v1.0.0-acceptance-fixes` / `release/v1.0.0`), подготовка финального релиза `v1.0.0` по одобрению владельца.
 - **Minimalist Compact UI Redesign & `v1.0.0` Release Prep**:
   - Выполнена полная переработка интерфейса в стиле Linear/Raycast/Docker Desktop (`DESIGN.md`, `app/ui/**`), удалены все декоративные анимации (оставлен лишь `150 ms OutCubic` `ToggleSwitch` при включённых анимациях ОС), добавлены `FlowLayout`-панели и `tests/integration/test_minimalist_ui_redesign.py` (`break-ui`, 6 размеров окна, `1.0–2.0` DPI).

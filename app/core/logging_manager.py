@@ -287,7 +287,7 @@ class LoggingManager:
             self._config = config.sanitized()
 
     def register_secret(self, secret: str) -> None:
-        self._redactor.register(secret)
+        self._redactor.register(secret, allow_short=True)
 
     def _ensure_dirs(self) -> bool:
         try:

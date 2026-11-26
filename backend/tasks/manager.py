@@ -431,6 +431,62 @@ class TaskManager:
             "content": text,
         }
 
+    def active_task_and_run_ids(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return task IDs with live worker tasks and run IDs with active processes."""
+        worker_ids = tuple(
+            tid for tid, task in self._workers.items() if task is not None and not task.done()
+        )
+        run_ids = tuple(self.runner.active_run_ids())
+        return worker_ids, run_ids
+
+    def count_purgeable_tasks(self, *, older_than_days: int | None = None) -> int:
+        ex_tasks, ex_runs = self.active_task_and_run_ids()
+        return self.store.count_purgeable_inactive(
+            older_than_days=older_than_days,
+            exclude_task_ids=ex_tasks,
+            exclude_run_ids=ex_runs,
+        )
+
+    def delete_inactive_task(self, task_id: str) -> dict[str, Any]:
+        ex_tasks, ex_runs = self.active_task_and_run_ids()
+        result = self.store.delete_inactive_tasks(
+            task_ids=[task_id],
+            spool_manager=self.spool,
+            artifacts_dir=self.artifacts_dir,
+            exclude_task_ids=ex_tasks,
+            exclude_run_ids=ex_runs,
+        )
+        self._log_task_event(
+            "task_deleted",
+            f"Deleted inactive task task_id={task_id} count={result['deleted_count']}",
+        )
+        return result
+
+    def purge_inactive_tasks(self, *, older_than_days: int | None = None) -> dict[str, Any]:
+        ex_tasks, ex_runs = self.active_task_and_run_ids()
+        result = self.store.delete_inactive_tasks(
+            older_than_days=older_than_days,
+            spool_manager=self.spool,
+            artifacts_dir=self.artifacts_dir,
+            exclude_task_ids=ex_tasks,
+            exclude_run_ids=ex_runs,
+        )
+        scope = f">{older_than_days}d" if older_than_days is not None else "all_inactive"
+        self._log_task_event(
+            "tasks_purged",
+            f"Purged inactive tasks scope={scope} deleted={result['deleted_count']} cleaned_dirs={result['cleaned_dirs']}",
+        )
+        return result
+
+    @staticmethod
+    def _log_task_event(event_code: str, message: str) -> None:
+        try:
+            from app.core.logging_manager import get_logging_manager
+
+            get_logging_manager().info("tasks", message, event_code=event_code)
+        except Exception:  # noqa: BLE001
+            pass
+
     async def close(self) -> None:
         self._stopped = True
         self._wake()

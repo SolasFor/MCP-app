@@ -30,7 +30,6 @@ def _button(text: str = "", obj_name: str | None = None) -> QPushButton:
     btn = QPushButton(text)
     if obj_name:
         btn.setObjectName(obj_name)
-    btn.setCursor(Qt.CursorShape.PointingHandCursor)
     return btn
 
 

@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSplitter,
     QTableWidgetItem,
     QTreeWidget,
     QTreeWidgetItem,
@@ -29,6 +28,7 @@ from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
 from app.ui import tokens
 from app.ui.components.cards import EmptyState, SectionHeader
+from app.ui.components.management_layout import ManagementTabs, management_list, management_split, management_toolbar
 from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
@@ -291,6 +291,7 @@ class WorkspacesPage(PageScaffold):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
+        self.content.setSpacing(10)
         base = user_data_dir() / "workspaces"
         self._config_path = config_path or (base / "workspaces.json")
         self._history_dir = history_dir or (base / "history")
@@ -301,22 +302,16 @@ class WorkspacesPage(PageScaffold):
         self.manager = WorkspaceManager(self.store, self.history, redactor=self._redactor)
         self._profiles: dict[str, WorkspaceProfile] = {}
 
-        top_bar = QHBoxLayout()
-        top_bar.setSpacing(6)
         self.search_edit = QLineEdit()
         self.search_edit.setObjectName("UiInput")
         self.search_edit.textChanged.connect(lambda q: self.table.filter_rows(q))
-        top_bar.addWidget(self.search_edit, 1)
 
         self.add_btn = self._make_btn(self.add_workspace, obj="Accent")
         self.run_task_btn = self._make_btn(self.run_selected_task, obj="Accent")
         self.refresh_btn = self._make_btn(self.reload)
         self.list_menu_btn = make_toolbar_menu_button(tr("common.actions"), parent=self)
         self.list_menu_btn.clicked.connect(self._open_list_menu)
-        top_bar.addWidget(self.add_btn)
-        top_bar.addWidget(self.refresh_btn)
-        top_bar.addWidget(self.list_menu_btn)
-        self.content.addLayout(top_bar)
+        self.content.addWidget(management_toolbar(self.search_edit, (self.add_btn, self.refresh_btn, self.list_menu_btn)))
 
         self.table_card = QWidget()
         table_lay = QVBoxLayout(self.table_card)
@@ -327,27 +322,26 @@ class WorkspacesPage(PageScaffold):
         self.table.itemSelectionChanged.connect(self._on_selected)
         self.table.set_row_menu_provider(self._build_row_menu)
         table_lay.addWidget(self.table, 1)
-        self.content.addWidget(self.table_card, 1)
 
         self.empty_state = EmptyState("workspaces")
-        self.content.addWidget(self.empty_state, 1)
+        list_panel = management_list(self.table_card, self.empty_state)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.detail_tabs = ManagementTabs()
 
         tree_pane = QWidget()
         tree_lay = QVBoxLayout(tree_pane)
-        tree_lay.setContentsMargins(0, 4, 8, 0)
+        tree_lay.setContentsMargins(10, 10, 10, 10)
         tree_lay.setSpacing(6)
         self.tree_header = SectionHeader()
         tree_lay.addWidget(self.tree_header)
         self.tree_widget = QTreeWidget()
         self.tree_widget.setHeaderHidden(True)
         tree_lay.addWidget(self.tree_widget, 1)
-        splitter.addWidget(tree_pane)
+        self.detail_tabs.add_section(tree_pane, "workspaces.details.tree_title", self.tree_header)
 
         git_pane = QWidget()
         git_lay = QVBoxLayout(git_pane)
-        git_lay.setContentsMargins(8, 4, 0, 0)
+        git_lay.setContentsMargins(10, 10, 10, 10)
         git_lay.setSpacing(6)
         self.git_header = SectionHeader()
         git_lay.addWidget(self.git_header)
@@ -359,17 +353,20 @@ class WorkspacesPage(PageScaffold):
         self.cmd_combo = SafeComboBox()
         git_tools.addWidget(self.file_search_edit, 1)
         git_tools.addWidget(self.file_search_btn)
-        git_tools.addWidget(self.cmd_combo)
-        git_tools.addWidget(self.run_task_btn)
         git_lay.addLayout(git_tools)
+        command_row = QHBoxLayout()
+        command_row.setSpacing(6)
+        command_row.addWidget(self.cmd_combo, 1)
+        command_row.addWidget(self.run_task_btn)
+        git_lay.addLayout(command_row)
+        self.file_search_edit.setClearButtonEnabled(True)
         self.details_view = QPlainTextEdit()
+        self.details_view.setObjectName("ConsoleLog")
         self.details_view.setReadOnly(True)
         git_lay.addWidget(self.details_view, 1)
-        splitter.addWidget(git_pane)
+        self.detail_tabs.add_section(git_pane, "workspaces.details.git_title", self.git_header)
 
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
-        self.content.addWidget(splitter, 1)
+        self.content.addWidget(management_split(list_panel, self.detail_tabs), 1)
 
         self.retranslate()
         self.apply_theme()
@@ -659,6 +656,7 @@ class WorkspacesPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("workspaces.title"), tr("workspaces.lead"))
+        self.detail_tabs.retranslate()
         self.search_edit.setPlaceholderText(tr("workspaces.search"))
         self.add_btn.setText(tr("workspaces.btn.add"))
         self.run_task_btn.setText(tr("workspaces.btn.run_task"))

@@ -113,14 +113,17 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: MCPApp-${{ needs.build-windows.outputs.version }}
-          path: dist
+          path: .
       - name: Prevent overwriting existing release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $v = "${{ needs.build-windows.outputs.version }}"
-          if (Test-Path "dist/build/selftest.txt") { Remove-Item "dist/build" -Recurse -Force }
+          if (Test-Path "build") { Remove-Item "build" -Recurse -Force }
+          foreach ($f in @("dist/MCPApp-Setup-$v.exe", "dist/MCPApp-$v-portable.zip", "dist/SBOM.cdx.json", "dist/SHA256SUMS.txt")) {
+            if (-not (Test-Path $f)) { throw "Missing release file: $f" }
+          }
           gh release view "v$v" --repo "${{ github.repository }}" *> $null
           if ($LASTEXITCODE -eq 0) { throw "Release v$v already exists - refusing to overwrite" }
           $global:LASTEXITCODE = 0

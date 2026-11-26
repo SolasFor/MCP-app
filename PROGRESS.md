@@ -49,10 +49,30 @@
     - Живой запуск `MCPApp.exe` на одноразовом неадминистративном профиле: GUI `--minimized` (**PASS**, процесс активен, `crash.log` пуст, созданы `token.json` и `secrets.key`), `--headless` (**PASS**, `/health` HTTP `200`, `/mcp` без токена HTTP `401`, `token.json` неизменен), `--repair-acl` (**PASS**, `ok=true`, повреждённый DACL восстановлен с сохранением `token.json` и `secrets.key`).
     - `dist\MCPApp-1.0.1-portable.zip`: `58,302,631` Б, SHA-256 `a233b5e9fa9cb77f1c573f1e91f18d0e092032c5a4fd950799a21c74da3ee268`; `dist\SBOM.cdx.json`: `12,195` Б (`38` компонентов), SHA-256 `62be61e19f16dc6458d11572594e0b311e134f823ba8137faf012c56e6dde401`.
 - **BLOCKED / NOT_RUN (без имитации прохождения)**:
-  - SonarQube Cloud MCP и `sonar` CLI (`1.13.1`): **BLOCKED** (`sonar auth status` — нет сохранённой сессии; удалённый `sonarqube-cloud` MCP не видит организацию/проект `SolasFor_MCP-app` без завершённой OAuth-привязки владельца; исходники наружу не отправлялись).
-  - Локальная сборка `MCPApp-Setup-1.0.1.exe` и локальный прогон installer upgrade: **NOT_RUN локально** (`ISCC.exe` / Inno Setup 6 отсутствует на локальной машине; собирается и проверяется в GitHub Actions `build.yml` / `rc-windows.yml`).
-  - Доверенный сертификат Authenticode (`.pfx`): **BLOCKED** (не настроен; EXE не подписан, `StagedUpdater.auto_install_enabled = False`).
-  - Внешние live SaaS AI-клиенты, платные/доменные туннели и восстановление реального профиля на ПК `SOLAS`: **BLOCKED / NOT_RUN** (реальный профиль `%APPDATA%\MCPApp` и облачные DNS/туннели не затрагивались по правилам безопасности).
+  - Доверенный сертификат Authenticode (`.pfx`): **BLOCKED** (не настроен; EXE и Setup собираются неподписанными, `StagedUpdater.auto_install_enabled = False`).
+  - Авторизация локального `sonar` CLI (`1.13.1`) и `sonarqube-cloud` MCP в Antigravity: **BLOCKED** (публичный read-only Quality Gate в PR #35 проверен через SonarCloud, локальный CLI/MCP не авторизованы).
+  - Внешние live SaaS AI-клиенты, платные/доменные туннели и восстановление реального профиля на ПК `SOLAS`: **BLOCKED / NOT_RUN** (реальный профиль `%APPDATA%\MCPApp` и облачные DNS/туннели не затрагивались по правилам безопасности; локальный запуск `Setup.exe` в текущей сессии не выполнялся из-за активного экземпляра `D:\Coding\MCP App\dist\MCPApp\MCPApp.exe` с `AppMutex=MCPApp-Running`).
+
+## Проверка GitHub Actions (PR #35) и тестирование `MCPApp-Setup-1.0.1.exe` в чистой Windows VM (2026-11-27)
+- **PR #35** (`fix_cursor_and_context_menus` → `main`, статус: **OPEN**, merge не выполнялся без решения владельца): https://github.com/SolasFor/MCP-app/pull/35
+- **Выявленные и исправленные по результатам первого CI-прогона дефекты (`26e04f6`)**:
+  - `app/core/acl_recovery.py`: поддержан `TokenOwner` (для файлов, созданных повышенным токеном с `Owner = BUILTIN\Administrators`), вынесен CLI `--repair-acl` в `run_repair_acl_cli()` с жёсткой санацией выходного пути отчёта `_resolve_report_output_path()`.
+  - `app/core/atomic_io.py`: добавлена внутрипроцессная блокировка по каноническому пути `_path_lock()` и расширенные Win32 retry-задержки `_REPLACE_DELAYS_S` при многопоточной записи.
+  - `.github/workflows/{rc-windows,build}.yml`: добавлен автоматический e2e-шаг `Test MCPApp-Setup installer, upgrade, and uninstall in clean environment` на свежей VM `windows-latest`.
+- **Прогоны GitHub Actions на коммите `26e04f6`**:
+  - `MCP transport checks` (`#45897725422`): **PASS** — `Verify & Test (ubuntu-latest)` (`1m16s`: https://github.com/SolasFor/MCP-app/actions/runs/45897725422/job/140175672144), `Verify & Test (windows-latest)` (`2m59s`: https://github.com/SolasFor/MCP-app/actions/runs/45897725422/job/140175672604).
+  - `RC Windows installer (no publish)` (`#45897725432`): **PASS** (`3m12s`: https://github.com/SolasFor/MCP-app/actions/runs/45897725432/job/140175672859).
+  - `SonarCloud Code Analysis`: **PASS** (`39s`, Quality Gate `OK`, `new_security_rating=1`, `new_reliability_rating=1`, `new_maintainability_rating=1`, `duplications=0.1%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=35
+- **Проверка артефакта `MCPApp-Setup-1.0.1.exe` в чистой VM `windows-latest` + проверка скачанного пакета (`MCPApp-RC-Windows-67`)**:
+  - **Свежая тихая установка (`/VERYSILENT /CURRENTUSER`) без прав администратора**: **PASS** (`%LOCALAPPDATA%\Programs\MCP app\MCPApp.exe`, `_internal\bin\cloudflared.exe`, `unins000.exe`, ярлык в меню «Пуск», ключ `HKCU\...\Uninstall\{8F3C2A71-4D5E-4B9A-9C61-2E7A1D0B5F43}_is1`, `DisplayVersion=1.0.1`).
+  - **Работа установленного `MCPApp.exe` в изолированном профиле**: `--selftest` (`RESULT OK`, `WindowsPlatformAdapter`), `--headless` (`/health` HTTP `200`, неавторизованный `/mcp` HTTP `401`, созданы `token.json` и `secrets\secrets.key`), `--repair-acl` на искусственно заблокированном подкаталоге `extensions\installed` (`ok=true`, DACL восстановлен с сохранением SHA-256 `token.json`).
+  - **Обновление поверх существующей установки (in-place upgrade)**: **PASS** (устаревший маркер `_internal\stale_old_version.marker` удалён секцией `[InstallDelete]`; `token.json` с неизменным SHA-256, `secrets\secrets.key` и `settings.json` сохранены; повторные `--selftest` и `--headless` пройдены).
+  - **Чистое удаление (`unins000.exe /VERYSILENT`)**: **PASS** (`MCPApp.exe`, ярлык и запись реестра удалены, данные пользователя в `%APPDATA%\MCPApp` сохранены).
+  - **Контрольные суммы и метаданные скачанного артефакта (`#45897725432`)**:
+    - `MCPApp-Setup-1.0.1.exe`: `46,270,766` Б, SHA-256 `1f270144a0222607e1253cfc3deec9dc17e9280e693c4d4233cb6322d023cb58` (`ProductName=MCP app`, `ProductVersion=1.0.1`, `AuthenticodeStatus=NotSigned`).
+    - `MCPApp-1.0.1-portable.zip`: `62,577,287` Б, SHA-256 `fb21aac93dbf0acc15c78430031888b86fc0fb9055280542eabad3c9eef048f7`.
+    - `SBOM.cdx.json`: `12,195` Б (`38` компонентов), SHA-256 `b97ca7ce5fa9a1275e16260eb91ce9af86131115ec8bc19043b0131c8c7053ab`.
+    - `SHA256SUMS.txt` и `build/selftest.txt` (`RESULT OK`): сверены байт-в-байт, 0 расхождений.
 
 ## Аудит после v1.0.0 — исправление Windows ACL (2026-11-26)
 - Статус: IN_PROGRESS. Подтверждено использование короткого USERNAME в icacls, создающее риск блокировки данных при совпадении имени ПК и пользователя.

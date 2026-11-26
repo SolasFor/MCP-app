@@ -9,10 +9,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mcp.shared.auth import OAuthClientInformationFull
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QShortcut
-from PyQt6.QtWidgets import QApplication, QLineEdit
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from mcp.shared.auth import OAuthClientInformationFull  # noqa: E402
+from PyQt6.QtCore import Qt  # noqa: E402
+from PyQt6.QtGui import QShortcut  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QLineEdit  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -34,7 +36,6 @@ from backend.oauth_store import OAuthStore  # noqa: E402
 class MinimalistUiRedesignTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:

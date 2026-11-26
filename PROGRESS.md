@@ -20,10 +20,14 @@
 Статусы: TODO / IN_PROGRESS / BLOCKED / VERIFIED / MERGED / RELEASED. Отдельные проверки: PASS / FAIL / NOT_RUN / BLOCKED / N/A. Не менять TODO на VERIFIED без доказательств приёмки.
 
 ## Последняя рабочая сессия
-- Дата, ветка, основа: 2026-11-26, ветка `fix/v1.0.0-acceptance-fixes` (продолжение PR #32 поверх `release/v1.0.0`).
-- Статус Этапа 12 (`v1.0.0 — Stable Release` + Wave 1 / Wave 2 / Wave 3 UI-исправления): все требования реализованы и проверены локально: статические проверки (`compileall`, `ruff`, `mypy` Windows + `--platform linux`), `check_licenses.py` (`38/38`), `tests/unit` (178/178), `tests/integration` (67/67), реальные браузерные E2E-тесты Playwright `tests/e2e/test_oauth_browsers_playwright.py` (Chromium, Chrome, Edge, Firefox — `OK`), оптимизация `_internal`, Windows EXE `--selftest`, проверка DPI `1.0–2.0` и визуальная проверка скриншотов в Light/Dark темах.
-- Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), Playwright `1.65.2` (только в dev `.venv`), Chrome / Edge / Chromium / Firefox, `cloudflared 2026.11.2`, `tailscale 1.104.2`, `gh` авторизован (`SolasFor`), `iscc` используется в GitHub Actions `windows-latest`.
-- Следующее действие: проверка CI-запусков GitHub Actions после финального пуша и согласование владельцем merge PR #32 / #20–#31 в `main`.
+- Дата, ветка, основа: 2026-11-26, ветка `feat/minimalist-compact-ui-redesign` (поверх `fix/v1.0.0-acceptance-fixes` / `release/v1.0.0`), подготовка финального релиза `v1.0.0` по одобрению владельца.
+- **Minimalist Compact UI Redesign & `v1.0.0` Release Prep**:
+  - Выполнена полная переработка интерфейса в стиле Linear/Raycast/Docker Desktop (`DESIGN.md`, `app/ui/**`), удалены все декоративные анимации (оставлен лишь `150 ms OutCubic` `ToggleSwitch` при включённых анимациях ОС), добавлены `FlowLayout`-панели и `tests/integration/test_minimalist_ui_redesign.py` (`break-ui`, 6 размеров окна, `1.0–2.0` DPI).
+  - Обновлены `README.md`, `CHANGELOG.md`, `docs/releases/v1.0.0.md`, `docs/screenshots/*.png`, изоляция `domain_state` в `tools/capture_ui_screenshots.py` и headless Qt env в `.github/workflows/build.yml`.
+- Ранее (`fix/v1.0.0-acceptance-fixes`, PR #32):
+  - Реализованы и проверены Wave 1 / Wave 2 / Wave 3 исправления (`compileall`, `ruff`, `mypy` Windows + Linux, `check_licenses.py`, `pip_audit`, `tests/unit`, `tests/integration`, Playwright E2E, EXE `--selftest`, `1.0–2.0` DPI).
+- Окружение: Windows 11 Pro 25H2 (x86_64), Python 3.13.15 (`.venv`), `gh` авторизован (`SolasFor`), `iscc` / Inno Setup 6 выполняется на `windows-latest` в GitHub Actions.
+- Следующее действие: зелёный CI на PR в `main`, merge в `main` и публикация тега/релиза `v1.0.0` через `.github/workflows/build.yml`.
 
 ## Release Acceptance Wave 3 — дополнительные исправления UI (`fix/v1.0.0-acceptance-fixes`, `VERIFIED` локально)
 1. **Вкладка «Безопасность» — Computer Use (`security_page.py`, `toggle_switch.py`, `backend/desktop/{models,manager}.py`)**:

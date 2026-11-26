@@ -35,7 +35,7 @@ def verify_layout_geometry(scale: str = "1.0") -> dict[str, str]:
         data_dir = Path(tmp)
         with patch("app.paths.user_data_dir", return_value=data_dir), patch(
             "app.core.service_manager.user_data_dir", return_value=data_dir
-        ), patch(
+        ), patch("app.core.domain_state.user_data_dir", return_value=data_dir), patch(
             "app.config.user_data_dir", return_value=data_dir
         ), patch("app.ui.theme.user_data_dir", return_value=data_dir, create=True), patch(
             "app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"
@@ -72,7 +72,7 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
         data_dir = Path(tmp)
         with patch("app.paths.user_data_dir", return_value=data_dir), patch(
             "app.core.service_manager.user_data_dir", return_value=data_dir
-        ), patch(
+        ), patch("app.core.domain_state.user_data_dir", return_value=data_dir), patch(
             "app.config.user_data_dir", return_value=data_dir
         ), patch("app.ui.main_window.default_store_path", return_value=data_dir / "oauth" / "state.sqlite3"):
             i18n.set_language(LANG_RU)

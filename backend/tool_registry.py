@@ -298,6 +298,15 @@ class ToolRegistry:
             for tool_name in grant.get("tool_names", ()):
                 if tool_name in self._specs and self._specs[tool_name].category != "desktop":
                     allowed.add(tool_name)
+        tool_pol = execution.client_tool_policy(client_id)
+        denied = set(tool_pol.get("denied_tools", ()))
+        only = set(tool_pol.get("allowed_tools_only", ()))
+        if "*" in denied:
+            return BASIC_TOOLS
+        if only:
+            allowed = (allowed & only) | set(BASIC_TOOLS)
+        if denied:
+            allowed -= (denied - set(BASIC_TOOLS))
         return frozenset(allowed)
 
     def authorize_call(

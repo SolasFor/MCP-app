@@ -25,7 +25,9 @@ from app.ui.components.context_menu import MenuActionSpec
 from app.ui.components.silent_dialog import SilentMessageBox
 from app.ui.components.table import DataTable, TableCellCombo
 from app.ui.i18n import tr
+from app.ui.oauth_execution_dialogs import ClientPermissionsDialog
 from app.ui.pages.base import PageScaffold
+from backend.desktop.models import DesktopPolicyStore
 from backend.oauth_execution import ExecutionApprovals
 from backend.oauth_store import OAuthStore, canonical_oauth_urls, default_store_path
 
@@ -42,10 +44,14 @@ class ClientsPage(PageScaffold):
         parent=None,  # noqa: ANN001
         *,
         store_path_fn: Callable[[], Path] | None = None,
+        default_profile_fn: Callable[[], str] | None = None,
+        desktop_policy_path: Path | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
         self._public_url = ""
         self._store_path_fn = store_path_fn or default_store_path
+        self._default_profile_fn = default_profile_fn
+        self._desktop_store = DesktopPolicyStore(desktop_policy_path) if desktop_policy_path is not None else None
         self._store: OAuthStore | None = None
         self._execution: ExecutionApprovals | None = None
         self._entries: list[dict] = []
@@ -125,11 +131,20 @@ class ClientsPage(PageScaffold):
         has_custom = False
         if approved and self._execution is not None:
             try:
-                has_custom = cid in self._execution.client_profiles()
+                has_custom = self._execution.has_client_overrides(cid)
+                if not has_custom and self._desktop_store is not None:
+                    has_custom = cid in self._desktop_store.load().client_overrides
             except Exception:
                 has_custom = False
 
         return [
+            MenuActionSpec(
+                key="permissions",
+                label=tr("clients.menu.permissions"),
+                icon_name="shield",
+                enabled=approved,
+                callback=lambda c=entry: self._open_client_permissions(c),
+            ),
             MenuActionSpec(
                 key="details",
                 label=tr("clients.menu.details"),
@@ -184,7 +199,8 @@ class ClientsPage(PageScaffold):
         issuer, resource_url = canonical_oauth_urls(self._public_url)
         try:
             self._store = OAuthStore(self._store_path_fn(), issuer, resource_url)
-            self._execution = ExecutionApprovals(self._store)
+            def_prof = self._default_profile_fn() if self._default_profile_fn is not None else None
+            self._execution = ExecutionApprovals(self._store, default_profile=def_prof)
             clients = self._store.list_clients()
         except Exception:
             self.table.setRowCount(0)
@@ -351,11 +367,35 @@ class ClientsPage(PageScaffold):
         ) + extra_uris
         SilentMessageBox.information(self, tr("clients.menu.details"), body)
 
+    def _open_client_permissions(self, entry: dict) -> None:
+        if self._execution is None or not entry.get("approved_at"):
+            return
+        cid = str(entry.get("client_id") or "")
+        cname = str(entry.get("client_name") or cid)
+        if not cid:
+            return
+        dlg = ClientPermissionsDialog(
+            self._execution,
+            cid,
+            cname,
+            desktop_store=self._desktop_store,
+            parent=self,
+        )
+        if dlg.exec():
+            self.reload()
+            self.status_message.emit(tr("clients.toast.perms_saved", name=cname), "ok")
+
     def _reset_custom_profile(self, client_id: str) -> None:
         if self._execution is None:
             return
         self._execution.clear_client_profile(client_id)
         self._execution.clear_client_allowlist(client_id)
+        self._execution.clear_client_tool_policy(client_id)
+        if self._desktop_store is not None:
+            try:
+                self._desktop_store.set_client_override(client_id, "inherit")
+            except Exception:  # noqa: BLE001
+                pass
         label = client_id
         for entry in self._entries:
             if str(entry.get("client_id") or "") == client_id:
@@ -380,6 +420,11 @@ class ClientsPage(PageScaffold):
         ):
             return False
         self._store.revoke_client(client_id)
+        if self._desktop_store is not None:
+            try:
+                self._desktop_store.set_client_override(client_id, "inherit")
+            except Exception:  # noqa: BLE001
+                pass
         try:
             from app.core.logging_manager import get_logging_manager
 

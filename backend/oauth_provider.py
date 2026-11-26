@@ -687,6 +687,7 @@ class LocalConsentOAuthProvider(
         *,
         transport_secret: str | None = None,
         language: str | None = None,
+        bind_owner: bool = True,
     ) -> None:
         if not owner_secret:
             raise ValueError("owner_secret must not be empty")
@@ -711,7 +712,8 @@ class LocalConsentOAuthProvider(
         self.store = OAuthStore(store_path, self.issuer, self.resource_url) if store_path else None
         if self.store:
             self.store.remove_old_quick_tunnels()
-            self.store.bind_owner(owner_secret)
+            if bind_owner:
+                self.store.bind_owner(owner_secret)
             self.store.prune_expired()
 
     def _lang_for_request(self, request: Request | None = None) -> str:

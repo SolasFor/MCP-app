@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -19,8 +18,9 @@ DEFAULT_MAX_IMAGE_WIDTH = 1280
 MAX_UI_TREE_DEPTH = 6
 MAX_UI_TREE_NODES = 250
 MAX_WAIT_TIMEOUT_S = 30.0
-CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+CLIENT_ID_RE = re.compile(r"^[\x21-\x7E]{1,256}$")
 DESKTOP_MIN_PROFILES = ("allowlist", "full")
+DESKTOP_CLIENT_MODES = ("inherit", "disabled", "view", "control")
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
 SENSITIVE_TITLE_KEYWORDS = (
@@ -55,6 +55,7 @@ class DesktopPolicy:
     max_image_bytes: int = MAX_SCREENSHOT_BYTES
     emergency_stop: bool = False
     emergency_reason: str = ""
+    client_overrides: dict[str, str] = field(default_factory=dict)
 
     @property
     def effective_screen_capture(self) -> bool:
@@ -79,6 +80,11 @@ class DesktopPolicy:
         for cid in self.allowed_clients:
             if not CLIENT_ID_RE.fullmatch(cid):
                 raise ValueError(f"Invalid allowed client_id: {cid!r}")
+        for cid, mode in self.client_overrides.items():
+            if not CLIENT_ID_RE.fullmatch(str(cid)):
+                raise ValueError(f"Invalid override client_id: {cid!r}")
+            if mode not in DESKTOP_CLIENT_MODES:
+                raise ValueError(f"Invalid desktop client override mode: {mode!r}")
         for item in (*self.allowed_apps, *self.blocked_title_patterns):
             if not isinstance(item, str) or not item.strip() or "\x00" in item:
                 raise ValueError("Invalid desktop app/title rule")
@@ -102,12 +108,25 @@ class DesktopPolicy:
             "max_image_bytes": int(self.max_image_bytes),
             "emergency_stop": bool(self.emergency_stop),
             "emergency_reason": self.emergency_reason,
+            "client_overrides": {
+                str(cid): str(mode)
+                for cid, mode in sorted(self.client_overrides.items())
+                if str(mode) in DESKTOP_CLIENT_MODES and str(mode) != "inherit"
+            },
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DesktopPolicy:
         if not isinstance(data, dict):
             return cls()
+        raw_overrides = data.get("client_overrides")
+        overrides: dict[str, str] = {}
+        if isinstance(raw_overrides, dict):
+            for cid, mode in raw_overrides.items():
+                clean_cid = str(cid).strip()
+                clean_mode = str(mode).strip().lower()
+                if clean_cid and clean_mode in DESKTOP_CLIENT_MODES and clean_mode != "inherit":
+                    overrides[clean_cid] = clean_mode
         pol = cls(
             enabled=bool(data.get("enabled", False)),
             allow_screen_capture=bool(data.get("allow_screen_capture", False)),
@@ -123,6 +142,7 @@ class DesktopPolicy:
             max_image_bytes=int(data.get("max_image_bytes", MAX_SCREENSHOT_BYTES)),
             emergency_stop=bool(data.get("emergency_stop", False)),
             emergency_reason=str(data.get("emergency_reason") or "").strip(),
+            client_overrides=overrides,
         )
         pol.validate()
         return pol
@@ -290,16 +310,11 @@ class DesktopPolicyStore:
                 return DesktopPolicy()
 
     def save(self, policy: DesktopPolicy) -> None:
+        from app.core.atomic_io import atomic_write_json
+
         policy.validate()
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._platform.restrict_path_acl(self.path.parent, is_dir=True)
-            tmp = self.path.with_suffix(".json.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(policy.to_dict(), fh, indent=2, ensure_ascii=False)
-            os.replace(tmp, self.path)
-            self._platform.restrict_path_acl(self.path, is_dir=False)
+            atomic_write_json(self.path, policy.to_dict(), indent=2, restrict_acl=True)
 
     def update(self, **changes: Any) -> DesktopPolicy:
         """Atomically update selected fields while preserving min_profile, lists, and emergency_stop."""
@@ -312,17 +327,9 @@ class DesktopPolicyStore:
     def set_emergency_stop(self, active: bool, reason: str = "") -> DesktopPolicy:
         with self._lock:
             cur = self.load()
-            updated = DesktopPolicy(
+            updated = replace(
+                cur,
                 enabled=False if active else cur.enabled,
-                allow_screen_capture=cur.allow_screen_capture,
-                allow_input_control=cur.allow_input_control,
-                allow_secret_typing=cur.allow_secret_typing,
-                allowed_clients=cur.allowed_clients,
-                min_profile=cur.min_profile,
-                allowed_apps=cur.allowed_apps,
-                blocked_title_patterns=cur.blocked_title_patterns,
-                max_image_width=cur.max_image_width,
-                max_image_bytes=cur.max_image_bytes,
                 emergency_stop=active,
                 emergency_reason=reason if active else "",
             )
@@ -331,19 +338,36 @@ class DesktopPolicyStore:
                 self.set_activity(False)
             return updated
 
+    def set_client_override(self, client_id: str, mode: str) -> DesktopPolicy:
+        """Persist a per-client Computer Use override (``inherit`` removes explicit entry)."""
+        clean_cid = str(client_id or "").strip()
+        if not CLIENT_ID_RE.fullmatch(clean_cid):
+            raise ValueError(f"Invalid client_id: {client_id!r}")
+        if mode not in DESKTOP_CLIENT_MODES:
+            raise ValueError(f"Invalid desktop client mode: {mode!r}")
+        with self._lock:
+            cur = self.load()
+            overrides = dict(cur.client_overrides)
+            if mode == "inherit":
+                overrides.pop(clean_cid, None)
+            else:
+                overrides[clean_cid] = mode
+            updated = replace(cur, client_overrides=overrides)
+            self.save(updated)
+            return updated
+
     def set_activity(self, active: bool, *, client_id: str = "", tool: str = "") -> None:
+        from app.core.atomic_io import atomic_write_json
+
         with self._lock:
             try:
-                self.activity_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = self.activity_path.with_suffix(".act.tmp")
                 payload = {
                     "active": bool(active),
                     "client_id": client_id,
                     "tool": tool,
                     "updated_at": time.time(),
                 }
-                tmp.write_text(json.dumps(payload), encoding="utf-8")
-                os.replace(tmp, self.activity_path)
+                atomic_write_json(self.activity_path, payload, indent=None, restrict_acl=True)
             except OSError:
                 pass
 
@@ -386,6 +410,7 @@ def record_desktop_policy_audit(
             "allowed_apps",
             "min_profile",
             "emergency_stop",
+            "client_overrides",
         )
         if getattr(old_policy, field_name) != getattr(new_policy, field_name)
     }
@@ -419,6 +444,13 @@ def desktop_tool_permissions(
             return (False, False)
         if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(policy.min_profile, 1):
             return (False, False)
+        override = policy.client_overrides.get(str(client_id), "inherit")
+        if override == "disabled":
+            return (False, False)
+        if override == "view":
+            return (bool(policy.allow_screen_capture), False)
+        if override == "control":
+            return (bool(policy.allow_screen_capture), bool(policy.allow_input_control))
         if policy.allowed_clients and client_id not in policy.allowed_clients:
             return (False, False)
     return (bool(policy.allow_screen_capture), bool(policy.allow_input_control))

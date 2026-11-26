@@ -16,6 +16,7 @@ from backend.desktop.models import (
     DesktopPolicy,
     DesktopPolicyStore,
     ScreenshotResult,
+    desktop_tool_permissions,
 )
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
@@ -70,10 +71,15 @@ class DesktopManager:
             raise PermissionError("Desktop window and input control are not enabled by owner")
 
         if client_id not in (None, "", "owner"):
-            if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(policy.min_profile, 1):
-                raise PermissionError("OAuth client profile does not permit Computer Use")
-            if policy.allowed_clients and client_id not in policy.allowed_clients:
-                raise PermissionError(f"Client {client_id!r} is not in Computer Use allowed_clients")
+            allow_view, allow_control = desktop_tool_permissions(
+                policy, client_id, client_profile, emergency_stopped=False
+            )
+            if require_control and not allow_control:
+                raise PermissionError("OAuth client is not authorized for Computer Use input control")
+            if require_screen and not allow_view:
+                raise PermissionError("OAuth client is not authorized for Computer Use screen access")
+            if not allow_view and not allow_control:
+                raise PermissionError("OAuth client is not authorized for Computer Use")
 
         session = self.backend.check_session_state()
         if not session.interactive or session.locked or session.secure_desktop:

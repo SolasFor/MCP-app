@@ -734,6 +734,35 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tasks.purge.confirm": "Удалить {scope} ({count} шт.) и их временные файлы?",
         "tasks.purge.refused_active": "Нельзя удалить выполняющуюся или ожидающую задачу.",
         "tasks.toast.deleted": "Удалено задач: {count}",
+        "acl.recovery.title": "Обнаружены повреждённые права доступа к данным",
+        "acl.recovery.body": (
+            "Некоторые папки или файлы в профиле MCP App ({data_dir}) недоступны для чтения или записи "
+            "из-за повреждённых прав доступа Windows (ACL).\n\n"
+            "Восстановить права доступа только для вашей учётной записи Windows без удаления баз данных, "
+            "ключей DPAPI и токенов?"
+        ),
+        "acl.recovery.unrecoverable_title": "Частичное восстановление прав доступа",
+        "acl.recovery.unrecoverable_body": (
+            "Права восстановлены для {repaired} объектов, но {failed} объектов остались недоступны "
+            "(например, принадлежат другому пользователю ОС или физически повреждены).\n\n"
+            "Существующие ключи и базы не удалялись."
+        ),
+        "clients.menu.permissions": "Настроить права…",
+        "clients.perms.title": "Права AI-клиента — {name}",
+        "clients.perms.lead": "Индивидуальные границы доступа для клиента {client_id}. Изменения вступают в силу на сервере мгновенно.",
+        "clients.perms.scenario": "Сценарий доступа",
+        "clients.perms.inherit_default": "По умолчанию ({role})",
+        "clients.perms.desktop": "Доступ Computer Use (экран и управление)",
+        "clients.perms.desktop.inherit": "По глобальной политике безопасности",
+        "clients.perms.desktop.disabled": "Запрещён для этого клиента",
+        "clients.perms.desktop.view": "Только просмотр экрана (если включён глобально)",
+        "clients.perms.desktop.control": "Просмотр и управление (если включены глобально)",
+        "clients.perms.custom_allowlist": "Использовать индивидуальный белый список команд вместо общего",
+        "clients.perms.win_cmds": "Windows: разрешённые команды (по строкам)",
+        "clients.perms.ssh_hosts": "SSH: разрешённые хосты",
+        "clients.perms.ssh_cmds": "SSH: разрешённые команды",
+        "clients.perms.denied_tools": "Заблокированные MCP-инструменты для этого клиента (через запятую или по строкам)",
+        "clients.toast.perms_saved": "Индивидуальные права сохранены для {name}",
     },
     LANG_EN: {
         "nav.section.primary": "CORE",
@@ -1461,6 +1490,35 @@ _STRINGS: dict[str, dict[str, str]] = {
         "tasks.purge.confirm": "Delete {scope} ({count}) and their temporary files?",
         "tasks.purge.refused_active": "Cannot delete a running or queued task.",
         "tasks.toast.deleted": "Deleted tasks: {count}",
+        "acl.recovery.title": "Damaged Data Folder Permissions Detected",
+        "acl.recovery.body": (
+            "One or more folders or files in your MCP App profile ({data_dir}) cannot be read or written "
+            "due to damaged Windows ACL permissions.\n\n"
+            "Repair permissions strictly for your current Windows account without deleting databases, "
+            "DPAPI keys, or tokens?"
+        ),
+        "acl.recovery.unrecoverable_title": "Partial Permission Recovery",
+        "acl.recovery.unrecoverable_body": (
+            "Permissions were repaired for {repaired} item(s), while {failed} item(s) remain inaccessible "
+            "(for example, owned by another OS user or physically corrupted).\n\n"
+            "Existing keys and databases were preserved."
+        ),
+        "clients.menu.permissions": "Permissions…",
+        "clients.perms.title": "AI Client Permissions — {name}",
+        "clients.perms.lead": "Individual access boundaries for client {client_id}. Changes take effect immediately on the live server.",
+        "clients.perms.scenario": "Access Scenario",
+        "clients.perms.inherit_default": "Inherit global default ({role})",
+        "clients.perms.desktop": "Computer Use Access (Screen & UI Control)",
+        "clients.perms.desktop.inherit": "Follow global Security policy",
+        "clients.perms.desktop.disabled": "Disabled for this client",
+        "clients.perms.desktop.view": "View only (bounded by global master toggle)",
+        "clients.perms.desktop.control": "View & control (bounded by global master toggle)",
+        "clients.perms.custom_allowlist": "Use a custom command allowlist for this client instead of global",
+        "clients.perms.win_cmds": "Windows: exact allowed commands (one per line)",
+        "clients.perms.ssh_hosts": "SSH: exact allowed hosts",
+        "clients.perms.ssh_cmds": "SSH: exact allowed commands",
+        "clients.perms.denied_tools": "Blocked MCP tools for this client (comma- or newline-separated)",
+        "clients.toast.perms_saved": "Saved individual permissions for {name}",
     },
 }
 

@@ -377,20 +377,40 @@ class WindowsPlatformAdapter(PlatformAdapter):
         return bool(_windll().advapi32.CredDeleteW(target, _CRED_TYPE_GENERIC, 0))
 
     def restrict_path_acl(self, path: Path, is_dir: bool = False) -> bool:
-        user = os.environ.get("USERNAME")
-        if not user:
-            return False
-        grant = f"{user}:(OI)(CI)(F)" if is_dir else f"{user}:(F)"
+        # Resolve the process token, never a potentially ambiguous account name.
+        # Set the complete protected DACL in one operation: do not remove
+        # inheritance before the current user's access is established.
         try:
-            res = subprocess.run(
-                ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
-                capture_output=True,
-                timeout=5,
-                creationflags=_CREATE_NO_WINDOW,
-                check=False,
+            import ntsecuritycon
+            import pywintypes
+            import win32api
+            import win32con
+            import win32security
+        except ImportError:
+            return False
+
+        try:
+            token = win32security.OpenProcessToken(
+                win32api.GetCurrentProcess(), win32con.TOKEN_QUERY
             )
-            return res.returncode == 0
-        except (OSError, subprocess.SubprocessError):
+            try:
+                sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+            finally:
+                token.Close()
+
+            dacl = win32security.ACL()
+            flags = (win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE) if is_dir else 0
+            dacl.AddAccessAllowedAceEx(
+                win32security.ACL_REVISION, flags, ntsecuritycon.FILE_ALL_ACCESS, sid
+            )
+            win32security.SetNamedSecurityInfo(
+                str(path),
+                win32security.SE_FILE_OBJECT,
+                win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, dacl, None,
+            )
+            return True
+        except (OSError, pywintypes.error):
             return False
 
     def default_oem_encoding(self) -> str:

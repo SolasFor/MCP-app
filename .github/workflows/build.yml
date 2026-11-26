@@ -113,7 +113,7 @@ jobs:
 
           $OrigAppData = $env:APPDATA
           $OrigLocalAppData = $env:LOCALAPPDATA
-          $WorkDir = Join-Path $env:RUNNER_TEMP ("mcpapp_setup_test_" + [guid]::NewGuid().ToString("N"))
+          $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mcpapp_setup_test_" + [guid]::NewGuid().ToString("N"))
           $ProfileDir = Join-Path $WorkDir "profile"
           New-Item -ItemType Directory -Force -Path "$ProfileDir\Roaming", "$ProfileDir\Local" | Out-Null
 
@@ -204,9 +204,10 @@ jobs:
             try {
               $RepJsonPath = Join-Path $WorkDir "acl-repair.json"
               $repProc = Start-Process -FilePath $InstalledExe -ArgumentList @("--repair-acl", "`"$RepJsonPath`"") -Wait -PassThru -WindowStyle Hidden
+              if (Test-Path $RepJsonPath) { Write-Host (Get-Content $RepJsonPath -Raw -Encoding UTF8) }
               if ($repProc.ExitCode -ne 0) { throw "Installed --repair-acl exited $($repProc.ExitCode)" }
               $repObj = Get-Content $RepJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
-              if (-not $repObj.ok) { throw "Installed --repair-acl failed: $(Get-Content $RepJsonPath -Raw)" }
+              if (-not $repObj.ok) { throw "Installed --repair-acl failed: unrecoverable=$($repObj.unrecoverable_paths | ConvertTo-Json -Compress)" }
               if ((Get-FileHash -Path $TokenPath -Algorithm SHA256).Hash -ne $TokenHash1) {
                 throw "token.json modified during --repair-acl"
               }

@@ -40,36 +40,9 @@ def main() -> int:
         return run(sys.argv)
 
     if "--repair-acl" in args:
-        import json
-        from pathlib import Path
+        from app.core.acl_recovery import run_repair_acl_cli
 
-        from app.core.acl_recovery import diagnose_data_acls, repair_data_acls
-        from app.paths import user_data_dir
-
-        idx = args.index("--repair-acl")
-        out_path = args[idx + 1] if idx + 1 < len(args) and not args[idx + 1].startswith("--") else ""
-        data_root = user_data_dir()
-        diag = diagnose_data_acls(data_root)
-        report = repair_data_acls(data_root, isolate_unreadable=True) if diag.has_issues else None
-        payload = {
-            "data_dir": str(data_root),
-            "detected_issues": len(diag.issues),
-            "repaired_paths": list(report.repaired_paths) if report else [],
-            "unrecoverable_paths": [
-                {"path": p, "reason": r} for p, r in (report.unrecoverable_paths if report else ())
-            ],
-            "backup_paths": list(report.backup_paths) if report else [],
-            "ok": True if report is None else report.ok,
-        }
-        text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        if out_path:
-            Path(out_path).write_text(text, encoding="utf-8")
-        else:
-            try:
-                print(text, end="")
-            except (OSError, AttributeError):
-                pass
-        return 0 if payload["ok"] else 1
+        return run_repair_acl_cli(sys.argv)
 
     from app.gui import run_gui
 

@@ -5,13 +5,39 @@ import json
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from app.platform import get_platform
 
 _TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32})  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
-_REPLACE_DELAYS_S = (0.015, 0.04, 0.08)
+_REPLACE_DELAYS_S = (0.015, 0.03, 0.06, 0.12, 0.25, 0.5)
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[str, list[Any]] = {}
+
+
+@contextmanager
+def _path_lock(target: Path):
+    """Serialize in-process atomic writes to the same target path."""
+    key = os.path.normcase(os.path.abspath(os.fspath(target)))
+    with _PATH_LOCKS_GUARD:
+        entry = _PATH_LOCKS.get(key)
+        if entry is None:
+            entry = [threading.Lock(), 0]
+            _PATH_LOCKS[key] = entry
+        entry[1] += 1
+        lock = entry[0]
+    try:
+        with lock:
+            yield
+    finally:
+        with _PATH_LOCKS_GUARD:
+            cur = _PATH_LOCKS.get(key)
+            if cur is not None:
+                cur[1] -= 1
+                if cur[1] <= 0:
+                    _PATH_LOCKS.pop(key, None)
 
 
 def ensure_private_dir(path: Path, *, restrict_acl: bool = True) -> None:
@@ -51,30 +77,32 @@ def atomic_write_bytes(path: Path, data: bytes, *, restrict_acl: bool = True) ->
     so the existing target file remains intact and no orphan ``.tmp`` files accumulate.
     """
     target = Path(path)
-    ensure_private_dir(target.parent, restrict_acl=restrict_acl)
     tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                # Some virtual/ramdisk filesystems do not support fsync on file descriptors.
-                pass
-        if restrict_acl:
-            # Restrict temp file ACL before publishing it under the target name.
-            get_platform().restrict_path_acl(tmp, is_dir=False)
-        _replace_with_retry(tmp, target)
-        if restrict_acl:
-            get_platform().restrict_path_acl(target, is_dir=False)
-    except BaseException:
+    with _path_lock(target):
+        if not target.parent.exists():
+            ensure_private_dir(target.parent, restrict_acl=restrict_acl)
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    # Some virtual/ramdisk filesystems do not support fsync on file descriptors.
+                    pass
+            if restrict_acl:
+                # Restrict temp file ACL before publishing it under the target name.
+                get_platform().restrict_path_acl(tmp, is_dir=False)
+            _replace_with_retry(tmp, target)
+            if restrict_acl and not target.exists():
+                get_platform().restrict_path_acl(target, is_dir=False)
+        except BaseException:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def atomic_write_text(

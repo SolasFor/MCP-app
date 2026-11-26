@@ -322,6 +322,47 @@ class WindowsAclTests(unittest.TestCase):
             finally:
                 repair_data_acls(data_dir)
 
+    def test_is_owned_by_sid_accepts_elevated_token_owner_tuple_and_rejects_foreign(self) -> None:
+        import win32security as security
+
+        from app.core.acl_recovery import _is_owned_by_sid
+
+        user_sid = self._current_sid()
+        admins_sid = security.ConvertStringSidToSid("S-1-5-32-544")
+        system_sid = security.ConvertStringSidToSid("S-1-5-18")
+        mock_sd = type("_SD", (), {"GetSecurityDescriptorOwner": lambda self: admins_sid})()
+        with patch.object(security, "GetNamedSecurityInfo", return_value=mock_sd):
+            self.assertTrue(_is_owned_by_sid("C:\\dummy\\file", (user_sid, admins_sid), security, object))
+            self.assertFalse(_is_owned_by_sid("C:\\dummy\\file", (user_sid,), security, object))
+        mock_sys_sd = type("_SD", (), {"GetSecurityDescriptorOwner": lambda self: system_sid})()
+        with patch.object(security, "GetNamedSecurityInfo", return_value=mock_sys_sd):
+            self.assertFalse(_is_owned_by_sid("C:\\dummy\\file", (user_sid, admins_sid), security, object))
+
+    def test_resolve_report_output_path_sanitizes_cli_destinations(self) -> None:
+        from app.core.acl_recovery import _resolve_report_output_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp) / "MCPApp"
+            data_root.mkdir(parents=True)
+
+            ok_temp = _resolve_report_output_path(str(Path(tmp) / "acl-report.json"), data_root)
+            self.assertEqual(ok_temp.name, "acl-report.json")
+
+            ok_txt = _resolve_report_output_path(str(data_root / "logs" / "acl.txt"), data_root)
+            self.assertEqual(ok_txt.name, "acl.txt")
+
+            for bad in (
+                "",
+                "--another-flag",
+                "report.exe",
+                str(data_root / "secrets" / "secrets.key"),
+                str(data_root / "token.json"),
+                r"C:\Windows\System32\evil.json",
+                str(Path(tmp) / "bad\x00.json"),
+            ):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    _resolve_report_output_path(bad, data_root)
+
 
 if __name__ == "__main__":
     unittest.main()

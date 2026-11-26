@@ -14,9 +14,11 @@ Guarantees:
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,7 +108,7 @@ def _is_reparse(path_str: str) -> bool:
     return is_reparse_point(path_str)
 
 
-def _win32_security_context() -> tuple[Any, Any, Any, Any] | None:
+def _win32_security_context() -> tuple[Any, tuple[Any, ...], Any, Any, Any] | None:
     if sys.platform != "win32":
         return None
     try:
@@ -123,14 +125,23 @@ def _win32_security_context() -> tuple[Any, Any, Any, Any] | None:
         )
         try:
             current_sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+            try:
+                token_owner_sid = win32security.GetTokenInformation(token, win32security.TokenOwner)
+            except (OSError, pywintypes.error):
+                token_owner_sid = None
         finally:
             token.Close()
-        return current_sid, win32security, ntsecuritycon, pywintypes
+        allowed_owner_sids: tuple[Any, ...] = (
+            (current_sid, token_owner_sid)
+            if token_owner_sid is not None and token_owner_sid != current_sid
+            else (current_sid,)
+        )
+        return current_sid, allowed_owner_sids, win32security, ntsecuritycon, pywintypes
     except (OSError, pywintypes.error):
         return None
 
 
-def _is_owned_by_sid(path_str: str, current_sid: Any, win32security: Any, pywintypes: Any) -> bool:
+def _is_owned_by_sid(path_str: str, expected_sids: Any, win32security: Any, pywintypes: Any) -> bool:
     try:
         sd = win32security.GetNamedSecurityInfo(
             path_str,
@@ -138,7 +149,10 @@ def _is_owned_by_sid(path_str: str, current_sid: Any, win32security: Any, pywint
             win32security.OWNER_SECURITY_INFORMATION,
         )
         owner_sid = sd.GetSecurityDescriptorOwner()
-        return bool(owner_sid is not None and owner_sid == current_sid)
+        if owner_sid is None:
+            return False
+        sids = expected_sids if isinstance(expected_sids, tuple) else (expected_sids,)
+        return any(owner_sid == sid for sid in sids)
     except (OSError, pywintypes.error):
         return False
 
@@ -265,7 +279,7 @@ def diagnose_data_acls(data_dir: Path) -> AclDiagnosticReport:
     ctx = _win32_security_context()
     if ctx is None:
         return AclDiagnosticReport(data_dir=root_abs)
-    current_sid, win32security, ntsecuritycon, pywintypes = ctx
+    current_sid, allowed_owner_sids, win32security, ntsecuritycon, pywintypes = ctx
 
     if _is_reparse(root_abs):
         return AclDiagnosticReport(data_dir=root_abs, skipped_reparse=(root_abs,))
@@ -291,7 +305,7 @@ def diagnose_data_acls(data_dir: Path) -> AclDiagnosticReport:
             pywintypes=pywintypes,
         )
         if reason is not None:
-            owned = _is_owned_by_sid(path_abs, current_sid, win32security, pywintypes)
+            owned = _is_owned_by_sid(path_abs, allowed_owner_sids, win32security, pywintypes)
             issues.append(
                 AclIssue(
                     path=path_abs,
@@ -357,7 +371,7 @@ def repair_data_acls(
             data_dir=root_abs,
             unrecoverable_paths=((root_abs, "pywin32_unavailable"),),
         )
-    current_sid, win32security, ntsecuritycon, pywintypes = ctx
+    current_sid, allowed_owner_sids, win32security, ntsecuritycon, pywintypes = ctx
 
     if _is_reparse(root_abs):
         return AclRepairReport(
@@ -393,7 +407,7 @@ def repair_data_acls(
             pywintypes=pywintypes,
         )
         if reason is not None:
-            if not _is_owned_by_sid(path_abs, current_sid, win32security, pywintypes):
+            if not _is_owned_by_sid(path_abs, allowed_owner_sids, win32security, pywintypes):
                 unrecoverable.append((path_abs, "not_owned_by_current_user"))
                 return
             ok = adapter.restrict_path_acl(Path(path_abs), is_dir=is_dir)
@@ -461,3 +475,61 @@ def _try_backup_unreadable_file(path_abs: str, adapter: Any) -> str:
         return str(bak)
     except OSError:
         return ""
+
+
+def _resolve_report_output_path(raw_path: str, data_root: Path) -> Path:
+    """Validate and canonicalize ``--repair-acl <out_path>`` inside safe workspace/temp/data roots."""
+    cleaned = str(raw_path or "").strip()
+    if not cleaned or "\x00" in cleaned or cleaned.startswith("--"):
+        raise ValueError("Invalid repair report path")
+    real_target = os.path.realpath(os.path.abspath(cleaned))
+    if _is_reparse(real_target):
+        raise ValueError("Refusing symlink or reparse point for repair report")
+    target_path = Path(real_target)
+    if target_path.name.lower() in _CRITICAL_KEEP_NAMES:
+        raise ValueError("Refusing to overwrite critical security file")
+    if target_path.suffix.lower() not in {".json", ".txt"}:
+        raise ValueError("Repair report must end with .json or .txt")
+
+    allowed_roots = (data_root, Path(tempfile.gettempdir()), Path.cwd(), Path.home())
+    norm_target = os.path.normcase(real_target)
+    for base in allowed_roots:
+        real_base = os.path.realpath(os.path.abspath(os.fspath(base)))
+        prefix = os.path.normcase(real_base.rstrip("\\/")) + os.sep
+        if norm_target.startswith(prefix):
+            return Path(real_target)
+    raise ValueError("Repair report path must stay inside AppData, temp, workspace, or home directory")
+
+
+def run_repair_acl_cli(argv: list[str]) -> int:
+    """Handle ``--repair-acl [report.json]`` non-destructively and return exit status."""
+    from app.paths import user_data_dir
+
+    args = argv[1:]
+    idx = args.index("--repair-acl")
+    raw_out = args[idx + 1] if idx + 1 < len(args) and not args[idx + 1].startswith("--") else ""
+    data_root = user_data_dir()
+    diag = diagnose_data_acls(data_root)
+    report = repair_data_acls(data_root, isolate_unreadable=True) if diag.has_issues else None
+    payload = {
+        "data_dir": str(data_root),
+        "detected_issues": len(diag.issues),
+        "repaired_paths": list(report.repaired_paths) if report else [],
+        "unrecoverable_paths": [
+            {"path": p, "reason": r} for p, r in (report.unrecoverable_paths if report else ())
+        ],
+        "backup_paths": list(report.backup_paths) if report else [],
+        "ok": True if report is None else report.ok,
+    }
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    if raw_out:
+        safe_out = _resolve_report_output_path(raw_out, data_root)
+        safe_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(safe_out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        try:
+            print(text, end="")
+        except (OSError, AttributeError):
+            pass
+    return 0 if payload["ok"] else 1

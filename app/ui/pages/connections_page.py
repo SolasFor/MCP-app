@@ -1,7 +1,7 @@
 """Connections & Transports page: flat hairline sections for providers, owner token, and proxy."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QGuiApplication
 from PyQt6.QtWidgets import (
     QFrame,
@@ -21,6 +21,7 @@ from app.config import (
     PROVIDER_NGROK,
     PROVIDER_TAILSCALE,
 )
+from app.ui import icons, theme
 from app.ui.components.cards import Badge, Divider, ErrorBanner, FlowLayout, Section
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
@@ -60,6 +61,18 @@ class ConnectionsPage(PageScaffold):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(scroll=True, parent=parent)
         self._migration_source = ""
+        # The complete connection form lives in a single, softly outlined surface.
+        outer_content = self.content
+        header_item = outer_content.takeAt(0)
+        self.connection_panel = QFrame()
+        self.connection_panel.setObjectName("ConnectionPanel")
+        self.content = QVBoxLayout(self.connection_panel)
+        self.content.setContentsMargins(14, 14, 14, 14)
+        self.content.setSpacing(14)
+        if header_item is not None:
+            self.content.addItem(header_item)
+        outer_content.addWidget(self.connection_panel)
+        outer_content.addStretch(1)
 
         self.migration_banner = ErrorBanner()
         self.purge_openai_secret_btn = _button("", "Danger")
@@ -79,32 +92,36 @@ class ConnectionsPage(PageScaffold):
         ] = {}
         list_col = QVBoxLayout()
         list_col.setContentsMargins(0, 2, 0, 0)
-        list_col.setSpacing(5)
+        list_col.setSpacing(8)
         for pid, key in _PROVIDER_SPEC:
             row_w = QFrame()
-            row_w.setObjectName('ProviderRow')
-            row_w.setMinimumHeight(42)
+            row_w.setObjectName("ProviderRow")
+            row_w.setMinimumHeight(38)
             row = QHBoxLayout(row_w)
-            row.setContentsMargins(10, 5, 8, 5)
+            row.setContentsMargins(7, 4, 5, 4)
             row.setSpacing(8)
 
             name = QLabel()
-            name.setObjectName("SettingTitle")
+            name.setObjectName("ProviderName")
             name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             active_badge = Badge("", variant="ok")
+            active_badge.setObjectName("ProviderStatus")
             active_badge.hide()
             badge_slot = QWidget()
-            badge_slot.setFixedWidth(88)
+            badge_slot.setFixedWidth(76)
             badge_layout = QHBoxLayout(badge_slot)
             badge_layout.setContentsMargins(0, 0, 0, 0)
             badge_layout.addStretch(1)
             badge_layout.addWidget(active_badge)
 
             select_btn = _button("", "ProviderSelect")
-            select_btn.setFixedWidth(90)
+            select_btn.setMinimumWidth(58)
+            select_btn.setFixedHeight(25)
             select_btn.clicked.connect(lambda _c=False, p=pid: self.provider_selected.emit(p))
-            menu_btn = _button("⋯", "ProviderMenu")
-            menu_btn.setFixedSize(32, 30)
+            menu_btn = _button("", "ProviderMenu")
+            menu_btn.setFixedSize(24, 25)
+            menu_btn.setIconSize(QSize(15, 15))
+            menu_btn.setIcon(icons.vector_icon("more", theme.TEXT_MUTED, 15))
             menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             menu = QMenu(menu_btn)
             configure = QAction(menu)
@@ -142,15 +159,21 @@ class ConnectionsPage(PageScaffold):
         t_input_row = QHBoxLayout()
         t_input_row.setSpacing(6)
         self.token_edit = QLineEdit()
-        self.token_edit.setObjectName("UiInput")
+        self.token_edit.setObjectName("OwnerTokenInput")
+        self.token_edit.setFixedHeight(36)
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.setMinimumWidth(140)
         self.token_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.token_edit.textEdited.connect(self.token_edited.emit)
         self.token_edit.returnPressed.connect(self.token_save_requested.emit)
-        self.token_eye = _button("", "Ghost")
+        self.token_eye = _button("", "OwnerTokenIcon")
+        self.token_eye.setFixedSize(29, 29)
+        self.token_eye.setIconSize(QSize(15, 15))
         self.token_eye.clicked.connect(self.toggle_token_visibility)
-        self.token_copy = _button("")
+        self.token_copy = _button("", "OwnerTokenIcon")
+        self.token_copy.setFixedSize(29, 29)
+        self.token_copy.setIconSize(QSize(15, 15))
+        self.token_copy.setProperty("iconOnly", True)
         self.token_copy.clicked.connect(lambda: self.copy_requested.emit("token", self.token_copy))
         t_input_row.addWidget(self.token_edit, 1)
         t_input_row.addWidget(self.token_eye, 0)
@@ -165,9 +188,16 @@ class ConnectionsPage(PageScaffold):
         self.token_save = _button("", "Accent")
         self.token_save.clicked.connect(self.token_save_requested.emit)
         self.token_save.hide()
-        for w in (self.token_paste, self.token_gen, self.token_save):
-            t_actions.addWidget(w)
+        # Keep paste/generate available in the token field's context menu.
+        # The explicit Save action appears only for unsaved edits.
+        self.token_paste.setParent(self)
+        self.token_gen.setParent(self)
+        self.token_paste.hide()
+        self.token_gen.hide()
+        t_actions.addWidget(self.token_save)
         self.token_section.body.addLayout(t_actions)
+        self.token_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.token_edit.customContextMenuRequested.connect(self._open_token_menu)
 
         self.token_error = QLabel("")
         self.token_error.setObjectName("Error")
@@ -191,8 +221,18 @@ class ConnectionsPage(PageScaffold):
         self.proxy_section.body.addWidget(self.proxy_page)
         self.content.addWidget(self.proxy_section)
 
-        self.content.addStretch(1)
         self.retranslate()
+        self.apply_theme()
+
+    def _open_token_menu(self, pos) -> None:  # noqa: ANN001
+        menu = self.token_edit.createStandardContextMenu()
+        menu.addSeparator()
+        paste = menu.addAction(tr("conn.token.paste"))
+        paste.triggered.connect(self.token_paste.click)
+        generate = menu.addAction(tr("conn.token.gen"))
+        generate.triggered.connect(self.token_gen.click)
+        menu.exec(self.token_edit.mapToGlobal(pos))
+        menu.deleteLater()
 
     def _paste_token(self) -> None:
         clip = QGuiApplication.clipboard()
@@ -206,7 +246,10 @@ class ConnectionsPage(PageScaffold):
         self.token_edit.setEchoMode(
             QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
         )
-        self.token_eye.setText(tr("conn.token.hide" if visible else "conn.token.show"))
+        label = tr("conn.token.hide" if visible else "conn.token.show")
+        self.token_eye.setToolTip(label)
+        self.token_eye.setAccessibleName(label)
+        self.token_eye.setIcon(icons.vector_icon("eye", theme.ACCENT if visible else theme.TEXT_MUTED, 15))
 
     def toggle_token_visibility(self) -> None:
         self.set_token_visible(self.token_edit.echoMode() == QLineEdit.EchoMode.Password)
@@ -271,18 +314,26 @@ class ConnectionsPage(PageScaffold):
             configure.setText(tr("conn.btn.configure"))
             diagnose.setText(tr("conn.btn.diagnose"))
             guide.setText(tr("conn.btn.guide"))
-        self.token_header.set_texts(tr("conn.token.title"), tr("conn.token.hint"))
+        self.token_header.set_texts(tr("conn.token.title"))
+        self.token_edit.setToolTip(tr("conn.token.hint"))
         self.token_edit.setPlaceholderText(tr("conn.token.placeholder"))
         visible = self.token_edit.echoMode() == QLineEdit.EchoMode.Normal
-        self.token_eye.setText(tr("conn.token.hide" if visible else "conn.token.show"))
+        label = tr("conn.token.hide" if visible else "conn.token.show")
+        self.token_eye.setToolTip(label)
+        self.token_eye.setAccessibleName(label)
+        self.token_eye.setIcon(icons.vector_icon("eye", theme.ACCENT if visible else theme.TEXT_MUTED, 15))
         self.token_paste.setText(tr("conn.token.paste"))
         self.token_save.setText(tr("conn.token.save"))
-        self.token_copy.setText(tr("conn.token.copy"))
+        self.token_copy.setToolTip(tr("conn.token.copy"))
+        self.token_copy.setAccessibleName(tr("conn.token.copy"))
         self.token_gen.setText(tr("conn.token.gen"))
         self.proxy_title.setText(tr("conn.proxy.title"))
         self.proxy_page.retranslate()
 
     def apply_theme(self) -> None:
         self.migration_banner.apply_theme()
-        for _pid, (_k, _n, active_badge, _s, _c, _d) in self.provider_rows.items():
+        for _pid, (_k, _n, active_badge, _s, menu_btn, _d) in self.provider_rows.items():
             active_badge.set_variant("ok")
+            menu_btn.setIcon(icons.vector_icon("more", theme.TEXT_MUTED, 15))
+        self.token_copy.setIcon(icons.vector_icon("copy", theme.TEXT_MUTED, 15))
+        self.set_token_visible(self.token_edit.echoMode() == QLineEdit.EchoMode.Normal)

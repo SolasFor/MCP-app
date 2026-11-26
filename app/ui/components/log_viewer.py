@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 
 from PyQt6.QtCore import QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QAction, QDesktopServices
 from PyQt6.QtWidgets import (
     QCheckBox,
     QFrame,
@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (
 )
 
 from app.core.logging_manager import LOG_COMPONENTS, LOG_LEVELS, get_logging_manager
-from app.ui.components.cards import Badge, Divider, FlowLayout
+from app.ui import icons, theme
+from app.ui.components.cards import Badge, FlowLayout
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.i18n import tr
 from app.ui.widgets import LogView
@@ -45,12 +46,15 @@ class LogViewerWidget(QWidget):
         toolbar.setObjectName("LogToolbar")
         toolbar_layout = QVBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(10, 9, 10, 9)
-        toolbar_layout.setSpacing(8)
+        toolbar_layout.setSpacing(9)
         root.addWidget(toolbar)
         top = QHBoxLayout()
-        top.setSpacing(6)
+        top.setSpacing(8)
         self.search_edit = QLineEdit()
-        self.search_edit.setObjectName("UiInput")
+        self.search_edit.setObjectName("LogFilterInput")
+        self.search_edit.setFixedHeight(36)
+        self._search_icon = QAction(self.search_edit)
+        self.search_edit.addAction(self._search_icon, QLineEdit.ActionPosition.LeadingPosition)
         self.search_edit.setMinimumWidth(100)
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -65,7 +69,10 @@ class LogViewerWidget(QWidget):
         top.addLayout(search_group, 1)
 
         self.component_combo = SafeComboBox()
-        self.component_combo.setMinimumWidth(125)
+        self.component_combo.setMinimumWidth(100)
+        self.component_combo.setFixedHeight(36)
+        self.component_combo.setObjectName("LogFilterCombo")
+        self.component_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.component_combo.addItem("", "all")
         for comp in LOG_COMPONENTS:
             self.component_combo.addItem(f"{comp}.log", comp)
@@ -77,10 +84,13 @@ class LogViewerWidget(QWidget):
         self.source_label.setBuddy(self.component_combo)
         source_group.addWidget(self.source_label)
         source_group.addWidget(self.component_combo)
-        top.addLayout(source_group)
+        top.addLayout(source_group, 1)
 
         self.level_combo = SafeComboBox()
         self.level_combo.setMinimumWidth(100)
+        self.level_combo.setFixedHeight(36)
+        self.level_combo.setObjectName("LogFilterCombo")
+        self.level_combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.level_combo.addItem("", "ALL")
         for lvl in LOG_LEVELS:
             self.level_combo.addItem(lvl, lvl)
@@ -92,9 +102,9 @@ class LogViewerWidget(QWidget):
         self.level_label.setBuddy(self.level_combo)
         level_group.addWidget(self.level_label)
         level_group.addWidget(self.level_combo)
-        top.addLayout(level_group)
+        top.addLayout(level_group, 1)
         toolbar_layout.addLayout(top)
-        toolbar_layout.addWidget(Divider())
+        toolbar_layout.addSpacing(15)
 
         # Compact actions + counts row (wraps cleanly at 800px)
         actions_bar = QHBoxLayout()
@@ -106,21 +116,21 @@ class LogViewerWidget(QWidget):
         self.auto_scroll_check.toggled.connect(self.log_view_auto_scroll)
 
         self.open_folder_btn = QPushButton()
-        self.open_folder_btn.setObjectName("Ghost")
+        self.open_folder_btn.setObjectName("LogAction")
         self.open_folder_btn.clicked.connect(self.open_logs_folder)
 
         self.copy_btn = QPushButton()
-        self.copy_btn.setObjectName("Ghost")
+        self.copy_btn.setObjectName("LogAction")
         self.copy_btn.clicked.connect(
             lambda: self.copy_requested.emit(self.log_view.plain_text(), self.copy_btn)
         )
 
         self.clear_btn = QPushButton()
-        self.clear_btn.setObjectName("Danger")
+        self.clear_btn.setObjectName("LogClearAction")
         self.clear_btn.clicked.connect(self.clear_logs)
 
         self.load_more_btn = QPushButton()
-        self.load_more_btn.setObjectName("Ghost")
+        self.load_more_btn.setObjectName("LogAction")
         self.load_more_btn.clicked.connect(self.load_more)
         self.load_more_btn.hide()
 
@@ -130,18 +140,22 @@ class LogViewerWidget(QWidget):
             self.clear_btn,
             self.load_more_btn,
         ):
+            btn.setFixedHeight(25)
             actions.addWidget(btn)
-        actions.addWidget(self.auto_scroll_check)
         actions_bar.addLayout(actions, 1)
+        actions_bar.addWidget(self.auto_scroll_check)
 
         badges = QHBoxLayout()
         badges.setSpacing(6)
         self.errors_badge = Badge("", variant="neutral")
         self.count_badge = Badge("", variant="neutral")
+        self.errors_badge.setObjectName("LogCount")
+        self.count_badge.setObjectName("LogCount")
+        badges.addStretch(1)
         badges.addWidget(self.errors_badge)
         badges.addWidget(self.count_badge)
-        actions_bar.addLayout(badges, 0)
         toolbar_layout.addLayout(actions_bar)
+        toolbar_layout.addLayout(badges)
 
         self.log_view = LogView()
         self.log_view.counts_changed.connect(self._update_count)
@@ -150,6 +164,7 @@ class LogViewerWidget(QWidget):
         self._page_loaded.connect(self._apply_loaded_page)
         self.retranslate()
         self._update_count(0, 0)
+        self.apply_theme()
 
     def log_view_auto_scroll(self, enabled: bool) -> None:
         self.log_view.set_auto_scroll(enabled)
@@ -245,6 +260,7 @@ class LogViewerWidget(QWidget):
         self.log_view.re_render()
 
     def apply_theme(self) -> None:
+        self._search_icon.setIcon(icons.vector_icon("search", theme.TEXT_MUTED, 14))
         self.log_view.re_render()
         err_cnt = self.log_view.error_count()
         self.errors_badge.set_variant("err" if err_cnt > 0 else "neutral")

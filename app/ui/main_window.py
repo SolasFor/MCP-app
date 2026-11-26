@@ -1211,7 +1211,8 @@ class MainWindow(QMainWindow):
         if not text:
             return
         QGuiApplication.clipboard().setText(text)
-        self._flash(button, tr("home.url.copied"))
+        if not button.property("iconOnly"):
+            self._flash(button, tr("home.url.copied"))
         self.toasts.show_toast(tr("toast.copied"), "ok")
 
     @staticmethod

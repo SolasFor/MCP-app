@@ -369,17 +369,57 @@ QLabel#Pill[variant="err"] {
 }
 
 /* ---------- surfaces, cards, copy field & banners ---------- */
-QFrame#ProviderRow, QFrame#LogToolbar {
+QFrame#ConnectionPanel, QFrame#LogToolbar {
     background: $SURFACE;
     border: 1px solid $HAIRLINE;
     border-radius: 8px;
 }
+QFrame#ProviderRow {
+    background: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+}
+QLabel#ProviderName { color: $TEXT; font-size: 12px; font-weight: 400; }
+QLabel#ProviderStatus { background: transparent; border: none; color: $OK; font-size: 11px; padding: 0; }
+QLabel#LogCount { background: transparent; border: none; color: $TEXT_MUTED; font-size: 12px; padding: 0; }
+QLabel#LogCount[variant="err"] { color: $ERR; }
+QLineEdit#OwnerTokenInput, QLineEdit#LogFilterInput, QComboBox#LogFilterCombo {
+    background: $SURFACE;
+    border: 1px solid $BORDER;
+    border-radius: 6px;
+    color: $TEXT;
+    font-size: 12px;
+    padding: 4px 7px;
+}
+QLineEdit#LogFilterInput { font-family: $FONT_UI; }
+QLineEdit#OwnerTokenInput:focus, QLineEdit#LogFilterInput:focus, QComboBox#LogFilterCombo:focus {
+    border-color: $TEXT_MUTED;
+}
+QPushButton#OwnerTokenIcon, QPushButton#LogAction, QPushButton#LogClearAction {
+    background: transparent;
+    border: 1px solid $BORDER;
+    border-radius: 5px;
+    color: $TEXT;
+    font-size: 12px;
+    padding: 2px 5px;
+    min-height: 0;
+    min-width: 0;
+}
+QPushButton#LogClearAction { color: $ERR; }
+QPushButton#OwnerTokenIcon:hover, QPushButton#LogAction:hover, QPushButton#LogClearAction:hover {
+    background: $CONTROL_HOVER;
+    border-color: $BORDER_STRONG;
+}
+QPushButton#OwnerTokenIcon:focus, QPushButton#LogAction:focus, QPushButton#LogClearAction:focus,
+QPushButton#ProviderMenu:focus, QPushButton#ProviderSelect:focus { border-color: $TEXT_MUTED; }
 QPushButton#ProviderSelect {
     background: $CONTROL;
     border: 1px solid $BORDER;
     border-radius: 6px;
-    min-height: 22px;
-    padding: 3px 6px;
+    min-height: 0px;
+    min-width: 0px;
+    font-size: 12px;
+    padding: 2px 4px;
 }
 QPushButton#ProviderSelect:hover { background: $CONTROL_HOVER; }
 QPushButton#ProviderSelect:disabled { color: $TEXT_FAINT; background: transparent; border-color: $HAIRLINE; }

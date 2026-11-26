@@ -521,3 +521,8 @@
 - Удалены дублирующая справка Named Tunnel и два подзаголовка подключения; выровнены кнопки выбора, статусы и меню провайдеров.
 - Журналы: единая панель с подписанными фильтрами, очисткой поля поиска, действиями и счётчиками; экспорт из вкладки удалён. Внутренняя диагностика и защищённый аудит сохранены.
 - Ruff, штатный mypy (74 файла), GUI Wave 2 (6), transport GUI (2), acceptance GUI (7): PASS. Визуальная приёмка: NOT_RUN.
+
+### Reference layout polish — Connections and Logs
+- Matched the supplied visual references with compact provider rows, token icon actions, aligned log filters and a compact action/count area.
+- Preserved token generation/paste in the token context menu and existing log filtering/actions.
+- Validation: Ruff, mypy (74 files), 16 targeted GUI tests (offscreen); visual acceptance pending.

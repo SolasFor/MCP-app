@@ -127,6 +127,26 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         self.assertEqual(c.token_edit.text(), "  custom-pasted-owner-token-987654  ")
         self.assertFalse(c.token_save.isHidden())
 
+    def test_reference_connection_and_log_layout(self) -> None:
+        from PyQt6.QtWidgets import QFrame
+
+        page = self.window.connections_page
+        self.assertEqual(page.connection_panel.objectName(), "ConnectionPanel")
+        self.assertEqual(len(page.connection_panel.findChildren(QFrame, "ProviderRow")), 4)
+        self.assertTrue(page.token_header.subtitle_label.isHidden())
+        self.assertFalse(page.token_eye.icon().isNull())
+        self.assertFalse(page.token_copy.icon().isNull())
+        self.assertEqual(page.token_eye.size(), page.token_copy.size())
+        page.set_token_visible(True)
+        self.assertEqual(page.token_eye.toolTip(), "Скрыть")
+        page.set_token_visible(False)
+        self.assertEqual(page.token_eye.toolTip(), "Показать")
+        viewer = self.window.logs_page.viewer
+        for control in (viewer.search_edit, viewer.component_combo, viewer.level_combo):
+            self.assertEqual(control.minimumHeight(), 36)
+        self.assertEqual(viewer.errors_badge.objectName(), "LogCount")
+        self.assertFalse(viewer._search_icon.icon().isNull())
+
     def test_provider_context_menus_and_guides(self) -> None:
         from app.config import PROVIDER_CF_NAMED
         from app.ui.pages.connections_page import ConnectionsPage

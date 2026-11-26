@@ -11,13 +11,13 @@ POSIX:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from app.core.atomic_io import atomic_write_bytes, try_init_private_dir
 from app.paths import user_data_dir
 from app.platform import get_platform
 
@@ -51,8 +51,7 @@ class SecretStore:
         self._use_credman = use_credman
         self._lock = threading.RLock()
         self._platform = get_platform()
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._platform.restrict_path_acl(self._dir, is_dir=True)
+        try_init_private_dir(self._dir)
         self._key_path = self._dir / _KEY_FILE
         self._vault_path = self._dir / _VAULT_FILE
 
@@ -111,12 +110,7 @@ class SecretStore:
             if sys.platform == "win32"
             else _KEY_PREFIX_POSIX + key
         )
-        tmp = self._key_path.with_suffix(".key.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(stored)
-        os.replace(tmp, self._key_path)
-        self._platform.restrict_path_acl(self._key_path, is_dir=False)
+        atomic_write_bytes(self._key_path, stored, restrict_acl=True)
         return key
 
     def _cipher(self) -> Fernet:
@@ -144,12 +138,7 @@ class SecretStore:
     def _write_vault(self, data: dict[str, dict[str, str]]) -> None:
         payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         encrypted = self._cipher().encrypt(payload)
-        tmp = self._vault_path.with_suffix(".vault.tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(encrypted)
-        os.replace(tmp, self._vault_path)
-        self._platform.restrict_path_acl(self._vault_path, is_dir=False)
+        atomic_write_bytes(self._vault_path, encrypted, restrict_acl=True)
 
     @staticmethod
     def _credman_target(namespace: str, key: str) -> str:

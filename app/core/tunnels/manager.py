@@ -40,11 +40,12 @@ class ConnectionManager:
     """Manages transport providers (4 UI providers + internal loopback fallback) and non-secret config."""
 
     def __init__(self, data_dir: Path, secret_store: SecretStore | None = None) -> None:
+        from app.core.atomic_io import try_init_private_dir
+
         self._data_dir = Path(data_dir)
         self._tunnels_dir = self._data_dir / "tunnels"
-        self._tunnels_dir.mkdir(parents=True, exist_ok=True)
         self._platform = get_platform()
-        self._platform.restrict_path_acl(self._tunnels_dir, is_dir=True)
+        try_init_private_dir(self._tunnels_dir)
 
         self._config_path = self._tunnels_dir / CONNECTIONS_FILE
         self.secrets = secret_store or SecretStore(self._data_dir / "secrets")
@@ -111,6 +112,8 @@ class ConnectionManager:
             return False
 
     def save(self) -> None:
+        from app.core.atomic_io import atomic_write_json
+
         payload = {
             "active_provider": self._active_provider_id,
             "providers": {
@@ -122,10 +125,7 @@ class ConnectionManager:
                 for pid, prov in self.providers.items()
             },
         }
-        tmp = self._config_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self._config_path)
-        self._platform.restrict_path_acl(self._config_path, is_dir=False)
+        atomic_write_json(self._config_path, payload, indent=2, restrict_acl=True)
 
     @property
     def active_provider_id(self) -> str:

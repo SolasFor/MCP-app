@@ -29,6 +29,7 @@ def run(argv: list[str]) -> int:
             lines.append(f"FAIL  {title}\n{traceback.format_exc()}")
 
     check("Qt (QtWidgets, QtNetwork)", _check_qt)
+    check("Windows ACL и SecretStore", _check_acl_and_secrets)
     check("cloudflared", _check_cloudflared)
     check("MCP-сервер (импорт и сборка приложения)", _check_backend)
 
@@ -58,7 +59,7 @@ def _check_qt() -> str:
     # Ensure that the newly added OAuth and connection diagnostic dialogs
     # were actually included by PyInstaller, without opening any window.
     from app.ui.oauth_clients_dialog import OAuthClientsDialog  # noqa: F401
-    from app.ui.oauth_execution_dialogs import ExecutionPolicyDialog  # noqa: F401
+    from app.ui.oauth_execution_dialogs import ClientPermissionsDialog, ExecutionPolicyDialog  # noqa: F401
     from app.ui.connection_diagnostics_dialog import ConnectionDiagnosticsDialog  # noqa: F401
     from app.ui.components.context_menu import AppContextMenu  # noqa: F401
     from app.ui.components.safe_combo import SafeComboBox  # noqa: F401
@@ -75,6 +76,31 @@ def _check_qt() -> str:
     from app.ui.pages.automation_page import AutomationPage  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR
+
+
+def _check_acl_and_secrets() -> str:
+    from app.core.acl_recovery import diagnose_data_acls
+    from app.core.secret_store import SecretStore
+    from app.platform import get_platform
+
+    adapter = get_platform()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "mcp_selftest_data"
+        root.mkdir(parents=True, exist_ok=True)
+        if not adapter.restrict_path_acl(root, is_dir=True):
+            raise RuntimeError("restrict_path_acl(dir) returned False — pywin32/ACL unavailable in build")
+        probe = root / "probe.txt"
+        probe.write_text("ok", encoding="utf-8")
+        if not adapter.restrict_path_acl(probe, is_dir=False):
+            raise RuntimeError("restrict_path_acl(file) returned False — pywin32/ACL unavailable in build")
+        store = SecretStore(root / "secrets")
+        store.set_secret("owner", "selftest_probe", "probe_secret_value")
+        if store.get_secret("owner", "selftest_probe") != "probe_secret_value":
+            raise RuntimeError("SecretStore DPAPI roundtrip failed in selftest")
+        diag = diagnose_data_acls(root)
+        if diag.has_issues:
+            raise RuntimeError(f"Fresh restricted directory reported ACL issues: {diag.issues}")
+    return type(adapter).__name__
 
 
 def _check_cloudflared() -> str:

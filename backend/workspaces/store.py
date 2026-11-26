@@ -127,8 +127,8 @@ class WorkspaceStore:
                 if prof.workspace_id != wid:
                     raise ValueError("Workspace key mismatch")
                 prof.validate()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._platform.restrict_path_acl(self.path.parent, is_dir=True)
+            from app.core.atomic_io import atomic_write_json
+
             payload = {
                 "schema_version": SCHEMA_VERSION,
                 "workspaces": {
@@ -136,13 +136,7 @@ class WorkspaceStore:
                     for wid in sorted(profiles)
                 },
             }
-            data = json.dumps(payload, indent=2, ensure_ascii=False)
-            tmp = self.path.with_suffix(".json.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(data)
-            os.replace(tmp, self.path)
-            self._platform.restrict_path_acl(self.path, is_dir=False)
+            atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
 
     def upsert_workspace(self, profile: WorkspaceProfile) -> None:
         profile.validate()

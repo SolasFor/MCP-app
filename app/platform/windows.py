@@ -31,6 +31,29 @@ _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
 _CREATE_BREAKAWAY_FROM_JOB = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+_INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_KERNEL32_DLL: Any = None
+
+
+def is_reparse_point(path: Path | str) -> bool:
+    """Return True if ``path`` itself is a symlink, junction, or NTFS reparse point."""
+    raw = os.path.abspath(os.fspath(path))
+    if sys.platform != "win32":
+        return os.path.islink(raw)
+    global _KERNEL32_DLL
+    try:
+        if _KERNEL32_DLL is None:
+            dll = ctypes.WinDLL("kernel32", use_last_error=True)
+            dll.GetFileAttributesW.argtypes = [wintypes.LPCWSTR]
+            dll.GetFileAttributesW.restype = wintypes.DWORD
+            _KERNEL32_DLL = dll
+        attrs = int(_KERNEL32_DLL.GetFileAttributesW(raw))
+        if attrs == _INVALID_FILE_ATTRIBUTES:
+            return os.path.islink(raw)
+        return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+    except OSError:
+        return os.path.islink(raw)
 
 
 class _DataBlob(ctypes.Structure):
@@ -380,6 +403,9 @@ class WindowsPlatformAdapter(PlatformAdapter):
         # Resolve the process token, never a potentially ambiguous account name.
         # Set the complete protected DACL in one operation: do not remove
         # inheritance before the current user's access is established.
+        norm = os.path.abspath(os.fspath(path))
+        if is_reparse_point(norm):
+            return False
         try:
             import ntsecuritycon
             import pywintypes
@@ -404,7 +430,7 @@ class WindowsPlatformAdapter(PlatformAdapter):
                 win32security.ACL_REVISION, flags, ntsecuritycon.FILE_ALL_ACCESS, sid
             )
             win32security.SetNamedSecurityInfo(
-                str(path),
+                norm,
                 win32security.SE_FILE_OBJECT,
                 win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
                 None, None, dacl, None,

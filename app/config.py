@@ -321,10 +321,9 @@ class Settings:
                 setattr(self, coord, None)
 
     def save(self) -> None:
+        from app.core.atomic_io import atomic_write_json
+
         target = self.path()
-        target.parent.mkdir(parents=True, exist_ok=True)
         payload = asdict(self)
         payload.pop("migrated_from_provider", None)
-        tmp = target.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(target)  # атомарная запись
+        atomic_write_json(target, payload, indent=2, restrict_acl=False)

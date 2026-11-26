@@ -315,11 +315,11 @@ class MainWindow(QMainWindow):
         h.copy_requested.connect(self._handle_copy_request)
 
         c = self.connections_page
-        c.domain_wizard_requested.connect(self.show_domain_wizard)
         c.domain_guide_requested.connect(self.show_domain_guide)
         c.provider_selected.connect(self._on_provider_selected)
         c.provider_configure_requested.connect(self._open_provider_config)
         c.provider_diagnose_requested.connect(self._open_provider_diagnose)
+        c.provider_guide_requested.connect(self.show_provider_guide)
         c.token_edited.connect(self._on_token_edited)
         c.token_save_requested.connect(self._save_token)
         c.token_generate_requested.connect(self._generate_token)
@@ -743,10 +743,12 @@ class MainWindow(QMainWindow):
 
     # ================================================================== endpoint & modes
     def show_domain_guide(self) -> None:
+        self.show_provider_guide(PROVIDER_CF_NAMED)
+
+    def show_provider_guide(self, provider_id: str) -> None:
         if self._domain_guide is None:
             self._domain_guide = DomainGuideDialog(self.settings, self.manager.cloudflared_path(), self)
-        else:
-            self._domain_guide.apply_theme()
+        self._domain_guide.set_provider(provider_id)
         self._domain_guide.show()
         self._domain_guide.raise_()
         self._domain_guide.activateWindow()
@@ -811,7 +813,7 @@ class MainWindow(QMainWindow):
             self.show_domain_wizard()
             return
         if provider_id == PROVIDER_CF_QUICK:
-            self.show_domain_guide()
+            self.show_provider_guide(provider_id)
             return
         dlg = ProviderConfigDialog(
             self.manager.connections,

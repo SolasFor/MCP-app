@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtGui import QAction, QGuiApplication
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -45,11 +46,11 @@ _PROVIDER_SPEC = (
 class ConnectionsPage(PageScaffold):
     """Transport provider selector/diagnostics, owner Bearer token editor, and proxy settings."""
 
-    domain_wizard_requested = pyqtSignal()
     domain_guide_requested = pyqtSignal()
     provider_selected = pyqtSignal(str)
     provider_configure_requested = pyqtSignal(str)
     provider_diagnose_requested = pyqtSignal(str)
+    provider_guide_requested = pyqtSignal(str, arguments=["provider_id"])
     purge_openai_secret_requested = pyqtSignal()
     token_edited = pyqtSignal(str)
     token_save_requested = pyqtSignal()
@@ -71,10 +72,10 @@ class ConnectionsPage(PageScaffold):
         self.providers_section = Section(spacing=6)
         self.providers_header = self.providers_section.header
 
-        # provider_id -> (key, name_label, active_badge, select_btn, config_btn, diag_btn)
+        # provider_id -> (key, name_label, active_badge, select_btn, menu_btn, menu)
         self.provider_rows: dict[
             str,
-            tuple[str, QLabel, Badge, QPushButton, QPushButton, QPushButton],
+            tuple[str, QLabel, Badge, QPushButton, QPushButton, QMenu],
         ] = {}
         list_col = QVBoxLayout()
         list_col.setContentsMargins(0, 4, 0, 0)
@@ -96,26 +97,37 @@ class ConnectionsPage(PageScaffold):
 
             select_btn = _button("")
             select_btn.clicked.connect(lambda _c=False, p=pid: self.provider_selected.emit(p))
-            config_btn = _button("", "Ghost")
-            config_btn.clicked.connect(lambda _c=False, p=pid: self.provider_configure_requested.emit(p))
-            diag_btn = _button("", "Ghost")
-            diag_btn.clicked.connect(lambda _c=False, p=pid: self.provider_diagnose_requested.emit(p))
+            menu_btn = _button("⋯", "Ghost")
+            menu_btn.setFixedWidth(44)
+            menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            menu = QMenu(menu_btn)
+            configure = QAction(menu)
+            menu.addAction(configure)
+            configure.triggered.connect(lambda _c=False, p=pid: self.provider_configure_requested.emit(p))
+            diagnose = QAction(menu)
+            menu.addAction(diagnose)
+            diagnose.triggered.connect(lambda _c=False, p=pid: self.provider_diagnose_requested.emit(p))
+            menu.addSeparator()
+            guide = QAction(menu)
+            menu.addAction(guide)
+            guide.triggered.connect(lambda _c=False, p=pid: self.provider_guide_requested.emit(p))
+            menu_btn.setMenu(menu)
+            row_w.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            row_w.customContextMenuRequested.connect(
+                lambda pos, w=row_w, m=menu: m.popup(w.mapToGlobal(pos))
+            )
 
             row.addWidget(name, 1)
             row.addWidget(active_badge, 0)
             row.addWidget(select_btn, 0)
-            row.addWidget(config_btn, 0)
-            row.addWidget(diag_btn, 0)
+            row.addWidget(menu_btn, 0)
             list_col.addWidget(row_w)
-            self.provider_rows[pid] = (key, name, active_badge, select_btn, config_btn, diag_btn)
+            self.provider_rows[pid] = (key, name, active_badge, select_btn, menu_btn, menu)
         self.providers_section.body.addLayout(list_col)
 
         transport_actions = FlowLayout(spacing=10)
-        self.wizard_btn = _button("", "Accent")
-        self.wizard_btn.clicked.connect(self.domain_wizard_requested.emit)
         self.guide_btn = _button("", "SubtleLink")
         self.guide_btn.clicked.connect(self.domain_guide_requested.emit)
-        transport_actions.addWidget(self.wizard_btn)
         transport_actions.addWidget(self.guide_btn)
         self.providers_section.body.addLayout(transport_actions)
         self.content.addWidget(self.providers_section)
@@ -203,7 +215,7 @@ class ConnectionsPage(PageScaffold):
         *,
         active_provider: str,
         statuses: dict[str, dict] | None = None,  # noqa: ARG002
-        has_domain: bool = False,
+        has_domain: bool = False,  # noqa: ARG002
     ) -> None:
         for pid, (_key, _name, active_badge, select_btn, _cfg, _diag) in self.provider_rows.items():
             is_active = pid == active_provider
@@ -212,8 +224,6 @@ class ConnectionsPage(PageScaffold):
                 active_badge.setText(tr("conn.badge.active"))
                 active_badge.set_variant("ok")
             select_btn.setEnabled(not is_active)
-
-        self.wizard_btn.setText(tr("home.wizard.edit" if has_domain else "home.wizard.setup"))
 
     def refresh_transport_status(self, *, is_quick: bool, has_domain: bool) -> None:
         self.refresh_providers(
@@ -248,15 +258,19 @@ class ConnectionsPage(PageScaffold):
         self.migration_banner.message_label.setText(tr(banner_key))
         self.purge_openai_secret_btn.setText(tr("conn.openai_removed.purge_btn"))
         self.providers_header.set_texts(tr("conn.providers.title"), tr("conn.providers.note"))
-        for _pid, (key, name, active_badge, select_btn, config_btn, diag_btn) in self.provider_rows.items():
+        for _pid, (key, name, active_badge, select_btn, menu_btn, menu) in self.provider_rows.items():
             text = tr(f"conn.provider.{key}")
             name.setText(text)
             name.setToolTip(text)
             active_badge.setText(tr("conn.badge.active"))
             select_btn.setText(tr("conn.btn.select"))
-            config_btn.setText(tr("conn.btn.configure"))
-            diag_btn.setText(tr("conn.btn.diagnose"))
-        self.guide_btn.setText(tr("home.guide.open"))
+            menu_btn.setToolTip(tr("conn.btn.more"))
+            menu_btn.setAccessibleName(f"{text}: {tr('conn.btn.more')}")
+            configure, diagnose, _, guide = menu.actions()
+            configure.setText(tr("conn.btn.configure"))
+            diagnose.setText(tr("conn.btn.diagnose"))
+            guide.setText(tr("conn.btn.guide"))
+        self.guide_btn.setText(f"Cloudflare Named Tunnel — {tr('home.guide.open')}")
         self.token_header.set_texts(tr("conn.token.title"), tr("conn.token.hint"))
         self.token_edit.setPlaceholderText(tr("conn.token.placeholder"))
         visible = self.token_edit.echoMode() == QLineEdit.EchoMode.Normal

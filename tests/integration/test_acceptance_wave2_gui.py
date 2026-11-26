@@ -127,6 +127,46 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         self.assertEqual(c.token_edit.text(), "  custom-pasted-owner-token-987654  ")
         self.assertFalse(c.token_save.isHidden())
 
+    def test_provider_context_menus_and_guides(self) -> None:
+        from app.config import PROVIDER_CF_NAMED
+        from app.ui.pages.connections_page import ConnectionsPage
+
+        page = ConnectionsPage()
+        selected: list[tuple[str, str]] = []
+        page.provider_configure_requested.connect(lambda pid: selected.append(("configure", pid)))
+        page.provider_diagnose_requested.connect(lambda pid: selected.append(("diagnose", pid)))
+        page.provider_guide_requested.connect(lambda pid: selected.append(("guide", pid)))
+        for pid, (_, _, _, _, button, menu) in page.provider_rows.items():
+            self.assertIs(button.menu(), menu)
+            actions = [action for action in menu.actions() if not action.isSeparator()]
+            self.assertEqual([action.text() for action in actions], ["Настроить…", "Проверить", "Инструкция"])
+            for action in actions:
+                action.trigger()
+            self.assertEqual(selected[-3:], [("configure", pid), ("diagnose", pid), ("guide", pid)])
+        page.close()
+
+        for pid, marker in (
+            (PROVIDER_NGROK, "Authtoken"),
+            (PROVIDER_TAILSCALE, "MagicDNS"),
+            (PROVIDER_CF_QUICK, "Quick Tunnel"),
+            (PROVIDER_CF_NAMED, "config.yml"),
+        ):
+            self.window.connections_page.provider_rows[pid][-1].actions()[-1].trigger()
+            dialog = self.window._domain_guide
+            self.assertIsNotNone(dialog)
+            assert dialog is not None
+            self.assertEqual(dialog._provider_id, pid)
+            self.assertIn(marker, dialog._browser.toPlainText())
+            self.assertEqual(dialog._copy_template.isHidden(), pid != PROVIDER_CF_NAMED)
+            self.assertEqual(dialog._open_folder.isHidden(), pid != PROVIDER_CF_NAMED)
+        self.window.show_provider_guide(PROVIDER_NGROK)
+        self.window.connections_page.guide_btn.click()
+        assert self.window._domain_guide is not None
+        self.assertEqual(self.window._domain_guide._provider_id, PROVIDER_CF_NAMED)
+        self.window._open_provider_config(PROVIDER_CF_QUICK)
+        self.assertEqual(self.window._domain_guide._provider_id, PROVIDER_CF_QUICK)
+        self.window._domain_guide.close()
+
     def test_security_page_toggle_switches_autosave_and_rollback(self) -> None:
         from app.ui.i18n import LANG_EN, tr
         from backend.desktop.models import DesktopPolicyStore

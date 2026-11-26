@@ -108,11 +108,26 @@ class ExtensionProcessHost:
         env["MCP_EXTENSION_DATA_DIR"] = str(self.data_dir)
         return env
 
+    def _close_proc_handles_locked(self, proc: subprocess.Popen[str] | None) -> None:
+        if proc is None:
+            return
+        for th in self._pump_threads:
+            th.join(timeout=0.3)
+        self._pump_threads = []
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
     def start(self, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
         with self._lock:
             if self.is_alive():
                 return {"already_running": True, "pid": self.pid}
             if self._proc is not None and self._proc.poll() is not None:
+                self._close_proc_handles_locked(self._proc)
+                self._proc = None
                 self.restarts += 1
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self._replies = queue.Queue()
@@ -132,18 +147,31 @@ class ExtensionProcessHost:
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             else:
                 kwargs["start_new_session"] = True
-            self._proc = subprocess.Popen(cmd, **kwargs)
-            self._on_log(f"[runtime] started worker pid={self._proc.pid}")
-            t_out = threading.Thread(target=self._pump_stdout, args=(self._proc,), daemon=True)
-            t_err = threading.Thread(target=self._pump_stderr, args=(self._proc,), daemon=True)
+            proc = subprocess.Popen(cmd, **kwargs)
+            self._proc = proc
+            self._on_log(f"[runtime] started worker pid={proc.pid}")
+            t_out = threading.Thread(target=self._pump_stdout, args=(proc,), daemon=True)
+            t_err = threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True)
             self._pump_threads = [t_out, t_err]
             t_out.start()
             t_err.start()
-            init_res = self._rpc_locked(
-                "initialize",
-                {"data_dir": str(self.data_dir), "secrets": self.declared_secrets},
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                init_res = self._rpc_locked(
+                    "initialize",
+                    {"data_dir": str(self.data_dir), "secrets": self.declared_secrets},
+                    timeout_seconds=timeout_seconds,
+                )
+            except BaseException:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                self._close_proc_handles_locked(proc)
+                self._proc = None
+                raise
             self.last_error = ""
             return dict(init_res) if isinstance(init_res, dict) else {"result": init_res}
 

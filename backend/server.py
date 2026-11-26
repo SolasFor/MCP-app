@@ -776,6 +776,7 @@ oauth_provider = (
         store_path=os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path(),
         default_profile=DEFAULT_ACCESS_PROFILE,
         transport_secret=SECRET_TOKEN,
+        bind_owner=TOKEN_FROM_ENV,
     )
     if OAUTH_ENABLED else None
 )
@@ -1256,7 +1257,8 @@ async def oauth_managed_server(
         EXEC_AUDIT.record(client_id=client_id, kind="windows", profile="full",
                           event="failed", command=audit_command, action_id=action_id,
                           duration_ms=int((time.monotonic() - started) * 1000))
-        return {"error": f"Managed server operation failed: {type(exc).__name__}"}
+        detail = REDACTOR.redact_text(str(exc)) or type(exc).__name__
+        return {"error": f"Managed server operation failed: {detail}"}
 
 
 def _authorize_managed_server(client_id: str, tool_name: str, server_name: str = "") -> str:
@@ -1305,7 +1307,7 @@ async def server_list() -> dict:
         )
         return {"servers": items}
     except (OSError, ValueError) as exc:
-        return {"error": f"Server list failed: {type(exc).__name__}"}
+        return {"error": f"Server list failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1426,7 +1428,7 @@ async def server_stop(name: str) -> dict:
             event="failed", command=audit_command, action_id=action_id,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
-        return {"error": f"Server stop failed: {type(exc).__name__}"}
+        return {"error": f"Server stop failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1491,7 +1493,7 @@ async def server_status(name: str) -> dict:
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
-        return {"error": f"Server status failed: {type(exc).__name__}"}
+        return {"error": f"Server status failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1520,7 +1522,7 @@ async def server_logs(
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
-        return {"error": f"Server logs failed: {type(exc).__name__}"}
+        return {"error": f"Server logs failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1538,7 +1540,7 @@ async def server_metrics(name: str) -> dict:
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
-        return {"error": f"Server metrics failed: {type(exc).__name__}"}
+        return {"error": f"Server metrics failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1560,7 +1562,7 @@ async def server_health(name: str, run_probe: bool = True) -> dict:
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
-        return {"error": f"Server health failed: {type(exc).__name__}"}
+        return {"error": f"Server health failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
 
 
 def _ws_call_error(exc: Exception) -> dict:

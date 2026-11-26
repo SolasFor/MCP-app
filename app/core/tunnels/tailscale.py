@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from app.core.tunnels.base import (
 )
 
 ALLOWED_FUNNEL_PORTS = (443, 8443, 10000)
+_IDENTITY_DNS_CACHE_TTL_S = 30.0
 
 
 def _find_tailscale(configured: str = "") -> str:
@@ -38,6 +40,10 @@ def _find_tailscale(configured: str = "") -> str:
 class TailscaleFunnelProvider(TunnelProvider):
     provider_id = PROVIDER_TAILSCALE
     is_external = True
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._dns_cache: tuple[float, str] | None = None
 
     def detect(self) -> ProviderDetection:
         exe = _find_tailscale(str(self._config.get("binary_path") or "").strip())
@@ -183,10 +189,19 @@ class TailscaleFunnelProvider(TunnelProvider):
         else:
             dns = str(self._config.get("hostname_override") or "").strip().rstrip(".")
             if not dns:
-                det = self.detect()
-                if det.installed:
-                    st_json, _ = self._query_status_json(det.executable)
-                    dns = self._resolve_dns_name(st_json)
+                owned_route = self._ownership.get_route(self.provider_id)
+                if owned_route and owned_route.get("host_key"):
+                    dns = str(owned_route["host_key"]).split(":", 1)[0].strip().rstrip(".")
+            if not dns:
+                now = time.monotonic()
+                if self._dns_cache is not None and (now - self._dns_cache[0]) < _IDENTITY_DNS_CACHE_TTL_S:
+                    dns = self._dns_cache[1]
+                else:
+                    exe = _find_tailscale(str(self._config.get("binary_path") or "").strip())
+                    if exe:
+                        st_json, _ = self._query_status_json(exe)
+                        dns = self._resolve_dns_name(st_json)
+                    self._dns_cache = (now, dns)
             port = self._selected_https_port()
             if dns:
                 netloc = dns if port == 443 else f"{dns}:{port}"

@@ -35,12 +35,18 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
         self.oauth_path = self.root / "oauth" / "state.sqlite3"
         self.policy_path = self.root / "desktop" / "policy.json"
         self.settings_path = self.root / "settings.json"
-        self.store_patch = patch("app.ui.main_window.default_store_path", return_value=self.oauth_path)
-        self.settings_patch = patch.object(Settings, "path", return_value=self.settings_path)
-        self.policy_patch = patch.object(ServiceManager, "desktop_policy_path", return_value=self.policy_path)
-        self.store_patch.start()
-        self.settings_patch.start()
-        self.policy_patch.start()
+        self.patches = [
+            patch("app.ui.main_window.default_store_path", return_value=self.oauth_path),
+            patch("app.paths.user_data_dir", return_value=self.root),
+            patch("app.core.service_manager.user_data_dir", return_value=self.root),
+            patch("app.core.token_store.user_data_dir", return_value=self.root),
+            patch("app.core.domain_state.user_data_dir", return_value=self.root),
+            patch("app.ui.main_window.user_data_dir", return_value=self.root),
+            patch.object(Settings, "path", return_value=self.settings_path),
+            patch.object(ServiceManager, "desktop_policy_path", return_value=self.policy_path),
+        ]
+        for p in self.patches:
+            p.start()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.settings = Settings()
@@ -50,9 +56,8 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.allow_close()
         self.window.close()
-        self.store_patch.stop()
-        self.settings_patch.stop()
-        self.policy_patch.stop()
+        for p in reversed(self.patches):
+            p.stop()
         i18n.set_language(LANG_RU)
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
@@ -132,65 +137,95 @@ class DesktopComputerUseIntegrationTests(unittest.TestCase):
 
     def test_mcp_desktop_tools_pipeline_and_image_content(self) -> None:
         import asyncio
-        from backend import server
+        import sys
+        import backend as backend_pkg
         from mcp.server.auth.provider import AccessToken
         from mcp.shared.auth import OAuthClientInformationFull
 
-        self.assertEqual(len(DESKTOP_TOOLS), 13)
-        fake = _FakeBackend()
-        server.DESKTOP_POLICY_STORE = server.DesktopPolicyStore(self.policy_path)
-        server.DESKTOP_MANAGER = server.DesktopManager(
-            server.DESKTOP_POLICY_STORE, fake, redactor=server.REDACTOR
-        )
-        assert server.oauth_provider is not None and server.oauth_execution is not None
-        server.oauth_provider.store.save_client(
-            OAuthClientInformationFull(
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_store import OAuthStore
+
+        was_loaded = "backend.server" in sys.modules
+        from backend import server
+
+        try:
+            self.assertEqual(len(DESKTOP_TOOLS), 13)
+            fake = _FakeBackend()
+            policy_store = server.DesktopPolicyStore(self.policy_path)
+            desk_mgr = server.DesktopManager(policy_store, fake, redactor=server.REDACTOR)
+            store = OAuthStore(
+                self.root / "srv_oauth.sqlite3",
+                issuer=server.BASE_URL,
+                resource_url=server.RESOURCE_URL,
+            )
+            exec_app = ExecutionApprovals(store, default_profile="safe")
+            store.save_client(
+                OAuthClientInformationFull(
+                    client_id="dt-client",
+                    client_name="DT Client",
+                    redirect_uris=["http://127.0.0.1:19991/cb"],
+                    token_endpoint_auth_method="none",
+                )
+            )
+            store.mark_approved("dt-client")
+            exec_app.set_client_profile("dt-client", "allowlist")
+            policy_store.save(
+                DesktopPolicy(
+                    enabled=True,
+                    allow_screen_capture=True,
+                    allow_input_control=True,
+                    allowed_clients=("dt-client",),
+                )
+            )
+            tok = AccessToken(
+                token="t",
                 client_id="dt-client",
-                client_name="DT Client",
-                redirect_uris=["http://127.0.0.1:19991/cb"],
-                token_endpoint_auth_method="none",
+                scopes=["mcp:read"],
+                resource=server.RESOURCE_URL,
             )
-        )
-        server.oauth_provider.store.mark_approved("dt-client")
-        server.oauth_execution.set_client_profile("dt-client", "allowlist")
-        server.DESKTOP_POLICY_STORE.save(
-            DesktopPolicy(
-                enabled=True,
-                allow_screen_capture=True,
-                allow_input_control=True,
-                allowed_clients=("dt-client",),
-            )
-        )
-        tok = AccessToken(
-            token="t",
-            client_id="dt-client",
-            scopes=["mcp:read"],
-            resource=server.RESOURCE_URL,
-        )
-        with patch("backend.tool_permissions.get_access_token", return_value=tok):
-            shot_res = asyncio.run(server.desktop_screenshot())
-            self.assertIsInstance(shot_res.content[0], TextContent)
-            self.assertIsInstance(shot_res.content[1], ImageContent)
-            meta = json.loads(shot_res.content[0].text)
-            self.assertFalse(meta["saved_to_disk"])
-            self.assertGreater(meta["size_bytes"], 0)
+            fake_prov = type("_P", (), {"store": store})()
+            with patch("backend.tool_permissions.get_access_token", return_value=tok), patch.object(
+                server, "DESKTOP_POLICY_STORE", policy_store
+            ), patch.object(server, "DESKTOP_MANAGER", desk_mgr), patch.object(
+                server, "oauth_provider", fake_prov
+            ), patch.object(
+                server, "oauth_execution", exec_app
+            ):
+                shot_res = asyncio.run(server.desktop_screenshot())
+                self.assertIsInstance(shot_res.content[0], TextContent)
+                self.assertIsInstance(shot_res.content[1], ImageContent)
+                meta = json.loads(shot_res.content[0].text)
+                self.assertFalse(meta["saved_to_disk"])
+                self.assertGreater(meta["size_bytes"], 0)
 
-            mons = asyncio.run(server.desktop_list_monitors())
-            self.assertEqual(mons["monitors"][0]["scale_percent"], 150)
+                mons = asyncio.run(server.desktop_list_monitors())
+                self.assertEqual(mons["monitors"][0]["scale_percent"], 150)
 
-            tree = asyncio.run(server.desktop_get_ui_tree(hwnd=101))
-            self.assertEqual(tree["root"]["name"], "Test Notepad")
+                tree = asyncio.run(server.desktop_get_ui_tree(hwnd=101))
+                self.assertEqual(tree["root"]["name"], "Test Notepad")
 
-            clicked = asyncio.run(server.desktop_click(hwnd=101, automation_id="ok_btn"))
-            self.assertEqual(clicked["method"], "uia_invoke")
+                clicked = asyncio.run(server.desktop_click(hwnd=101, automation_id="ok_btn"))
+                self.assertEqual(clicked["method"], "uia_invoke")
 
-            wait_res = asyncio.run(server.desktop_wait_for_element(hwnd=101, name="OK", timeout_seconds=0.5))
-            self.assertTrue(wait_res["found"])
+                wait_res = asyncio.run(
+                    server.desktop_wait_for_element(hwnd=101, name="OK", timeout_seconds=0.5)
+                )
+                self.assertTrue(wait_res["found"])
 
-            asyncio.run(server.desktop_scroll(delta=-2, x=100, y=100))
-            asyncio.run(server.desktop_drag(10, 10, 50, 50))
-            asyncio.run(server.desktop_keypress("Enter", hwnd=101))
-            self.assertTrue(any(c[0] == "keypress" for c in fake.calls))
+                asyncio.run(server.desktop_scroll(delta=-2, x=100, y=100))
+                asyncio.run(server.desktop_drag(10, 10, 50, 50))
+                asyncio.run(server.desktop_keypress("Enter", hwnd=101))
+                self.assertTrue(any(c[0] == "keypress" for c in fake.calls))
+        finally:
+            if not was_loaded:
+                server.PROCESS_RUNNER.close()
+                server.EXEC_AUDIT.close()
+                server.REMOTE_MANAGER.close()
+                server.EXTENSION_MANAGER.shutdown_all()
+                server.MANAGED_SERVERS.close()
+                sys.modules.pop("backend.server", None)
+                if hasattr(backend_pkg, "server"):
+                    delattr(backend_pkg, "server")
 
 
 if __name__ == "__main__":

@@ -188,11 +188,16 @@ class ExtensionsIntegrationTests(unittest.TestCase):
 
         # Verify backend.server extension_* OAuth tools enforce profiles & return live extension output
         from backend import server
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_store import OAuthStore
 
-        server.EXTENSION_STORE = self.store
-        server.EXTENSION_MANAGER = self.mgr
-        assert server.oauth_provider is not None and server.oauth_execution is not None
-        server.oauth_provider.store.save_client(
+        store = OAuthStore(
+            self.root / "srv_oauth.sqlite3",
+            issuer=server.BASE_URL,
+            resource_url=server.RESOURCE_URL,
+        )
+        exec_app = ExecutionApprovals(store, default_profile="safe")
+        store.save_client(
             OAuthClientInformationFull(
                 client_id="ext-client",
                 client_name="Ext Client",
@@ -200,10 +205,17 @@ class ExtensionsIntegrationTests(unittest.TestCase):
                 token_endpoint_auth_method="none",
             )
         )
-        server.oauth_provider.store.mark_approved("ext-client")
-        server.oauth_execution.set_client_profile("ext-client", "allowlist")
+        store.mark_approved("ext-client")
+        exec_app.set_client_profile("ext-client", "allowlist")
         tok = AccessToken(token="t", client_id="ext-client", scopes=["mcp:read"], resource=server.RESOURCE_URL)
-        with patch("backend.tool_permissions.get_access_token", return_value=tok):
+        fake_prov = type("_P", (), {"store": store})()
+        with patch("backend.tool_permissions.get_access_token", return_value=tok), patch.object(
+            server, "EXTENSION_STORE", self.store
+        ), patch.object(server, "EXTENSION_MANAGER", self.mgr), patch.object(
+            server, "oauth_provider", fake_prov
+        ), patch.object(
+            server, "oauth_execution", exec_app
+        ):
             listed = asyncio.run(server.extension_list())
             self.assertTrue(any(x["id"] == "system_monitor" for x in listed["installed"]))
             called = asyncio.run(server.extension_call_tool("system_monitor", "system_metrics", {}))

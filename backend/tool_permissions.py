@@ -133,9 +133,13 @@ def make_tool_middleware(
             name = params.get("name") if isinstance(params, dict) else getattr(params, "name", None)
             t0 = time.monotonic()
             try:
-                if name in EXEC_TOOLS and name not in allowed:
+                if isinstance(name, str) and name in registry.registered_names() and name not in allowed:
                     raise MCPError(
-                        code=FORBIDDEN_TOOL, message="Execution is not available to this OAuth client"
+                        code=FORBIDDEN_TOOL,
+                        message=(
+                            f"Execution of '{name}' is not available to this OAuth client "
+                            "(check client access scenario, Computer Use opt-in, or tool restrictions)."
+                        ),
                     )
                 if gateway_router is not None and isinstance(name, str):
                     await gateway_router.ensure_initialized()

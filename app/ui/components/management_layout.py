@@ -67,6 +67,7 @@ class ManagementTabs(QTabWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._translation_keys: list[str] = []
+        self._section_headers: list[tuple[SectionHeader | None, bool]] = []
         self.setUsesScrollButtons(True)
 
     def add_section(
@@ -77,18 +78,24 @@ class ManagementTabs(QTabWidget):
         *,
         controls: bool = False,
     ) -> None:
+        self._section_headers.append((header, controls))
+        self._hide_duplicate_header(header, controls)
+        self._translation_keys.append(title_key)
+        self.addTab(pane, tr(title_key))
+
+    @staticmethod
+    def _hide_duplicate_header(header: SectionHeader | None, controls: bool) -> None:
         if header is not None:
             if controls:
                 header.title_label.hide()
                 header.subtitle_label.hide()
             else:
                 header.hide()
-        self._translation_keys.append(title_key)
-        self.addTab(pane, tr(title_key))
 
     def retranslate(self) -> None:
         for index, key in enumerate(self._translation_keys):
             self.setTabText(index, tr(key))
+            self._hide_duplicate_header(*self._section_headers[index])
 
 
 def management_split(primary: QWidget, inspector: QWidget) -> QSplitter:

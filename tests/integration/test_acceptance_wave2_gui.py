@@ -78,6 +78,55 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
         theme.apply(self.app, theme.THEME_DARK)
         self.tmp.cleanup()
 
+    def test_management_page_inspectors_and_translation(self) -> None:
+        from PyQt6.QtWidgets import QSplitter
+        from app.ui.i18n import LANG_EN, tr
+
+        w = self.window
+        cases = (
+            (w.servers_page, w.servers_page.logs_view, w.servers_page.info_view,
+             "servers.details.logs_title", "servers.details.info_title"),
+            (w.workspaces_page, w.workspaces_page.tree_widget, w.workspaces_page.details_view,
+             "workspaces.details.tree_title", "workspaces.details.git_title"),
+            (w.extensions_page, w.extensions_page.ui_preview, w.extensions_page.logs_view,
+             "extensions.details.ui", "extensions.details.logs"),
+            (w.tasks_page, w.tasks_page.logs_view, w.tasks_page.artifact_view,
+             "tasks.details.output_title", "tasks.details.artifacts_title"),
+            (w.gateway_page, w.gateway_page.tools_table, w.gateway_page.logs_view,
+             "gateway.details.tools_title", "gateway.details.logs_title"),
+        )
+        w.resize(1100, 780)
+        w.show()
+        for lang in (LANG_RU, LANG_EN):
+            w.set_language(lang)
+            for page, first, second, key1, key2 in cases:
+                tabs = page.detail_tabs
+                self.assertEqual(tabs.count(), 2)
+                self.assertIsInstance(tabs.parentWidget(), QSplitter)
+                self.assertEqual(tabs.tabText(0), tr(key1))
+                self.assertEqual(tabs.tabText(1), tr(key2))
+                self.assertTrue(tabs.widget(0).isAncestorOf(first))
+                self.assertTrue(tabs.widget(1).isAncestorOf(second))
+                w._stack.setCurrentWidget(page)
+                for index in (0, 1):
+                    tabs.setCurrentIndex(index)
+                    self.app.processEvents()
+                    self.assertGreater(tabs.currentWidget().width(), 0)
+                    self.assertGreater(tabs.currentWidget().height(), 0)
+                search = page.search_input if page is w.extensions_page else page.search_edit
+                self.assertTrue(search.isClearButtonEnabled())
+            self.assertTrue(w.tasks_page.logs_header.title_label.isHidden())
+            self.assertTrue(w.tasks_page.art_header.title_label.isHidden())
+            self.assertTrue(w.servers_page.logs_header.title_label.isHidden())
+            self.assertEqual(w.extensions_page.collection_tabs.count(), 2)
+            self.assertTrue(w.extensions_page.collection_tabs.widget(0).isAncestorOf(
+                w.extensions_page.installed_table
+            ))
+            self.assertTrue(w.extensions_page.collection_tabs.widget(1).isAncestorOf(
+                w.extensions_page.catalog_table
+            ))
+        w.set_language(LANG_RU)
+
     def test_unnecessary_notifications_removed_on_theme_and_tray(self) -> None:
         self.assertFalse(hasattr(self.window, "hidden_to_tray"))
         with patch.object(self.window.toasts, "show_toast") as toast_mock:

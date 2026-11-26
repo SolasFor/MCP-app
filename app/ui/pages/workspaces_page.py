@@ -656,7 +656,6 @@ class WorkspacesPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("workspaces.title"), tr("workspaces.lead"))
-        self.detail_tabs.retranslate()
         self.search_edit.setPlaceholderText(tr("workspaces.search"))
         self.add_btn.setText(tr("workspaces.btn.add"))
         self.run_task_btn.setText(tr("workspaces.btn.run_task"))
@@ -676,6 +675,7 @@ class WorkspacesPage(PageScaffold):
         self.empty_state.set_content(tr("workspaces.empty.title"), tr("workspaces.empty.desc"))
         self.tree_header.set_texts(tr("workspaces.details.tree_title"))
         self.git_header.set_texts(tr("workspaces.details.git_title"))
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

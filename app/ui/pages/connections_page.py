@@ -122,7 +122,7 @@ class ConnectionsPage(PageScaffold):
             menu_btn.setFixedSize(24, 25)
             menu_btn.setIconSize(QSize(15, 15))
             menu_btn.setIcon(icons.vector_icon("more", theme.TEXT_MUTED, 15))
-            menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            menu_btn.setCursor(Qt.CursorShape.ArrowCursor)
             menu = QMenu(menu_btn)
             configure = QAction(menu)
             menu.addAction(configure)

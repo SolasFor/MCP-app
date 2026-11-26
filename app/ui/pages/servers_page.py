@@ -871,7 +871,6 @@ class ServersPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("servers.title"), tr("servers.lead"))
-        self.detail_tabs.retranslate()
         self.search_edit.setPlaceholderText(tr("servers.search"))
         self.add_btn.setText(tr("servers.btn.add"))
         self.refresh_btn.setText(tr("servers.btn.refresh"))
@@ -892,6 +891,7 @@ class ServersPage(PageScaffold):
         self.empty_state.set_content(tr("servers.empty.title"), tr("servers.empty.desc"))
         self.logs_header.set_texts(tr("servers.details.logs_title"))
         self.info_header.set_texts(tr("servers.details.info_title"))
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

@@ -780,7 +780,6 @@ class GatewayPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("gateway.title"), tr("gateway.lead"))
-        self.detail_tabs.retranslate()
         self.search_edit.setPlaceholderText(tr("gateway.search"))
         self.add_btn.setText(tr("gateway.btn.add"))
         self.refresh_btn.setText(tr("gateway.btn.refresh"))
@@ -809,6 +808,7 @@ class GatewayPage(PageScaffold):
                 tr("gateway.tools.col.desc"),
             ]
         )
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

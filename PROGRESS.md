@@ -526,3 +526,9 @@
 - Matched the supplied visual references with compact provider rows, token icon actions, aligned log filters and a compact action/count area.
 - Preserved token generation/paste in the token context menu and existing log filtering/actions.
 - Validation: Ruff, mypy (74 files), 16 targeted GUI tests (offscreen); visual acceptance pending.
+
+### Unified management UI redesign
+- Integrated the provider guide, compact connection/log layout, and management redesign branches.
+- Servers, Workspaces, Extensions, Tasks, and Gateway share compact action panels, resizable list/inspector areas and translated full-width detail tabs.
+- Fixed duplicate inspector headings after language change and provider menu cursor regression.
+- Validation: 45 targeted integration tests, Ruff and mypy; offscreen geometry and RU/EN checks. Manual visual acceptance pending.

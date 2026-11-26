@@ -641,7 +641,6 @@ class TasksPage(PageScaffold):
 
     def retranslate(self) -> None:
         self.set_header(tr("tasks.title"), tr("tasks.lead"))
-        self.detail_tabs.retranslate()
         self.scope_all_btn.setText(tr("tasks.scope.all"))
         self.scope_active_btn.setText(tr("tasks.scope.active"))
         self.scope_history_btn.setText(tr("tasks.scope.history"))
@@ -677,6 +676,7 @@ class TasksPage(PageScaffold):
         self.empty_state.set_content(tr("tasks.empty.title"), tr("tasks.empty.desc"))
         self.logs_header.set_texts(tr("tasks.details.output_title"))
         self.art_header.set_texts(tr("tasks.details.artifacts_title"))
+        self.detail_tabs.retranslate()
         self.reload()
 
     def apply_theme(self) -> None:

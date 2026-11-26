@@ -532,8 +532,6 @@ class ExtensionsPage(PageScaffold):
         self.manager.shutdown_all()
 
     def retranslate(self) -> None:
-        self.collection_tabs.retranslate()
-        self.detail_tabs.retranslate()
         self.set_header(tr("extensions.title"), tr("extensions.lead"))
         self._notice_lbl.setText(tr("extensions.isolation_notice"))
         self.search_input.setPlaceholderText(tr("extensions.search"))
@@ -562,4 +560,6 @@ class ExtensionsPage(PageScaffold):
             tr("extensions.col.desc"),
             "",
         ])
+        self.collection_tabs.retranslate()
+        self.detail_tabs.retranslate()
         self.refresh_all()

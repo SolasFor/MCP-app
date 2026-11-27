@@ -14,11 +14,29 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
+from pathlib import Path
 
 
 def main() -> int:
     multiprocessing.freeze_support()
     args = sys.argv[1:]
+
+    if "--version" in args:
+        from app import APP_NAME, __version__
+        from app.backend_entry import _ensure_std_streams
+
+        text = f"{APP_NAME} {__version__}"
+        idx = args.index("--version")
+        if idx + 1 < len(args) and not args[idx + 1].startswith("-"):
+            Path(args[idx + 1]).write_text(text + "\n", encoding="utf-8")
+        _ensure_std_streams()
+        print(text)
+        return 0
+
+    if "--apply-update" in args:
+        from app.updater.helper import run_apply_update_cli
+
+        return run_apply_update_cli(args)
 
     if "--run-extension" in args:
         idx = args.index("--run-extension")

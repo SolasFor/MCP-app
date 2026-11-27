@@ -78,6 +78,7 @@ def _check_qt() -> str:
     from app.ui.pages.extensions_page import ExtensionsPage  # noqa: F401
     from app.ui.pages.devices_page import DevicesPage  # noqa: F401
     from app.ui.pages.automation_page import AutomationPage  # noqa: F401
+    from app.updater import UpdateManager, detect_install_environment  # noqa: F401
 
     return QtCore.PYQT_VERSION_STR
 

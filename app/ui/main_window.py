@@ -202,7 +202,10 @@ class MainWindow(QMainWindow):
             redactor=manager._redactor,
             admin_client_provider=manager.admin_client,
             backend_running_checker=manager.is_backend_running,
+            settings=settings,
+            quit_for_update_callback=self.request_restart_for_update,
         )
+        self._pending_update_handoff = False
 
         self._pages_by_id: dict[str, QWidget] = {
             "home": self.home_page,
@@ -1304,6 +1307,15 @@ class MainWindow(QMainWindow):
 
     def allow_close(self) -> None:
         self._allow_close = True
+
+    def request_restart_for_update(self) -> None:
+        self._pending_update_handoff = True
+        self.quit_requested.emit()
+
+    def consume_pending_update_handoff(self) -> bool:
+        pending = self._pending_update_handoff
+        self._pending_update_handoff = False
+        return pending
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         self._persist_geometry()

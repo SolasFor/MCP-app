@@ -663,3 +663,32 @@
 - Независимая приёмка: 10/10 lifecycle tests, 4.813s, exit 0, изолированный профиль. Полные 324 теста и сборка — по отчёту Antigravity, не повторены ChatGPT.
 - P2: ResourceWarning незакрытого mcp_audit.log при тестовой переинициализации backend/server.py:352. Остаточные BLOCKED/NOT_RUN N01 сохранены.
 - N02: feat/n02-secure-updater, ANTIGRAVITY_PROMPT.md. Код не начат; auto-install запрещён без доверенного signing. Версия 1.0.2, релиз не опубликован. PR #32 не изменять.
+
+## N02 — Безопасное автообновление (2026-11-27)
+- **Ветка / база / версия**: `feat/n02-secure-updater` (подготовка `12948ac`, база `main` `32086cc`, PR #32 не затрагивался) | версия приложения сохранена (`1.0.2`).
+- **Реализованные модули и изменения**:
+  - Пакет `app/updater/`:
+    - `models.py` — строгий SemVer, канонический JSON-манифест `schema_version=1` (`stable` only, отказ при `public_key`/`trusted_keys`/`url`/`download_url`/лишних полях), состояния транзакции `UpdateTransaction` и `UpdaterPersistentState` (`highest_seen_version` против downgrade/replay).
+    - `trust.py` — политика доверия `TrustPolicy` (`PRODUCTION_TRUST_ROOTS = ()` без тестовых ключей, ротация `not_before`/`not_after`, отзыв `revoked_key_ids`, отсоединённая проверка Ed25519 над каноническим UTF-8 JSON, нативная Win32 проверка Authenticode через `wintrust!WinVerifyTrust` + `crypt32!CryptQueryObject`). Автоустановка в релизе строго заблокирована (`MISSING_TRUST_ROOTS`), пока не будут внесены продакшн-ключи доверия и отпечатки.
+    - `network.py` — строго HTTPS, pinned-хосты GitHub (`api.github.com`, `github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`), не более 3 редиректов со сбросом `Authorization`, запрет URL из release body и prerelease/draft, потоковая загрузка с отменой и контролем размера/SHA-256.
+    - `staging.py` — проверка квоты диска, защита от zip-slip/UNC/drive/NUL/POSIX-symlink/DOS-reparse (`0x400`)/NTFS case-collision/zip-bomb/защищённых пользовательских файлов (`token.json`, `settings.json`, `schedules.json`, `oauth/`, `secrets/`), private ACL и предзапусковая проверка TOCTOU `reverify_staged_bundle`.
+    - `detector.py` — детектор `dev` / `installed` (Inno Setup, проверка прав записи и кэша отката) / `portable` (проверка прав на каталог/родителя и отсутствия посторонних файлов).
+    - `helper.py` — внедеревый запуск `--apply-update` из `updates/helper_run/<tx_id>` (`__COMPAT_LAYER=RunAsInvoker`, `hmac.compare_digest` + TTL handoff token, `.updater.lock`, ожидание `ProcessIdentity`, проверка активных `TaskStore` задач), атомарная замена portable-пакета с `.MCPApp-old-<tx_id>`, пост-проверка `--version`/`--selftest`/`--headless /health=200`, автооткат при сбое и аварийное восстановление при старте (`recover_interrupted_update_on_boot`) без затрагивания `%APPDATA%\MCPApp`.
+    - `manager.py` — `UpdateManager` (троттлинг авто-проверки 24 ч, opt-in download/stage, cancel, явная передача установки на `Quit`).
+  - Интеграция: `main.py` (`--version [file]`, `--apply-update`), `app/config.py` (`update_auto_check`, `update_auto_download`, `update_auto_install`, `update_channel`), `app/ui/pages/automation_page.py`, `app/ui/main_window.py`, `app/gui.py`, `app/ui/theme.py`, `app/ui/i18n.py` (RU/EN паритет), `app/selftest.py`, `packaging/mcp_app.spec`, `pyproject.toml`, `tools/release_manifest.py`, `packaging/build.ps1`, `.github/workflows/rc-windows.yml`, `.github/workflows/build.yml`.
+  - Существующий `backend/automation/backup_updater.py` (`BackupManager`, `StagedUpdater`) и N01-расписания в паузе сохранены без изменений поведения.
+- **TDD-тесты и локальные доказательства (после финальных правок, Python `3.13.15`, `QT_QPA_PLATFORM=offscreen`)**:
+  - Новые тесты: `tests/unit/test_n02_updater_security.py` (`9` security/trust/network/ZIP/TOCTOU тестов) и `tests/integration/test_n02_updater_lifecycle.py` (`7` lifecycle/installed/portable/rollback/crash-recovery/UI/release-manifest тестов) — предварительно зафиксированы RED, затем GREEN.
+  - `compileall -q backend app tests tools`: **PASS**.
+  - `ruff check app backend tests tools`: **PASS** (`All checks passed!`).
+  - `mypy` (`win32`) и `mypy --platform linux`: **PASS** (`Success: no issues found in 83 source files`).
+  - `tools/check_licenses.py`: **PASS** (`All 38 components passed license check`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
+  - Полный прогон тестов: `tests/unit` **241/241 PASS**, `tests/integration` **97/97 PASS**, `tests/e2e` (Playwright) **2/2 PASS** (итого **340/340 PASS**).
+  - `graphify update .`: **PASS** (`5661 nodes, 18181 edges, 213 communities`, `graphify-out` не отслеживается Git).
+  - Изолированная frozen-сборка PyInstaller на `D:\Coding\.mcpapp-n02-tmp` (живой `D:\Coding\MCP App\dist\MCPApp\MCPApp.exe` PID `3044`/`8428` и реальный `%APPDATA%\MCPApp` не затронуты, каталог удалён):
+    - Собраны `1.0.2` и стендовая `1.0.3` (`MCPApp.exe`: `8,547,934` Б, SHA-256 `24839ec7970beed35a1ef9af129a5143e02b98029b75eef6e2564631c3d2d30a`), подтверждены откат `1.0.2 -> ROLLED_BACK -> MCP app 1.0.2` и реальный апгрейд `1.0.2 -> COMMITTED -> MCP app 1.0.3` (реальные `--version`, `--selftest` `RESULT OK`, `--headless` `/health=200`) с побайтным сохранением DPAPI v2 `token.json`/`SecretStore` и N01 `schedules.json`.
+- **Незавершённые / `BLOCKED` / `NOT_RUN` проверки**:
+  - Локальный `ISCC.exe` отсутствует (**NOT_RUN** локально — Inno Setup установка/апгрейд/откат и `update-manifest.json` проверяются в CI job `windows-package`);
+  - Продакшн-ключи Ed25519 (`PRODUCTION_TRUST_ROOTS`) и сертификат Windows Authenticode (`.pfx` / `PRODUCTION_PUBLISHER_THUMBPRINTS`) не передавались агентом — в релизе автоустановка остаётся **BLOCKED (`MISSING_TRUST_ROOTS`)**;
+  - Ручной OAuth для `sonarqube-cloud` MCP не выполнялся (проверка качества через SonarCloud CI).
+- **Статус**: `IN_PROGRESS` — ожидает прохождения PR checks / SonarCloud CI и независимой приёмки (без merge, без смены версии, без публикации релиза, N03 не начат).

@@ -170,13 +170,22 @@ if (-not $SkipInstaller) {
     }
 }
 
-# ------------------------------------------------------------------ 9. SBOM and SHA-256 checksums
-Step "SBOM and SHA-256 checksums"
+# ------------------------------------------------------------------ 9. Update manifest, SBOM and SHA-256 checksums
+Step "Update manifest, SBOM and SHA-256 checksums"
 $SbomPath = Join-Path $Root "dist\SBOM.cdx.json"
 & $Py tools\generate_sbom.py --output $SbomPath
 Check "generate_sbom.py"
 
+$ManifestPath = Join-Path $Root "dist\update-manifest.json"
+$ManifestSigPath = Join-Path $Root "dist\update-manifest.json.sig"
+if ((Test-Path $Setup) -and (Test-Path $Zip)) {
+    & $Py tools\release_manifest.py --version $Version --installer $Setup --portable $Zip --output $ManifestPath
+    Check "release_manifest.py"
+}
+
 $HashTargets = @($Zip, $SbomPath)
+if (Test-Path $ManifestPath) { $HashTargets += $ManifestPath }
+if (Test-Path $ManifestSigPath) { $HashTargets += $ManifestSigPath }
 if (Test-Path $Setup) { $HashTargets = @($Setup) + $HashTargets }
 $SumLines = foreach ($file in $HashTargets) {
     $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()

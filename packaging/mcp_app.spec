@@ -59,6 +59,7 @@ hiddenimports = [
     "win32con",
     "win32security",
     *collect_submodules("app.core.tunnels"),
+    *collect_submodules("app.updater"),
     *collect_submodules("backend.gateway"),
     *collect_submodules("backend.tasks"),
     *collect_submodules("backend.servers"),

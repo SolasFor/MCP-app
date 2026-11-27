@@ -977,6 +977,21 @@ QScrollBar::handle:horizontal { background: $BORDER; border-radius: 3px; min-wid
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 
+/* ---------- progress & menus ---------- */
+QProgressBar {
+    background: $INPUT;
+    border: 1px solid $BORDER;
+    border-radius: 5px;
+    min-height: 8px;
+    max-height: 8px;
+    text-align: center;
+    color: transparent;
+}
+QProgressBar::chunk {
+    background: $ACCENT_STRONG;
+    border-radius: 4px;
+}
+
 /* ---------- menus & popups ---------- */
 QToolTip {
     background: $ELEVATED;

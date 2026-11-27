@@ -616,6 +616,11 @@
     - `--headless` (порт `18981`): **PASS** (`/health` HTTP `200`, неавторизованный `POST /mcp` HTTP `401`).
     - `--repair-acl`: **PASS** (`exit=0`, `ok=true` в временном профиле на `D:`).
 - **PR #37 / CI / незавершённые проверки (`BLOCKED` / `NOT_RUN`)**:
-  - Открыт для обновления [PR #37](https://github.com/SolasFor/MCP-app/pull/37); PR #32 не затрагивался, merge в `main` и публикация релиза не выполнялись.
-  - `BLOCKED`/`NOT_RUN`: Authenticode `.pfx`, локальный `ISCC.exe` (`Setup.exe` проверяется в CI), второй live GUI при запущенном `MCPApp-Running`, live облачные туннели/SaaS AI-клиенты/внешний SSH, ручной OAuth для `sonarqube-cloud` MCP.
-  - Прогон GitHub Actions и SonarCloud Quality Gate на новом HEAD обновляются после push в PR #37.
+  - Обновлён [PR #37](https://github.com/SolasFor/MCP-app/pull/37) (`feat/n01-baseline-audit` → `main`, статус: **OPEN**; PR #32 не затрагивался, merge в `main` и публикация релиза не выполнялись).
+  - Облачный CI и SonarCloud Quality Gate на финальном кодовом коммите `497789e` (исправление `python:S6418` в `backend/server.py`):
+    - `Verify & Test (ubuntu-latest)`: **PASS** (`2m15s`: https://github.com/SolasFor/MCP-app/actions/runs/46000862980/job/140511841054).
+    - `Verify & Test (windows-latest)`: **PASS** (`2m58s`: https://github.com/SolasFor/MCP-app/actions/runs/46000862980/job/140511840609).
+    - `windows-package` (`RC Windows installer`): **PASS** (`2m50s`: https://github.com/SolasFor/MCP-app/actions/runs/46000862929/job/140511840499).
+    - `SonarCloud Code Analysis`: **PASS** (`37s`, Quality Gate `OK`, `new_security_rating=1`, `new_reliability_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=1.1%`, `new_security_hotspots_reviewed=100.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=37.
+  - `BLOCKED`/`NOT_RUN`: Authenticode `.pfx`, локальный `ISCC.exe` (`Setup.exe` проверен в `windows-package`), второй live GUI при запущенном `MCPApp-Running`, live облачные туннели/SaaS AI-клиенты/внешний SSH, ручной OAuth для `sonarqube-cloud` MCP.
+  - **Вывод**: этап N01 готов к независимой приёмке и одобрению merge владельцем перед переходом к N02.

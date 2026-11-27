@@ -67,9 +67,8 @@
 - Не изменять глобальные настройки Antigravity, разрешения, токены, sidecars, DNS, SSH-службы и ключи владельца ради прохождения тестов. Режимы использования инструментов — docs/antigravity-workflow.md.
 - Сначала точечные проверки, затем полный gate на значимых границах. Нельзя объявлять VERIFIED без доказательств; независимое ревью ChatGPT/владельца перед merge/release.
 
-## Текущая граница: N03
-N01 MERGED (PR #37, 32086cc), N02 MERGED (PR #38, 4b9bedb). N03 только после явной команды владельца; использовать ANTIGRAVITY_PROMPT.md. Сохранить единый Server Manager и linked_servers, убрать навигацию «Серверы» только после lossless migration и функциональной эквивалентности. Не начинать N04, не менять версию и не публиковать релиз.
-
+## Текущая граница: N04
+N01 MERGED (#37, 32086cc), N02 MERGED (#38, 4b9bedb), N03 MERGED (#39, 3c0d1a1). N04 только после явной команды владельца; использовать ANTIGRAVITY_PROMPT.md. Discovery только статический read-only в выбранных границах, без исполнения, установки, сети и чтения секретов; preview и явный commit, новые права deny-by-default для OAuth, без autostart. Сохранить N03 runtime, links, workspace_scoped, transaction/locks и live auth. Не начинать N05, не менять версию, не публиковать релиз.
 
 ## Обязательный production gate после merge N02
 N02 MERGED (PR #38, 4b9bedb) означает приёмку кода, не допуск автоустановки. PRODUCTION_TRUST_ROOTS и PRODUCTION_PUBLISHER_THUMBPRINTS остаются пустыми до отдельного решения владельца; production auto-install и автоматический boot-recovery BLOCKED (MISSING_TRUST_ROOTS), installed без криптографически проверенного rollback — BLOCKED (NO_ROLLBACK_CONTRACT). До включения production требуется отдельная приёмка инфраструктуры Ed25519/Authenticode, проверка криптографической целостности именно восстанавливаемого portable-пакета до запуска его бинарника, проверка rollback при прерывании и потере питания (включая отсутствие install_dir между rename). Самопроверка/health не заменяют криптографическую проверку. Первый переход с неподписанной 1.0.2 — вручную в доверенную сборку. Не включать production-ключи/автоустановку в N03–N13 без отдельной авторизации и успешной приёмки этих gates; не выдавать BLOCKED/NOT_RUN за PASS.

@@ -829,3 +829,9 @@
     - Полный прогон (`-W always::ResourceWarning`): `tests/unit` **268/268 PASS** (`26.867s`, `UNIT_SUBPROC_WARNINGS=0`), `tests/integration` **105/105 PASS** (`73.746s`, `INTEG_SUBPROC_WARNINGS=0`), `tests/e2e` **2/2 PASS** (`8.373s`) — итого **375/375 PASS**.
     - Изолированная сборка PyInstaller (`D:\Coding\.mcpapp-n03-final-tmp`, `CLEANUP_OK=True`): `MCPApp.exe` (`11,671,819` Б, SHA-256 `a4590e0bc50669ad4fbe94f1bdadeae82e92da8505915279dd0d5147976678d3`), `--selftest` exit `0` (`RESULT OK`), `--headless /health` → `200 {"status":"ok"}`.
 - **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`); живой внешний туннельный smoke-тест **NOT_RUN** в рамках N03; N02 production gates (`PRODUCTION_TRUST_ROOTS = ()`, `PRODUCTION_PUBLISHER_THUMBPRINTS = ()`, auto-install/boot-recovery **BLOCKED** `MISSING_TRUST_ROOTS` / `NO_ROLLBACK_CONTRACT`) сохранены без изменений.
+
+## N03 — MERGED / N04 — подготовка (2026-11-28)
+- PR #39 объединён по разрешению владельца: 3c0d1a1ecb47a1b057a641f0803ec3ccd71c2de4; проверенный HEAD 098e496, 4 CI checks SUCCESS.
+- Независимая приёмка ChatGPT: 16 unit + 8 integration, 24/24 PASS, exit 0, временный профиль, 0 предупреждений subprocess still running. Полный набор 375 и frozen smoke — по отчёту Antigravity, не повторены ChatGPT.
+- N03 runtime/tx/scopes/live auth/TaskManager приняты в пределах проверенных сценариев. Внешний туннель и локальный ISCC NOT_RUN. N02 production gates сохранены, P2 mcp_audit.log остаётся.
+- N04: feat/n04-workspace-wizard; текущий план ANTIGRAVITY_PROMPT.md. Реализация не начата. Версия 1.0.2, PR #32 не изменять, релиз не опубликован.

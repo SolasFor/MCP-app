@@ -4083,7 +4083,9 @@ async def invoke_playground_tool(
             }
 
     ephemeral_id = f"{client_id}-{secrets.token_hex(4)}"
-    need_ephemeral = tool_name != "server_info" and oauth_provider is not None and oauth_execution is not None
+    provider = oauth_provider
+    exec_approvals = oauth_execution
+    need_ephemeral = tool_name != "server_info" and provider is not None and exec_approvals is not None
     tok = AccessToken(
         token=secrets.token_urlsafe(12),
         client_id=ephemeral_id if need_ephemeral else client_id,
@@ -4093,17 +4095,16 @@ async def invoke_playground_tool(
     created_ephemeral = False
     auth_token = None
     try:
-        if need_ephemeral:
-            assert oauth_provider is not None and oauth_execution is not None
+        if need_ephemeral and provider is not None and exec_approvals is not None:
             client_info = OAuthClientInformationFull(
                 client_id=ephemeral_id,
                 client_name="MCP Playground (ephemeral)",
                 redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
             )
             created_ephemeral = True
-            oauth_provider.store.save_client(client_info)
-            oauth_provider.store.mark_approved(ephemeral_id)
-            oauth_execution.set_client_profile(ephemeral_id, profile)
+            provider.store.save_client(client_info)
+            provider.store.mark_approved(ephemeral_id)
+            exec_approvals.set_client_profile(ephemeral_id, profile)
         auth_token = auth_context_var.set(AuthenticatedUser(tok))
         res = await mcp.call_tool(tool_name, dict(arguments or {}))
         elapsed = (time.monotonic() - t0) * 1000.0

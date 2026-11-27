@@ -1,10 +1,9 @@
 """Loopback-only authenticated HTTP client for communicating with the local Admin REST API."""
 from __future__ import annotations
 
+import http.client
 import json
-import urllib.error
 import urllib.parse
-import urllib.request
 from typing import Any
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -36,8 +35,7 @@ class LocalAdminClient:
         self._host = clean_host
         self._port = int(port)
         self._token = token
-        netloc = f"[{clean_host}]:{self._port}" if ":" in clean_host else f"{clean_host}:{self._port}"
-        self.base_url = f"http://{netloc}"
+        self._host_header = f"[{clean_host}]:{self._port}" if ":" in clean_host else f"{clean_host}:{self._port}"
 
     def _request_raw(
         self,
@@ -47,35 +45,47 @@ class LocalAdminClient:
         body: dict[str, Any] | None = None,
         timeout: float = 15.0,
     ) -> tuple[int, str]:
-        url = f"{self.base_url}{path}"
         headers: dict[str, str] = {
+            "Host": self._host_header,
             "Authorization": f"Bearer {self._token}",
             "Accept": "application/json",
+            "Connection": "close",
         }
-        data: bytes | None = None
+        payload: bytes | None = None
         if body is not None:
-            data = json.dumps(body).encode("utf-8")
+            payload = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+
+        conn: http.client.HTTPConnection | None = None
         try:
-            with urllib.request.urlopen(req, timeout=max(0.5, float(timeout))) as resp:
-                return int(resp.status), resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            err_body = ""
+            conn = http.client.HTTPConnection(
+                self._host,
+                self._port,
+                timeout=max(0.5, float(timeout)),
+            )
+            conn.request(method.upper(), path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            text = resp.read().decode("utf-8", errors="replace")
+        except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+        if status >= 400:
+            msg = text
             try:
-                err_body = exc.read().decode("utf-8", errors="replace")
-            except OSError:
-                pass
-            msg = err_body
-            try:
-                parsed = json.loads(err_body)
+                parsed = json.loads(text)
                 if isinstance(parsed, dict) and parsed.get("error"):
                     msg = str(parsed["error"])
             except json.JSONDecodeError:
                 pass
-            raise AdminApiError(int(exc.code), msg or f"Admin API HTTP {exc.code}") from exc
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
-            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
+            raise AdminApiError(status, msg or f"Admin API HTTP {status}")
+        return status, text
 
     def _request_json(
         self,

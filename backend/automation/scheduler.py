@@ -19,6 +19,17 @@ from app.paths import user_data_dir
 
 _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2}):?(\d{2})$", re.IGNORECASE)
 _ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,128}$")
+_RESERVED_CLIENT_IDS = frozenset({"mcp-app-user"})
+
+
+def _validate_client_id(raw: object) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("Invalid client_id")
+    clean = raw.strip()
+    if not _CLIENT_ID_RE.fullmatch(clean) or clean in _RESERVED_CLIENT_IDS:
+        raise ValueError(f"Invalid schedule client_id: {raw!r}")
+    return clean
 
 
 def resolve_timezone(name: str) -> tzinfo:
@@ -160,6 +171,7 @@ class ScheduleSpec:
         self.max_retries = max(0, min(int(self.max_retries), 3))
         if not (self.tool_name or "").strip():
             raise ValueError("tool_name is required")
+        self.client_id = _validate_client_id(self.client_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,7 +208,11 @@ class ScheduleSpec:
             interval_seconds=int(data.get("interval_seconds") or 300),
             event_name=str(data.get("event_name") or ""),
             timezone_name=str(data.get("timezone_name") or "UTC"),
-            client_id=str(data.get("client_id") or "owner"),
+            client_id=(
+                str(data["client_id"])
+                if "client_id" in data and data["client_id"] is not None
+                else ("" if "client_id" in data else "owner")
+            ),
             misfire_policy=str(data.get("misfire_policy") or "skip"),
             concurrency_policy=str(data.get("concurrency_policy") or "forbid"),
             safe_retry=bool(data.get("safe_retry", False)),
@@ -317,9 +333,22 @@ class AutomationScheduler:
                 pass
 
     @staticmethod
-    def check_actor_can_mutate(*, actor_id: str, actor_profile: str) -> None:
-        if actor_id != "owner" and actor_profile != "full":
+    def check_actor_can_mutate(*, actor_id: str, actor_profile: str) -> str:
+        clean_actor = _validate_client_id(actor_id)
+        if clean_actor != "owner" and actor_profile != "full":
             raise PermissionError("Modifying automation schedules requires owner or Full Access profile")
+        return clean_actor
+
+    def _safe_check_permission(self, spec: ScheduleSpec) -> tuple[bool, str]:
+        if self._permission_checker is None:
+            return (True, "")
+        try:
+            res = self._permission_checker(spec)
+            if not isinstance(res, tuple) or len(res) != 2:
+                return (False, "Invalid authorization check result")
+            return (bool(res[0]), str(res[1] or ""))
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"Authorization check error: {type(exc).__name__}")
 
     def list_schedules(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -348,12 +377,21 @@ class AutomationScheduler:
         actor_profile: str = "full",
         now: float | None = None,
     ) -> dict[str, Any]:
-        self.check_actor_can_mutate(actor_id=actor_id, actor_profile=actor_profile)
+        clean_actor = self.check_actor_can_mutate(actor_id=actor_id, actor_profile=actor_profile)
+        if clean_actor != "owner" and spec.client_id != clean_actor:
+            raise PermissionError("OAuth client schedules must bind client_id to the calling actor")
+        if clean_actor != "owner" and self._permission_checker is not None:
+            allowed, reason = self._safe_check_permission(spec)
+            if not allowed:
+                raise PermissionError(reason or "Client is not authorized for scheduled tool or arguments")
         ts = time.time() if now is None else float(now)
         if spec.enabled and spec.next_run_at <= 0.0:
             spec.next_run_at = self._compute_next_run(spec, ts)
         with self._lock:
             all_s = self._load_schedules_unlocked()
+            existing = all_s.get(spec.schedule_id)
+            if clean_actor != "owner" and existing is not None and existing.client_id != clean_actor:
+                raise PermissionError("Cannot overwrite a schedule owned by another principal")
             all_s[spec.schedule_id] = spec
             self._save_schedules_unlocked(all_s)
         return spec.to_dict()
@@ -365,11 +403,14 @@ class AutomationScheduler:
         actor_id: str = "owner",
         actor_profile: str = "full",
     ) -> bool:
-        self.check_actor_can_mutate(actor_id=actor_id, actor_profile=actor_profile)
+        clean_actor = self.check_actor_can_mutate(actor_id=actor_id, actor_profile=actor_profile)
         with self._lock:
             all_s = self._load_schedules_unlocked()
-            if schedule_id not in all_s:
+            existing = all_s.get(schedule_id)
+            if existing is None:
                 return False
+            if clean_actor != "owner" and existing.client_id != clean_actor:
+                raise PermissionError("Cannot remove a schedule owned by another principal")
             all_s.pop(schedule_id, None)
             self._save_schedules_unlocked(all_s)
             return True
@@ -512,7 +553,7 @@ class AutomationScheduler:
         try:
             while attempts < max_attempts:
                 if self._permission_checker is not None:
-                    allowed, reason = self._permission_checker(spec)
+                    allowed, reason = self._safe_check_permission(spec)
                     if not allowed:
                         with self._lock:
                             all_s = self._load_schedules_unlocked()
@@ -544,7 +585,10 @@ class AutomationScheduler:
                         if self._executor is not None
                         else {"executed": spec.tool_name, "arguments": spec.arguments}
                     )
-                    summary = self._redactor.redact_text(json.dumps(out, ensure_ascii=False, default=str)[:500])
+                    redacted_out = self._redactor.redact_mapping(out)
+                    summary = self._redactor.redact_text(
+                        json.dumps(redacted_out, ensure_ascii=False, default=str)[:500]
+                    )
                     rec = ScheduleRunRecord(
                         run_id=run_id,
                         schedule_id=spec.schedule_id,

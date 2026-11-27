@@ -18,7 +18,7 @@ from typing import Any, Callable
 from app.core.logging_manager import configure_logging
 from app.core.redaction import SecretRedactor
 from app.platform import get_platform
-from app.platform.base import ProcessJobHandle
+from app.platform.base import ProcessIdentity, ProcessJobHandle
 from backend.extensions.store import runtime_entrypoint_prefix
 
 
@@ -67,6 +67,7 @@ class ExtensionProcessHost:
         self._redactor = redactor
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
+        self._proc_identity: ProcessIdentity | None = None
         self._job: ProcessJobHandle | None = None
         self._pump_threads: list[threading.Thread] = []
         self._replies: queue.Queue[dict[str, Any] | None] = queue.Queue()
@@ -111,32 +112,90 @@ class ExtensionProcessHost:
         env["MCP_EXTENSION_DATA_DIR"] = str(self.data_dir)
         return env
 
-    def _close_proc_handles_locked(self, proc: subprocess.Popen[str] | None) -> None:
-        if self._job is not None:
+    @staticmethod
+    def _terminate_worker_processes(
+        proc: subprocess.Popen[str] | None,
+        job: ProcessJobHandle | None,
+        identity: ProcessIdentity | None,
+        adapter: Any,
+    ) -> None:
+        if proc is not None and proc.poll() is None:
             try:
-                get_platform().close_job(self._job)
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if job is not None:
+            try:
+                adapter.terminate_job(job, exit_code=1)
+            except Exception:  # noqa: BLE001
+                pass
+        if identity is not None:
+            try:
+                adapter.terminate_process_tree(identity, grace_seconds=0.2)
+            except Exception:  # noqa: BLE001
+                pass
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
             except OSError:
                 pass
-            self._job = None
-        if proc is None:
-            return
-        for th in self._pump_threads:
-            th.join(timeout=0.3)
+            try:
+                proc.wait(timeout=1.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    @staticmethod
+    def _close_worker_io_and_job(
+        proc: subprocess.Popen[str] | None,
+        threads: list[threading.Thread],
+        job: ProcessJobHandle | None,
+        adapter: Any,
+    ) -> None:
+        if proc is not None:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+        cur_thread = threading.current_thread()
+        for th in threads:
+            if th is not cur_thread:
+                th.join(timeout=0.5)
+        if job is not None:
+            try:
+                adapter.close_job(job)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _cleanup_proc_locked(
+        self,
+        proc: subprocess.Popen[str] | None,
+        *,
+        terminate_active: bool = True,
+    ) -> None:
+        """Terminate worker/tree if running and release all handles, pipes, threads, and OS job."""
+        adapter = get_platform()
+        job = self._job
+        self._job = None
+        identity = self._proc_identity
+        self._proc_identity = None
+        threads = list(self._pump_threads)
         self._pump_threads = []
-        for pipe in (proc.stdin, proc.stdout, proc.stderr):
-            if pipe is not None:
-                try:
-                    pipe.close()
-                except OSError:
-                    pass
+        if self._proc is proc:
+            self._proc = None
+
+        if terminate_active:
+            self._terminate_worker_processes(proc, job, identity, adapter)
+        self._close_worker_io_and_job(proc, threads, job, adapter)
 
     def start(self, *, timeout_seconds: float = 10.0) -> dict[str, Any]:
         with self._lock:
             if self.is_alive():
                 return {"already_running": True, "pid": self.pid}
-            if self._proc is not None and self._proc.poll() is not None:
-                self._close_proc_handles_locked(self._proc)
-                self._proc = None
+            if self._proc is not None or self._job is not None:
+                self._cleanup_proc_locked(self._proc, terminate_active=True)
                 self.restarts += 1
             self.data_dir.mkdir(parents=True, exist_ok=True)
             self._replies = queue.Queue()
@@ -156,35 +215,36 @@ class ExtensionProcessHost:
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             else:
                 kwargs["start_new_session"] = True
-            proc = subprocess.Popen(cmd, **kwargs)
-            self._proc = proc
-            adapter = get_platform()
-            job = adapter.create_job(name=f"ext-{self.extension_id}", kill_on_close=True)
-            if job is not None:
-                adapter.assign_process_to_job(job, proc.pid)
-                self._job = job
-            self._on_log(f"[runtime] started worker pid={proc.pid}")
-            t_out = threading.Thread(target=self._pump_stdout, args=(proc,), daemon=True)
-            t_err = threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True)
-            self._pump_threads = [t_out, t_err]
-            t_out.start()
-            t_err.start()
+            proc: subprocess.Popen[str] | None = None
             try:
+                proc = subprocess.Popen(cmd, **kwargs)
+                self._proc = proc
+                adapter = get_platform()
+                try:
+                    self._proc_identity = adapter.capture_process_identity(proc.pid)
+                except Exception:  # noqa: BLE001
+                    self._proc_identity = None
+                job = adapter.create_job(name=f"ext-{self.extension_id}", kill_on_close=True)
+                self._job = job
+                if job is not None:
+                    assigned = adapter.assign_process_to_job(job, proc.pid)
+                    if assigned is False:
+                        raise RuntimeError(
+                            f"Failed to assign extension {self.extension_id!r} worker pid={proc.pid} to OS job"
+                        )
+                self._on_log(f"[runtime] started worker pid={proc.pid}")
+                t_out = threading.Thread(target=self._pump_stdout, args=(proc,), daemon=True)
+                t_err = threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True)
+                self._pump_threads = [t_out, t_err]
+                t_out.start()
+                t_err.start()
                 init_res = self._rpc_locked(
                     "initialize",
                     {"data_dir": str(self.data_dir), "secrets": self.declared_secrets},
                     timeout_seconds=timeout_seconds,
                 )
             except BaseException:
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                self._close_proc_handles_locked(proc)
-                self._proc = None
+                self._cleanup_proc_locked(proc, terminate_active=True)
                 raise
             self.last_error = ""
             return dict(init_res) if isinstance(init_res, dict) else {"result": init_res}
@@ -271,25 +331,17 @@ class ExtensionProcessHost:
     def stop(self) -> None:
         with self._lock:
             proc = self._proc
-            if proc is None:
+            if proc is None and self._job is None:
                 return
-            if proc.poll() is None:
+            if proc is not None and proc.poll() is None:
                 try:
                     self._rpc_locked("shutdown", {}, timeout_seconds=2.0)
                 except Exception:  # noqa: BLE001
                     pass
                 try:
                     proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        if self._job is not None:
-                            get_platform().terminate_job(self._job, exit_code=1)
-                        proc.kill()
-                        proc.wait(timeout=2.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             self._on_log("[runtime] stopped worker")
-            self._close_proc_handles_locked(proc)
-            self._proc = None
+            self._cleanup_proc_locked(proc, terminate_active=True)
             self._replies = queue.Queue()

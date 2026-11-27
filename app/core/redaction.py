@@ -79,7 +79,7 @@ _PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1[REDACTED]",
     ),
     (
-        re.compile(r"(?i)(?<![A-Za-z0-9_])((?:code|state_secret|csrf_token)\s*[:=]\s*[\"']?)([^\s\"',}&]{4,})"),
+        re.compile(r"(?i)(?<!exit )(?<![A-Za-z0-9_])((?:code|state_secret|csrf_token)\s*[:=]\s*[\"']?)([^\s\"',}&]{4,})"),
         r"\1[REDACTED]",
     ),
     (re.compile(r"(?i)((?:socks5h?|https?)://[^:/@\s]+:)[^@\s]+(@)"), r"\1[REDACTED]\2"),

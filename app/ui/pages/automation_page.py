@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import __version__
+from app.core.atomic_io import atomic_write_text
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 from app.ui.components.cards import Divider, EmptyState, FlowLayout, Section
@@ -672,13 +673,11 @@ class AutomationPage(PageScaffold):
         )
         if dest_path is not None:
             out = Path(dest_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(bundle, encoding="utf-8")
+            atomic_write_text(out, bundle, encoding="utf-8", restrict_acl=True)
             self.status_message.emit(tr("automation.toast.diag_exported", path=str(out)), "ok")
         else:
             out = self._automation_dir / f"diagnostics-{int(time.time())}.json"
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(bundle, encoding="utf-8")
+            atomic_write_text(out, bundle, encoding="utf-8", restrict_acl=True)
             self.metrics_view.setPlainText(bundle)
             self.status_message.emit(tr("automation.toast.diag_exported", path=str(out)), "ok")
         return bundle

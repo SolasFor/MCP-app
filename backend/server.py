@@ -4,10 +4,12 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import weakref
 from contextlib import asynccontextmanager
@@ -40,7 +42,14 @@ if __package__:
         resolve_oauth_language,
     )
     from .oauth_store import canonical_oauth_urls, default_store_path
-    from .oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
+    from .oauth_execution import (
+        ExecutionApprovals,
+        PROFILE_ALLOWLIST,
+        PROFILE_FULL,
+        PROFILE_SAFE,
+        PROFILES,
+        windows_whitelisted,
+    )
     from .execution_audit import ExecutionAudit, classify_command_output
     from .gateway import GatewayConfigStore, GatewayRouter
     from .gateway.security import check_loop_headers
@@ -184,7 +193,14 @@ else:
         resolve_oauth_language,
     )
     from oauth_store import canonical_oauth_urls, default_store_path
-    from oauth_execution import ExecutionApprovals, PROFILE_ALLOWLIST, PROFILE_SAFE, PROFILES
+    from oauth_execution import (
+        ExecutionApprovals,
+        PROFILE_ALLOWLIST,
+        PROFILE_FULL,
+        PROFILE_SAFE,
+        PROFILES,
+        windows_whitelisted,
+    )
     from execution_audit import ExecutionAudit, classify_command_output
     from gateway import GatewayConfigStore, GatewayRouter
     from gateway.security import check_loop_headers
@@ -827,48 +843,210 @@ class _ActiveSessionToolTracker:
 SESSION_TRACKER = _ActiveSessionToolTracker()
 
 
-def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
-    if oauth_execution is not None and oauth_execution.emergency_stopped():
-        return (False, "Emergency stop is active")
-    if spec.client_id == "owner":
-        return (True, "")
-    if oauth_provider is None or oauth_execution is None:
-        return (False, "OAuth store unavailable")
-    tok = AccessToken(
-        token="sched-check",
-        client_id=spec.client_id,
-        scopes=[READ_SCOPE],
-        resource=RESOURCE_URL,
-    )
-    if not oauth_execution.client_approved(spec.client_id):
-        return (False, f"Client {spec.client_id!r} is not approved")
-    allowed = set(
-        DEFAULT_REGISTRY.allowed_tools(
-            oauth_provider.store, tok, oauth_execution, desktop_policy_store=DESKTOP_POLICY_STORE
+_SCHED_PROFILE_RANK = {PROFILE_SAFE: 0, PROFILE_ALLOWLIST: 1, PROFILE_FULL: 2}
+_SCHED_SSH_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,251}$")
+
+
+def _scheduler_validate_int_arg(value: Any, *, default: int, minimum: int, maximum: int) -> int | None:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if not (minimum <= value <= maximum):
+        return None
+    return value
+
+
+def _scheduler_check_windows_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
+    args = spec.arguments or {}
+    cmd = args.get("command")
+    shell = args.get("shell", "cmd")
+    max_to = 600 if profile == PROFILE_FULL else 15
+    timeout = _scheduler_validate_int_arg(args.get("timeout"), default=15, minimum=1, maximum=max_to)
+    if not isinstance(cmd, str) or not cmd.strip() or shell not in ("cmd", "powershell") or timeout is None:
+        return f"Invalid Windows command arguments in schedule {spec.schedule_id}"
+    if profile != PROFILE_FULL and shell != "cmd":
+        return f"PowerShell execution requires Full Access in schedule {spec.schedule_id}"
+    if is_owner:
+        if profile == PROFILE_SAFE:
+            return f"Profile 'safe' forbids command execution in {spec.schedule_id}"
+        if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
+            if not windows_whitelisted(cmd, oauth_execution.policy()["windows"]):
+                return f"Owner allowlist forbids Windows command in {spec.schedule_id}"
+        return None
+    assert oauth_execution is not None
+    if not oauth_execution.can_request(spec.client_id, "windows", command=cmd, expected_profile=profile):
+        return f"Client {spec.client_id!r} is not authorized for Windows command in {spec.schedule_id}"
+    return None
+
+
+def _scheduler_check_ssh_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
+    args = spec.arguments or {}
+    cmd = args.get("command")
+    host = args.get("host")
+    user = args.get("user", "")
+    port = _scheduler_validate_int_arg(args.get("port"), default=22, minimum=1, maximum=65535)
+    max_to = 600 if profile == PROFILE_FULL else 12
+    timeout = _scheduler_validate_int_arg(args.get("timeout"), default=12, minimum=1, maximum=max_to)
+    if (
+        not isinstance(cmd, str)
+        or not cmd.strip()
+        or not isinstance(host, str)
+        or not _SCHED_SSH_HOST_RE.fullmatch(host)
+        or not isinstance(user, str)
+        or port is None
+        or timeout is None
+    ):
+        return f"Invalid SSH arguments in schedule {spec.schedule_id}"
+    if is_owner:
+        if profile == PROFILE_SAFE:
+            return f"Profile 'safe' forbids SSH execution in {spec.schedule_id}"
+        if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
+            pol = oauth_execution.policy()
+            if host not in pol["hosts"] or cmd.strip() not in pol["ssh_commands"]:
+                return f"Owner allowlist forbids SSH target/command in {spec.schedule_id}"
+        return None
+    assert oauth_execution is not None
+    if not oauth_execution.can_request(
+        spec.client_id, "ssh", command=cmd, host=host, user=user, port=port, expected_profile=profile
+    ):
+        return f"Client {spec.client_id!r} is not authorized for SSH target/command in {spec.schedule_id}"
+    return None
+
+
+def _scheduler_check_task_start_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
+    if profile == PROFILE_SAFE:
+        return f"Background tasks are forbidden in 'safe' profile ({spec.schedule_id})"
+    args = spec.arguments or {}
+    kind = args.get("kind", "windows")
+    cmd = args.get("command")
+    shell = args.get("shell", "cmd")
+    host = args.get("host", "")
+    user = args.get("user", "")
+    port = _scheduler_validate_int_arg(args.get("port"), default=22, minimum=1, maximum=65535)
+    max_to = 600 if profile == PROFILE_FULL else (12 if kind == "ssh" else 15)
+    timeout = _scheduler_validate_int_arg(args.get("timeout"), default=max_to, minimum=1, maximum=max_to)
+    if kind not in ("windows", "ssh") or not isinstance(cmd, str) or not cmd.strip() or shell not in ("cmd", "powershell"):
+        return f"Invalid task_start arguments in schedule {spec.schedule_id}"
+    if timeout is None or port is None:
+        return f"Invalid timeout or port in task_start schedule {spec.schedule_id}"
+    if profile != PROFILE_FULL and kind == "windows" and shell != "cmd":
+        return f"PowerShell background task requires Full Access in {spec.schedule_id}"
+    if kind == "ssh" and (not isinstance(host, str) or not _SCHED_SSH_HOST_RE.fullmatch(host) or not isinstance(user, str)):
+        return f"Invalid SSH task target in schedule {spec.schedule_id}"
+    if is_owner:
+        if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
+            pol = oauth_execution.policy()
+            if kind == "windows" and not windows_whitelisted(cmd, pol["windows"]):
+                return f"Owner allowlist forbids Windows task command in {spec.schedule_id}"
+            if kind == "ssh" and (host not in pol["hosts"] or cmd.strip() not in pol["ssh_commands"]):
+                return f"Owner allowlist forbids SSH task in {spec.schedule_id}"
+        return None
+    assert oauth_execution is not None
+    ok = (
+        oauth_execution.can_request(
+            spec.client_id, "ssh", command=cmd, host=host, user=user, port=port, expected_profile=profile
         )
+        if kind == "ssh"
+        else oauth_execution.can_request(spec.client_id, "windows", command=cmd, expected_profile=profile)
     )
-    try:
-        allowed.update(
-            t.name for t in GATEWAY_ROUTER.list_authorized_tools(tok, oauth_execution)
-        )
-    except Exception:  # noqa: BLE001
-        pass
-    if spec.tool_name not in allowed:
-        return (False, f"Client {spec.client_id!r} is not authorized for {spec.tool_name}")
+    if not ok:
+        return f"Client {spec.client_id!r} is not authorized for task_start command in {spec.schedule_id}"
+    return None
+
+
+def _scheduler_check_command_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
+    """Validate command, shell, timeout, and target arguments for scheduled exec/task tools."""
     if spec.tool_name == EXEC_WINDOWS:
-        cmd = str(spec.arguments.get("command") or "")
-        if not oauth_execution.can_request(spec.client_id, "windows", command=cmd):
-            return (False, f"Client {spec.client_id!r} is not authorized for Windows command in {spec.schedule_id}")
-    elif spec.tool_name == EXEC_SSH:
-        cmd = str(spec.arguments.get("command") or "")
-        host = str(spec.arguments.get("host") or "")
-        user = str(spec.arguments.get("user") or "")
-        raw_port = spec.arguments.get("port", 22)
-        if isinstance(raw_port, bool) or not isinstance(raw_port, int):
-            return (False, f"Invalid SSH port in schedule {spec.schedule_id}")
-        if not oauth_execution.can_request(spec.client_id, "ssh", command=cmd, host=host, user=user, port=raw_port):
-            return (False, f"Client {spec.client_id!r} is not authorized for SSH target/command in {spec.schedule_id}")
-    return (True, "")
+        return _scheduler_check_windows_args(spec, profile, is_owner=is_owner)
+    if spec.tool_name == EXEC_SSH:
+        return _scheduler_check_ssh_args(spec, profile, is_owner=is_owner)
+    if spec.tool_name == TASK_START:
+        return _scheduler_check_task_start_args(spec, profile, is_owner=is_owner)
+    return None
+
+
+def _scheduler_check_desktop_policy(tool_name: str) -> str | None:
+    if tool_name not in DESKTOP_TOOLS:
+        return None
+    if tool_name in DESKTOP_CONTROL_TOOLS:
+        return "Desktop input control tools are forbidden in unattended schedules"
+    dt_policy = DESKTOP_POLICY_STORE.load()
+    if dt_policy.emergency_stop or not dt_policy.enabled:
+        return "Computer Use is disabled by owner policy"
+    if tool_name in DESKTOP_VIEW_TOOLS and not dt_policy.allow_screen_capture:
+        return "Screen capture is disabled by owner policy"
+    return None
+
+
+def _scheduler_check_owner_gateway(tool_name: str, owner_profile: str) -> str | None:
+    catalog = getattr(GATEWAY_ROUTER, "_catalog", None)
+    if not isinstance(catalog, dict):
+        return None
+    entry = catalog.get(tool_name)
+    if entry is None:
+        return f"Unknown gateway tool: {tool_name}"
+    prof = GATEWAY_ROUTER.store.get(entry.server_id)
+    if prof is None or not prof.enabled or not prof.approved_by_owner:
+        return "Upstream gateway server is disabled or unapproved"
+    if _SCHED_PROFILE_RANK.get(owner_profile, 0) < _SCHED_PROFILE_RANK.get(prof.min_profile, 99):
+        return f"Owner profile '{owner_profile}' cannot invoke gateway tool {tool_name}"
+    if entry.raw_name in prof.denied_tools or (prof.allowed_tools and entry.raw_name not in prof.allowed_tools):
+        return f"Gateway tool {tool_name} is disallowed by server policy"
+    return None
+
+
+def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
+    try:
+        if oauth_execution is not None and oauth_execution.emergency_stopped():
+            return (False, "Emergency stop is active")
+        desktop_err = _scheduler_check_desktop_policy(spec.tool_name)
+        if desktop_err:
+            return (False, desktop_err)
+        if spec.client_id == "owner":
+            owner_profile = oauth_execution.profile() if oauth_execution is not None else PROFILE_SAFE
+            reg_spec = DEFAULT_REGISTRY._specs.get(spec.tool_name)
+            if reg_spec is not None:
+                if _SCHED_PROFILE_RANK.get(owner_profile, 0) < _SCHED_PROFILE_RANK.get(reg_spec.min_profile, 99):
+                    return (False, f"Owner profile '{owner_profile}' cannot run {spec.tool_name}")
+            elif GATEWAY_ROUTER.is_gateway_tool(spec.tool_name):
+                gw_err = _scheduler_check_owner_gateway(spec.tool_name, owner_profile)
+                if gw_err:
+                    return (False, gw_err)
+            else:
+                return (False, f"Unknown scheduled tool: {spec.tool_name}")
+            cmd_err = _scheduler_check_command_args(spec, owner_profile, is_owner=True)
+            return (False, cmd_err) if cmd_err else (True, "")
+
+        if not OAUTH_ENABLED or oauth_provider is None or oauth_execution is None:
+            return (False, "OAuth store unavailable")
+        if not oauth_execution.client_approved(spec.client_id):
+            return (False, f"Client {spec.client_id!r} is not approved")
+        tok = AccessToken(
+            token="sched-check",
+            client_id=spec.client_id,
+            scopes=[READ_SCOPE],
+            resource=RESOURCE_URL,
+        )
+        allowed = set(
+            DEFAULT_REGISTRY.allowed_tools(
+                oauth_provider.store, tok, oauth_execution, desktop_policy_store=DESKTOP_POLICY_STORE
+            )
+        )
+        try:
+            allowed.update(
+                t.name for t in GATEWAY_ROUTER.list_authorized_tools(tok, oauth_execution)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if spec.tool_name not in allowed:
+            return (False, f"Client {spec.client_id!r} is not authorized for {spec.tool_name}")
+        profile = oauth_execution.profile_for(spec.client_id)
+        cmd_err = _scheduler_check_command_args(spec, profile, is_owner=False)
+        return (False, cmd_err) if cmd_err else (True, "")
+    except Exception as exc:  # noqa: BLE001
+        # Fail closed on any storage/policy error during scheduled authorization.
+        return (False, f"Authorization check failed: {type(exc).__name__}")
 
 
 AUTOMATION_SCHEDULER = AutomationScheduler(
@@ -3533,6 +3711,171 @@ def write_workspace_file(relative_path: str, content: str) -> str:
         return f"❌ Запись файла запрещена: {type(exc).__name__}"
     logger.info("[FILE WRITE] bytes=%d (path redacted)", len(content.encode("utf-8")))
     return "✅ Файл сохранён в разрешённой рабочей папке."
+
+
+def _run_coro_sync(coro: Any) -> Any:
+    """Execute an async coroutine safely whether or not an event loop is active on this thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    result_box: list[Any] = []
+    err_box: list[BaseException] = []
+
+    def _runner() -> None:
+        try:
+            result_box.append(asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            err_box.append(exc)
+
+    th = threading.Thread(target=_runner, daemon=True)
+    th.start()
+    th.join()
+    if err_box:
+        raise err_box[0]
+    return result_box[0] if result_box else None
+
+
+def _extract_scheduled_tool_output(res: Any) -> dict[str, Any]:
+    """Normalize MCP CallToolResult/list/dict/tuple and raise RuntimeError on tool-level errors."""
+    is_err = bool(getattr(res, "isError", False) or getattr(res, "is_error", False))
+    structured = getattr(res, "structuredContent", None) or getattr(res, "structured_content", None)
+    raw_items = getattr(res, "content", None)
+    if isinstance(res, tuple) and len(res) == 2:
+        raw_items, structured = res
+    elif isinstance(res, list):
+        raw_items = res
+    elif isinstance(res, dict):
+        structured = res
+
+    texts: list[str] = []
+    for item in raw_items or ():
+        if isinstance(item, TextContent) or hasattr(item, "text"):
+            texts.append(REDACTOR.redact_text(str(getattr(item, "text", ""))))
+        else:
+            texts.append(REDACTOR.redact_text(str(item)))
+
+    if structured is None and len(texts) == 1:
+        try:
+            parsed = json.loads(texts[0])
+            if isinstance(parsed, dict):
+                structured = parsed
+        except json.JSONDecodeError:
+            pass
+
+    if isinstance(structured, dict):
+        if structured.get("error"):
+            is_err = True
+        elif structured.get("ok") is False:
+            is_err = True
+    if any(t.lstrip().startswith("❌") for t in texts):
+        is_err = True
+
+    if is_err:
+        err_msg = ""
+        if isinstance(structured, dict) and structured.get("error"):
+            err_msg = str(structured.get("error"))
+        elif texts:
+            err_msg = texts[0]
+        raise RuntimeError(REDACTOR.redact_text(err_msg or "Scheduled tool returned an error"))
+
+    out: dict[str, Any] = {"ok": True}
+    if texts:
+        out["text"] = "\n".join(texts)
+    if structured is not None:
+        out["result"] = structured
+    return out
+
+
+async def _invoke_owner_scheduled_tool_async(spec: ScheduleSpec, args: dict[str, Any]) -> Any:
+    """Execute owner-owned schedule strictly capped at the configured owner global profile."""
+    if spec.tool_name == "server_info":
+        return await mcp.call_tool("server_info", {})
+    owner_profile = oauth_execution.profile() if oauth_execution is not None else PROFILE_SAFE
+    if GATEWAY_ROUTER.is_gateway_tool(spec.tool_name):
+        await GATEWAY_ROUTER.ensure_initialized()
+        await GATEWAY_ROUTER.sync_dirty()
+        gw_err = _scheduler_check_owner_gateway(spec.tool_name, owner_profile)
+        if gw_err:
+            raise PermissionError(gw_err)
+        entry = GATEWAY_ROUTER._catalog[spec.tool_name]
+        prof = GATEWAY_ROUTER.store.get(entry.server_id)
+        assert prof is not None
+        handle = await GATEWAY_ROUTER._get_or_connect(prof, "owner")
+        raw_res = await handle.call_tool(entry.raw_name, args)
+        return GATEWAY_ROUTER._sanitize_result(raw_res, prof.max_response_bytes)
+
+    if oauth_provider is None or oauth_execution is None:
+        raise PermissionError("OAuth store unavailable for scheduled execution")
+    ephemeral_id = f"sched-owner-{secrets.token_hex(4)}"
+    client_info = OAuthClientInformationFull(
+        client_id=ephemeral_id,
+        client_name="MCP Scheduler (owner ephemeral)",
+        redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
+    )
+    oauth_provider.store.save_client(client_info)
+    oauth_provider.store.mark_approved(ephemeral_id)
+    oauth_execution.set_client_profile(ephemeral_id, owner_profile)
+    tok = AccessToken(
+        token="sched-owner-exec",
+        client_id=ephemeral_id,
+        scopes=[READ_SCOPE],
+        resource=RESOURCE_URL,
+    )
+    token_ctx = auth_context_var.set(AuthenticatedUser(tok))
+    try:
+        return await mcp.call_tool(spec.tool_name, args)
+    finally:
+        auth_context_var.reset(token_ctx)
+        try:
+            oauth_provider.store.revoke_client(ephemeral_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _invoke_scheduled_tool_async(spec: ScheduleSpec) -> Any:
+    args = dict(spec.arguments or {})
+    if spec.client_id == "owner":
+        return await _invoke_owner_scheduled_tool_async(spec, args)
+    tok = AccessToken(
+        token="sched-exec",
+        client_id=spec.client_id,
+        scopes=[READ_SCOPE],
+        resource=RESOURCE_URL,
+    )
+    token_ctx = auth_context_var.set(AuthenticatedUser(tok))
+    try:
+        await GATEWAY_ROUTER.ensure_initialized()
+        await GATEWAY_ROUTER.sync_dirty()
+        if GATEWAY_ROUTER.is_gateway_tool(spec.tool_name):
+            return await GATEWAY_ROUTER.call_authorized_tool(
+                spec.tool_name, args, tok, oauth_execution
+            )
+        return await mcp.call_tool(spec.tool_name, args)
+    finally:
+        auth_context_var.reset(token_ctx)
+
+
+def _execute_scheduled_tool(spec: ScheduleSpec, idem_key: str) -> dict[str, Any]:
+    """Authorize and execute one due scheduled MCP/Gateway tool under strict principal scoping."""
+    t0 = time.monotonic()
+    allowed, reason = _scheduler_permission_check(spec)
+    if not allowed:
+        METRICS_REGISTRY.record_call(spec.tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        raise PermissionError(reason or f"Unauthorized scheduled execution for {spec.tool_name}")
+    try:
+        res = _run_coro_sync(_invoke_scheduled_tool_async(spec))
+        out = _extract_scheduled_tool_output(res)
+        METRICS_REGISTRY.record_call(spec.tool_name, (time.monotonic() - t0) * 1000.0, error=False)
+        out["idempotency_key"] = idem_key
+        return out
+    except Exception:
+        METRICS_REGISTRY.record_call(spec.tool_name, (time.monotonic() - t0) * 1000.0, error=True)
+        raise
+
+
+AUTOMATION_SCHEDULER._executor = _execute_scheduled_tool
+
 
 # ==========================================
 # 6. ЗАПУСК

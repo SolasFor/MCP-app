@@ -213,9 +213,8 @@ class StagedUpdater:
             raise PermissionError("Corrupted or forged update signature") from exc
 
         stage_dir = self.updates_dir / "staged" / candidate.version
-        stage_dir.mkdir(parents=True, exist_ok=True)
         out = stage_dir / f"MCPApp-update-{candidate.version}.zip"
-        out.write_bytes(payload)
+        atomic_write_bytes(out, payload, restrict_acl=True)
         return out
 
     def apply_staged(

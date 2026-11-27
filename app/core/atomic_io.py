@@ -91,11 +91,12 @@ def atomic_write_bytes(path: Path, data: bytes, *, restrict_acl: bool = True) ->
                 except OSError:
                     # Some virtual/ramdisk filesystems do not support fsync on file descriptors.
                     pass
+            acl_applied = True
             if restrict_acl:
                 # Restrict temp file ACL before publishing it under the target name.
-                get_platform().restrict_path_acl(tmp, is_dir=False)
+                acl_applied = bool(get_platform().restrict_path_acl(tmp, is_dir=False))
             _replace_with_retry(tmp, target)
-            if restrict_acl and not target.exists():
+            if restrict_acl and not acl_applied:
                 get_platform().restrict_path_acl(target, is_dir=False)
         except BaseException:
             try:

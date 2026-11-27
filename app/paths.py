@@ -45,6 +45,29 @@ def user_data_dir() -> Path:
     return path
 
 
+def tasks_data_dir(data_root: Path | None = None) -> Path:
+    """Единый каталог durable TaskManager (`tasks/`)."""
+    return (data_root if data_root is not None else user_data_dir()) / "tasks"
+
+
+def tasks_db_path(data_root: Path | None = None) -> Path:
+    """Единый источник истины для пути к БД TaskStore (`tasks/tasks.sqlite3`)."""
+    if data_root is None:
+        override = os.environ.get("MCP_TASKS_DB_PATH", "").strip()
+        if override:
+            return Path(override).expanduser().resolve()
+    return tasks_data_dir(data_root) / "tasks.sqlite3"
+
+
+def automation_dir_path(data_root: Path | None = None) -> Path:
+    """Единый источник истины для каталога автоматизации и блокировок расписания."""
+    if data_root is None:
+        override = os.environ.get("MCP_AUTOMATION_DIR", "").strip()
+        if override:
+            return Path(override).expanduser().resolve()
+    return (data_root if data_root is not None else user_data_dir()) / "automation"
+
+
 def default_backend_workdir() -> Path:
     """Рабочая папка бэкенда: туда пишется mcp_audit.log, и это WORKSPACE_DIR по умолчанию.
 

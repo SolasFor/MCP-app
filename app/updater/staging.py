@@ -6,10 +6,10 @@ import os
 import posixpath
 import shutil
 import stat
-import sys
 import zipfile
 from pathlib import Path
 
+from app.paths import APP_ID
 from app.platform import get_platform
 from app.updater.models import DEFAULT_DISK_RESERVE_BYTES, UpdateBlockReason, UpdateError
 from app.updater.trust import verify_windows_authenticode
@@ -215,33 +215,136 @@ def extract_verified_portable_zip(zip_path: Path, stage_dir: Path) -> dict[str, 
     return extracted_hashes
 
 
+def _hash_zip_entry(zf: zipfile.ZipFile, entry_info: zipfile.ZipInfo, rel: str) -> str:
+    h = hashlib.sha256()
+    written = 0
+    with zf.open(entry_info, "r") as src:
+        for chunk in iter(lambda: src.read(65536), b""):
+            written += len(chunk)
+            if written > entry_info.file_size:
+                raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"ZIP entry expanded past size: {rel}")
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def verify_portable_zip_and_compute_map(
+    zip_path: Path,
+    *,
+    expected_sha256: str,
+    expected_size: int,
+) -> dict[str, str]:
+    """Verify portable ZIP digest/size against signed manifest and derive `{rel_path: sha256}` without disk writes."""
+    if not zip_path.is_file() or is_reparse_or_symlink(zip_path):
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Verified portable ZIP missing: {zip_path}")
+    if expected_size <= 0 or zip_path.stat().st_size != expected_size:
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Portable ZIP size mismatch: {zip_path.name}")
+    if compute_file_sha256(zip_path) != expected_sha256.lower():
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Portable ZIP SHA-256 mismatch: {zip_path.name}")
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        validated, _ = _scan_zip_infos(zf.infolist())
+        rel_map = _strip_optional_wrapper(validated)
+        _check_rel_collisions(rel_map)
+        hashes = {rel: _hash_zip_entry(zf, entry_info, rel) for entry_info, rel in rel_map.items()}
+
+    if not hashes or f"{APP_ID.lower()}.exe" not in {k.lower() for k in hashes}:
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, "Portable ZIP does not contain application executable")
+    return hashes
+
+
 def _reverify_installer_file(
     stage_path: Path,
     expected_sha256: str,
     *,
+    expected_size: int | None = None,
     require_authenticode: bool,
     allowed_thumbprints: tuple[str, ...],
 ) -> None:
-    if not stage_path.is_file():
-        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Staged installer missing: {stage_path}")
+    if not expected_sha256 or not stage_path.is_file() or is_reparse_or_symlink(stage_path):
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Staged installer missing or unsafe: {stage_path}")
+    if expected_size is not None and stage_path.stat().st_size != expected_size:
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, "Staged installer size mismatch before launch")
     if compute_file_sha256(stage_path) != expected_sha256.lower():
         raise UpdateError(UpdateBlockReason.HASH_MISMATCH, "Staged installer SHA-256 mismatch before launch")
-    if require_authenticode and sys.platform == "win32":
+    if require_authenticode:
+        if not allowed_thumbprints:
+            raise UpdateError(UpdateBlockReason.NO_AUTHENTICODE_POLICY, "No trusted Authenticode thumbprints configured")
         auth = verify_windows_authenticode(stage_path, allowed_thumbprints=allowed_thumbprints)
         if not auth.verified:
             raise UpdateError(UpdateBlockReason.AUTHENTICODE_FAILED, auth.reason)
 
 
+def _validate_single_rel_entry(rel: object, digest: object) -> str:
+    if not isinstance(rel, str) or not isinstance(digest, str) or not digest.strip():
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, "Malformed entry in staged hash map")
+    if "\x00" in rel or "\\" in rel or rel.startswith("/") or ":" in rel:
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Unsafe relative path in hash map: {rel!r}")
+    norm = posixpath.normpath(rel)
+    if norm != rel or norm in ("", ".") or norm.startswith("..") or "/../" in f"/{norm}/":
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Path traversal in hash map: {rel!r}")
+    _check_forbidden_rel_path(norm)
+    return norm
+
+
+def _validate_expected_hash_map(expected_hashes: dict[str, str] | None) -> dict[str, str]:
+    if not isinstance(expected_hashes, dict) or not expected_hashes:
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, "Missing or empty staged file hash map")
+    normalized: dict[str, str] = {}
+    seen_low: set[str] = set()
+    for rel, digest in expected_hashes.items():
+        norm = _validate_single_rel_entry(rel, digest)
+        low = norm.lower()
+        if low in seen_low:
+            raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Case-collision in staged hash map: {rel!r}")
+        seen_low.add(low)
+        normalized[norm] = str(digest).lower()
+    if f"{APP_ID.lower()}.exe" not in seen_low:
+        raise UpdateError(UpdateBlockReason.HASH_MISMATCH, "Staged bundle missing main application executable")
+    return normalized
+
+
+def _ensure_no_reparse_names(cur_dir: Path, names: list[str]) -> None:
+    for name in names:
+        if is_reparse_or_symlink(cur_dir / name):
+            raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Symlink/reparse entry rejected: {name}")
+
+
+def _collect_actual_stage_files(stage_path: Path) -> dict[str, Path]:
+    actual: dict[str, Path] = {}
+    seen_low: set[str] = set()
+    for current, dirs, files in os.walk(stage_path, topdown=True, followlinks=False):
+        cur_dir = Path(current)
+        if is_reparse_or_symlink(cur_dir):
+            raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Symlink/reparse dir rejected: {cur_dir}")
+        _ensure_no_reparse_names(cur_dir, dirs)
+        _ensure_no_reparse_names(cur_dir, files)
+        for fname in files:
+            fpath = cur_dir / fname
+            if not fpath.is_file():
+                raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Non-regular staged entry: {fpath}")
+            rel = fpath.relative_to(stage_path).as_posix()
+            low = rel.lower()
+            if low in seen_low:
+                raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Duplicate staged path collision: {rel}")
+            seen_low.add(low)
+            actual[rel] = fpath
+    return actual
+
+
 def _reverify_portable_dir(stage_path: Path, expected_hashes: dict[str, str] | None) -> None:
     if not stage_path.is_dir():
         raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Staged directory missing: {stage_path}")
-    if expected_hashes is None:
-        return
-    for rel, digest in expected_hashes.items():
-        target = stage_path / rel
-        if not target.is_file() or is_reparse_or_symlink(target):
-            raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Missing or unsafe staged file: {rel}")
-        if compute_file_sha256(target) != digest.lower():
+    expected = _validate_expected_hash_map(expected_hashes)
+    actual = _collect_actual_stage_files(stage_path)
+    missing = set(expected.keys()) - set(actual.keys())
+    extra = set(actual.keys()) - set(expected.keys())
+    if missing or extra:
+        raise UpdateError(
+            UpdateBlockReason.HASH_MISMATCH,
+            f"Staged file set mismatch (missing={len(missing)}, extra={len(extra)})",
+        )
+    for rel, digest in expected.items():
+        if compute_file_sha256(actual[rel]) != digest:
             raise UpdateError(UpdateBlockReason.HASH_MISMATCH, f"Staged payload modified before swap: {rel}")
 
 
@@ -249,6 +352,7 @@ def reverify_staged_bundle(
     stage_path: Path,
     expected_hashes: dict[str, str] | str | None,
     *,
+    expected_size: int | None = None,
     require_authenticode: bool = False,
     allowed_thumbprints: tuple[str, ...] = (),
 ) -> None:
@@ -258,6 +362,7 @@ def reverify_staged_bundle(
         _reverify_installer_file(
             stage_path,
             expected_hashes,
+            expected_size=expected_size,
             require_authenticode=require_authenticode,
             allowed_thumbprints=allowed_thumbprints,
         )

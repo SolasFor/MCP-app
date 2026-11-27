@@ -17,9 +17,10 @@ from typing import Any, Callable
 from app import __version__
 from app.config import Settings
 from app.core.atomic_io import atomic_write_json
+from app.paths import tasks_db_path
 from app.platform import get_platform
 from app.updater.detector import InstallEnvironment, detect_install_environment
-from app.updater.helper import has_active_tasks
+from app.updater.helper import check_active_operations, has_active_tasks
 from app.updater.models import (
     UpdateBlockReason,
     UpdateError,
@@ -97,6 +98,7 @@ class UpdateManager:
         return detect_install_environment(
             current_version=self._current_version,
             rollback_cache_dir=self._updates_dir / "rollback",
+            policy=self._policy,
         )
 
     def _initial_snapshot(self) -> UpdateCheckSnapshot:
@@ -123,8 +125,11 @@ class UpdateManager:
         if cur_env.install_type == "installed" and self._policy.require_authenticode_for_installer:
             if not self._policy.allowed_thumbprints:
                 return UpdateBlockReason.NO_AUTHENTICODE_POLICY
-        if has_active_tasks(self._data_dir / "tasks.sqlite3"):
+        if has_active_tasks(tasks_db_path(self._data_dir)):
             return UpdateBlockReason.ACTIVE_TASKS
+        active_op = check_active_operations(self._data_dir)
+        if active_op != UpdateBlockReason.OK:
+            return active_op
         return UpdateBlockReason.OK
 
     def can_auto_install(self) -> bool:
@@ -140,6 +145,38 @@ class UpdateManager:
         st = UpdaterPersistentState.load(self._state_path)
         cur = time.time() if now is None else now
         return (cur - st.last_check_at) >= AUTO_CHECK_COOLDOWN_SECONDS
+
+    def _fetch_verified_release_manifest(
+        self,
+        *,
+        highest_seen_version: str,
+        fetch_bytes: Callable[[str], bytes] | None,
+    ) -> tuple[dict[str, str], Any]:
+        release = fetch_latest_release_info(fetch_bytes=fetch_bytes)
+        manifest_url = release.assets.get("update-manifest.json")
+        sig_url = release.assets.get("update-manifest.json.sig")
+        if not manifest_url or not sig_url:
+            raise UpdateError(
+                UpdateBlockReason.SIGNATURE_INVALID,
+                "Release does not publish update-manifest.json and update-manifest.json.sig",
+            )
+        manifest_raw = fetch_release_text_asset(manifest_url, fetch_bytes=fetch_bytes)
+        sig_text = fetch_release_text_asset(sig_url, fetch_bytes=fetch_bytes).decode("utf-8")
+        sig_raw = json.loads(sig_text)
+        manifest = verify_manifest_and_signature(
+            manifest_bytes=manifest_raw,
+            key_id=str(sig_raw.get("key_id") or ""),
+            signature_b64=str(sig_raw.get("signature_b64") or ""),
+            current_version=self._current_version,
+            highest_seen_version=highest_seen_version,
+            policy=self._policy,
+        )
+        manifest_dir = self._updates_dir / "manifests" / manifest.version
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        get_platform().restrict_path_acl(manifest_dir, is_dir=True)
+        (manifest_dir / "update-manifest.json").write_bytes(manifest_raw)
+        (manifest_dir / "update-manifest.json.sig").write_text(sig_text, encoding="utf-8")
+        return dict(release.assets), manifest
 
     def check_for_updates(
         self,
@@ -157,29 +194,10 @@ class UpdateManager:
         st.last_check_at = time.time()
 
         try:
-            release = fetch_latest_release_info(fetch_bytes=fetch_bytes)
-            manifest_url = release.assets.get("update-manifest.json")
-            sig_url = release.assets.get("update-manifest.json.sig")
-            if not manifest_url or not sig_url:
-                raise UpdateError(
-                    UpdateBlockReason.SIGNATURE_INVALID,
-                    "Release does not publish update-manifest.json and update-manifest.json.sig",
-                )
-
-            manifest_bytes = fetch_release_text_asset(manifest_url, fetch_bytes=fetch_bytes)
-            sig_raw = json.loads(fetch_release_text_asset(sig_url, fetch_bytes=fetch_bytes).decode("utf-8"))
-            key_id = str(sig_raw.get("key_id") or "")
-            sig_b64 = str(sig_raw.get("signature_b64") or "")
-
-            manifest = verify_manifest_and_signature(
-                manifest_bytes=manifest_bytes,
-                key_id=key_id,
-                signature_b64=sig_b64,
-                current_version=self._current_version,
+            assets, manifest = self._fetch_verified_release_manifest(
                 highest_seen_version=st.highest_seen_version,
-                policy=self._policy,
+                fetch_bytes=fetch_bytes,
             )
-
             st.last_known_version = manifest.version
             st.last_changelog = manifest.changelog
             st.save(self._state_path)
@@ -187,7 +205,7 @@ class UpdateManager:
             newer = parse_semver(manifest.version) > parse_semver(self._current_version)
             reason = self.evaluate_block_reason(env)
             with self._lock:
-                self._latest_release_assets = dict(release.assets)
+                self._latest_release_assets = assets
                 self._snapshot = UpdateCheckSnapshot(
                     state=UpdateState.AVAILABLE if newer else UpdateState.IDLE,
                     current_version=self._current_version,
@@ -200,23 +218,39 @@ class UpdateManager:
             return self._snapshot
         except UpdateError as exc:
             st.save(self._state_path)
+            blocked_codes = {
+                UpdateBlockReason.MISSING_TRUST_ROOTS,
+                UpdateBlockReason.KEY_REVOKED,
+                UpdateBlockReason.KEY_EXPIRED,
+                UpdateBlockReason.DOWNGRADE_BLOCKED,
+            }
             with self._lock:
                 self._snapshot = UpdateCheckSnapshot(
-                    state=UpdateState.BLOCKED
-                    if exc.code
-                    in {
-                        UpdateBlockReason.MISSING_TRUST_ROOTS,
-                        UpdateBlockReason.KEY_REVOKED,
-                        UpdateBlockReason.KEY_EXPIRED,
-                        UpdateBlockReason.DOWNGRADE_BLOCKED,
-                    }
-                    else UpdateState.FAILED,
+                    state=UpdateState.BLOCKED if exc.code in blocked_codes else UpdateState.FAILED,
                     current_version=self._current_version,
                     install_type=env.install_type,
                     block_reason=exc.code,
                     block_detail=str(exc),
                 )
             return self._snapshot
+
+    def _stage_verified_asset(
+        self,
+        dl_path: Path,
+        asset: Any,
+        manifest: Any,
+        env: Any,
+    ) -> tuple[Path, dict[str, str] | str]:
+        if env.install_type != "installed":
+            staged = self._updates_dir / "staged" / manifest.version
+            return staged, extract_verified_portable_zip(dl_path, staged)
+        if asset.authenticode_required:
+            thumbs = self._policy.allowed_thumbprints or manifest.publisher_thumbprints
+            auth = verify_windows_authenticode(dl_path, allowed_thumbprints=thumbs)
+            if not auth.verified:
+                dl_path.unlink(missing_ok=True)
+                raise UpdateError(UpdateBlockReason.AUTHENTICODE_FAILED, auth.reason)
+        return dl_path, str(asset.sha256)
 
     def download_and_stage(
         self,
@@ -254,19 +288,7 @@ class UpdateManager:
             open_url=open_url,
         )
 
-        if env.install_type == "installed":
-            if asset.authenticode_required:
-                thumbs = self._policy.allowed_thumbprints or manifest.publisher_thumbprints
-                auth = verify_windows_authenticode(dl_path, allowed_thumbprints=thumbs)
-                if not auth.verified:
-                    dl_path.unlink(missing_ok=True)
-                    raise UpdateError(UpdateBlockReason.AUTHENTICODE_FAILED, auth.reason)
-            staged = dl_path
-            expected: dict[str, str] | str = asset.sha256
-        else:
-            staged = self._updates_dir / "staged" / manifest.version
-            expected = extract_verified_portable_zip(dl_path, staged)
-
+        staged, expected = self._stage_verified_asset(dl_path, asset, manifest, env)
         reason = self.evaluate_block_reason(env)
         with self._lock:
             self._staged = _StagedArtifact(
@@ -318,33 +340,22 @@ class UpdateManager:
 
         token = secrets.token_urlsafe(32)
         parent_id = get_platform().capture_process_identity(os.getpid())
+        if parent_id is None:
+            return False
         plan_path = helper_dir / "plan.json"
         plan = {
             "tx_id": tx_id,
             "install_type": staged.install_type,
             "install_dir": str(env_info.install_dir),
-            "data_dir": str(self._data_dir),
-            "source_version": self._current_version,
             "target_version": staged.manifest.version,
-            "staged_dir": str(staged.staged_path) if staged.install_type == "portable" else "",
-            "expected_hashes": staged.expected_hashes if isinstance(staged.expected_hashes, dict) else None,
-            "installer_path": str(staged.staged_path) if staged.install_type == "installed" else "",
-            "expected_sha256": staged.expected_hashes if isinstance(staged.expected_hashes, str) else None,
-            "rollback_installer": str(env_info.rollback_installer) if env_info.rollback_installer else "",
-            "require_authenticode": self._policy.require_authenticode_for_installer,
-            "allowed_thumbprints": list(self._policy.allowed_thumbprints or staged.manifest.publisher_thumbprints),
             "expected_token": token,
             "issued_at": time.time(),
-            "parent_identity": (
-                {
-                    "pid": parent_id.pid,
-                    "create_time": parent_id.create_time,
-                    "executable": parent_id.executable,
-                    "captured_at": parent_id.captured_at,
-                }
-                if parent_id is not None
-                else None
-            ),
+            "parent_identity": {
+                "pid": parent_id.pid,
+                "create_time": parent_id.create_time,
+                "executable": parent_id.executable,
+                "captured_at": parent_id.captured_at,
+            },
             "restart_gui": restart_gui,
         }
         atomic_write_json(plan_path, plan, restrict_acl=True)

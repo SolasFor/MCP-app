@@ -93,16 +93,14 @@ def _select_active_root(policy: TrustPolicy, key_id: str, published_at: str) -> 
     return match
 
 
-def verify_manifest_and_signature(
+def verify_release_manifest_signature(
     *,
     manifest_bytes: bytes,
     key_id: str,
     signature_b64: str,
-    current_version: str,
-    highest_seen_version: str,
     policy: TrustPolicy,
 ) -> UpdateManifest:
-    """Validate manifest schema, pinned Ed25519 signature, key rotation/revocation, and anti-downgrade rules."""
+    """Validate manifest schema, canonical form, trust root, revocation, and Ed25519 signature."""
     if not policy.trust_roots:
         raise UpdateError(
             UpdateBlockReason.MISSING_TRUST_ROOTS,
@@ -111,7 +109,6 @@ def verify_manifest_and_signature(
     manifest = UpdateManifest.from_json_bytes(manifest_bytes)
     canonical = manifest.canonical_bytes()
     if canonical != manifest_bytes:
-        # Signature must match canonical representation exactly; reject non-canonical tampering.
         raise UpdateError(UpdateBlockReason.SIGNATURE_INVALID, "Manifest bytes are not in canonical UTF-8 form")
 
     root = _select_active_root(policy, key_id, manifest.published_at)
@@ -121,6 +118,25 @@ def verify_manifest_and_signature(
         pub.verify(sig_bytes, canonical)
     except (ValueError, InvalidSignature) as exc:
         raise UpdateError(UpdateBlockReason.SIGNATURE_INVALID, f"Manifest Ed25519 verification failed: {exc}") from exc
+    return manifest
+
+
+def verify_manifest_and_signature(
+    *,
+    manifest_bytes: bytes,
+    key_id: str,
+    signature_b64: str,
+    current_version: str,
+    highest_seen_version: str,
+    policy: TrustPolicy,
+) -> UpdateManifest:
+    """Validate manifest signature plus anti-downgrade and minimum-supported-version bounds."""
+    manifest = verify_release_manifest_signature(
+        manifest_bytes=manifest_bytes,
+        key_id=key_id,
+        signature_b64=signature_b64,
+        policy=policy,
+    )
 
     cur_v = parse_semver(current_version)
     target_v = parse_semver(manifest.version)

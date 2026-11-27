@@ -13,26 +13,37 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
-from app.paths import APP_ID, user_data_dir
+import psutil
+
+from app.paths import APP_ID, automation_dir_path, tasks_db_path, user_data_dir
 from app.platform import get_platform
 from app.platform.base import ProcessIdentity
+from app.updater.detector import detect_install_environment, verify_cached_rollback_bundle
 from app.updater.models import (
     UpdateBlockReason,
     UpdateError,
+    UpdateManifest,
     UpdaterPersistentState,
     UpdateState,
     UpdateTransaction,
     parse_semver,
 )
-from app.updater.staging import reverify_staged_bundle
+from app.updater.staging import (
+    ensure_disk_headroom,
+    is_reparse_or_symlink,
+    reverify_staged_bundle,
+    verify_portable_zip_and_compute_map,
+)
+from app.updater.trust import TrustPolicy, verify_manifest_and_signature, verify_windows_authenticode
 
 UPDATER_MUTEX_NAME = "Local\\MCPApp-Updater"
-_ACTIVE_TASK_STATUSES = ("queued", "pending", "running", "cancelling")
+_GUI_MUTEX_NAME = "MCPApp-Running"
+_VERSION_RE = re.compile(r"\b(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\b")
 
 
 def _sanitize_confined_path(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
@@ -47,13 +58,32 @@ def _sanitize_confined_path(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
     raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Path escaped allowed boundary: {resolved}")
 
 
-def _allowed_install_roots() -> tuple[Path, ...]:
-    roots: list[Path] = [Path(sys.executable).resolve().parent.parent, Path(tempfile.gettempdir())]
+def _allowed_install_roots(parent_id: ProcessIdentity | None = None) -> tuple[Path, ...]:
+    roots: list[Path] = [Path(tempfile.gettempdir())]
     local_app = os.environ.get("LOCALAPPDATA", "").strip()
     if local_app:
         roots.append(Path(local_app) / "Programs")
     roots.append(user_data_dir())
+    if parent_id is not None and "\x00" not in parent_id.executable and not parent_id.executable.startswith("\\\\"):
+        exe_path = Path(os.path.realpath(os.path.abspath(parent_id.executable)))
+        if exe_path.name.lower() == f"{APP_ID.lower()}.exe":
+            roots.append(exe_path.parent)
     return tuple(roots)
+
+
+def _validate_install_target(install_dir: Path) -> None:
+    if str(install_dir).startswith("\\\\"):
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, "Refusing UNC install directory target")
+    resolved = install_dir.resolve()
+    forbidden = {resolved.parent, Path.home().resolve(), user_data_dir().resolve(), Path(tempfile.gettempdir()).resolve()}
+    for env_name in ("SystemRoot", "WINDIR", "ProgramData"):
+        val = os.environ.get(env_name, "").strip()
+        if val:
+            forbidden.add(Path(val).resolve())
+    if resolved in forbidden:
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Refusing unsafe install directory target: {resolved}")
+    if is_reparse_or_symlink(install_dir):
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Refusing symlink/reparse install dir: {install_dir}")
 
 
 def _utc_now_iso() -> str:
@@ -78,26 +108,122 @@ def verify_handoff_token(
 
 
 def has_active_tasks(task_db_path: Path) -> bool:
-    """Return True if SQLite TaskStore reports any queued/running/cancelling background task."""
-    if not task_db_path.is_file():
-        return False
+    """Return True (fail-closed) if SQLite TaskStore has non-terminal tasks or is unreadable/corrupt."""
+    if not task_db_path.exists():
+        wal_or_key = (
+            task_db_path.with_name(f"{task_db_path.name}-wal").exists()
+            or task_db_path.with_name(f"{task_db_path.name}-shm").exists()
+            or task_db_path.with_suffix(".key").exists()
+        )
+        return wal_or_key
+    if is_reparse_or_symlink(task_db_path) or not task_db_path.is_file():
+        return True
     try:
+        if task_db_path.stat().st_size == 0:
+            return True
         conn = sqlite3.connect(f"file:{task_db_path}?mode=ro", uri=True, timeout=2.0)
         try:
             row = conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status IN ('queued', 'pending', 'running', 'cancelling')"
+                "SELECT COUNT(*) FROM tasks WHERE status NOT IN ('succeeded', 'failed', 'cancelled', 'interrupted')"
             ).fetchone()
             return bool(row and int(row[0]) > 0)
         finally:
             conn.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError, ValueError):
+        return True
+
+
+def _is_lock_contended(lock_path: Path) -> bool:
+    if not lock_path.exists():
         return False
+    try:
+        fh = lock_path.open("a+b")
+    except OSError:
+        return True
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.seek(0)
+            if lock_path.stat().st_size == 0:
+                return False
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+    finally:
+        fh.close()
+
+
+def _is_gui_mutex_held() -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+
+    k32 = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if k32 is None:
+        return False
+    h = k32.OpenMutexW(0x00100000, False, _GUI_MUTEX_NAME)
+    if h:
+        k32.CloseHandle(h)
+        return True
+    return False
+
+
+def _has_processes_inside_dir(install_dir: Path) -> bool:
+    prefix = os.path.normcase(os.path.realpath(str(install_dir))) + os.sep
+    my_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "exe"]):
+        try:
+            if proc.info.get("pid") == my_pid:
+                continue
+            exe = proc.info.get("exe") or ""
+            if exe and os.path.normcase(os.path.realpath(exe)).startswith(prefix):
+                return True
+        except (psutil.Error, OSError):
+            continue
+    return False
+
+
+def check_active_operations(
+    data_dir: Path,
+    install_dir: Path | None = None,
+    *,
+    check_gui_mutex: bool = False,
+) -> str:
+    """Fail-closed check across TaskStore, scheduler locks/history, GUI mutex, and install-dir processes."""
+    if has_active_tasks(tasks_db_path(data_dir)):
+        return UpdateBlockReason.ACTIVE_TASKS
+    auto_dir = automation_dir_path(data_dir)
+    if _is_lock_contended(auto_dir / ".automation.lock"):
+        return UpdateBlockReason.SCHEDULER_ACTIVE
+    hist = auto_dir / "history.json"
+    if hist.exists():
+        try:
+            entries = json.loads(hist.read_text(encoding="utf-8"))
+            if isinstance(entries, list) and any(isinstance(e, dict) and e.get("status") == "running" for e in entries):
+                return UpdateBlockReason.SCHEDULER_ACTIVE
+        except (OSError, ValueError):
+            return UpdateBlockReason.SCHEDULER_ACTIVE
+    if check_gui_mutex and _is_gui_mutex_held():
+        return UpdateBlockReason.ACTIVE_TASKS
+    if install_dir is not None and install_dir.exists() and _has_processes_inside_dir(install_dir):
+        return UpdateBlockReason.ACTIVE_TASKS
+    return UpdateBlockReason.OK
 
 
 def wait_for_parent_exit(parent_identity: ProcessIdentity | None, timeout_s: float = 15.0) -> bool:
-    """Wait until captured parent process exits cleanly (verified via ProcessIdentity)."""
-    if parent_identity is None:
-        return True
+    """Wait until captured parent process exits cleanly (strictly requiring valid ProcessIdentity)."""
+    if parent_identity is None or parent_identity.pid <= 0 or parent_identity.create_time <= 0:
+        return False
+    if not parent_identity.executable.strip():
+        return False
     adapter = get_platform()
     deadline = time.monotonic() + max(0.5, timeout_s)
     while time.monotonic() < deadline:
@@ -107,45 +233,51 @@ def wait_for_parent_exit(parent_identity: ProcessIdentity | None, timeout_s: flo
     return not adapter.verify_process_identity(parent_identity)
 
 
-@contextmanager
-def acquire_updater_lock(lock_path: Path) -> Iterator[None]:
-    """Acquire non-blocking single-instance advisory lock for updater transactions."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = lock_path.open("a+b")
-    locked = False
+def _acquire_os_lock(fh: Any, lock_path: Path) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        fh.seek(0)
+        if lock_path.stat().st_size == 0:
+            fh.write(b"0")
+            fh.flush()
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_os_lock(fh: Any) -> None:
     try:
         if sys.platform == "win32":
             import msvcrt
 
             fh.seek(0)
-            if lock_path.stat().st_size == 0:
-                fh.write(b"0")
-                fh.flush()
-            fh.seek(0)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            locked = True
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
 
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            locked = True
-        yield
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def acquire_updater_lock(lock_path: Path) -> Iterator[None]:
+    """Acquire non-blocking single-instance advisory lock without swallowing body OSErrors."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+b")
+    try:
+        _acquire_os_lock(fh, lock_path)
     except OSError as exc:
+        fh.close()
         raise UpdateError(UpdateBlockReason.ACTIVE_TASKS, f"Another updater transaction is already active: {exc}") from exc
+    try:
+        yield
     finally:
-        if locked:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+        _release_os_lock(fh)
         fh.close()
 
 
@@ -209,6 +341,22 @@ def _probe_headless_health(
             proc.terminate()
 
 
+def _query_binary_version(exe: Path, env: dict[str, str], flags: int) -> str:
+    ver_proc = subprocess.run(
+        [str(exe), "--version"],
+        env=env,
+        creationflags=flags,
+        timeout=10.0,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ver_proc.returncode != 0:
+        return ""
+    m = _VERSION_RE.search(ver_proc.stdout or "")
+    return m.group(0) if m else ""
+
+
 def verify_updated_binary(
     target_dir: Path,
     target_version: str,
@@ -227,16 +375,7 @@ def verify_updated_binary(
         env["APPDATA"] = str(data_dir.parent)
 
     try:
-        ver_proc = subprocess.run(
-            [str(exe), "--version"],
-            env=env,
-            creationflags=flags,
-            timeout=10.0,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if ver_proc.returncode != 0 or target_version not in (ver_proc.stdout or ""):
+        if _query_binary_version(exe, env, flags) != target_version:
             return False
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,8 +402,10 @@ def verify_updated_binary(
 
 
 def _restore_portable_backup(install_dir: Path, backup_dir: Path) -> None:
-    if not backup_dir.is_dir():
-        return
+    if not backup_dir.is_dir() or is_reparse_or_symlink(backup_dir):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup directory missing or unsafe")
+    if not (backup_dir / f"{APP_ID}.exe").is_file():
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup missing application executable")
     if install_dir.exists():
         broken = install_dir.with_name(f".{install_dir.name}-failed-{int(time.time())}")
         if broken.exists():
@@ -274,6 +415,60 @@ def _restore_portable_backup(install_dir: Path, backup_dir: Path) -> None:
         shutil.rmtree(broken, ignore_errors=True)
     else:
         backup_dir.replace(install_dir)
+
+
+def _rollback_portable_tx(tx: UpdateTransaction, install_dir: Path, backup_dir: Path, state_path: Path) -> UpdateTransaction:
+    tx.state = UpdateState.ROLLING_BACK
+    _persist_tx(state_path, tx)
+    try:
+        _restore_portable_backup(install_dir, backup_dir)
+        tx.state = UpdateState.ROLLED_BACK
+    except Exception as exc:  # noqa: BLE001
+        tx.error = f"{tx.error}; rollback failed: {exc}" if tx.error else str(exc)
+        tx.state = UpdateState.FAILED
+    _finalize_tx(state_path, tx)
+    return tx
+
+
+def _prepare_portable_candidate(
+    staged_dir: Path,
+    candidate_dir: Path,
+    install_dir: Path,
+    expected_hashes: dict[str, str] | None,
+) -> None:
+    reverify_staged_bundle(staged_dir, expected_hashes)
+    total_bytes = sum(p.stat().st_size for p in staged_dir.rglob("*") if p.is_file())
+    ensure_disk_headroom(install_dir.parent, total_bytes)
+    if candidate_dir.exists():
+        shutil.rmtree(candidate_dir, ignore_errors=True)
+    shutil.copytree(staged_dir, candidate_dir, symlinks=False)
+    get_platform().restrict_path_acl(candidate_dir, is_dir=True)
+    reverify_staged_bundle(candidate_dir, expected_hashes)
+
+
+def _verify_or_rollback_portable(
+    tx: UpdateTransaction,
+    install_dir: Path,
+    backup_dir: Path,
+    state_path: Path,
+    target_version: str,
+    data_dir: Path | None,
+    verify_callback: Callable[[Path, Path | None], bool] | None,
+) -> UpdateTransaction:
+    verifier = verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, target_version, dd))
+    ok = False
+    try:
+        ok = bool(verifier(install_dir, data_dir))
+    except Exception as exc:  # noqa: BLE001
+        tx.error = str(exc)
+    if not ok:
+        tx.error = tx.error or "Post-upgrade verification failed"
+        return _rollback_portable_tx(tx, install_dir, backup_dir, state_path)
+    tx.state = UpdateState.COMMITTED
+    _finalize_tx(state_path, tx, highest_seen=target_version)
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    return tx
 
 
 def apply_portable_transaction(
@@ -287,8 +482,10 @@ def apply_portable_transaction(
     state_path: Path,
     data_dir: Path | None = None,
     verify_callback: Callable[[Path, Path | None], bool] | None = None,
+    _lock_already_held: bool = False,
 ) -> UpdateTransaction:
-    """Execute atomic portable swap retaining `.MCPApp-old-<tx_id>` until health checks commit."""
+    """Execute atomic portable swap retaining `.MCPApp-old-<tx_id>` until COMMITTED state is persisted."""
+    _validate_install_target(install_dir)
     backup_dir = install_dir.parent / f".{install_dir.name}-old-{tx_id}"
     candidate_dir = install_dir.parent / f".{install_dir.name}-new-{tx_id}"
     tx = UpdateTransaction(
@@ -304,13 +501,10 @@ def apply_portable_transaction(
         created_at=_utc_now_iso(),
     )
 
-    with acquire_updater_lock(state_path.parent / ".updater.lock"):
+    lock_cm = nullcontext() if _lock_already_held else acquire_updater_lock(state_path.parent / ".updater.lock")
+    with lock_cm:
         _persist_tx(state_path, tx)
-        reverify_staged_bundle(staged_dir, expected_hashes)
-
-        if candidate_dir.exists():
-            shutil.rmtree(candidate_dir, ignore_errors=True)
-        shutil.copytree(staged_dir, candidate_dir, symlinks=False)
+        _prepare_portable_candidate(staged_dir, candidate_dir, install_dir, expected_hashes)
 
         tx.state = UpdateState.BACKING_UP
         _persist_tx(state_path, tx)
@@ -324,43 +518,72 @@ def apply_portable_transaction(
         try:
             candidate_dir.replace(install_dir)
         except Exception as exc:  # noqa: BLE001
-            tx.state = UpdateState.ROLLING_BACK
             tx.error = str(exc)
-            _persist_tx(state_path, tx)
-            _restore_portable_backup(install_dir, backup_dir)
-            tx.state = UpdateState.ROLLED_BACK
-            _finalize_tx(state_path, tx)
-            return tx
+            return _rollback_portable_tx(tx, install_dir, backup_dir, state_path)
 
         tx.state = UpdateState.VERIFYING_NEW
         _persist_tx(state_path, tx)
-        verifier = verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, target_version, dd))
-        ok = False
-        try:
-            ok = bool(verifier(install_dir, data_dir))
-        except Exception as exc:  # noqa: BLE001
-            tx.error = str(exc)
-
-        if not ok:
-            tx.state = UpdateState.ROLLING_BACK
-            tx.error = tx.error or "Post-upgrade verification failed"
-            _persist_tx(state_path, tx)
-            _restore_portable_backup(install_dir, backup_dir)
-            tx.state = UpdateState.ROLLED_BACK
-            _finalize_tx(state_path, tx)
-            return tx
-
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
-        tx.state = UpdateState.COMMITTED
-        _finalize_tx(state_path, tx, highest_seen=target_version)
-        return tx
+        return _verify_or_rollback_portable(
+            tx, install_dir, backup_dir, state_path, target_version, data_dir, verify_callback
+        )
 
 
 def _default_run_installer(cmd: list[str], env: dict[str, str]) -> int:
     flags = get_platform().subprocess_creation_flags(detached=False, hide_console=True)
     res = subprocess.run(cmd, env=env, creationflags=flags, check=False)
     return int(res.returncode)
+
+
+def _run_installed_and_verify(
+    *,
+    tx: UpdateTransaction,
+    install_dir: Path,
+    installer_path: Path,
+    rollback_installer_path: Path,
+    target_version: str,
+    source_version: str,
+    state_path: Path,
+    data_dir: Path | None,
+    rollback_expected_sha256: str,
+    require_authenticode: bool,
+    allowed_thumbprints: tuple[str, ...],
+    runner: Callable[[list[str], dict[str, str]], int],
+    verify_callback: Callable[[Path, Path | None], bool] | None,
+    rollback_verify_callback: Callable[[Path, Path | None], bool] | None,
+    env: dict[str, str],
+) -> UpdateTransaction:
+    silent_flags = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={install_dir}"]
+    rc = runner([str(installer_path), *silent_flags], env)
+    verified = False
+    if rc == 0:
+        tx.state = UpdateState.VERIFYING_NEW
+        _persist_tx(state_path, tx)
+        verifier = verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, target_version, dd))
+        try:
+            verified = bool(verifier(install_dir, data_dir))
+        except Exception as exc:  # noqa: BLE001
+            tx.error = str(exc)
+
+    if rc != 0 or not verified:
+        tx.state = UpdateState.ROLLING_BACK
+        tx.error = tx.error or f"Installer exit={rc} or verification failed"
+        _persist_tx(state_path, tx)
+        reverify_staged_bundle(
+            rollback_installer_path,
+            rollback_expected_sha256,
+            require_authenticode=require_authenticode,
+            allowed_thumbprints=allowed_thumbprints,
+        )
+        rb_rc = runner([str(rollback_installer_path), *silent_flags], env)
+        rb_verifier = rollback_verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, source_version, dd))
+        rb_ok = rb_rc == 0 and bool(rb_verifier(install_dir, data_dir))
+        tx.state = UpdateState.ROLLED_BACK if rb_ok else UpdateState.FAILED
+        _finalize_tx(state_path, tx)
+        return tx
+
+    tx.state = UpdateState.COMMITTED
+    _finalize_tx(state_path, tx, highest_seen=target_version)
+    return tx
 
 
 def apply_installed_transaction(
@@ -374,14 +597,22 @@ def apply_installed_transaction(
     state_path: Path,
     data_dir: Path | None = None,
     expected_sha256: str | None = None,
-    require_authenticode: bool = False,
+    rollback_expected_sha256: str | None = None,
+    require_authenticode: bool = True,
     allowed_thumbprints: tuple[str, ...] = (),
     run_installer: Callable[[list[str], dict[str, str]], int] | None = None,
     verify_callback: Callable[[Path, Path | None], bool] | None = None,
+    rollback_verify_callback: Callable[[Path, Path | None], bool] | None = None,
+    _lock_already_held: bool = False,
 ) -> UpdateTransaction:
-    """Execute non-elevated silent Inno Setup upgrade with explicit rollback installer recovery."""
+    """Execute non-elevated silent Inno Setup upgrade with verified rollback installer and post-rollback check."""
+    _validate_install_target(install_dir)
     if rollback_installer_path is None or not rollback_installer_path.is_file():
         raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Missing rollback installer for installed mode")
+    if not expected_sha256 or not rollback_expected_sha256:
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Missing expected SHA-256 for installer or rollback")
+    if require_authenticode and not allowed_thumbprints:
+        raise UpdateError(UpdateBlockReason.NO_AUTHENTICODE_POLICY, "No trusted Authenticode thumbprints configured")
 
     tx = UpdateTransaction(
         tx_id=tx_id,
@@ -398,43 +629,40 @@ def apply_installed_transaction(
     env = dict(os.environ)
     env["__COMPAT_LAYER"] = "RunAsInvoker"
 
-    with acquire_updater_lock(state_path.parent / ".updater.lock"):
+    lock_cm = nullcontext() if _lock_already_held else acquire_updater_lock(state_path.parent / ".updater.lock")
+    with lock_cm:
         _persist_tx(state_path, tx)
-        if expected_sha256 is not None:
-            reverify_staged_bundle(
-                installer_path,
-                expected_sha256,
-                require_authenticode=require_authenticode,
-                allowed_thumbprints=allowed_thumbprints,
-            )
-
+        reverify_staged_bundle(
+            installer_path,
+            expected_sha256,
+            require_authenticode=require_authenticode,
+            allowed_thumbprints=allowed_thumbprints,
+        )
+        reverify_staged_bundle(
+            rollback_installer_path,
+            rollback_expected_sha256,
+            require_authenticode=require_authenticode,
+            allowed_thumbprints=allowed_thumbprints,
+        )
         tx.state = UpdateState.INSTALLING
         _persist_tx(state_path, tx)
-        silent_flags = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={install_dir}"]
-        rc = runner([str(installer_path), *silent_flags], env)
-
-        verified = False
-        if rc == 0:
-            tx.state = UpdateState.VERIFYING_NEW
-            _persist_tx(state_path, tx)
-            verifier = verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, target_version, dd))
-            try:
-                verified = bool(verifier(install_dir, data_dir))
-            except Exception as exc:  # noqa: BLE001
-                tx.error = str(exc)
-
-        if rc != 0 or not verified:
-            tx.state = UpdateState.ROLLING_BACK
-            tx.error = tx.error or f"Installer exit={rc} or verification failed"
-            _persist_tx(state_path, tx)
-            rb_rc = runner([str(rollback_installer_path), *silent_flags], env)
-            tx.state = UpdateState.ROLLED_BACK if rb_rc == 0 else UpdateState.FAILED
-            _finalize_tx(state_path, tx)
-            return tx
-
-        tx.state = UpdateState.COMMITTED
-        _finalize_tx(state_path, tx, highest_seen=target_version)
-        return tx
+        return _run_installed_and_verify(
+            tx=tx,
+            install_dir=install_dir,
+            installer_path=installer_path,
+            rollback_installer_path=rollback_installer_path,
+            target_version=target_version,
+            source_version=source_version,
+            state_path=state_path,
+            data_dir=data_dir,
+            rollback_expected_sha256=rollback_expected_sha256,
+            require_authenticode=require_authenticode,
+            allowed_thumbprints=allowed_thumbprints,
+            runner=runner,
+            verify_callback=verify_callback,
+            rollback_verify_callback=rollback_verify_callback,
+            env=env,
+        )
 
 
 def _try_sanitize(raw: str, roots: tuple[Path, ...]) -> Path | None:
@@ -447,28 +675,39 @@ def _try_sanitize(raw: str, roots: tuple[Path, ...]) -> Path | None:
 
 
 def _recover_installed_tx(
-    tx: UpdateTransaction, target_dir: Path, updates_root: Path, state_path: Path
+    tx: UpdateTransaction,
+    target_dir: Path,
+    updates_root: Path,
+    state_path: Path,
+    policy: TrustPolicy,
 ) -> UpdateTransaction | None:
-    rb = _try_sanitize(tx.rollback_installer, (updates_root / "rollback",))
-    if rb is None or not rb.is_file():
+    verified = verify_cached_rollback_bundle(
+        updates_root / "rollback",
+        expected_version=tx.source_version,
+        policy=policy,
+    )
+    if verified is None:
         return None
+    rb, _rb_sha = verified
     env = dict(os.environ)
     env["__COMPAT_LAYER"] = "RunAsInvoker"
     rc = _default_run_installer(
         [str(rb), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={target_dir}"],
         env,
     )
-    tx.state = UpdateState.ROLLED_BACK if rc == 0 else UpdateState.FAILED
+    data_dir = updates_root.parent
+    rb_ok = rc == 0 and verify_updated_binary(target_dir, tx.source_version, data_dir)
+    tx.state = UpdateState.ROLLED_BACK if rb_ok else UpdateState.FAILED
     _finalize_tx(state_path, tx)
     return tx
 
 
-def recover_interrupted_update_on_boot(
+def _recover_under_lock(
     state_path: Path,
     updates_root: Path,
-    install_dir: Path | None = None,
+    install_dir: Path | None,
+    policy: TrustPolicy | None,
 ) -> UpdateTransaction | None:
-    """Recover cleanly from an interrupted crash/power-loss update transaction at startup."""
     st = UpdaterPersistentState.load(state_path)
     tx = st.active_transaction
     active_states = {
@@ -492,7 +731,9 @@ def recover_interrupted_update_on_boot(
         return tx
 
     if tx.install_type == "installed" and target_dir is not None:
-        recovered = _recover_installed_tx(tx, target_dir, updates_root, state_path)
+        recovered = _recover_installed_tx(
+            tx, target_dir, updates_root, state_path, policy or TrustPolicy.production_default()
+        )
         if recovered is not None:
             return recovered
 
@@ -500,6 +741,33 @@ def recover_interrupted_update_on_boot(
     tx.error = "Interrupted update state could not be automatically recovered"
     _finalize_tx(state_path, tx)
     return tx
+
+
+def recover_interrupted_update_on_boot(
+    state_path: Path,
+    updates_root: Path,
+    install_dir: Path | None = None,
+    *,
+    policy: TrustPolicy | None = None,
+) -> UpdateTransaction | None:
+    """Recover cleanly from an interrupted update at startup while honoring active `.updater.lock`."""
+    try:
+        lock_cm = acquire_updater_lock(updates_root / ".updater.lock")
+    except UpdateError:
+        return None
+
+    try:
+        with lock_cm:
+            return _recover_under_lock(state_path, updates_root, install_dir, policy)
+    except UpdateError:
+        return UpdateTransaction(
+            tx_id="",
+            state="ACTIVE_EXTERNAL",
+            install_type="portable",
+            source_version="",
+            target_version="",
+            install_dir="",
+        )
 
 
 def _parse_plan_arg(argv: list[str]) -> str:
@@ -512,12 +780,12 @@ def _parse_plan_arg(argv: list[str]) -> str:
 def _parse_parent_identity(raw: object) -> ProcessIdentity | None:
     if not isinstance(raw, dict):
         return None
-    return ProcessIdentity(
-        pid=int(raw["pid"]),
-        create_time=float(raw["create_time"]),
-        executable=str(raw.get("executable") or ""),
-        captured_at=float(raw.get("captured_at") or 0.0),
-    )
+    pid = int(raw.get("pid") or 0)
+    ctime = float(raw.get("create_time") or 0.0)
+    exe = str(raw.get("executable") or "").strip()
+    if pid <= 0 or ctime <= 0.0 or not exe:
+        return None
+    return ProcessIdentity(pid=pid, create_time=ctime, executable=exe, captured_at=float(raw.get("captured_at") or 0.0))
 
 
 def _maybe_restart_gui(plan: dict, install_dir: Path) -> None:
@@ -534,81 +802,253 @@ def _maybe_restart_gui(plan: dict, install_dir: Path) -> None:
     )
 
 
-def _execute_cli_transaction(
+def _load_and_verify_helper_manifest(
+    updates_root: Path,
+    *,
+    target_ver: str,
+    actual_source_ver: str,
+    highest_seen_version: str,
+    policy: TrustPolicy,
+) -> UpdateManifest:
+    manifest_dir = updates_root / "manifests" / target_ver
+    manifest_path = manifest_dir / "update-manifest.json"
+    sig_path = manifest_dir / "update-manifest.json.sig"
+    if not (manifest_path.is_file() and sig_path.is_file()):
+        raise UpdateError(UpdateBlockReason.SIGNATURE_INVALID, "Signed manifest missing for helper verification")
+    sig_raw = json.loads(sig_path.read_text(encoding="utf-8"))
+    manifest = verify_manifest_and_signature(
+        manifest_bytes=manifest_path.read_bytes(),
+        key_id=str(sig_raw.get("key_id") or ""),
+        signature_b64=str(sig_raw.get("signature_b64") or ""),
+        current_version=actual_source_ver,
+        highest_seen_version=highest_seen_version,
+        policy=policy,
+    )
+    if parse_semver(manifest.version) <= parse_semver(actual_source_ver):
+        raise UpdateError(UpdateBlockReason.DOWNGRADE_BLOCKED, "Helper update must advance binary version")
+    return manifest
+
+
+def _execute_verified_installed_tx(
+    *,
+    data_dir: Path,
+    updates_root: Path,
+    install_dir: Path,
+    tx_id: str,
+    source_ver: str,
+    manifest: UpdateManifest,
+    policy: TrustPolicy,
+) -> UpdateTransaction | None:
+    if policy.require_authenticode_for_installer and not policy.allowed_thumbprints:
+        return None
+    installer_path = updates_root / "downloads" / manifest.installer.name
+    if not installer_path.is_file() or installer_path.stat().st_size != manifest.installer.size:
+        return None
+    if policy.require_authenticode_for_installer:
+        if not verify_windows_authenticode(installer_path, allowed_thumbprints=policy.allowed_thumbprints).verified:
+            return None
+    rb_bundle = verify_cached_rollback_bundle(
+        updates_root / "rollback",
+        expected_version=source_ver,
+        policy=policy,
+    )
+    if rb_bundle is None:
+        return None
+    rb_exe, rb_sha = rb_bundle
+    return apply_installed_transaction(
+        tx_id=tx_id,
+        install_dir=install_dir,
+        installer_path=installer_path,
+        rollback_installer_path=rb_exe,
+        source_version=source_ver,
+        target_version=manifest.version,
+        state_path=updates_root / "state.json",
+        data_dir=data_dir,
+        expected_sha256=manifest.installer.sha256,
+        rollback_expected_sha256=rb_sha,
+        require_authenticode=policy.require_authenticode_for_installer,
+        allowed_thumbprints=policy.allowed_thumbprints,
+        _lock_already_held=True,
+    )
+
+
+def _execute_verified_cli_tx(
+    *,
     plan: dict,
     data_dir: Path,
     updates_root: Path,
     install_dir: Path,
     tx_id: str,
     source_ver: str,
-    target_ver: str,
+    manifest: UpdateManifest,
+    policy: TrustPolicy,
 ) -> UpdateTransaction | None:
-    state_path = updates_root / "state.json"
     install_type = str(plan.get("install_type") or "")
+    env_info = detect_install_environment(
+        frozen=True,
+        app_dir=install_dir,
+        current_version=source_ver,
+        rollback_cache_dir=updates_root / "rollback",
+        policy=policy,
+    )
+    if env_info.install_type != install_type or env_info.block_reasons:
+        return None
+
     if install_type == "portable":
+        dl_zip = updates_root / "downloads" / manifest.portable.name
+        expected_hashes = verify_portable_zip_and_compute_map(
+            dl_zip,
+            expected_sha256=manifest.portable.sha256,
+            expected_size=manifest.portable.size,
+        )
         return apply_portable_transaction(
             tx_id=tx_id,
             install_dir=install_dir,
-            staged_dir=updates_root / "staged" / target_ver,
-            expected_hashes=plan.get("expected_hashes"),
+            staged_dir=updates_root / "staged" / manifest.version,
+            expected_hashes=expected_hashes,
             source_version=source_ver,
-            target_version=target_ver,
-            state_path=state_path,
+            target_version=manifest.version,
+            state_path=updates_root / "state.json",
             data_dir=data_dir,
+            _lock_already_held=True,
         )
     if install_type == "installed":
-        installer_path = updates_root / "downloads" / f"{APP_ID}-Setup-{target_ver}.exe"
-        rb_candidate = updates_root / "rollback" / f"{APP_ID}-Setup-{source_ver}.exe"
-        return apply_installed_transaction(
-            tx_id=tx_id,
-            install_dir=install_dir,
-            installer_path=installer_path,
-            rollback_installer_path=rb_candidate if rb_candidate.is_file() else None,
-            source_version=source_ver,
-            target_version=target_ver,
-            state_path=state_path,
+        return _execute_verified_installed_tx(
             data_dir=data_dir,
-            expected_sha256=plan.get("expected_sha256"),
-            require_authenticode=bool(plan.get("require_authenticode", True)),
-            allowed_thumbprints=tuple(plan.get("allowed_thumbprints") or ()),
+            updates_root=updates_root,
+            install_dir=install_dir,
+            tx_id=tx_id,
+            source_ver=source_ver,
+            manifest=manifest,
+            policy=policy,
         )
     return None
 
 
-def run_apply_update_cli(argv: list[str]) -> int:
-    """CLI handler for `MCPApp.exe --apply-update --plan <json> --handoff <token>`."""
-    data_dir = Path(os.path.realpath(str(user_data_dir())))
-    updates_root = data_dir / "updates"
+def _consume_single_use_plan(state_path: Path, tx_id: str, plan_path: Path) -> bool:
+    """Reject replayed handoff ids and burn plan.json under the updater lock."""
+    st = UpdaterPersistentState.load(state_path)
+    if tx_id in st.consumed_handoff_ids:
+        return False
+    if st.active_transaction is not None and st.active_transaction.tx_id == tx_id:
+        return False
+    st.consumed_handoff_ids = (list(st.consumed_handoff_ids) + [tx_id])[-64:]
+    st.save(state_path)
+    try:
+        plan_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return True
+
+
+def _run_locked_cli_tx(
+    *,
+    plan: dict,
+    plan_path: Path,
+    data_dir: Path,
+    updates_root: Path,
+    install_dir: Path,
+    tx_id: str,
+    target_ver: str,
+    policy: TrustPolicy,
+) -> int:
+    state_path = updates_root / "state.json"
+    install_type = str(plan.get("install_type") or "")
+    with acquire_updater_lock(updates_root / ".updater.lock"):
+        if not _consume_single_use_plan(state_path, tx_id, plan_path):
+            return 3
+        if check_active_operations(data_dir, install_dir, check_gui_mutex=(install_type == "installed")) != UpdateBlockReason.OK:
+            return 5
+        actual_source = _query_binary_version(
+            install_dir / f"{APP_ID}.exe",
+            {**os.environ, "__COMPAT_LAYER": "RunAsInvoker"},
+            get_platform().subprocess_creation_flags(detached=False, hide_console=True),
+        )
+        if not actual_source:
+            return 6
+        st = UpdaterPersistentState.load(state_path)
+        try:
+            manifest = _load_and_verify_helper_manifest(
+                updates_root,
+                target_ver=target_ver,
+                actual_source_ver=actual_source,
+                highest_seen_version=st.highest_seen_version,
+                policy=policy,
+            )
+        except (OSError, ValueError, UpdateError):
+            return 7
+        tx = _execute_verified_cli_tx(
+            plan=plan,
+            data_dir=data_dir,
+            updates_root=updates_root,
+            install_dir=install_dir,
+            tx_id=tx_id,
+            source_ver=actual_source,
+            manifest=manifest,
+            policy=policy,
+        )
+        if tx is None:
+            return 6
+    _maybe_restart_gui(plan, install_dir)
+    return 0 if tx.state == UpdateState.COMMITTED else 1
+
+
+def _load_validated_plan(argv: list[str], updates_root: Path) -> tuple[Path, dict] | None:
     plan_path = _try_sanitize(_parse_plan_arg(argv), (updates_root / "helper_run",))
     if plan_path is None or not plan_path.is_file():
-        return 2
+        return None
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return (plan_path, plan) if isinstance(plan, dict) else None
 
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    if not isinstance(plan, dict):
+
+def run_apply_update_cli(
+    argv: list[str],
+    *,
+    _policy_override: TrustPolicy | None = None,
+    _data_dir_override: Path | None = None,
+) -> int:
+    """CLI handler for `MCPApp.exe --apply-update --plan <json>` with independent trust checks."""
+    policy = _policy_override or TrustPolicy.production_default()
+    if not policy.auto_install_permitted():
+        return 7
+
+    data_dir = Path(os.path.realpath(str(_data_dir_override or user_data_dir())))
+    updates_root = data_dir / "updates"
+    loaded = _load_validated_plan(argv, updates_root)
+    if loaded is None:
         return 2
+    plan_path, plan = loaded
+
     if not verify_handoff_token(
         str(plan.get("expected_token") or ""),
         os.environ.get("MCP_UPDATER_HANDOFF_TOKEN", ""),
         issued_at=float(plan.get("issued_at") or 0.0),
     ):
         return 3
-    if not wait_for_parent_exit(_parse_parent_identity(plan.get("parent_identity")), timeout_s=20.0):
+    parent_id = _parse_parent_identity(plan.get("parent_identity"))
+    if not wait_for_parent_exit(parent_id, timeout_s=20.0):
         return 4
-    if has_active_tasks(data_dir / "tasks.sqlite3"):
-        return 5
 
     tx_id = str(plan.get("tx_id") or "")
-    if not re.fullmatch(r"[A-Za-z0-9_-]{3,48}", tx_id):
+    install_dir = _try_sanitize(str(plan.get("install_dir") or ""), _allowed_install_roots(parent_id))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,48}", tx_id) or install_dir is None:
         return 6
     try:
-        source_ver = parse_semver(str(plan.get("source_version") or "")).raw
         target_ver = parse_semver(str(plan.get("target_version") or "")).raw
-        install_dir = _sanitize_confined_path(str(plan.get("install_dir") or ""), _allowed_install_roots())
+        _validate_install_target(install_dir)
     except UpdateError:
         return 6
 
-    tx = _execute_cli_transaction(plan, data_dir, updates_root, install_dir, tx_id, source_ver, target_ver)
-    if tx is None:
-        return 6
-    _maybe_restart_gui(plan, install_dir)
-    return 0 if tx.state == UpdateState.COMMITTED else 1
+    return _run_locked_cli_tx(
+        plan=plan,
+        plan_path=plan_path,
+        data_dir=data_dir,
+        updates_root=updates_root,
+        install_dir=install_dir,
+        tx_id=tx_id,
+        target_ver=target_ver,
+        policy=policy,
+    )

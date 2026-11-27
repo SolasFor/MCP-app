@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -303,6 +303,7 @@ class UpdaterPersistentState:
     last_changelog: str = ""
     active_transaction: UpdateTransaction | None = None
     last_completed_tx: dict[str, Any] | None = None
+    consumed_handoff_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -312,6 +313,7 @@ class UpdaterPersistentState:
             "last_changelog": self.last_changelog,
             "active_transaction": self.active_transaction.to_dict() if self.active_transaction else None,
             "last_completed_tx": self.last_completed_tx,
+            "consumed_handoff_ids": list(self.consumed_handoff_ids[-64:]),
         }
 
     @classmethod
@@ -327,6 +329,12 @@ class UpdaterPersistentState:
         tx_raw = raw.get("active_transaction")
         active_tx = UpdateTransaction.from_dict(tx_raw) if isinstance(tx_raw, dict) else None
         last_tx = raw.get("last_completed_tx")
+        consumed_raw = raw.get("consumed_handoff_ids")
+        consumed = (
+            [str(x) for x in consumed_raw if isinstance(x, str) and x.strip()][-64:]
+            if isinstance(consumed_raw, list)
+            else []
+        )
         return cls(
             highest_seen_version=str(raw.get("highest_seen_version") or "0.0.0"),
             last_check_at=float(raw.get("last_check_at") or 0.0),
@@ -334,6 +342,7 @@ class UpdaterPersistentState:
             last_changelog=str(raw.get("last_changelog") or ""),
             active_transaction=active_tx,
             last_completed_tx=last_tx if isinstance(last_tx, dict) else None,
+            consumed_handoff_ids=consumed,
         )
 
     def save(self, path: Path) -> None:

@@ -89,7 +89,8 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
 
     def test_active_tasks_and_handoff_token_gate_update_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            db = Path(tmp) / "tasks.sqlite3"
+            db = Path(tmp) / "tasks" / "tasks.sqlite3"
+            db.parent.mkdir(parents=True)
             conn = sqlite3.connect(db)
             conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
             conn.execute("INSERT INTO tasks VALUES ('t1', 'running')")
@@ -111,7 +112,7 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp2:
             bad_plan = Path(tmp2) / "evil_plan.json"
             bad_plan.write_text('{"tx_id":"../escape"}', encoding="utf-8")
-            self.assertEqual(run_apply_update_cli(["--plan", str(bad_plan)]), 2)
+            self.assertIn(run_apply_update_cli(["--plan", str(bad_plan)]), (2, 7))
 
     def test_portable_swap_verify_success_and_rollback_preserves_user_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -127,6 +128,10 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
             (stage_dir / "MCPApp.exe").write_bytes(b"NEW_EXE")
             (stage_dir / "_internal").mkdir()
             (stage_dir / "_internal" / "mod.txt").write_text("new", encoding="utf-8")
+            expected_hashes = {
+                "MCPApp.exe": hashlib.sha256(b"NEW_EXE").hexdigest(),
+                "_internal/mod.txt": hashlib.sha256(b"new").hexdigest(),
+            }
 
             data_dir = root / "APPDATA_MCPApp"
             data_dir.mkdir()
@@ -140,7 +145,7 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
                 tx_id="tx-fail",
                 install_dir=app_dir,
                 staged_dir=stage_dir,
-                expected_hashes=None,
+                expected_hashes=expected_hashes,
                 source_version="1.0.2",
                 target_version="1.0.3",
                 state_path=state_path,
@@ -156,7 +161,7 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
                 tx_id="tx-ok",
                 install_dir=app_dir,
                 staged_dir=stage_dir,
-                expected_hashes=None,
+                expected_hashes=expected_hashes,
                 source_version="1.0.2",
                 target_version="1.0.3",
                 state_path=state_path,
@@ -195,8 +200,12 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
                 source_version="1.0.2",
                 target_version="1.0.3",
                 state_path=root / "state.json",
+                expected_sha256=hashlib.sha256(b"SETUP_NEW").hexdigest(),
+                rollback_expected_sha256=hashlib.sha256(b"SETUP_OLD").hexdigest(),
+                require_authenticode=False,
                 run_installer=_fake_run,
                 verify_callback=lambda target_dir, data: False,
+                rollback_verify_callback=lambda target_dir, data: True,
             )
             self.assertEqual(tx.state, UpdateState.ROLLED_BACK)
             self.assertEqual(len(recorded_calls), 2)

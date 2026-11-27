@@ -162,7 +162,7 @@ def _run_startup_acl_recovery(data_root, lm) -> None:  # noqa: ANN001
     )
 
 
-def _run_boot_update_recovery(data_root, lm) -> None:  # noqa: ANN001
+def _run_boot_update_recovery(data_root, lm) -> bool:  # noqa: ANN001
     from app.updater.helper import recover_interrupted_update_on_boot
 
     try:
@@ -170,6 +170,9 @@ def _run_boot_update_recovery(data_root, lm) -> None:  # noqa: ANN001
             data_root / "updates" / "state.json",
             data_root / "updates",
         )
+        if recovered_tx is not None and recovered_tx.state == "ACTIVE_EXTERNAL":
+            lm.warning("app", "Active updater transaction in progress; deferring GUI startup", event_code="updater_active_defer")
+            return False
         if recovered_tx is not None:
             lm.warning(
                 "app",
@@ -178,6 +181,7 @@ def _run_boot_update_recovery(data_root, lm) -> None:  # noqa: ANN001
             )
     except Exception as exc:  # noqa: BLE001
         lm.warning("app", f"Boot update recovery check skipped: {exc}", event_code="updater_boot_recovery_err")
+    return True
 
 
 def _launch_pending_update_handoff(window: MainWindow, lm) -> None:  # noqa: ANN001
@@ -245,7 +249,10 @@ def run_gui(argv: list[str]) -> int:
     data_root = user_data_dir()
     theme.apply(app, "dark")
     _run_startup_acl_recovery(data_root, lm)
-    _run_boot_update_recovery(data_root, lm)
+    if not _run_boot_update_recovery(data_root, lm):
+        _close_installer_mutex()
+        lm.shutdown(timeout=1.0)
+        return 0
 
     migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 

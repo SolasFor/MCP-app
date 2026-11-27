@@ -6,7 +6,7 @@
 |---|---|
 | N00 | main синхронизирован, локальные правки сохранены, фактический список инструментов и блокеров, инструкция/план готовы; код продукта не изменён |
 | N01 | воспроизводимый аудит, приоритеты, локальный baseline, исправления только подтверждённых P0/P1, независимое ревью |
-| N02 | полный контракт docs/auto-update.md, подпись, installed/portable real upgrade + rollback, bad signature fail-closed, production block без доверенных корней/Authenticode |
+| N02 | полный контракт docs/auto-update.md, независимая граница доверия helper, полная биекция staging, signed/Authenticode rollback contract (иначе `installed` `BLOCKED`), bad signature fail-closed, production block без доверенных корней/Authenticode |
 | N03 | миграция v1.0.2→новый формат и повторный запуск, no loss of IDs/permissions/env refs; unlinked profiles доступны; tools совместимы; sidebar/shortcuts/palette/README согласованы |
 | N04 | Next.js/Python/Docker/monorepo/unknown, дубликаты, path traversal, no execution/secrets on discovery, cancel без записи |
 | N05 | verified host key, wrong/changed key rejects, failed auth, no secrets in logs, scopes, Windows/Linux smoke, импорт deny-by-default, cancel/no unwanted network scan |

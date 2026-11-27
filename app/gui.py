@@ -109,6 +109,105 @@ def _create_installer_mutex() -> None:
             pass
 
 
+def _close_installer_mutex() -> None:
+    global _mutex_handle
+    if sys.platform == "win32" and _mutex_handle:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        except (AttributeError, OSError):
+            pass
+        _mutex_handle = None
+
+
+def _run_startup_acl_recovery(data_root, lm) -> None:  # noqa: ANN001
+    from app.core.acl_recovery import diagnose_data_acls, repair_data_acls
+
+    acl_diag = diagnose_data_acls(data_root)
+    if not acl_diag.has_issues:
+        return
+    lm.warning(
+        "app",
+        f"Detected {len(acl_diag.issues)} damaged Windows ACL item(s) in {data_root}",
+        event_code="acl_damaged_detected",
+    )
+    details_text = "\n".join(
+        f"{item.path} [{item.reason}]" + ("" if item.owned_by_current_user else " (not owned by current user)")
+        for item in acl_diag.issues
+    )
+    confirmed = SilentMessageBox.question(
+        None,
+        i18n.t("acl.recovery.title"),
+        i18n.t("acl.recovery.body", data_dir=str(data_root)),
+        detailed_text=details_text,
+    )
+    if confirmed != SilentMessageBox.StandardButton.Yes:
+        return
+    rep = repair_data_acls(data_root, isolate_unreadable=True)
+    lm.set_base_dir(default_logs_dir())
+    lm.info(
+        "app",
+        f"ACL recovery finished: repaired={len(rep.repaired_paths)} unrecoverable={len(rep.unrecoverable_paths)}",
+        event_code="acl_recovery_completed",
+    )
+    if not rep.unrecoverable_paths:
+        return
+    unrec_details = "\n".join(f"{p} [{reason}]" for p, reason in rep.unrecoverable_paths)
+    if rep.backup_paths:
+        unrec_details += "\n\nBackups:\n" + "\n".join(rep.backup_paths)
+    SilentMessageBox.warning(
+        None,
+        i18n.t("acl.recovery.unrecoverable_title"),
+        i18n.t("acl.recovery.unrecoverable_body", repaired=len(rep.repaired_paths), failed=len(rep.unrecoverable_paths)),
+        detailed_text=unrec_details,
+    )
+
+
+def _run_boot_update_recovery(data_root, lm) -> bool:  # noqa: ANN001
+    if not getattr(sys, "frozen", False):
+        return True
+    from pathlib import Path
+    from app.updater.helper import recover_interrupted_update_on_boot
+    from app.updater.models import UpdateState
+
+    install_dir = Path(os.path.realpath(sys.executable)).parent
+    try:
+        recovered_tx = recover_interrupted_update_on_boot(
+            data_root / "updates" / "state.json",
+            data_root / "updates",
+            install_dir=install_dir,
+        )
+        if recovered_tx is None:
+            return True
+        if recovered_tx.state == "ACTIVE_EXTERNAL":
+            lm.warning("app", "Active updater transaction in progress; deferring GUI startup", event_code="updater_active_defer")
+            return False
+        if recovered_tx.state == UpdateState.BLOCKED:
+            lm.warning(
+                "app",
+                f"Boot update recovery blocked (manual inspection required): {recovered_tx.error}",
+                event_code="updater_boot_recovery_blocked",
+            )
+            return True
+        lm.warning(
+            "app",
+            f"Recovered interrupted update tx={recovered_tx.tx_id} state={recovered_tx.state}",
+            event_code="updater_boot_recovery",
+        )
+    except Exception as exc:  # noqa: BLE001
+        lm.warning("app", f"Boot update recovery check skipped: {exc}", event_code="updater_boot_recovery_err")
+    return True
+
+
+def _launch_pending_update_handoff(window: MainWindow, lm) -> None:  # noqa: ANN001
+    if not window.consume_pending_update_handoff():
+        return
+    try:
+        launched = window.automation_page.update_manager.launch_staged_install_handoff(restart_gui=True)
+        lm.info("app", f"Launched out-of-tree updater helper: {launched}", event_code="updater_handoff")
+    except Exception as exc:  # noqa: BLE001
+        lm.warning("app", f"Updater handoff failed: {exc}", event_code="updater_handoff_err")
+
+
 def _install_crash_handler() -> None:
     """В оконном .exe нет консоли: необработанное исключение пишем в logs/crash.log и показываем."""
 
@@ -162,50 +261,12 @@ def run_gui(argv: list[str]) -> int:
     _create_installer_mutex()
 
     data_root = user_data_dir()
-    from app.core.acl_recovery import diagnose_data_acls, repair_data_acls
-
-    acl_diag = diagnose_data_acls(data_root)
-    if acl_diag.has_issues:
-        # Apply default theme before showing early startup recovery dialog so UI stays legible.
-        theme.apply(app, "dark")
-        lm.warning(
-            "app",
-            f"Detected {len(acl_diag.issues)} damaged Windows ACL item(s) in {data_root}",
-            event_code="acl_damaged_detected",
-        )
-        details_text = "\n".join(
-            f"{item.path} [{item.reason}]"
-            + ("" if item.owned_by_current_user else " (not owned by current user)")
-            for item in acl_diag.issues
-        )
-        confirmed = SilentMessageBox.question(
-            None,
-            i18n.t("acl.recovery.title"),
-            i18n.t("acl.recovery.body", data_dir=str(data_root)),
-            detailed_text=details_text,
-        )
-        if confirmed == SilentMessageBox.StandardButton.Yes:
-            rep = repair_data_acls(data_root, isolate_unreadable=True)
-            lm.set_base_dir(default_logs_dir())
-            lm.info(
-                "app",
-                f"ACL recovery finished: repaired={len(rep.repaired_paths)} unrecoverable={len(rep.unrecoverable_paths)}",
-                event_code="acl_recovery_completed",
-            )
-            if rep.unrecoverable_paths:
-                unrec_details = "\n".join(f"{p} [{reason}]" for p, reason in rep.unrecoverable_paths)
-                if rep.backup_paths:
-                    unrec_details += "\n\nBackups:\n" + "\n".join(rep.backup_paths)
-                SilentMessageBox.warning(
-                    None,
-                    i18n.t("acl.recovery.unrecoverable_title"),
-                    i18n.t(
-                        "acl.recovery.unrecoverable_body",
-                        repaired=len(rep.repaired_paths),
-                        failed=len(rep.unrecoverable_paths),
-                    ),
-                    detailed_text=unrec_details,
-                )
+    theme.apply(app, "dark")
+    _run_startup_acl_recovery(data_root, lm)
+    if not _run_boot_update_recovery(data_root, lm):
+        _close_installer_mutex()
+        lm.shutdown(timeout=1.0)
+        return 0
 
     migration_notes = migrate.run()  # данные SouronMCP -> MCP app, до чтения настроек
 
@@ -252,6 +313,8 @@ def run_gui(argv: list[str]) -> int:
             tray.hide()  # иначе в трее остаётся «призрак» до наведения мыши
         manager.shutdown()  # блокирующая остановка туннеля и сервера (до ~6 с)
         instance_server.close()
+        _close_installer_mutex()
+        _launch_pending_update_handoff(window, lm)
         lm.info("app", "Application shutdown completed cleanly", event_code="gui_shutdown")
         lm.shutdown(timeout=2.0)
 
@@ -269,5 +332,6 @@ def run_gui(argv: list[str]) -> int:
     QTimer.singleShot(0, window.servers_page.start_autostart_servers)
     if settings.start_services_on_launch and settings.active_provider != PROVIDER_NONE:
         QTimer.singleShot(0, manager.start_all)
+    QTimer.singleShot(4000, window.automation_page.maybe_run_startup_auto_check)
 
     return app.exec()

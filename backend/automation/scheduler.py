@@ -18,11 +18,15 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import psutil
+
 from app.core.atomic_io import atomic_write_json, try_init_private_dir
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
 
 SCHEDULES_SCHEMA_VERSION = 2
+HISTORY_SCHEMA_VERSION = 1
+ACTIVE_RUNS_SCHEMA_VERSION = 1
 
 _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2}):?(\d{2})$", re.IGNORECASE)
 _ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
@@ -355,6 +359,7 @@ class AutomationScheduler:
         try_init_private_dir(self.base_dir)
         self.schedules_path = self.base_dir / "schedules.json"
         self.history_path = self.base_dir / "history.json"
+        self.active_runs_path = self.base_dir / "active_runs.json"
         self._lock_path = self.base_dir / ".automation.lock"
         self._executor = executor
         self._async_executor = async_executor
@@ -462,7 +467,73 @@ class AutomationScheduler:
                 rows = []
         rows.append(rec.to_dict())
         rows = rows[-300:]
-        self._atomic_write_json(self.history_path, {"version": 1, "runs": rows})
+        self._atomic_write_json(self.history_path, {"version": HISTORY_SCHEMA_VERSION, "runs": rows})
+
+    @staticmethod
+    def _is_entry_process_alive(entry: object) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        pid = entry.get("pid")
+        ctime = entry.get("create_time")
+        if type(pid) is not int or pid <= 0 or not isinstance(ctime, (int, float)) or isinstance(ctime, bool):
+            return False
+        try:
+            proc = psutil.Process(pid)
+            return proc.is_running() and abs(float(proc.create_time()) - float(ctime)) <= 2.0
+        except psutil.NoSuchProcess:
+            return False
+        except (psutil.Error, OSError):
+            return True
+
+    def _load_active_runs_unlocked(self) -> dict[str, dict[str, Any]]:
+        if not self.active_runs_path.is_file():
+            return {}
+        try:
+            raw = json.loads(self.active_runs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict) or raw.get("version") != ACTIVE_RUNS_SCHEMA_VERSION:
+            return {}
+        active = raw.get("active")
+        if not isinstance(active, dict):
+            return {}
+        return {str(k): v for k, v in active.items() if isinstance(k, str) and self._is_entry_process_alive(v)}
+
+    def _record_active_run_unlocked(self, run_id: str, schedule_id: str, trigger: str, started_at: float) -> None:
+        active = self._load_active_runs_unlocked()
+        try:
+            proc_ctime = float(psutil.Process(os.getpid()).create_time())
+        except (psutil.Error, OSError):
+            proc_ctime = started_at
+        active[run_id] = {
+            "run_id": run_id,
+            "schedule_id": schedule_id,
+            "trigger": trigger,
+            "started_at": started_at,
+            "pid": os.getpid(),
+            "create_time": proc_ctime,
+        }
+        self._atomic_write_json(self.active_runs_path, {"version": ACTIVE_RUNS_SCHEMA_VERSION, "active": active})
+
+    def _remove_active_run_unlocked(self, schedule_id: str, run_id: str = "") -> None:
+        if not self.active_runs_path.is_file() and not run_id:
+            return
+        active = self._load_active_runs_unlocked()
+        if run_id:
+            active.pop(run_id, None)
+        else:
+            my_pid = os.getpid()
+            active = {
+                k: v
+                for k, v in active.items()
+                if not (v.get("schedule_id") == schedule_id and v.get("pid") == my_pid)
+            }
+        self._atomic_write_json(self.active_runs_path, {"version": ACTIVE_RUNS_SCHEMA_VERSION, "active": active})
+
+    def has_active_runs(self) -> bool:
+        """Return True if any schedule run is currently active in memory."""
+        with self._lock:
+            return bool(self._active_ids)
 
     def _notify(self, title: str, body: str) -> None:
         redacted_body = self._redactor.redact_text(body)
@@ -658,6 +729,7 @@ class AutomationScheduler:
             self._active_ids.add(spec.schedule_id)
             if idem:
                 self._seen_idempotency.append(idem)
+            self._record_active_run_unlocked(run_id, spec.schedule_id, trigger, now)
             return (run_id, idem, None)
 
     def _pause_revoked(
@@ -757,9 +829,10 @@ class AutomationScheduler:
             self._notify("Schedule Failed", f"{spec.name}: {last_err}")
         return rec
 
-    def _release_slot(self, schedule_id: str) -> None:
+    def _release_slot(self, schedule_id: str, run_id: str = "") -> None:
         with self._state_lock():
             self._active_ids.discard(schedule_id)
+            self._remove_active_run_unlocked(schedule_id, run_id)
 
     def _check_attempt_permission(self, spec: ScheduleSpec) -> tuple[bool, str]:
         if self._permission_checker is None:
@@ -817,7 +890,7 @@ class AutomationScheduler:
                 now=now, attempts=attempts, last_err=last_err,
             )
         finally:
-            self._release_slot(spec.schedule_id)
+            self._release_slot(spec.schedule_id, run_id)
 
     async def _attempt_once_async(
         self,
@@ -888,7 +961,7 @@ class AutomationScheduler:
                 now=now, attempts=attempts, last_err=last_err,
             )
         finally:
-            self._release_slot(spec.schedule_id)
+            self._release_slot(spec.schedule_id, run_id)
 
     def _evaluate_due_spec(
         self, spec: ScheduleSpec, *, now: float, reserve_slots: bool

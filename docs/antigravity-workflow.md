@@ -30,3 +30,6 @@
 
 ## Первый запуск агента
 Проверить git status, branch, HEAD, worktree, Python, gh auth status (не выводить токены), graphify help; AG Customizations → Installed проверить listed tools. Для Context7 получить документацию PyQt6, для SonarCloud — статус project/PR, для Chrome DevTools — тестовую страницу, для Cloudflare — только read-only при необходимости. Если UI/UX Pro Max не виден, проверить доступность SKILL.md, не переустанавливать неизвестные источники. Не запускать live SSH/туннели или сканирование без согласия. Не пытаться включить Swarm/Vercel.
+
+## N02
+Claude Opus high reasoning либо Carbon (при доступности). Superpowers/TDD, Ponytail, Graphify AST, Context7, SonarCloud CI; UI Skills только для Qt. Проверить AG Installed; ручной OAuth SonarCloud остаётся BLOCKED, PR-check допустим. Не менять глобальные разрешения. Текущий промт ANTIGRAVITY_PROMPT.md.

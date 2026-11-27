@@ -20,6 +20,19 @@ def main() -> int:
     multiprocessing.freeze_support()
     args = sys.argv[1:]
 
+    if "--version" in args:
+        from app import APP_NAME, __version__
+        from app.backend_entry import _ensure_std_streams
+
+        _ensure_std_streams()
+        print(f"{APP_NAME} {__version__}")
+        return 0
+
+    if "--apply-update" in args:
+        from app.updater.helper import run_apply_update_cli
+
+        return run_apply_update_cli(args)
+
     if "--run-extension" in args:
         idx = args.index("--run-extension")
         if idx + 1 >= len(args):

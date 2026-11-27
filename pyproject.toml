@@ -33,6 +33,7 @@ files = [
     "app/core/diagnostics_bundle.py",
     "app/core/reconnect.py",
     "app/core/tunnels",
+    "app/updater",
     "app/ui/tokens.py",
     "app/ui/i18n.py",
     "backend/gateway",

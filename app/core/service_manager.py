@@ -879,7 +879,9 @@ class ServiceManager(QObject):
         return user_data_dir() / "remote" / "devices.json"
 
     def automation_dir(self) -> Path:
-        return user_data_dir() / "automation"
+        from app.paths import automation_dir_path
+
+        return automation_dir_path()
 
     def managed_servers_path(self) -> Path:
         target = user_data_dir() / "servers" / "managed_servers.json"
@@ -897,10 +899,14 @@ class ServiceManager(QObject):
         return target
 
     def tasks_data_dir(self) -> Path:
-        return user_data_dir() / "tasks"
+        from app.paths import tasks_data_dir
+
+        return tasks_data_dir()
 
     def tasks_db_path(self) -> Path:
-        return self.tasks_data_dir() / "tasks.sqlite3"
+        from app.paths import tasks_db_path
+
+        return tasks_db_path()
 
     def tasks_artifacts_dir(self) -> Path:
         return self.tasks_data_dir() / "artifacts"

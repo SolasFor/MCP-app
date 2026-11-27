@@ -656,3 +656,110 @@
     - `SonarCloud Code Analysis`: **PASS** (`44s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.8%`, `new_security_hotspots_reviewed=100.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=37.
   - `BLOCKED`/`NOT_RUN`: Authenticode `.pfx`, локальный `ISCC.exe` (`Setup.exe` проверен в `windows-package`), второй live GUI при запущенном `MCPApp-Running`, live облачные туннели/SaaS AI-клиенты/внешний SSH, ручной OAuth для `sonarqube-cloud` MCP.
   - **Вывод**: этап N01 (включая `N01-FINAL-01`) полностью закрыт и готов к финальной приёмке и одобрению merge [PR #37](https://github.com/SolasFor/MCP-app/pull/37) владельцем перед переходом к N02.
+
+## N01 — MERGED / N02 — подготовка (2026-11-27)
+
+- PR #37 объединён по разрешению владельца: 32086cced4451d4c9ff31f80327f4dea7e9e91b5; HEAD f9b776a, 4 PR checks SUCCESS.
+- Независимая приёмка: 10/10 lifecycle tests, 4.813s, exit 0, изолированный профиль. Полные 324 теста и сборка — по отчёту Antigravity, не повторены ChatGPT.
+- P2: ResourceWarning незакрытого mcp_audit.log при тестовой переинициализации backend/server.py:352. Остаточные BLOCKED/NOT_RUN N01 сохранены.
+- N02: feat/n02-secure-updater, ANTIGRAVITY_PROMPT.md. Код не начат; auto-install запрещён без доверенного signing. Версия 1.0.2, релиз не опубликован. PR #32 не изменять.
+
+## N02 — Безопасное автообновление (2026-11-27)
+- **Ветка / база / версия**: `feat/n02-secure-updater` (подготовка `12948ac`, база `main` `32086cc`, PR #32 не затрагивался) | версия приложения сохранена (`1.0.2`).
+- **Реализованные модули и изменения**:
+  - Пакет `app/updater/`:
+    - `models.py` — строгий SemVer, канонический JSON-манифест `schema_version=1` (`stable` only, отказ при `public_key`/`trusted_keys`/`url`/`download_url`/лишних полях), состояния транзакции `UpdateTransaction` и `UpdaterPersistentState` (`highest_seen_version` против downgrade/replay).
+    - `trust.py` — политика доверия `TrustPolicy` (`PRODUCTION_TRUST_ROOTS = ()` без тестовых ключей, ротация `not_before`/`not_after`, отзыв `revoked_key_ids`, отсоединённая проверка Ed25519 над каноническим UTF-8 JSON, нативная Win32 проверка Authenticode через `wintrust!WinVerifyTrust` + `crypt32!CryptQueryObject`). Автоустановка в релизе строго заблокирована (`MISSING_TRUST_ROOTS`), пока не будут внесены продакшн-ключи доверия и отпечатки.
+    - `network.py` — строго HTTPS, pinned-хосты GitHub (`api.github.com`, `github.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`), не более 3 редиректов со сбросом `Authorization`, запрет URL из release body и prerelease/draft, потоковая загрузка с отменой и контролем размера/SHA-256.
+    - `staging.py` — проверка квоты диска, защита от zip-slip/UNC/drive/NUL/POSIX-symlink/DOS-reparse (`0x400`)/NTFS case-collision/zip-bomb/защищённых пользовательских файлов (`token.json`, `settings.json`, `schedules.json`, `oauth/`, `secrets/`), private ACL и предзапусковая проверка TOCTOU `reverify_staged_bundle`.
+    - `detector.py` — детектор `dev` / `installed` (Inno Setup, проверка прав записи и кэша отката) / `portable` (проверка прав на каталог/родителя и отсутствия посторонних файлов).
+    - `helper.py` — внедеревый запуск `--apply-update` из `updates/helper_run/<tx_id>` (`__COMPAT_LAYER=RunAsInvoker`, `hmac.compare_digest` + TTL handoff token, `.updater.lock`, ожидание `ProcessIdentity`, проверка активных `TaskStore` задач), атомарная замена portable-пакета с `.MCPApp-old-<tx_id>`, пост-проверка `--version`/`--selftest`/`--headless /health=200`, автооткат при сбое и аварийное восстановление при старте (`recover_interrupted_update_on_boot`) без затрагивания `%APPDATA%\MCPApp`.
+    - `manager.py` — `UpdateManager` (троттлинг авто-проверки 24 ч, opt-in download/stage, cancel, явная передача установки на `Quit`).
+  - Интеграция: `main.py` (`--version [file]`, `--apply-update`), `app/config.py` (`update_auto_check`, `update_auto_download`, `update_auto_install`, `update_channel`), `app/ui/pages/automation_page.py`, `app/ui/main_window.py`, `app/gui.py`, `app/ui/theme.py`, `app/ui/i18n.py` (RU/EN паритет), `app/selftest.py`, `packaging/mcp_app.spec`, `pyproject.toml`, `tools/release_manifest.py`, `packaging/build.ps1`, `.github/workflows/rc-windows.yml`, `.github/workflows/build.yml`.
+  - Существующий `backend/automation/backup_updater.py` (`BackupManager`, `StagedUpdater`) и N01-расписания в паузе сохранены без изменений поведения.
+- **TDD-тесты и локальные доказательства (после финальных правок, Python `3.13.15`, `QT_QPA_PLATFORM=offscreen`)**:
+  - Новые тесты: `tests/unit/test_n02_updater_security.py` (`9` security/trust/network/ZIP/TOCTOU тестов) и `tests/integration/test_n02_updater_lifecycle.py` (`7` lifecycle/installed/portable/rollback/crash-recovery/UI/release-manifest тестов) — предварительно зафиксированы RED, затем GREEN.
+  - `compileall -q backend app tests tools`: **PASS**.
+  - `ruff check app backend tests tools`: **PASS** (`All checks passed!`).
+  - `mypy` (`win32`) и `mypy --platform linux`: **PASS** (`Success: no issues found in 83 source files`).
+  - `tools/check_licenses.py`: **PASS** (`All 38 components passed license check`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
+  - Полный прогон тестов: `tests/unit` **241/241 PASS**, `tests/integration` **97/97 PASS**, `tests/e2e` (Playwright) **2/2 PASS** (итого **340/340 PASS**).
+  - `graphify update .`: **PASS** (`5661 nodes, 18181 edges, 213 communities`, `graphify-out` не отслеживается Git).
+  - Изолированная frozen-сборка PyInstaller на `D:\Coding\.mcpapp-n02-tmp` (живой `D:\Coding\MCP App\dist\MCPApp\MCPApp.exe` PID `3044`/`8428` и реальный `%APPDATA%\MCPApp` не затронуты, каталог удалён):
+    - Собраны `1.0.2` и стендовая `1.0.3` (`MCPApp.exe`: `8,547,934` Б, SHA-256 `24839ec7970beed35a1ef9af129a5143e02b98029b75eef6e2564631c3d2d30a`), подтверждены откат `1.0.2 -> ROLLED_BACK -> MCP app 1.0.2` и реальный апгрейд `1.0.2 -> COMMITTED -> MCP app 1.0.3` (реальные `--version`, `--selftest` `RESULT OK`, `--headless` `/health=200`) с побайтным сохранением DPAPI v2 `token.json`/`SecretStore` и N01 `schedules.json`.
+- **Незавершённые / `BLOCKED` / `NOT_RUN` проверки**:
+  - Локальный `ISCC.exe` отсутствует (**NOT_RUN** локально — Inno Setup установка/апгрейд/откат и `update-manifest.json` проверяются в CI job `windows-package`);
+  - Продакшн-ключи Ed25519 (`PRODUCTION_TRUST_ROOTS`) и сертификат Windows Authenticode (`.pfx` / `PRODUCTION_PUBLISHER_THUMBPRINTS`) не передавались агентом — в релизе автоустановка остаётся **BLOCKED (`MISSING_TRUST_ROOTS`)**;
+  - Ручной OAuth для `sonarqube-cloud` MCP не выполнялся (проверка качества через SonarCloud CI).
+- **Статус**: `IN_PROGRESS` — ожидает прохождения PR checks / SonarCloud CI и независимой приёмки (без merge, без смены версии, без публикации релиза, N03 не начат).
+- **PR #38 и облачный CI на кодовом коммите `780a865`** ([PR #38](https://github.com/SolasFor/MCP-app/pull/38), `feat/n02-secure-updater` → `main`, статус: **OPEN**; PR #32 не затрагивался):
+  - Исправление после первой проверки CI/Sonar: в `helper.py`/`models.py`/`trust.py`/`main.py`/`tools/release_manifest.py` добавлено строгое каноническое ограничение путей (`os.path.realpath` + prefix confinement), в `.github/workflows/rc-windows.yml` и `build.yml` проверка схемы `dist/update-manifest.json` переведена на `./.venv-build/Scripts/python.exe`, добавлен негативный тест `run_apply_update_cli` для отклонения path-traversal планов (`tests/unit` **241**, `tests/integration` **97**, `tests/e2e` **2**, когнитивная сложность всех функций N02 `< 15`).
+  - `Verify & Test (ubuntu-latest)`: **PASS** (`1m37s`, после перезапуска из-за совпадения прошлого запуска `cron-due` в N01-тесте с границей минуты `1795803899.92 → 1795803900.02`: https://github.com/SolasFor/MCP-app/actions/runs/46049076884/job/140677314585).
+  - `Verify & Test (windows-latest)`: **PASS** (`3m19s`: https://github.com/SolasFor/MCP-app/actions/runs/46049076884/job/140677317191).
+  - `windows-package` (`RC Windows installer`, clean-VM Inno Setup install/upgrade/uninstall + `dist/update-manifest.json` + `--selftest`): **PASS** (`3m10s`: https://github.com/SolasFor/MCP-app/actions/runs/46049076658/job/140675596051).
+  - `SonarCloud Code Analysis`: **PASS** (`48s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
+  - Итог: этап N02 реализован и готов к независимой приёмке (merge, публикация релиза и N03 не выполняются).
+
+### Дополнительная приёмка и исправления N02 по ревью ChatGPT (2026-11-27)
+- **Базовый проверенный коммит PR #38**: `d66d39a90b6333650b6aeba57e6429821a65a4fe` (`feat/n02-secure-updater`, версия `1.0.2`).
+- **TDD воспроизведение (RED → GREEN)**: созданы регрессионные тесты [`tests/unit/test_n02_review_regressions.py`](tests/unit/test_n02_review_regressions.py), которые на исходном `d66d39a` упали на всех 5 классах замечаний (`FAILED (failures=4, errors=1)`), а после исправлений перешли в `GREEN`.
+- **Исправленные архитектурные дефекты**:
+  - **`N02-01` (Независимая граница доверия helper)**: `run_apply_update_cli` в `app/updater/helper.py` проверяет `TrustPolicy` (при пустых `PRODUCTION_TRUST_ROOTS` немедленный выход `7`), подписанный `update-manifest.json` + `.sig`, отзыв/срок ключа, anti-downgrade по `highest_seen_version` и фактической версии `MCPApp.exe --version`, привязку к `parent_identity` (обязателен и завершён), одноразовость `tx_id` в `UpdaterPersistentState.consumed_handoff_ids` + удаление `plan.json` под `.updater.lock`, а также запрет UNC/системных/корневых/home/data/reparse путей при сохранении поддержки произвольного portable-каталога, совпадающего с `parent_identity.executable`. `UpdateManager.launch_staged_install_handoff` не записывает доверенные поля (`expected_hashes`, `require_authenticode`, `allowed_thumbprints`) в `plan.json`.
+  - **`N02-02` (Полная биекция staging)**: `verify_portable_zip_and_compute_map` и `reverify_staged_bundle` в `app/updater/staging.py` отклоняют `None`/`{}` карты хешей, отсутствующие или лишние файлы и reparse/symlink-точки; `candidate_dir` повторно проверяется после `copytree` перед подменой.
+  - **`N02-03` (Криптографический контракт отката `installed`)**: `detect_install_environment` в `app/updater/detector.py` вызывает `verify_cached_rollback_bundle` (подписанный манифест + размер/SHA-256 + Authenticode-отпечаток), иначе режим `installed` остаётся `BLOCKED` (`NO_ROLLBACK_CONTRACT`); `apply_installed_transaction` и `_recover_installed_tx` проверяют хеш/Authenticode установщика отката до запуска и целевую `source_version` после отката (`FAILED` при сбое).
+  - **`N02-04` (Единый путь `TaskStore` и fail-closed проверки)**: в `app/paths.py` введены общие функции `tasks_data_dir`, `tasks_db_path` (`tasks/tasks.sqlite3`), `automation_dir_path` (использованы `ServiceManager`, `UpdateManager`, `helper`); `has_active_tasks` завершается fail-closed (`True`) при повреждённой/пустой/symlink БД или осиротевших `-wal`/`-shm`/`.key`; `check_active_operations` проверяет `TaskStore`, `.automation.lock`, running/повреждённый `history.json`, мьютекс `MCPApp-Running` (для `installed`) и процессы внутри `install_dir`.
+  - **`N02-05` (Транзакционность и восстановление при старте)**: `apply_portable_transaction` финализирует `COMMITTED` до удаления `.MCPApp-old-<tx_id>`; `acquire_updater_lock` не проглатывает `OSError` тела блокировки; `recover_interrupted_update_on_boot` работает под `.updater.lock` (`ACTIVE_EXTERNAL` безопасно завершает запуск `app/gui.py` без порчи живого обновления). Физическое ограничение момента переименования `install_dir` документировано в [`docs/auto-update.md`](docs/auto-update.md).
+  - **`N01-P2-CRON-BOUNDARY`**: в `tests/integration/test_n01_scheduler_lifecycle.py` добавлена защита от попадания setup на последнюю 2.5 с окна минуты при проверке due cron без ослабления утверждений.
+- **Локальные проверки после финальных правок (Python `3.13.15`, `QT_QPA_PLATFORM=offscreen`)**:
+  - `compileall -q app backend tests tools`: **PASS**.
+  - `ruff check app backend tests tools`: **PASS**.
+  - `mypy` (`win32`) и `mypy --platform linux` (`83` файла): **PASS**.
+  - AST-проверка когнитивной сложности (`< 15` для `app/updater/*.py`, `app/paths.py`, `app/gui.py`): **PASS** (`HIGH_COG: []`).
+  - `tools/check_licenses.py`: **PASS** (`38/38`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
+  - Полный прогон тестов: `tests/unit` **248/248 PASS** (включая **7/7** новых тестов `test_n02_review_regressions.py`), `tests/integration` **97/97 PASS**, `tests/e2e` **2/2 PASS** (**347/347 PASS**).
+  - `graphify update .`: **PASS** (`5729 nodes, 18600 edges, 211 communities`).
+  - Изолированная frozen-сборка PyInstaller (`D:\Coding\.mcpapp-n02-tmp`, живой `MCPApp.exe` PID `3044`/`8428` и `%APPDATA%\MCPApp` не затронуты, временный каталог удалён `CLEANUP_OK`):
+    - Собраны `1.0.2` (`8,564,351` Б, SHA-256 `3500b6644a5e28c9dad8e0168eaf3145e5b3826ea75dcdb35ba93f4cd1d53543`) и стендовая `1.0.3` (`8,564,351` Б, SHA-256 `32151926432a2929545309d366679cd318e96c105f78e3e8560b39d20f4f1fed`);
+    - Реальный frozen `MCPApp.exe --apply-update` с поддельным планом: `rc=7`, версия осталась `'MCP app 1.0.2'`;
+    - Модельный `installed` без подписанного/Authenticode отката: `NO_ROLLBACK_CONTRACT`;
+    - Внедрение лишнего файла в staged bundle: `HASH_MISMATCH`;
+    - Сбой пост-проверки portable: `ROLLED_BACK` → `'MCP app 1.0.2'`;
+    - Подписанный CLI upgrade portable: `rc=0` → `'MCP app 1.0.3'` (`--version`, `--selftest` `RESULT OK`, `.MCPApp-old-*` удалён после commit, DPAPI v2 `token.json`/`secrets.vault.enc` и paused N01 `schedules.json` сохранены побайтно).
+- **Облачный CI и SonarCloud на кодовом коммите `bb65c5ae3d8e0177907ef497cc51f78df1234e52`** ([PR #38](https://github.com/SolasFor/MCP-app/pull/38), `feat/n02-secure-updater` → `main`, статус: **OPEN**; PR #32 оставлен **OPEN** на `cf77f74`; merge/релиз/N03 не выполнялись):
+  - После исправления SonarCloud `python:S3516` в [`app/updater/trust.py`](app/updater/trust.py) (`_extract_pe_signer_thumbprint` / `_first_store_cert_thumbprint`, после `55f90e3`):
+  - `Verify & Test (ubuntu-latest)`: **PASS** (`1m42s`: https://github.com/SolasFor/MCP-app/actions/runs/46056247924/job/140699329432).
+  - `Verify & Test (windows-latest)`: **PASS** (`3m24s`: https://github.com/SolasFor/MCP-app/actions/runs/46056247924/job/140699329134).
+  - `windows-package` (`RC Windows installer`): **PASS** (`3m02s`: https://github.com/SolasFor/MCP-app/actions/runs/46056248021/job/140699328823).
+  - `SonarCloud Code Analysis`: **PASS** (`41s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
+- **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`), `PRODUCTION_TRUST_ROOTS` и Windows Authenticode `.pfx` (автоустановка в релизе **BLOCKED** с кодом `MISSING_TRUST_ROOTS`), режим `installed` без подписанного кэша отката **BLOCKED** (`NO_ROLLBACK_CONTRACT`), ручной OAuth `sonarqube-cloud` MCP (**NOT_RUN**, используется SonarCloud CI/API).
+
+### Заключительное точечное исправление N02 (`N02-FINAL-01`, `N02-FINAL-02`) (2026-11-27)
+- **Базовый проверенный коммит**: `fb1ec7e2141b8110a11e5318ed10e6ce3c74a092` (`feat/n02-secure-updater`, PR #38, версия `1.0.2`).
+- **TDD воспроизведение (RED → GREEN)**:
+  - До правок в [`tests/unit/test_n02_final_regressions.py`](tests/unit/test_n02_final_regressions.py) зафиксированы воспроизводимые сбои: `HISTORY_REAL_SCHEMA_RESULT=ok`, `HISTORY_INVALID_SCHEMA_RESULT=ok`, а также отсутствие проверки доверия, привязки `install_dir`/имени backup, `active_runs` и постпроверки boot-recovery (`FAILED (failures=1, errors=3)` из `4`).
+  - После исправлений: `HISTORY_REAL_SCHEMA_RESULT=scheduler_active`, `HISTORY_INVALID_SCHEMA_RESULT=scheduler_active`, `4/4` регрессионных тестов `test_n02_final_regressions.py` перешли в `GREEN`.
+- **Исправления**:
+  - **`N02-FINAL-01` (История и живые запуски планировщика)**:
+    - В `backend/automation/scheduler.py` добавлен учёт активных выполнений `automation/active_runs.json` (`ACTIVE_RUNS_SCHEMA_VERSION = 1`, `pid` + `create_time` в `_claim_execution_slot`/`_release_slot`, прунинг мёртвых PID и `has_active_runs()`).
+    - В `app/updater/helper.py` (`check_active_operations`) добавлена строгая валидация схемы `{"version": 1, "runs": [...]}` и допустимых финальных статусов (`_has_unsafe_or_running_history`) + проверка живых выполнений (`_has_active_scheduler_runs`), symlink/reparse на `automation/`, `.automation.lock`, `active_runs.json` и `history.json` (fail-closed `SCHEDULER_ACTIVE`).
+  - **`N02-FINAL-02` (Безопасный boot-recovery)**:
+    - В `app/updater/helper.py` (`recover_interrupted_update_on_boot`, `_recover_under_lock`, `_restore_portable_backup`) введены: раздельная обработка блокировки `.updater.lock` (`ACTIVE_EXTERNAL`) без маскировки ошибок recovery; строгая загрузка `state.json` без перезаписи повреждённого файла (`BLOCKED`); проверка `TrustPolicy` (отказ при пустых `PRODUCTION_TRUST_ROOTS`) и подписанного `update-manifest.json` + `.sig`; строгая привязка к реальной `install_dir` и точному имени `.MCPApp-old-<tx_id>` без произвольных sibling-каталогов; запрет symlink/reparse внутри `install_dir`/`backup_dir`; безопасная перестановка через `.MCPApp-displaced-<tx_id>` с реальной проверкой восстановленной версии/selftest/health до присвоения `ROLLED_BACK` и откатом к исходной рабочей копии при провале без удаления backup.
+    - В `app/gui.py` (`_run_boot_update_recovery`): в dev-режиме (`not frozen`) пропуск, в frozen-режиме явная передача `Path(os.path.realpath(sys.executable)).parent` и корректная обработка `BLOCKED` без удаления данных.
+- **Проверки после финальных правок (Python `3.13.15`, `QT_QPA_PLATFORM=offscreen`)**:
+  - `compileall -q app backend tests tools`: **PASS**.
+  - `ruff check app backend tests tools`: **PASS**.
+  - `mypy` (`win32`) и `mypy --platform linux` (`83` файла): **PASS**.
+  - AST-проверка когнитивной сложности (`< 15` для `app/updater/*.py`, `app/paths.py`, `app/gui.py` и новых методов `scheduler.py`): **PASS** (`HIGH_COG: []`).
+  - `tools/check_licenses.py`: **PASS** (`38/38`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
+  - Полный прогон тестов: `tests/unit` **252/252 PASS** (`20.561s`), `tests/integration` **97/97 PASS** (`52.135s`), `tests/e2e` **2/2 PASS** (`8.316s`) — итого **351/351 PASS**.
+  - `graphify update .`: **PASS** (`5764 nodes, 18782 edges, 210 communities`).
+  - Изолированная frozen smoke-проверка `boot-recovery` (`D:\Coding\.mcpapp-n02-tmp`, живой `MCPApp.exe` PID `3044`/`8428` и `%APPDATA%\MCPApp` не затронуты, удалено `CLEANUP_OK`):
+    - `BOOT_SMOKE_PROD_BLOCK`: при пустом `PRODUCTION_TRUST_ROOTS` `recover_interrupted_update_on_boot` вернул `BLOCKED`, `MCPApp.exe --version` остался `'MCP app 1.0.2'`.
+    - `BOOT_SMOKE_FAIL_PRESERVED`: при повреждённой резервной копии постпроверка отклонена (`BLOCKED`), рабочая копия `'MCP app 1.0.2'` и backup сохранены.
+    - `BOOT_SMOKE_RECOVERED_OK`: реальная прерванная portable-замена (`'MCP app 1.0.3'` → frozen `'MCP app 1.0.2'`) с реальными `--version`, `--selftest` `RESULT OK`, `--headless /health == 200` завершилась `ROLLED_BACK`, `.MCPApp-displaced-*` удалён, DPAPI v2 `token.json`/`secrets.vault.enc` и N01 `schedules.json` сохранены побайтно.
+- **Облачный CI и SonarCloud на кодовом коммите `fce59dc4395f89fd0c5e87aaecdfb0d397ba206a`** ([PR #38](https://github.com/SolasFor/MCP-app/pull/38), `feat/n02-secure-updater` → `main`, статус: **OPEN**; PR #32 оставлен **OPEN** на `cf77f74`; merge/релиз/N03 не выполнялись):
+  - `Verify & Test (ubuntu-latest)`: **PASS** (`2m01s`: https://github.com/SolasFor/MCP-app/actions/runs/46063053041/job/140721683871).
+  - `Verify & Test (windows-latest)`: **PASS** (`3m28s`: https://github.com/SolasFor/MCP-app/actions/runs/46063053041/job/140721684203).
+  - `windows-package` (`RC Windows installer`): **PASS** (`2m49s`: https://github.com/SolasFor/MCP-app/actions/runs/46063053292/job/140721684836).
+  - `SonarCloud Code Analysis`: **PASS** (`37s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
+- **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`), `PRODUCTION_TRUST_ROOTS` и Windows Authenticode `.pfx` (автоустановка и автоматический boot-recovery в релизе **BLOCKED** с кодом `MISSING_TRUST_ROOTS`), режим `installed` без подписанного кэша отката **BLOCKED** (`NO_ROLLBACK_CONTRACT`), ручной OAuth `sonarqube-cloud` MCP (**NOT_RUN**, используется SonarCloud CI/API).

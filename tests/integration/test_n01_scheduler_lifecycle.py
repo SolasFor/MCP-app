@@ -242,6 +242,10 @@ class AutomationSchedulerLifecycleTests(unittest.TestCase):
                         idempotency_key="boot",
                     )
                 )
+                sec_in_min = time.time() % 60.0
+                if sec_in_min > 57.5:
+                    time.sleep(60.05 - sec_in_min)
+
                 srv.AUTOMATION_SCHEDULER.upsert_schedule(
                     ScheduleSpec(
                         schedule_id="iv-due",

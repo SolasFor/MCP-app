@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QTabWidget,
     QTableWidgetItem,
@@ -26,18 +27,22 @@ from PyQt6.QtWidgets import (
 )
 
 from app import __version__
+from app.config import Settings
 from app.core.admin_client import AdminBackendUnavailableError, LocalAdminClient
 from app.core.atomic_io import atomic_write_text
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
-from app.ui.components.cards import Divider, EmptyState, FlowLayout, Section
+from app.ui.components.cards import Divider, EmptyState, FlowLayout, Section, SettingRow
 from app.ui.components.context_menu import AppContextMenu, MenuActionSpec, make_toolbar_menu_button
 from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.safe_spin import SafeSpinBox
 from app.ui.components.silent_dialog import SilentDialog
 from app.ui.components.table import DataTable
+from app.ui.components.toggle_switch import ToggleSwitch
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
+from app.updater.manager import UpdateCheckSnapshot, UpdateManager
+from app.updater.models import UpdateBlockReason, UpdateState
 from backend.automation.backup_updater import BackupManager, StagedUpdater
 from backend.automation.monitoring import (
     MetricsRegistry,
@@ -272,6 +277,8 @@ class AutomationPage(PageScaffold):
 
     status_message = pyqtSignal(str, str)
     _run_completed = pyqtSignal(str, object, str)
+    _updater_snapshot_ready = pyqtSignal(object)
+    _updater_progress_sig = pyqtSignal(int, int)
 
     def __init__(
         self,
@@ -282,6 +289,8 @@ class AutomationPage(PageScaffold):
         playground_runner: Callable[[str, dict[str, Any], str], dict[str, Any]] | None = None,
         admin_client_provider: Callable[[], LocalAdminClient | None] | None = None,
         backend_running_checker: Callable[[], bool] | None = None,
+        settings: Settings | None = None,
+        quit_for_update_callback: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
@@ -291,15 +300,20 @@ class AutomationPage(PageScaffold):
         self._playground_runner = playground_runner
         self._admin_client_provider = admin_client_provider
         self._backend_running_checker = backend_running_checker
+        self._settings = settings or Settings()
+        self._quit_for_update_callback = quit_for_update_callback
         # Read/offline-config facade only (executor=None): never executes tools locally in GUI.
         self.scheduler = AutomationScheduler(self._automation_dir, redactor=self._redactor)
         self.metrics = MetricsRegistry()
         self.updater = StagedUpdater(self._automation_dir / "updates")
+        self.update_manager = UpdateManager(self._settings, self._config_root)
         self._schedules: list[dict[str, Any]] = []
         self._pending_lock = threading.Lock()
         self._pending_threads: set[threading.Thread] = set()
         self._shutting_down = False
         self._run_completed.connect(self._on_run_completed)
+        self._updater_snapshot_ready.connect(self._apply_updater_snapshot)
+        self._updater_progress_sig.connect(self._on_updater_progress)
 
         self.set_header(tr("automation.title"), tr("automation.lead"))
 
@@ -503,20 +517,86 @@ class AutomationPage(PageScaffold):
             spacing=8,
         )
         self._updater_hdr = u_sec.header
-        u_row = QHBoxLayout()
-        u_row.setSpacing(8)
+        u_actions = FlowLayout(spacing=6)
         self.updater_check_btn = QPushButton(tr("automation.updater.check"))
         self.updater_check_btn.setObjectName("Ghost")
         self.updater_check_btn.clicked.connect(self.check_for_updates)
-        u_row.addWidget(self.updater_check_btn)
-        u_row.addStretch(1)
-        u_sec.body.addLayout(u_row)
+        u_actions.addWidget(self.updater_check_btn)
+
+        self.updater_download_btn = QPushButton(tr("automation.updater.download"))
+        self.updater_download_btn.setObjectName("Ghost")
+        self.updater_download_btn.setEnabled(False)
+        self.updater_download_btn.clicked.connect(self.download_staged_update)
+        u_actions.addWidget(self.updater_download_btn)
+
+        self.updater_install_btn = QPushButton(tr("automation.updater.install"))
+        self.updater_install_btn.setObjectName("Primary")
+        self.updater_install_btn.setEnabled(False)
+        self.updater_install_btn.clicked.connect(self.restart_and_install_update)
+        u_actions.addWidget(self.updater_install_btn)
+
+        self.updater_cancel_btn = QPushButton(tr("automation.updater.cancel"))
+        self.updater_cancel_btn.setObjectName("Ghost")
+        self.updater_cancel_btn.setEnabled(False)
+        self.updater_cancel_btn.clicked.connect(self.cancel_update_download)
+        u_actions.addWidget(self.updater_cancel_btn)
+        u_sec.body.addLayout(u_actions)
+
+        self.updater_auto_check_toggle = ToggleSwitch()
+        self.updater_auto_check_toggle.setChecked(self._settings.update_auto_check)
+        self.updater_auto_check_toggle.toggled.connect(self._on_updater_toggles_changed)
+        self._updater_row_check = SettingRow(
+            tr("automation.updater.auto_check"),
+            self.updater_auto_check_toggle,
+            subtitle=tr("automation.updater.auto_check_hint"),
+        )
+        u_sec.body.addWidget(self._updater_row_check)
+
+        self.updater_auto_download_toggle = ToggleSwitch()
+        self.updater_auto_download_toggle.setChecked(self._settings.update_auto_download)
+        self.updater_auto_download_toggle.toggled.connect(self._on_updater_toggles_changed)
+        self._updater_row_download = SettingRow(
+            tr("automation.updater.auto_download"),
+            self.updater_auto_download_toggle,
+            subtitle=tr("automation.updater.auto_download_hint"),
+        )
+        u_sec.body.addWidget(self._updater_row_download)
+
+        self.updater_auto_install_toggle = ToggleSwitch()
+        self.updater_auto_install_toggle.setChecked(self._settings.update_auto_install)
+        self.updater_auto_install_toggle.toggled.connect(self._on_updater_toggles_changed)
+        self._updater_row_install = SettingRow(
+            tr("automation.updater.auto_install"),
+            self.updater_auto_install_toggle,
+            subtitle=tr("automation.updater.auto_install_hint"),
+        )
+        u_sec.body.addWidget(self._updater_row_install)
+
+        self.updater_progress = QProgressBar()
+        self.updater_progress.setRange(0, 100)
+        self.updater_progress.setValue(0)
+        self.updater_progress.setVisible(False)
+        u_sec.body.addWidget(self.updater_progress)
+
         self.updater_status = QLabel(
-            tr("automation.updater.idle", auto_install="OFF")
+            tr("automation.updater.idle", mode=self.update_manager.snapshot().install_type)
         )
         self.updater_status.setObjectName("Hint")
         self.updater_status.setWordWrap(True)
         u_sec.body.addWidget(self.updater_status)
+
+        self.updater_block_lbl = QLabel()
+        self.updater_block_lbl.setObjectName("Hint")
+        self.updater_block_lbl.setWordWrap(True)
+        u_sec.body.addWidget(self.updater_block_lbl)
+
+        self.updater_changelog = QPlainTextEdit()
+        self.updater_changelog.setReadOnly(True)
+        self.updater_changelog.setFixedHeight(88)
+        self.updater_changelog.setPlaceholderText(tr("automation.updater.changelog_empty"))
+        u_sec.body.addWidget(self.updater_changelog)
+
+        self._apply_updater_snapshot(self.update_manager.snapshot())
         col.addWidget(u_sec)
         col.addStretch(1)
         return page
@@ -919,15 +999,125 @@ class AutomationPage(PageScaffold):
             except Exception as exc:  # noqa: BLE001
                 self.backup_status.setText(str(exc))
 
-    def check_for_updates(self) -> None:
-        try:
-            cand = self.updater.fetch_latest_github_release()
-            self.updater_status.setText(
-                f"Latest: {cand.version} | auto_install={self.updater.auto_install_enabled} | "
-                f"signed={bool(cand.sig_b64)}"
+    def _on_updater_toggles_changed(self, _checked: bool) -> None:
+        self._settings.update_auto_check = self.updater_auto_check_toggle.isChecked()
+        self._settings.update_auto_download = self.updater_auto_download_toggle.isChecked()
+        reason = self.update_manager.evaluate_block_reason()
+        want_install = self.updater_auto_install_toggle.isChecked()
+        if want_install and reason != UpdateBlockReason.OK:
+            self.updater_auto_install_toggle.blockSignals(True)
+            self.updater_auto_install_toggle.setChecked(False)
+            self.updater_auto_install_toggle.blockSignals(False)
+            self._settings.update_auto_install = False
+            self.status_message.emit(
+                tr("automation.updater.blocked", reason=tr(f"automation.updater.reason.{reason}")),
+                "warn",
             )
-        except Exception as exc:  # noqa: BLE001
-            self.updater_status.setText(f"Update check failed: {exc}")
+        else:
+            self._settings.update_auto_install = want_install
+        try:
+            self._settings.save()
+        except OSError:
+            pass
+        self._apply_updater_snapshot(self.update_manager.snapshot())
+
+    def _spawn_updater_worker(self, fn: Callable[[], UpdateCheckSnapshot]) -> None:
+        if self._shutting_down:
+            return
+
+        def _worker() -> None:
+            try:
+                snap = fn()
+            except Exception as exc:  # noqa: BLE001
+                cur = self.update_manager.snapshot()
+                snap = UpdateCheckSnapshot(
+                    state=UpdateState.FAILED,
+                    current_version=cur.current_version,
+                    install_type=cur.install_type,
+                    block_reason=getattr(exc, "code", UpdateBlockReason.NETWORK_POLICY),
+                    block_detail=str(exc),
+                )
+            if not self._shutting_down:
+                self._updater_snapshot_ready.emit(snap)
+            with self._pending_lock:
+                self._pending_threads.discard(threading.current_thread())
+
+        th = threading.Thread(target=_worker, daemon=True, name="mcp-updater-ui")
+        with self._pending_lock:
+            self._pending_threads.add(th)
+        th.start()
+
+    def maybe_run_startup_auto_check(self) -> None:
+        if self.update_manager.should_auto_check():
+            self._spawn_updater_worker(lambda: self.update_manager.check_for_updates(force=False))
+
+    def check_for_updates(self) -> None:
+        self.updater_check_btn.setEnabled(False)
+        self.updater_status.setText(tr("automation.updater.checking"))
+        self._spawn_updater_worker(lambda: self.update_manager.check_for_updates(force=True))
+
+    def download_staged_update(self) -> None:
+        self.updater_download_btn.setEnabled(False)
+        self.updater_cancel_btn.setEnabled(True)
+        self.updater_progress.setVisible(True)
+        self.updater_progress.setValue(0)
+        self._spawn_updater_worker(
+            lambda: self.update_manager.download_and_stage(
+                on_progress=lambda done, total: self._updater_progress_sig.emit(done, total)
+            )
+        )
+
+    def cancel_update_download(self) -> None:
+        self.update_manager.cancel()
+        self.updater_cancel_btn.setEnabled(False)
+
+    def restart_and_install_update(self) -> None:
+        if self._quit_for_update_callback is not None:
+            self._quit_for_update_callback()
+
+    def _on_updater_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self.updater_progress.setValue(int((done * 100) / total))
+            self.updater_status.setText(tr("automation.updater.downloading", done=done, total=total))
+
+    def _format_updater_status(self, snap: UpdateCheckSnapshot) -> str:
+        if snap.state == UpdateState.AVAILABLE:
+            return tr("automation.updater.available", version=snap.latest_version)
+        if snap.state == UpdateState.READY_TO_INSTALL:
+            return tr("automation.updater.staged", version=snap.latest_version)
+        if snap.state == UpdateState.FAILED:
+            return tr("automation.updater.failed", detail=snap.block_detail or snap.block_reason)
+        if snap.latest_version:
+            return tr("automation.updater.up_to_date", version=snap.current_version)
+        return tr("automation.updater.idle", mode=snap.install_type)
+
+    def _apply_updater_snapshot(self, snap: UpdateCheckSnapshot) -> None:
+        self.updater_check_btn.setEnabled(True)
+        self.updater_cancel_btn.setEnabled(False)
+        self.updater_progress.setVisible(False)
+        can_dl = snap.state == UpdateState.AVAILABLE and snap.block_reason in {
+            UpdateBlockReason.OK,
+            UpdateBlockReason.NO_AUTHENTICODE_POLICY,
+        }
+        self.updater_download_btn.setEnabled(can_dl)
+        self.updater_install_btn.setEnabled(snap.state == UpdateState.READY_TO_INSTALL)
+
+        if snap.changelog:
+            self.updater_changelog.setPlainText(snap.changelog)
+        self.updater_status.setText(self._format_updater_status(snap))
+
+        has_block = snap.block_reason != UpdateBlockReason.OK
+        self.updater_block_lbl.setVisible(has_block)
+        if has_block:
+            reason_text = tr(f"automation.updater.reason.{snap.block_reason}")
+            self.updater_block_lbl.setText(tr("automation.updater.blocked", reason=reason_text))
+
+        if (
+            snap.state == UpdateState.AVAILABLE
+            and self._settings.update_auto_download
+            and snap.block_reason == UpdateBlockReason.OK
+        ):
+            self.download_staged_update()
 
     def shutdown(self) -> None:
         """Clean hook for MainWindow shutdown lifecycle."""
@@ -978,4 +1168,18 @@ class AutomationPage(PageScaffold):
             tr("automation.updater.title"), tr("automation.updater.notice", version=__version__)
         )
         self.updater_check_btn.setText(tr("automation.updater.check"))
+        self.updater_download_btn.setText(tr("automation.updater.download"))
+        self.updater_install_btn.setText(tr("automation.updater.install"))
+        self.updater_cancel_btn.setText(tr("automation.updater.cancel"))
+        self._updater_row_check.set_texts(
+            tr("automation.updater.auto_check"), tr("automation.updater.auto_check_hint")
+        )
+        self._updater_row_download.set_texts(
+            tr("automation.updater.auto_download"), tr("automation.updater.auto_download_hint")
+        )
+        self._updater_row_install.set_texts(
+            tr("automation.updater.auto_install"), tr("automation.updater.auto_install_hint")
+        )
+        self.updater_changelog.setPlaceholderText(tr("automation.updater.changelog_empty"))
+        self._apply_updater_snapshot(self.update_manager.snapshot())
         self._reload_schedules_table()

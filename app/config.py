@@ -133,6 +133,12 @@ class Settings:
     minimize_to_tray_on_close: bool = True
     auto_restart: bool = True
 
+    # Автообновление (N02: opt-in)
+    update_auto_check: bool = True
+    update_auto_download: bool = False
+    update_auto_install: bool = False
+    update_channel: str = "stable"
+
     # Постоянное логирование (v1.0.0 Wave 2)
     logging_enabled: bool = True
     logging_level: str = "INFO"
@@ -234,10 +240,15 @@ class Settings:
             "logging_enabled",
             "logging_auto_rotate",
             "logging_archive_enabled",
+            "update_auto_check",
+            "update_auto_download",
+            "update_auto_install",
         ):
             if not isinstance(getattr(self, field_name), bool):
-                default_val = field_name.startswith("logging_")
+                default_val = field_name.startswith("logging_") or field_name == "update_auto_check"
                 setattr(self, field_name, default_val)
+        if self.update_channel != "stable":
+            self.update_channel = "stable"
         # Query tokens can leak via logs, history and copied URLs. OAuth
         # replaces the need for them; disable on existing installs too.
         self.allow_query_token = False

@@ -505,7 +505,10 @@ class MainWindow(QMainWindow):
 
     def open_command_palette(self) -> None:
         dlg = CommandPaletteDialog(self.build_palette_actions(), self)
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            dlg.deleteLater()
 
     # ================================================================== theme & i18n
     def set_theme_mode(self, mode: str) -> None:

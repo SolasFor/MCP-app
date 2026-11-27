@@ -124,15 +124,21 @@ class N03WorkspaceServersE2ETests(unittest.TestCase):
             # Command palette routes legacy server queries to Workspaces
             for query in ("servers", "серверы"):
                 palette = CommandPaletteDialog(win.build_palette_actions(), win)
-                palette.search_input.setText(query)
-                self.app.processEvents()
-                self.assertTrue(
-                    any(act.action_id == "nav.workspaces" for act in palette._filtered),
-                    f"Missing nav.workspaces for query {query!r}",
-                )
+                try:
+                    palette.search_input.setText(query)
+                    self.app.processEvents()
+                    self.assertTrue(
+                        any(act.action_id == "nav.workspaces" for act in palette._filtered),
+                        f"Missing nav.workspaces for query {query!r}",
+                    )
+                finally:
+                    palette.close()
+                    palette.deleteLater()
+                    self.app.processEvents()
         finally:
             win.allow_close()
             win.close()
+            win.deleteLater()
             self.app.processEvents()
 
     def test_workspaces_page_full_server_parity_nonblocking_lifecycle_and_break_ui(self) -> None:

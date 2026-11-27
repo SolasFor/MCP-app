@@ -52,6 +52,8 @@ class UiRedesignGuiTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.allow_close()
         self.window.close()
+        self.window.deleteLater()
+        self.app.processEvents()
         for p in reversed(self.patches):
             p.stop()
         i18n.set_language(LANG_RU)
@@ -102,13 +104,22 @@ class UiRedesignGuiTests(unittest.TestCase):
             self.assertGreaterEqual(self.window.height(), 540)
 
     def test_command_palette_filters_and_navigates(self) -> None:
+        attempts = {"n": 0}
+
         def drive_dialog() -> None:
             for w in self.app.topLevelWidgets():
-                if isinstance(w, CommandPaletteDialog):
+                if isinstance(w, CommandPaletteDialog) and w.isVisible():
                     w.search_input.setText("security")
                     self.app.processEvents()
                     w._run_selected()
                     return
+            attempts["n"] += 1
+            if attempts["n"] < 40:
+                QTimer.singleShot(25, drive_dialog)
+                return
+            for w in self.app.topLevelWidgets():
+                if hasattr(w, "reject") and w.isVisible():
+                    w.reject()  # type: ignore[attr-defined]
 
         QTimer.singleShot(25, drive_dialog)
         self.window.open_command_palette()

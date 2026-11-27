@@ -8,8 +8,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from app.core.atomic_io import atomic_write_json, try_init_private_dir
 from app.core.redaction import SecretRedactor
-from app.platform import get_platform
 from backend.output_stream import OutputSpoolManager
 from backend.process_runner import CommandResult, ProcessRunner
 from backend.tasks.models import (
@@ -52,8 +52,7 @@ class TaskManager:
         self.spool = spool or runner.spool
         self.redactor = redactor or runner.redactor
         self.artifacts_dir = Path(artifacts_dir).expanduser().resolve()
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        get_platform().restrict_path_acl(self.artifacts_dir, is_dir=True)
+        try_init_private_dir(self.artifacts_dir)
 
         self._auth_rechecker = auth_rechecker
         self._command_executor = command_executor
@@ -224,8 +223,7 @@ class TaskManager:
         clean_err = self.redactor.redact_text(error) if error else ""
         clean_summary = self.redactor.redact_text(summary_text) if summary_text else ""
         task_art_dir = self.artifacts_dir / rec.task_id
-        task_art_dir.mkdir(parents=True, exist_ok=True)
-        get_platform().restrict_path_acl(task_art_dir, is_dir=True)
+        try_init_private_dir(task_art_dir)
 
         result_file = task_art_dir / "result.json"
         payload = {
@@ -238,8 +236,7 @@ class TaskManager:
             "output_preview": clean_summary[:16384],
             "recorded_at": time.time(),
         }
-        result_file.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        get_platform().restrict_path_acl(result_file, is_dir=False)
+        atomic_write_json(result_file, payload, indent=2, restrict_acl=True)
 
         artifact_refs = [
             {

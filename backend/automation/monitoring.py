@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import threading
 import time
@@ -138,6 +137,8 @@ def filter_audit_entries(
 
 def prune_audit_file(path: Path, *, max_lines: int = 5000) -> int:
     """Atomically trim an audit file to at most `max_lines` newest lines; returns removed count."""
+    from app.core.atomic_io import atomic_write_text
+
     target = Path(path)
     if not target.is_file():
         return 0
@@ -147,7 +148,5 @@ def prune_audit_file(path: Path, *, max_lines: int = 5000) -> int:
         return 0
     removed = len(lines) - keep
     trimmed = "\n".join(lines[-keep:]) + "\n"
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.prune.tmp")
-    tmp.write_text(trimmed, encoding="utf-8")
-    os.replace(tmp, target)
+    atomic_write_text(target, trimmed, restrict_acl=True)
     return removed

@@ -17,6 +17,8 @@ from typing import Any, Callable
 
 from app.core.logging_manager import configure_logging
 from app.core.redaction import SecretRedactor
+from app.platform import get_platform
+from app.platform.base import ProcessJobHandle
 from backend.extensions.store import runtime_entrypoint_prefix
 
 
@@ -65,6 +67,7 @@ class ExtensionProcessHost:
         self._redactor = redactor
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
+        self._job: ProcessJobHandle | None = None
         self._pump_threads: list[threading.Thread] = []
         self._replies: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._req_id = 0
@@ -109,6 +112,12 @@ class ExtensionProcessHost:
         return env
 
     def _close_proc_handles_locked(self, proc: subprocess.Popen[str] | None) -> None:
+        if self._job is not None:
+            try:
+                get_platform().close_job(self._job)
+            except OSError:
+                pass
+            self._job = None
         if proc is None:
             return
         for th in self._pump_threads:
@@ -149,6 +158,11 @@ class ExtensionProcessHost:
                 kwargs["start_new_session"] = True
             proc = subprocess.Popen(cmd, **kwargs)
             self._proc = proc
+            adapter = get_platform()
+            job = adapter.create_job(name=f"ext-{self.extension_id}", kill_on_close=True)
+            if job is not None:
+                adapter.assign_process_to_job(job, proc.pid)
+                self._job = job
             self._on_log(f"[runtime] started worker pid={proc.pid}")
             t_out = threading.Thread(target=self._pump_stdout, args=(proc,), daemon=True)
             t_err = threading.Thread(target=self._pump_stderr, args=(proc,), daemon=True)
@@ -271,17 +285,11 @@ class ExtensionProcessHost:
                     try:
                         proc.wait(timeout=2.0)
                     except subprocess.TimeoutExpired:
+                        if self._job is not None:
+                            get_platform().terminate_job(self._job, exit_code=1)
                         proc.kill()
                         proc.wait(timeout=2.0)
             self._on_log("[runtime] stopped worker")
-            for th in self._pump_threads:
-                th.join(timeout=0.5)
-            self._pump_threads = []
-            for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except OSError:
-                        pass
+            self._close_proc_handles_locked(proc)
             self._proc = None
             self._replies = queue.Queue()

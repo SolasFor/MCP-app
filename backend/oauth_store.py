@@ -559,10 +559,8 @@ class OAuthStore:
             "clients": clients_safe,
             "secrets_included": False,
         }
+        from app.core.atomic_io import atomic_write_json
+
         dest = Path(dest_path)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".tmp")
-        tmp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, dest)
-        _user_private(dest)
+        atomic_write_json(dest, snapshot, indent=2, restrict_acl=True)
         return snapshot

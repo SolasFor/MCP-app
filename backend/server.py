@@ -842,11 +842,32 @@ def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
     )
     if not oauth_execution.client_approved(spec.client_id):
         return (False, f"Client {spec.client_id!r} is not approved")
-    allowed = DEFAULT_REGISTRY.allowed_tools(
-        oauth_provider.store, tok, oauth_execution, desktop_policy_store=DESKTOP_POLICY_STORE
+    allowed = set(
+        DEFAULT_REGISTRY.allowed_tools(
+            oauth_provider.store, tok, oauth_execution, desktop_policy_store=DESKTOP_POLICY_STORE
+        )
     )
+    try:
+        allowed.update(
+            t.name for t in GATEWAY_ROUTER.list_authorized_tools(tok, oauth_execution)
+        )
+    except Exception:  # noqa: BLE001
+        pass
     if spec.tool_name not in allowed:
         return (False, f"Client {spec.client_id!r} is not authorized for {spec.tool_name}")
+    if spec.tool_name == EXEC_WINDOWS:
+        cmd = str(spec.arguments.get("command") or "")
+        if not oauth_execution.can_request(spec.client_id, "windows", command=cmd):
+            return (False, f"Client {spec.client_id!r} is not authorized for Windows command in {spec.schedule_id}")
+    elif spec.tool_name == EXEC_SSH:
+        cmd = str(spec.arguments.get("command") or "")
+        host = str(spec.arguments.get("host") or "")
+        user = str(spec.arguments.get("user") or "")
+        raw_port = spec.arguments.get("port", 22)
+        if isinstance(raw_port, bool) or not isinstance(raw_port, int):
+            return (False, f"Invalid SSH port in schedule {spec.schedule_id}")
+        if not oauth_execution.can_request(spec.client_id, "ssh", command=cmd, host=host, user=user, port=raw_port):
+            return (False, f"Client {spec.client_id!r} is not authorized for SSH target/command in {spec.schedule_id}")
     return (True, "")
 
 

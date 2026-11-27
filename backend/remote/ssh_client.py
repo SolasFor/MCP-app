@@ -35,6 +35,11 @@ class SSHConnectionManager:
 
     def _open_client(self, device: DeviceProfile, *, timeout: float = 10.0) -> paramiko.SSHClient:
         client = paramiko.SSHClient()
+        if not device.known_hosts_path:
+            try:
+                client.load_system_host_keys()
+            except OSError:
+                pass
         known_hosts = (
             Path(device.known_hosts_path).expanduser()
             if device.known_hosts_path
@@ -42,9 +47,7 @@ class SSHConnectionManager:
         )
         if known_hosts.is_file():
             client.load_host_keys(str(known_hosts))
-        else:
-            # Fail closed: never trust an unverified host when known_hosts is absent.
-            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        # Fail closed: never trust an unverified host when known_hosts is absent or unmatched.
         client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
         password = self._store.resolve_secret_ref(device.password_ref) if device.password_ref else None
@@ -177,11 +180,26 @@ class SSHConnectionManager:
     ) -> str:
         allowed_norm = [normalize_posix_path(r) for r in allowed_roots]
         probe = posixpath.dirname(clean_path) if for_write else clean_path
-        try:
-            real_probe = normalize_posix_path(sftp.normalize(probe))
-        except IOError:
-            # Parent or file does not yet exist — verify against lexical root containment.
-            real_probe = probe
+        cur = probe
+        tail_parts: list[str] = []
+        while True:
+            try:
+                real_anc = normalize_posix_path(sftp.normalize(cur))
+                break
+            except IOError as exc:
+                if cur == "/":
+                    raise PermissionError(
+                        f"Unable to canonicalize remote SFTP path ancestor for {clean_path!r}"
+                    ) from exc
+                leaf = posixpath.basename(cur)
+                if leaf:
+                    tail_parts.append(leaf)
+                cur = posixpath.dirname(cur) or "/"
+        real_probe = (
+            normalize_posix_path(posixpath.join(real_anc, *reversed(tail_parts)))
+            if tail_parts
+            else real_anc
+        )
         allowed = any(
             root == "/" or real_probe == root or real_probe.startswith(root.rstrip("/") + "/")
             for root in allowed_norm

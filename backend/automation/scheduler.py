@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import secrets
 import threading
@@ -14,9 +13,9 @@ from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.core.atomic_io import atomic_write_json, try_init_private_dir
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
-from app.platform import get_platform
 
 _OFFSET_RE = re.compile(r"^(?:UTC|GMT)?([+-])(\d{1,2}):?(\d{2})$", re.IGNORECASE)
 _ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$")
@@ -253,8 +252,7 @@ class AutomationScheduler:
         redactor: SecretRedactor | None = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else (user_data_dir() / "automation")
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        get_platform().restrict_path_acl(self.base_dir, is_dir=True)
+        try_init_private_dir(self.base_dir)
         self.schedules_path = self.base_dir / "schedules.json"
         self.history_path = self.base_dir / "history.json"
         self._executor = executor
@@ -267,10 +265,7 @@ class AutomationScheduler:
         self._notifications: deque[dict[str, Any]] = deque(maxlen=100)
 
     def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, path)
-        get_platform().restrict_path_acl(path, is_dir=False)
+        atomic_write_json(path, payload, indent=2, restrict_acl=True)
 
     def _load_schedules_unlocked(self) -> dict[str, ScheduleSpec]:
         if not self.schedules_path.is_file():

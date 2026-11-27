@@ -65,10 +65,14 @@ def _check_qt() -> str:
     from app.ui.components.safe_combo import SafeComboBox  # noqa: F401
     from app.ui.components.safe_spin import SafeDoubleSpinBox, SafeSpinBox  # noqa: F401
     from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox  # noqa: F401
+    from app.ui.components.management_layout import ManagementPanel, ManagementTabs, management_guide_button  # noqa: F401
     from app.ui.components.toggle_switch import ToggleSwitch  # noqa: F401
     from app.ui.domain_wizard import DomainWizard  # noqa: F401
     from app.ui.gateway_add_wizard import AddMcpServerWizard  # noqa: F401
     from app.ui.proxy_page import ProxyPage  # noqa: F401
+    from app.ui.pages.connections_page import ConnectionsPage  # noqa: F401
+    from app.ui.pages.gateway_page import GatewayPage  # noqa: F401
+    from app.ui.pages.tasks_page import TasksPage  # noqa: F401
     from app.ui.pages.servers_page import ServersPage  # noqa: F401
     from app.ui.pages.workspaces_page import WorkspacesPage  # noqa: F401
     from app.ui.pages.extensions_page import ExtensionsPage  # noqa: F401

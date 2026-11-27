@@ -717,7 +717,7 @@
   - AST-проверка когнитивной сложности (`< 15` для `app/updater/*.py`, `app/paths.py`, `app/gui.py`): **PASS** (`HIGH_COG: []`).
   - `tools/check_licenses.py`: **PASS** (`38/38`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
   - Полный прогон тестов: `tests/unit` **248/248 PASS** (включая **7/7** новых тестов `test_n02_review_regressions.py`), `tests/integration` **97/97 PASS**, `tests/e2e` **2/2 PASS** (**347/347 PASS**).
-  - `graphify update .`: **PASS** (`5728 nodes, 18581 edges, 200 communities`).
+  - `graphify update .`: **PASS** (`5729 nodes, 18600 edges, 211 communities`).
   - Изолированная frozen-сборка PyInstaller (`D:\Coding\.mcpapp-n02-tmp`, живой `MCPApp.exe` PID `3044`/`8428` и `%APPDATA%\MCPApp` не затронуты, временный каталог удалён `CLEANUP_OK`):
     - Собраны `1.0.2` (`8,564,351` Б, SHA-256 `3500b6644a5e28c9dad8e0168eaf3145e5b3826ea75dcdb35ba93f4cd1d53543`) и стендовая `1.0.3` (`8,564,351` Б, SHA-256 `32151926432a2929545309d366679cd318e96c105f78e3e8560b39d20f4f1fed`);
     - Реальный frozen `MCPApp.exe --apply-update` с поддельным планом: `rc=7`, версия осталась `'MCP app 1.0.2'`;
@@ -725,4 +725,10 @@
     - Внедрение лишнего файла в staged bundle: `HASH_MISMATCH`;
     - Сбой пост-проверки portable: `ROLLED_BACK` → `'MCP app 1.0.2'`;
     - Подписанный CLI upgrade portable: `rc=0` → `'MCP app 1.0.3'` (`--version`, `--selftest` `RESULT OK`, `.MCPApp-old-*` удалён после commit, DPAPI v2 `token.json`/`secrets.vault.enc` и paused N01 `schedules.json` сохранены побайтно).
+- **Облачный CI и SonarCloud на кодовом коммите `bb65c5ae3d8e0177907ef497cc51f78df1234e52`** ([PR #38](https://github.com/SolasFor/MCP-app/pull/38), `feat/n02-secure-updater` → `main`, статус: **OPEN**; PR #32 оставлен **OPEN** на `cf77f74`; merge/релиз/N03 не выполнялись):
+  - После исправления SonarCloud `python:S3516` в [`app/updater/trust.py`](app/updater/trust.py) (`_extract_pe_signer_thumbprint` / `_first_store_cert_thumbprint`, после `55f90e3`):
+  - `Verify & Test (ubuntu-latest)`: **PASS** (`1m42s`: https://github.com/SolasFor/MCP-app/actions/runs/46056247924/job/140699329432).
+  - `Verify & Test (windows-latest)`: **PASS** (`3m24s`: https://github.com/SolasFor/MCP-app/actions/runs/46056247924/job/140699329134).
+  - `windows-package` (`RC Windows installer`): **PASS** (`3m02s`: https://github.com/SolasFor/MCP-app/actions/runs/46056248021/job/140699328823).
+  - `SonarCloud Code Analysis`: **PASS** (`41s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
 - **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`), `PRODUCTION_TRUST_ROOTS` и Windows Authenticode `.pfx` (автоустановка в релизе **BLOCKED** с кодом `MISSING_TRUST_ROOTS`), режим `installed` без подписанного кэша отката **BLOCKED** (`NO_ROLLBACK_CONTRACT`), ручной OAuth `sonarqube-cloud` MCP (**NOT_RUN**, используется SonarCloud CI/API).

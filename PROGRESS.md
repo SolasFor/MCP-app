@@ -656,3 +656,10 @@
     - `SonarCloud Code Analysis`: **PASS** (`44s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.8%`, `new_security_hotspots_reviewed=100.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=37.
   - `BLOCKED`/`NOT_RUN`: Authenticode `.pfx`, локальный `ISCC.exe` (`Setup.exe` проверен в `windows-package`), второй live GUI при запущенном `MCPApp-Running`, live облачные туннели/SaaS AI-клиенты/внешний SSH, ручной OAuth для `sonarqube-cloud` MCP.
   - **Вывод**: этап N01 (включая `N01-FINAL-01`) полностью закрыт и готов к финальной приёмке и одобрению merge [PR #37](https://github.com/SolasFor/MCP-app/pull/37) владельцем перед переходом к N02.
+
+## N01 — MERGED / N02 — подготовка (2026-11-27)
+
+- PR #37 объединён по разрешению владельца: 32086cced4451d4c9ff31f80327f4dea7e9e91b5; HEAD f9b776a, 4 PR checks SUCCESS.
+- Независимая приёмка: 10/10 lifecycle tests, 4.813s, exit 0, изолированный профиль. Полные 324 теста и сборка — по отчёту Antigravity, не повторены ChatGPT.
+- P2: ResourceWarning незакрытого mcp_audit.log при тестовой переинициализации backend/server.py:352. Остаточные BLOCKED/NOT_RUN N01 сохранены.
+- N02: feat/n02-secure-updater, ANTIGRAVITY_PROMPT.md. Код не начат; auto-install запрещён без доверенного signing. Версия 1.0.2, релиз не опубликован. PR #32 не изменять.

@@ -16,3 +16,6 @@ Baseline: backend/automation/backup_updater.py StagedUpdater проверяет 
 
 ## Приёмка
 Disposable installed/portable profiles, подлинный/поддельный/неподписанный manifest, неправильная версия/asset/hash/key, invalid ZIP/redirect, повреждение staging между проверкой и запуском, active tasks, mutex, kill/power loss, no disk, installer failure, failed startup, rollback, сохранение OAuth/DPAPI/config и no admin. Реальные Windows upgrade/uninstall и проверка подписанного артефакта на CI. Без signing infrastructure статус BLOCKED для включения auto-install; не выпускать функцию как полностью готовую.
+
+## Граница после N01
+Baseline 32086cc. Старые расписания N01 остаются в паузе до одобрения. Auto-install без доверенного signing заблокирован независимо от настройки. Тестовые ключи не production trust roots. Если нет безопасного контракта rollback, формат BLOCKED. Реализация по ANTIGRAVITY_PROMPT.md только после разрешения владельца.

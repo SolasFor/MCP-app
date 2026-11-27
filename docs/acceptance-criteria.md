@@ -20,3 +20,6 @@
 | N13 | full CI Linux/Windows, Sonar Quality Gate, test installer & upgrade, EXE selftest, SHA256/SBOM, docs, real UI/external smoke or explicit BLOCKED |
 
 CI-equivalent: python -m compileall -q backend app tests tools; python -m ruff check app backend tests tools; python -m mypy; python tools/check_licenses.py; python -m pip_audit -r requirements.lock --no-deps --disable-pip; QT_QPA_PLATFORM=offscreen unit/integration unittest discover; official packaging/build.ps1 in disposable environment, not over running dist. GitHub PR checks and gated Build workflow required before release. Offscreen tests do not replace actual Windows visuals or device/network tests.
+
+## Дополнение N03
+Сохранить существующие backend registry/tools/schema и связи WorkspaceProfile.linked_servers. Без потери ID/ACL/secret refs; непривязанные профили доступны, unlink не останавливает и не удаляет сервер, workspace delete не уничтожает сервер. Проверить пересечение актуальных прав для связанных операций и зависимости, прямые MCP calls, миграцию v1.0.2 и повторный запуск. Удаление навигации только после функционального паритета, включая shortcuts/palette и старые page keys. Production gates N02 в docs/auto-update.md неизменны; N02 no-trust regression обязателен.

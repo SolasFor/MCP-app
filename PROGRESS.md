@@ -763,3 +763,10 @@
   - `windows-package` (`RC Windows installer`): **PASS** (`2m49s`: https://github.com/SolasFor/MCP-app/actions/runs/46063053292/job/140721684836).
   - `SonarCloud Code Analysis`: **PASS** (`37s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
 - **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`), `PRODUCTION_TRUST_ROOTS` и Windows Authenticode `.pfx` (автоустановка и автоматический boot-recovery в релизе **BLOCKED** с кодом `MISSING_TRUST_ROOTS`), режим `installed` без подписанного кэша отката **BLOCKED** (`NO_ROLLBACK_CONTRACT`), ручной OAuth `sonarqube-cloud` MCP (**NOT_RUN**, используется SonarCloud CI/API).
+
+## N02 — MERGED / N03 — подготовка (2026-11-27)
+- PR #38 объединён по разрешению владельца: 4b9bedb0ba20848230ab133fab447e428571991b; проверенный HEAD 431d84d, 4 CI checks SUCCESS.
+- Независимая приёмка ChatGPT: N02 20 unit + 7 integration, N01 10 integration, 37/37 PASS, exit 0, временный профиль. Полный набор 351 и frozen smoke — по отчёту Antigravity, не повторены ChatGPT.
+- Production auto-install/boot-recovery BLOCKED; installed без доверенного rollback BLOCKED. Отдельная приёмка signing, криптографической проверки восстанавливаемого portable-пакета и power-loss recovery обязательна до включения. См. docs/auto-update.md.
+- P2 ResourceWarning mcp_audit.log остаётся. Другие NOT_RUN не переименованы в PASS.
+- N03: feat/n03-workspace-servers; текущий промт ANTIGRAVITY_PROMPT.md; реализация не начата. Версия 1.0.2, PR #32 без изменений, релиз не опубликован.

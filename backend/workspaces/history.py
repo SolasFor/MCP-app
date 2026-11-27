@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import json
-import os
 import secrets
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from app.platform import get_platform
+from app.core.atomic_io import atomic_write_bytes, atomic_write_json, try_init_private_dir
 from backend.workspaces.models import MAX_HISTORY_SNAPSHOTS, validate_workspace_id
 from backend.workspaces.path_security import sha256_bytes
 
@@ -22,15 +21,12 @@ class WorkspaceHistory:
     def __init__(self, history_dir: Path) -> None:
         self.history_dir = Path(history_dir)
         self._lock = threading.RLock()
-        self._platform = get_platform()
-        self.history_dir.mkdir(parents=True, exist_ok=True)
-        self._platform.restrict_path_acl(self.history_dir, is_dir=True)
+        try_init_private_dir(self.history_dir)
 
     def _ws_dir(self, workspace_id: str) -> Path:
         clean = validate_workspace_id(workspace_id)
         d = self.history_dir / clean
-        d.mkdir(parents=True, exist_ok=True)
-        self._platform.restrict_path_acl(d, is_dir=True)
+        try_init_private_dir(d)
         return d
 
     def _read_index(self, ws_dir: Path) -> list[dict[str, Any]]:
@@ -44,13 +40,7 @@ class WorkspaceHistory:
             return []
 
     def _write_index(self, ws_dir: Path, entries: list[dict[str, Any]]) -> None:
-        idx_path = ws_dir / "index.json"
-        tmp = ws_dir / "index.json.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(entries, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, idx_path)
-        self._platform.restrict_path_acl(idx_path, is_dir=False)
+        atomic_write_json(ws_dir / "index.json", entries, indent=2, restrict_acl=True)
 
     def record_snapshot(
         self,
@@ -74,10 +64,7 @@ class WorkspaceHistory:
                 before_size = len(before_bytes)
                 blob_name = f"{snap_id}.blob"
                 blob_path = ws_dir / blob_name
-                fd = os.open(blob_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o600)
-                with os.fdopen(fd, "wb") as fh:
-                    fh.write(before_bytes)
-                self._platform.restrict_path_acl(blob_path, is_dir=False)
+                atomic_write_bytes(blob_path, before_bytes, restrict_acl=True)
 
             entry: dict[str, Any] = {
                 "snapshot_id": snap_id,

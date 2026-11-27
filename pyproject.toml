@@ -26,6 +26,7 @@ files = [
     "app/platform",
     "app/core/atomic_io.py",
     "app/core/acl_recovery.py",
+    "app/core/admin_client.py",
     "app/core/secret_store.py",
     "app/core/redaction.py",
     "app/core/logging_manager.py",

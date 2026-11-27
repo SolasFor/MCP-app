@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import json
-import os
 import re
 import shutil
 import stat
@@ -19,7 +19,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from app import __version__
-from app.platform import get_platform
+from app.core.atomic_io import atomic_write_bytes
 
 BACKUP_SCHEMA_VERSION = 1
 _BACKUP_TARGETS = (
@@ -80,11 +80,12 @@ class BackupManager:
             "checksums": digests,
         }
         dest = Path(dest_zip).resolve()
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("backup_manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
             for rel_key, raw in sorted(files_map.items()):
                 zf.writestr(rel_key, raw)
+        atomic_write_bytes(dest, buf.getvalue(), restrict_acl=True)
         return {
             "path": str(dest),
             "file_count": len(files_map),
@@ -146,11 +147,7 @@ class BackupManager:
                 out = (root / target_sub).resolve()
                 if not out.is_relative_to(root):
                     raise ValueError(f"Resolved restore path escapes config root: {target_sub!r}")
-                out.parent.mkdir(parents=True, exist_ok=True)
-                tmp = out.with_name(f".{out.name}.{os.getpid()}.restore.tmp")
-                tmp.write_bytes(members[norm_rel])
-                os.replace(tmp, out)
-                get_platform().restrict_path_acl(out, is_dir=False)
+                atomic_write_bytes(out, members[norm_rel], restrict_acl=True)
                 restored.append(target_sub)
         except Exception:
             # Attempt best-effort rollback from pre_restore_backup
@@ -167,10 +164,7 @@ class BackupManager:
                             out = (root / sub).resolve()
                             if not out.is_relative_to(root):
                                 continue
-                            out.parent.mkdir(parents=True, exist_ok=True)
-                            tmp = out.with_name(f".{out.name}.{os.getpid()}.rb.tmp")
-                            tmp.write_bytes(prev_zf.read(info.filename))
-                            os.replace(tmp, out)
+                            atomic_write_bytes(out, prev_zf.read(info.filename), restrict_acl=True)
             except Exception:  # noqa: BLE001
                 pass
             raise
@@ -219,9 +213,8 @@ class StagedUpdater:
             raise PermissionError("Corrupted or forged update signature") from exc
 
         stage_dir = self.updates_dir / "staged" / candidate.version
-        stage_dir.mkdir(parents=True, exist_ok=True)
         out = stage_dir / f"MCPApp-update-{candidate.version}.zip"
-        out.write_bytes(payload)
+        atomic_write_bytes(out, payload, restrict_acl=True)
         return out
 
     def apply_staged(

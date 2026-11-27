@@ -41,3 +41,6 @@ spool/
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Local generated Graphify index (not a source of truth)
+/graphify-out/

@@ -200,6 +200,8 @@ class MainWindow(QMainWindow):
             automation_dir=manager.automation_dir(),
             config_root=user_data_dir(),
             redactor=manager._redactor,
+            admin_client_provider=manager.admin_client,
+            backend_running_checker=manager.is_backend_running,
         )
 
         self._pages_by_id: dict[str, QWidget] = {
@@ -421,6 +423,10 @@ class MainWindow(QMainWindow):
             self.servers_page.reload()
         elif page_id == "workspaces":
             self.workspaces_page.reload()
+        elif page_id == "extensions":
+            self.extensions_page.refresh_all()
+        elif page_id == "devices":
+            self.devices_page.refresh_all()
         elif page_id == "automation":
             self.automation_page.reload()
 

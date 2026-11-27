@@ -11,8 +11,10 @@ Stage 11 adds deterministic automation, runtime telemetry, a localhost-only Admi
   - `concurrency_policy`: `forbid` (skips overlapping run as `skipped_concurrency`) or `allow`.
   - **Idempotency**: Deduplicates repeated slots/events by `schedule_id:idempotency_key:slot_tag`.
 - **Safe-only Retries**: Schedules with `safe_retry=False` **refuse** automatic retries (`max_retries > 0`). Only explicitly safe schedules may retry up to 3 times.
-- **Live Permission Recheck & Revoke**: Before executing, `AutomationScheduler` runs `permission_checker(spec)` against OAuth approvals and Emergency Stop. Revoked or unauthorized schedules automatically transition to `enabled=False` (`paused_revoked`) with a local notification.
-- **Mutation Guard**: Creating or deleting schedules programmatically requires `actor_id="owner"` or `actor_profile="full"`.
+- **Live Permission Recheck & Revoke**: Before each execution attempt (initial run and each retry), `AutomationScheduler` runs `permission_checker(spec)` against OAuth approvals and Emergency Stop. Revoked or unauthorized schedules automatically transition to `enabled=False` (`paused_revoked`) with a local notification.
+- **No Fake Execution & Schema v2 Approval Guard**: Without an `executor`/`async_executor`, execution fails closed (`status="failed"`, never `"succeeded"`). Legacy `version < 2` schedule files are automatically paused on load (`live_execution_approved=False`) until explicitly approved/re-enabled by the owner.
+- **Native Async Backend Lifecycle & Cross-Process Locking**: In `backend/server.py`, `AUTOMATION_SCHEDULER` executes directly on the server's active asyncio event loop (sharing the loop with `GATEWAY_ROUTER` and `mcp`), starts/stops cleanly inside the FastAPI/Starlette lifespan (`startup`, `interval`, `cron`, and `event`), and synchronizes `schedules.json`/`history.json` under `.automation.lock`.
+- **Mutation Guard**: Creating, enabling, or deleting schedules programmatically requires `actor_id="owner"` or `actor_profile="full"`.
 
 ## 2. Monitoring, Audit Viewer & Diagnostics (`backend/automation/monitoring.py`)
 
@@ -26,8 +28,13 @@ Stage 11 adds deterministic automation, runtime telemetry, a localhost-only Admi
 `build_local_admin_app()` in `backend/server.py` exposes local administrative routes strictly separate from the public `/mcp` Starlette app:
 
 - `GET /api/v1/monitoring` (`admin:read`)
-- `GET /api/v1/schedules` (`admin:read`)
+- `GET /api/v1/schedules` (`admin:read`, includes recent `history`)
+- `GET /api/v1/schedules/history` (`admin:read`)
+- `POST /api/v1/schedules` (`admin:write`)
+- `POST /api/v1/schedules/{schedule_id}/enabled` (`admin:write`)
 - `POST /api/v1/schedules/{schedule_id}/run` (`admin:write`)
+- `DELETE /api/v1/schedules/{schedule_id}` (`admin:write`)
+- `POST /api/v1/events` (`admin:write`)
 - `GET /api/v1/diagnostics/export` (`admin:read`)
 
 Security enforcement:

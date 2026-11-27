@@ -93,12 +93,32 @@ class _TestSFTPServer(paramiko.SFTPServerInterface):
         target = self._resolve(path)
         writing = bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
         if writing:
+            if (flags & os.O_CREAT) and (flags & os.O_EXCL) and os.path.lexists(target):
+                return paramiko.SFTP_FAILURE
             target.parent.mkdir(parents=True, exist_ok=True)
             mode = "r+b" if target.exists() and not (flags & os.O_TRUNC) else "w+b"
             return _TestSFTPHandle(flags, target.open(mode))
         if not target.is_file():
             return paramiko.SFTP_NO_SUCH_FILE
         return _TestSFTPHandle(flags, target.open("rb"))
+
+    def remove(self, path: str) -> int:
+        target = self._resolve(path)
+        if not os.path.lexists(target):
+            return paramiko.SFTP_NO_SUCH_FILE
+        target.unlink()
+        return paramiko.SFTP_OK
+
+    def posix_rename(self, oldpath: str, newpath: str) -> int:
+        src = self._resolve(oldpath)
+        dst = self._resolve(newpath)
+        if not os.path.lexists(src):
+            return paramiko.SFTP_NO_SUCH_FILE
+        os.replace(src, dst)
+        return paramiko.SFTP_OK
+
+    def rename(self, oldpath: str, newpath: str) -> int:
+        return self.posix_rename(oldpath, newpath)
 
 
 class _TestSSHInterface(paramiko.ServerInterface):

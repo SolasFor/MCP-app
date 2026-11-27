@@ -143,12 +143,18 @@ class OwnerTokenPersistenceTests(unittest.TestCase):
             # token.json must NOT be overwritten
             self.assertEqual((self.root / "token.json").read_text(encoding="utf-8"), original_marker)
             # preflight must block cleanly rather than starting server with a random token
-            with patch.object(mgr_locked, "cloudflared_path", return_value="cloudflared.exe"):
+            with (
+                patch.object(mgr_locked, "cloudflared_path", return_value="cloudflared.exe"),
+                patch("app.core.service_manager._port_owner", return_value=None),
+            ):
                 problems = mgr_locked.preflight()
             self.assertTrue(any("--repair-acl" in p for p in problems), problems)
 
         # Once SecretStore is readable again, preflight recovers original_token and OAuth client stays intact!
-        with patch.object(mgr_locked, "cloudflared_path", return_value="cloudflared.exe"):
+        with (
+            patch.object(mgr_locked, "cloudflared_path", return_value="cloudflared.exe"),
+            patch("app.core.service_manager._port_owner", return_value=None),
+        ):
             self.assertEqual(mgr_locked.preflight(), [])
         self.assertEqual(mgr_locked.token, original_token)
         self.assertEqual(approvals.profile_for("claude-desktop"), PROFILE_FULL)

@@ -9,7 +9,6 @@ No tokens or OAuth credentials are included in diagnostic messages or exported r
 from __future__ import annotations
 
 import json
-import os
 import ssl
 import sys
 from collections.abc import Iterable
@@ -253,10 +252,8 @@ def build_diagnostic_report(
 
 def export_diagnostic_report(path: Path, report: dict) -> Path:
     """Atomically write a redacted diagnostic JSON report with private ACL."""
+    from app.core.atomic_io import atomic_write_json
+
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, target)
-    get_platform().restrict_path_acl(target, is_dir=False)
+    atomic_write_json(target, report, indent=2, restrict_acl=True)
     return target

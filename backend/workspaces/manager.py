@@ -7,9 +7,11 @@ import os
 import re
 import shlex
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
+from app.core.atomic_io import atomic_write_json, try_init_private_dir
 from app.core.redaction import SecretRedactor
 from backend.output_stream import decode_process_bytes
 from backend.process_runner import ProcessRunner
@@ -99,6 +101,10 @@ class WorkspaceManager:
         runner: ProcessRunner | None = None,
         *,
         redactor: SecretRedactor | None = None,
+        task_store: Any = None,
+        artifacts_dir: Path | None = None,
+        coordinator: Any = None,
+        server_manager: Any = None,
     ) -> None:
         self.store = store
         self.history = history
@@ -108,6 +114,14 @@ class WorkspaceManager:
             redactor=redactor,
         )
         self.redactor = redactor or self.runner.redactor
+        self.task_store = task_store
+        self.artifacts_dir = (
+            Path(artifacts_dir).expanduser().resolve()
+            if artifacts_dir is not None
+            else (store.path.parent / "task_artifacts")
+        )
+        self.coordinator = coordinator
+        self.server_manager = server_manager
         self._nohooks_dir = store.path.parent / "nohooks"
 
     @staticmethod
@@ -195,6 +209,30 @@ class WorkspaceManager:
             workspace_id, client_id=client_id, client_profile=client_profile, required=("read",)
         )
         perms = prof.permissions if self._is_owner(client_id) else prof.permissions_for(str(client_id))
+        linked_statuses: list[dict[str, Any]] = []
+        missing_servers: list[str] = []
+        if self.server_manager is not None:
+            try:
+                visible = {
+                    s["name"]: s
+                    for s in self.server_manager.list_servers(
+                        client_id=client_id,
+                        client_profile=client_profile,
+                        workspace_id=prof.workspace_id,
+                    )
+                }
+            except Exception:  # noqa: BLE001
+                visible = {}
+            all_profiles = self.server_manager.store.load_profiles(strict=False)
+            for sname in prof.linked_servers:
+                if sname not in all_profiles:
+                    missing_servers.append(sname)
+                elif sname in visible:
+                    linked_statuses.append(visible[sname])
+        elif self.coordinator is not None:
+            snap = self.coordinator.partition_servers()
+            missing_servers = list(snap.missing_by_workspace.get(prof.workspace_id, ()))
+
         return {
             "workspace_id": prof.workspace_id,
             "name": prof.name,
@@ -207,6 +245,8 @@ class WorkspaceManager:
             "env_keys": sorted(prof.env),
             "env_secret_refs": sorted(prof.env_secret_refs.values()),
             "linked_servers": list(prof.linked_servers),
+            "linked_servers_status": linked_statuses,
+            "missing_linked_servers": missing_servers,
             "linked_tasks": list(prof.linked_tasks),
             "linked_extensions": list(prof.linked_extensions),
             "exclude_patterns": list(prof.exclude_patterns),
@@ -699,6 +739,139 @@ class WorkspaceManager:
             ),
         }
 
+    def _record_task_start(
+        self,
+        workspace_id: str,
+        command_name: str,
+        raw_cmd: str,
+        *,
+        timeout_val: int,
+        client_id: str | None,
+        client_profile: str,
+    ) -> str | None:
+        if self.task_store is None:
+            return None
+        from backend.tasks.models import TaskSpec
+
+        spec = TaskSpec(kind="windows", command=raw_cmd, timeout=timeout_val)
+        rec = self.task_store.create_running_task(
+            owner_client_id=client_id or "owner",
+            profile=client_profile,
+            title=self.redactor.redact_text(f"workspace({workspace_id}): {command_name}"),
+            spec=spec,
+        )
+        return str(rec.task_id)
+
+    def _record_task_finish(
+        self,
+        workspace_id: str,
+        task_id: str | None,
+        res: Any,
+        *,
+        timeout_val: int,
+    ) -> None:
+        if self.task_store is None or not task_id:
+            return
+        from backend.tasks.models import STATUS_CANCELLED, STATUS_FAILED, STATUS_SUCCEEDED
+
+        if res.cancelled:
+            status, err = STATUS_CANCELLED, "Task cancelled"
+        elif res.timed_out:
+            status, err = STATUS_FAILED, f"Timed out after {timeout_val}s"
+        elif res.exit_code in (0, None):
+            status, err = STATUS_SUCCEEDED, ""
+        else:
+            status, err = STATUS_FAILED, f"Exited with code {res.exit_code}"
+
+        summary = self.redactor.redact_text(f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}".strip())
+        art_dir = self.artifacts_dir / task_id
+        try_init_private_dir(art_dir)
+        res_file = art_dir / "result.json"
+        atomic_write_json(
+            res_file,
+            {
+                "task_id": task_id,
+                "workspace_id": workspace_id,
+                "status": status,
+                "exit_code": res.exit_code,
+                "error": self.redactor.redact_text(err),
+                "stdout_bytes": res.stdout_bytes,
+                "stderr_bytes": res.stderr_bytes,
+                "output_preview": summary[:16384],
+                "recorded_at": time.time(),
+            },
+            indent=2,
+            restrict_acl=True,
+        )
+        refs = [
+            {
+                "name": "result.json",
+                "size_bytes": res_file.stat().st_size,
+                "content_type": "application/json",
+            }
+        ]
+        self.task_store.mark_finished(
+            task_id,
+            status=status,
+            exit_code=res.exit_code,
+            error=self.redactor.redact_text(err),
+            artifact_refs=refs,
+        )
+        self.store.append_linked_task(workspace_id, task_id)
+
+    @staticmethod
+    def _build_workspace_path(prof: WorkspaceProfile, env: dict[str, str]) -> str:
+        path_parts: list[str] = []
+        if prof.python_venv:
+            venv_bin = Path(prof.python_venv) / ("Scripts" if os.name == "nt" else "bin")
+            if venv_bin.is_dir():
+                path_parts.append(str(venv_bin))
+            env["VIRTUAL_ENV"] = prof.python_venv
+        if prof.node_path:
+            np = Path(prof.node_path)
+            node_dir = np if np.is_dir() else np.parent
+            if node_dir.is_dir():
+                path_parts.append(str(node_dir))
+        if os.environ.get("PATH"):
+            path_parts.append(os.environ["PATH"])
+        effective_path = os.pathsep.join(path_parts)
+        env["PATH"] = effective_path
+        return effective_path
+
+    def _prepare_workspace_command(
+        self,
+        prof: WorkspaceProfile,
+        command_name: str,
+        env: dict[str, str],
+    ) -> tuple[str, list[str]]:
+        raw_cmd = prof.commands.get(command_name)
+        if not raw_cmd:
+            raise ValueError(f"Unknown workspace command: {command_name!r}")
+        effective_path = self._build_workspace_path(prof, env)
+        argv = shlex.split(raw_cmd, posix=os.name != "nt")
+        if os.name == "nt":
+            argv = [p[1:-1] if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p for p in argv]
+        if not argv:
+            raise ValueError("Empty workspace command")
+        resolved_exe = shutil.which(argv[0], path=effective_path)
+        if not resolved_exe:
+            raise ValueError(f"Command executable {argv[0]!r} not found in workspace toolchain PATH")
+        argv[0] = resolved_exe
+        return raw_cmd, argv
+
+    def _fail_task_audit_record(self, workspace_id: str, task_id: str | None, exc: Exception) -> None:
+        if self.task_store is None or not task_id:
+            return
+        from backend.tasks.models import STATUS_FAILED
+
+        self.task_store.mark_finished(
+            task_id,
+            status=STATUS_FAILED,
+            exit_code=None,
+            error=self.redactor.redact_text(str(exc)),
+        )
+        self.store.append_linked_task(workspace_id, task_id)
+
     async def run_workspace_task(
         self,
         workspace_id: str,
@@ -709,61 +882,47 @@ class WorkspaceManager:
         client_profile: str = "full",
     ) -> dict[str, Any]:
         prof = self._authorize(
-            workspace_id, client_id=client_id, client_profile=client_profile, required=("execute",)
+            workspace_id, client_id=client_id, client_profile=client_profile, required=("read", "execute")
         )
-        raw_cmd = prof.commands.get(command_name)
-        if not raw_cmd:
-            raise ValueError(f"Unknown workspace command: {command_name!r}")
         root = canonical_workspace_root(prof.root_path)
         env = self._redact_payload_secrets(prof)
-
-        path_parts: list[str] = []
-        if prof.python_venv:
-            venv_bin = Path(prof.python_venv) / ("Scripts" if os.name == "nt" else "bin")
-            if venv_bin.is_dir():
-                path_parts.append(str(venv_bin))
-        if prof.node_path:
-            np = Path(prof.node_path)
-            node_dir = np if np.is_dir() else np.parent
-            if node_dir.is_dir():
-                path_parts.append(str(node_dir))
-        if os.environ.get("PATH"):
-            path_parts.append(os.environ["PATH"])
-        effective_path = os.pathsep.join(path_parts)
-        env["PATH"] = effective_path
-        if prof.python_venv:
-            env["VIRTUAL_ENV"] = prof.python_venv
-
-        argv = shlex.split(raw_cmd, posix=os.name != "nt")
-        if os.name == "nt":
-            argv = [p[1:-1] if len(p) >= 2 and p[0] == '"' and p[-1] == '"' else p for p in argv]
-        if not argv:
-            raise ValueError("Empty workspace command")
-
-        resolved_exe = shutil.which(argv[0], path=effective_path)
-        if not resolved_exe:
-            raise ValueError(f"Command executable {argv[0]!r} not found in workspace toolchain PATH")
-        argv[0] = resolved_exe
+        raw_cmd, argv = self._prepare_workspace_command(prof, command_name, env)
 
         def recheck() -> None:
             self._authorize(
                 workspace_id,
                 client_id=client_id,
                 client_profile=client_profile,
-                required=("execute",),
+                required=("read", "execute"),
             )
 
-        res = await self.runner.run_command(
-            argv,
-            cwd=root,
-            timeout=max(1, min(int(timeout), 600)),
-            client_id=client_id or "owner",
-            kind="workspace",
-            env=env,
-            spawn_fn=asyncio.create_subprocess_exec,
-            pre_dispatch_check=recheck,
+        bounded_timeout = max(1, min(int(timeout), 600))
+        task_id = self._record_task_start(
+            prof.workspace_id,
+            command_name,
+            raw_cmd,
+            timeout_val=bounded_timeout,
+            client_id=client_id,
+            client_profile=client_profile,
         )
-        return {
+        try:
+            res = await self.runner.run_command(
+                argv,
+                cwd=root,
+                timeout=bounded_timeout,
+                client_id=client_id or "owner",
+                kind="workspace",
+                env=env,
+                spawn_fn=asyncio.create_subprocess_exec,
+                pre_dispatch_check=recheck,
+                run_id=task_id,
+            )
+        except Exception as exc:
+            self._fail_task_audit_record(prof.workspace_id, task_id, exc)
+            raise
+
+        self._record_task_finish(prof.workspace_id, task_id, res, timeout_val=bounded_timeout)
+        payload: dict[str, Any] = {
             "workspace_id": prof.workspace_id,
             "command_name": command_name,
             "exit_code": res.exit_code,
@@ -772,6 +931,9 @@ class WorkspaceManager:
             "stderr": self.redactor.redact_text(res.stderr),
             "duration_ms": res.duration_ms,
         }
+        if task_id:
+            payload["task_id"] = task_id
+        return payload
 
     # ------------------------------ Git wrappers with per-client authorization ------------------------------
     def git_status(self, workspace_id: str, *, client_id: str | None = "owner", client_profile: str = "full") -> dict[str, Any]:

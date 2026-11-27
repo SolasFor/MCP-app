@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from app.core.atomic_io import atomic_write_json, cross_process_lock
 from app.core.secret_store import SecretStore
 from app.platform import get_platform
 from backend.servers.models import (
@@ -84,6 +85,10 @@ class ServerConfigStore:
         self._lock = threading.RLock()
         self._platform = get_platform()
 
+    def lock(self, timeout: float = 10.0):
+        """Return a thread-reentrant cross-process lock covering this server store."""
+        return cross_process_lock(self.path.with_name(".managed_servers.lock"), timeout=timeout)
+
     def _read_raw_document(self, source: Path | None = None) -> tuple[int, dict[str, Any]]:
         target = source or self.path
         if not target.exists():
@@ -134,7 +139,7 @@ class ServerConfigStore:
         return self.load_profiles(strict=True).get(name)
 
     def save_profiles(self, profiles: Mapping[str, ServerProfile]) -> None:
-        with self._lock:
+        with self._lock, self.lock():
             if len(profiles) > MAX_SERVERS:
                 raise ValueError(f"Server count exceeds maximum ({MAX_SERVERS})")
             for name, prof in profiles.items():
@@ -142,8 +147,6 @@ class ServerConfigStore:
                     raise ValueError(f"Server key {name!r} does not match profile name {prof.name!r}")
                 prof.validate()
             validate_dependencies(profiles)
-
-            from app.core.atomic_io import atomic_write_json
 
             payload = {
                 "schema_version": SCHEMA_VERSION,
@@ -156,19 +159,18 @@ class ServerConfigStore:
 
     def upsert_profile(self, profile: ServerProfile) -> None:
         profile.validate()
-        with self._lock:
-            profiles = self.load_profiles(strict=False)
+        with self._lock, self.lock():
+            profiles = self.load_profiles(strict=True)
             profiles[profile.name] = profile
             self.save_profiles(profiles)
 
     def delete_profile(self, name: str, *, delete_secrets: bool = True) -> bool:
         clean = validate_server_name(name)
-        with self._lock:
-            profiles = self.load_profiles(strict=False)
+        with self._lock, self.lock():
+            profiles = self.load_profiles(strict=True)
             removed = profiles.pop(clean, None)
             if removed is None:
                 return False
-            # Clean references cleanly only if unused, or leave validation to report error?
             # Refuse deleting a server still referenced by dependents so config stays valid.
             dependents = [
                 other.name for other in profiles.values() if clean in other.depends_on
@@ -200,11 +202,11 @@ class ServerConfigStore:
         if not source.is_file():
             return {"imported": [], "skipped": [], "total": 0, "backup_path": ""}
 
-        with self._lock:
+        with self._lock, self.lock():
             src_version, raw_map = self._read_raw_document(source)
             in_place = source.resolve() == self.path.resolve()
             existing = {} if (in_place and src_version == 1) else (
-                self.load_profiles(strict=False) if self.path.exists() else {}
+                self.load_profiles(strict=True) if self.path.exists() else {}
             )
             imported: list[str] = []
             skipped: list[str] = []

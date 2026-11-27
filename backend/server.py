@@ -81,6 +81,7 @@ if __package__:
         PathSecurityError,
         WorkspaceHistory,
         WorkspaceManager,
+        WorkspaceServerCoordinator,
         WorkspaceStore,
     )
     from .desktop import (
@@ -232,6 +233,7 @@ else:
         PathSecurityError,
         WorkspaceHistory,
         WorkspaceManager,
+        WorkspaceServerCoordinator,
         WorkspaceStore,
     )
     from desktop import (
@@ -493,11 +495,24 @@ MANAGED_SERVERS = ManagedServers(
     secret_store=_SERVER_SECRET_STORE,
 )
 SERVER_MANAGER = MANAGED_SERVERS.manager
+WORKSPACE_SERVER_COORDINATOR = WorkspaceServerCoordinator(
+    WORKSPACE_STORE,
+    MANAGED_SERVERS.store,
+)
+try:
+    WORKSPACE_SERVER_COORDINATOR.ensure_migrated()
+except Exception as _mig_exc:  # noqa: BLE001
+    logger.warning("Workspace/Server migration check failed closed: %s", type(_mig_exc).__name__)
+SERVER_MANAGER.workspace_authorizer = WORKSPACE_SERVER_COORDINATOR.authorize_server_operation
 WORKSPACE_MANAGER = WorkspaceManager(
     WORKSPACE_STORE,
     WORKSPACE_HISTORY,
     runner=PROCESS_RUNNER,
     redactor=REDACTOR,
+    task_store=TASK_STORE,
+    artifacts_dir=Path(os.environ.get("MCP_TASKS_ARTIFACTS_DIR") or (_TASKS_DEFAULT_DIR / "artifacts")),
+    coordinator=WORKSPACE_SERVER_COORDINATOR,
+    server_manager=SERVER_MANAGER,
 )
 _DESKTOP_DEFAULT_DIR = (
     Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
@@ -1462,8 +1477,15 @@ async def oauth_managed_server(
         return {"error": f"Managed server operation failed: {detail}"}
 
 
-def _authorize_managed_server(client_id: str, tool_name: str, server_name: str = "") -> str:
-    """Verify OAuth client authorization and active profile for Server Manager tools."""
+def _authorize_managed_server(
+    client_id: str,
+    tool_name: str,
+    server_name: str = "",
+    *,
+    mode: Literal["read", "control"] = "control",
+    workspace_id: str = "",
+) -> str:
+    """Verify OAuth client authorization, active profile, and workspace-server intersection."""
     verified_client = require_execution_permission(
         tool_name, oauth_provider.store if oauth_provider else None, oauth_execution
     )
@@ -1475,6 +1497,13 @@ def _authorize_managed_server(client_id: str, tool_name: str, server_name: str =
             SERVER_MANAGER._authorize_profile(
                 srv_profile, client_id=verified_client, client_profile=profile_mode
             )
+        WORKSPACE_SERVER_COORDINATOR.authorize_server_operation(
+            server_name,
+            client_id=verified_client,
+            client_profile=profile_mode,
+            mode=mode,
+            workspace_id=workspace_id,
+        )
     return profile_mode
 
 
@@ -1489,13 +1518,19 @@ def _server_auth_rechecker(client_id: str, srv_profile) -> None:
     SERVER_MANAGER._authorize_profile(
         srv_profile, client_id=client_id, client_profile=profile_mode
     )
+    WORKSPACE_SERVER_COORDINATOR.authorize_server_operation(
+        srv_profile.name,
+        client_id=client_id,
+        client_profile=profile_mode,
+        mode="control",
+    )
 
 
 SERVER_MANAGER.auth_rechecker = _server_auth_rechecker
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_list() -> dict:
+async def server_list(workspace_id: str = "") -> dict:
     """List owner-configured managed servers visible to the caller's access profile."""
     client_id = require_execution_permission(
         SERVER_LIST, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1504,11 +1539,50 @@ async def server_list() -> dict:
     profile_mode = oauth_execution.profile_for(client_id)
     try:
         items = await asyncio.to_thread(
-            SERVER_MANAGER.list_servers, client_id=client_id, client_profile=profile_mode
+            SERVER_MANAGER.list_servers,
+            client_id=client_id,
+            client_profile=profile_mode,
+            workspace_id=workspace_id,
         )
         return {"servers": items}
+    except PermissionError as exc:
+        return {"error": f"Server access denied: {exc}"}
     except (OSError, ValueError) as exc:
         return {"error": f"Server list failed: {REDACTOR.redact_text(str(exc)) or type(exc).__name__}"}
+
+
+async def _resolve_server_start_task_id(
+    client_id: str,
+    name: str,
+    linked_task_id: str,
+    run_pre_start_task: bool,
+) -> str | None:
+    if linked_task_id:
+        require_execution_permission(
+            TASK_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
+        )
+        trec = TASK_STORE.get_task(linked_task_id)
+        if trec is None or trec.owner_client_id != client_id:
+            raise PermissionError("Linked task not found for this client")
+        return trec.task_id
+    if not run_pre_start_task:
+        return None
+    require_execution_permission(
+        TASK_START, oauth_provider.store if oauth_provider else None, oauth_execution
+    )
+    srv_profile = MANAGED_SERVERS.store.get_profile(name)
+    if srv_profile is None or not srv_profile.pre_start_task_command:
+        return None
+    pre_spec = TaskSpec(kind="windows", command=srv_profile.pre_start_task_command)
+    pre_spec.validate()
+    task_prof = _authorize_task_spec(client_id, pre_spec)
+    trec, _ = await TASK_MANAGER.submit(
+        owner_client_id=client_id,
+        profile=task_prof,
+        spec=pre_spec,
+        title=f"pre-start:{name}",
+    )
+    return trec.task_id
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -1518,6 +1592,7 @@ async def server_start(
     wait_readiness: bool = True,
     linked_task_id: str = "",
     run_pre_start_task: bool = False,
+    workspace_id: str = "",
 ) -> dict:
     """Start an owner-configured managed server, resolving dependencies and readiness checks."""
     client_id = require_execution_permission(
@@ -1534,26 +1609,12 @@ async def server_start(
     )
     try:
         async with PROCESS_RUNNER.request_slot():
-            profile_mode = _authorize_managed_server(client_id, SERVER_START, name)
-            effective_task_id: str | None = None
-            if linked_task_id:
-                trec = TASK_STORE.get_task(linked_task_id)
-                if trec is None or trec.owner_client_id != client_id:
-                    raise PermissionError("Linked task not found for this client")
-                effective_task_id = trec.task_id
-            elif run_pre_start_task:
-                srv_profile = MANAGED_SERVERS.store.get_profile(name)
-                if srv_profile is not None and srv_profile.pre_start_task_command:
-                    pre_spec = TaskSpec(kind="windows", command=srv_profile.pre_start_task_command)
-                    pre_spec.validate()
-                    task_prof = _authorize_task_spec(client_id, pre_spec)
-                    trec, _ = await TASK_MANAGER.submit(
-                        owner_client_id=client_id,
-                        profile=task_prof,
-                        spec=pre_spec,
-                        title=f"pre-start:{name}",
-                    )
-                    effective_task_id = trec.task_id
+            profile_mode = _authorize_managed_server(
+                client_id, SERVER_START, name, mode="control", workspace_id=workspace_id
+            )
+            effective_task_id = await _resolve_server_start_task_id(
+                client_id, name, linked_task_id, run_pre_start_task
+            )
 
             result = await asyncio.to_thread(
                 SERVER_MANAGER.start_server,
@@ -1563,6 +1624,7 @@ async def server_start(
                 start_dependencies=start_dependencies,
                 wait_readiness=wait_readiness,
                 linked_task_id=effective_task_id,
+                workspace_id=workspace_id,
             )
             EXEC_AUDIT.record(
                 client_id=client_id, kind="windows", profile=profile_mode,
@@ -1587,7 +1649,7 @@ async def server_start(
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_stop(name: str) -> dict:
+async def server_stop(name: str, workspace_id: str = "") -> dict:
     """Stop a controlled managed server owned by this client; independent servers stay detached."""
     client_id = require_execution_permission(
         SERVER_STOP, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1603,12 +1665,15 @@ async def server_stop(name: str) -> dict:
     )
     try:
         async with PROCESS_RUNNER.request_slot():
-            profile_mode = _authorize_managed_server(client_id, SERVER_STOP, name)
+            profile_mode = _authorize_managed_server(
+                client_id, SERVER_STOP, name, mode="control", workspace_id=workspace_id
+            )
             result = await asyncio.to_thread(
                 SERVER_MANAGER.stop_server,
                 name,
                 client_id=client_id,
                 client_profile=profile_mode,
+                workspace_id=workspace_id,
             )
             EXEC_AUDIT.record(
                 client_id=client_id, kind="windows", profile=profile_mode,
@@ -1633,7 +1698,7 @@ async def server_stop(name: str) -> dict:
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_restart(name: str, wait_readiness: bool = True) -> dict:
+async def server_restart(name: str, wait_readiness: bool = True, workspace_id: str = "") -> dict:
     """Restart an owned controlled managed server and wait for readiness if configured."""
     client_id = require_execution_permission(
         SERVER_RESTART, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1649,13 +1714,16 @@ async def server_restart(name: str, wait_readiness: bool = True) -> dict:
     )
     try:
         async with PROCESS_RUNNER.request_slot():
-            profile_mode = _authorize_managed_server(client_id, SERVER_RESTART, name)
+            profile_mode = _authorize_managed_server(
+                client_id, SERVER_RESTART, name, mode="control", workspace_id=workspace_id
+            )
             result = await asyncio.to_thread(
                 SERVER_MANAGER.restart_server,
                 name,
                 client_id=client_id,
                 client_profile=profile_mode,
                 wait_readiness=wait_readiness,
+                workspace_id=workspace_id,
             )
             EXEC_AUDIT.record(
                 client_id=client_id, kind="windows", profile=profile_mode,
@@ -1680,7 +1748,7 @@ async def server_restart(name: str, wait_readiness: bool = True) -> dict:
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_status(name: str) -> dict:
+async def server_status(name: str, workspace_id: str = "") -> dict:
     """Inspect runtime status, uptime, restarts, and linked task for an authorized server."""
     client_id = require_execution_permission(
         SERVER_STATUS, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1689,7 +1757,11 @@ async def server_status(name: str) -> dict:
     profile_mode = oauth_execution.profile_for(client_id)
     try:
         return await asyncio.to_thread(
-            SERVER_MANAGER.status_server, name, client_id=client_id, client_profile=profile_mode
+            SERVER_MANAGER.status_server,
+            name,
+            client_id=client_id,
+            client_profile=profile_mode,
+            workspace_id=workspace_id,
         )
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
@@ -1703,6 +1775,7 @@ async def server_logs(
     stream: Literal["stdout", "stderr"] = "stdout",
     offset: int = 0,
     limit: int = 8000,
+    workspace_id: str = "",
 ) -> dict:
     """Read bounded, secret-redacted stdout or stderr logs for an authorized managed server."""
     client_id = require_execution_permission(
@@ -1719,6 +1792,7 @@ async def server_logs(
             stream=stream,
             offset=offset,
             limit=limit,
+            workspace_id=workspace_id,
         )
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
@@ -1727,7 +1801,7 @@ async def server_logs(
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_metrics(name: str) -> dict:
+async def server_metrics(name: str, workspace_id: str = "") -> dict:
     """Collect identity-verified CPU/RAM/thread metrics for an authorized managed server."""
     client_id = require_execution_permission(
         SERVER_METRICS, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1736,7 +1810,11 @@ async def server_metrics(name: str) -> dict:
     profile_mode = oauth_execution.profile_for(client_id)
     try:
         return await asyncio.to_thread(
-            SERVER_MANAGER.metrics_server, name, client_id=client_id, client_profile=profile_mode
+            SERVER_MANAGER.metrics_server,
+            name,
+            client_id=client_id,
+            client_profile=profile_mode,
+            workspace_id=workspace_id,
         )
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}
@@ -1745,7 +1823,7 @@ async def server_metrics(name: str) -> dict:
 
 
 @_conditional_tool(OAUTH_ENABLED)
-async def server_health(name: str, run_probe: bool = True) -> dict:
+async def server_health(name: str, run_probe: bool = True, workspace_id: str = "") -> dict:
     """Run or inspect readiness health probe results for an authorized managed server."""
     client_id = require_execution_permission(
         SERVER_HEALTH, oauth_provider.store if oauth_provider else None, oauth_execution
@@ -1759,6 +1837,7 @@ async def server_health(name: str, run_probe: bool = True) -> dict:
             client_id=client_id,
             client_profile=profile_mode,
             run_probe=run_probe,
+            workspace_id=workspace_id,
         )
     except PermissionError as exc:
         return {"error": f"Server access denied: {exc}"}

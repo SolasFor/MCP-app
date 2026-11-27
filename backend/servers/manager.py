@@ -55,6 +55,7 @@ class ServerManager:
         redactor: SecretRedactor | None = None,
         task_store: Any = None,
         auth_rechecker: Callable[[str, ServerProfile], None] | None = None,
+        workspace_authorizer: Callable[..., list[str]] | None = None,
         supervisor_poll_seconds: float = 0.2,
     ) -> None:
         self.store = store
@@ -66,6 +67,7 @@ class ServerManager:
         self.redactor = redactor or self.runner.redactor
         self.task_store = task_store
         self.auth_rechecker = auth_rechecker
+        self.workspace_authorizer = workspace_authorizer
         self._poll_seconds = max(0.05, float(supervisor_poll_seconds))
         self._platform = get_platform()
         self._lock = threading.RLock()
@@ -105,6 +107,27 @@ class ServerManager:
             raise PermissionError(
                 f"Client {client_id!r} is not authorized for server {profile.name!r}"
             )
+
+    def _authorize_workspace(
+        self,
+        server_name: str,
+        *,
+        client_id: str | None,
+        client_profile: str,
+        mode: Literal["read", "control"],
+        workspace_id: str = "",
+    ) -> list[str]:
+        if self.workspace_authorizer is None:
+            return []
+        return list(
+            self.workspace_authorizer(
+                server_name,
+                client_id=client_id,
+                client_profile=client_profile,
+                mode=mode,
+                workspace_id=workspace_id,
+            )
+        )
 
     @staticmethod
     def _make_backoff(profile: ServerProfile) -> BackoffPolicy:
@@ -307,7 +330,12 @@ class ServerManager:
             time.sleep(float(cfg.interval_seconds))
         return False, last_detail
 
-    def _state_payload(self, entry: _ManagedEntry) -> dict[str, Any]:
+    def _state_payload(
+        self,
+        entry: _ManagedEntry,
+        *,
+        linked_workspaces: list[str] | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             self._refresh_entry_state(entry)
             payload = entry.state.to_dict(self.redactor)
@@ -319,6 +347,20 @@ class ServerManager:
             payload["enabled"] = entry.profile.enabled
             payload["restart_policy"] = entry.profile.restart.policy
             payload["readiness_kind"] = entry.profile.readiness.kind
+            if linked_workspaces is not None:
+                payload["linked_workspaces"] = list(linked_workspaces)
+            elif self.workspace_authorizer is not None:
+                try:
+                    payload["linked_workspaces"] = self._authorize_workspace(
+                        entry.profile.name,
+                        client_id="owner",
+                        client_profile="full",
+                        mode="read",
+                    )
+                except PermissionError:
+                    payload["linked_workspaces"] = []
+            else:
+                payload["linked_workspaces"] = []
             if self.task_store is not None and entry.state.linked_task_id:
                 try:
                     trec = self.task_store.get_task(entry.state.linked_task_id)
@@ -337,6 +379,7 @@ class ServerManager:
         *,
         client_id: str | None = None,
         client_profile: str = "full",
+        workspace_id: str = "",
     ) -> list[dict[str, Any]]:
         profiles = self.store.load_profiles(strict=False)
         items: list[dict[str, Any]] = []
@@ -348,9 +391,64 @@ class ServerManager:
                         self._authorize_profile(prof, client_id=client_id, client_profile=client_profile)
                     except PermissionError:
                         continue
+                try:
+                    linked_wids = self._authorize_workspace(
+                        prof.name,
+                        client_id=client_id,
+                        client_profile=client_profile,
+                        mode="read",
+                        workspace_id=workspace_id,
+                    )
+                except PermissionError:
+                    continue
                 entry = self._entry_for(prof)
-                items.append(self._state_payload(entry))
+                items.append(self._state_payload(entry, linked_workspaces=linked_wids))
         return items
+
+    def _authorize_start_order(
+        self,
+        profiles: dict[str, ServerProfile],
+        order: list[str],
+        target_name: str,
+        *,
+        client_id: str | None,
+        client_profile: str,
+        workspace_id: str,
+    ) -> dict[str, list[str]]:
+        linked_wids_by_step: dict[str, list[str]] = {}
+        for step_name in order:
+            self._authorize_profile(profiles[step_name], client_id=client_id, client_profile=client_profile)
+            linked_wids_by_step[step_name] = self._authorize_workspace(
+                step_name,
+                client_id=client_id,
+                client_profile=client_profile,
+                mode="control",
+                workspace_id=workspace_id if step_name == target_name else "",
+            )
+        return linked_wids_by_step
+
+    def _running_step_result(
+        self,
+        prof: ServerProfile,
+        *,
+        is_target: bool,
+        client_id: str | None,
+        actor: str,
+        linked_wids: list[str] | None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            entry = self._entry_for(prof)
+            alive, _ = self._is_entry_alive(entry)
+            if not alive:
+                return None
+            if (
+                is_target
+                and not self._is_owner(client_id)
+                and entry.owner_client_id != actor
+                and not prof.allow_shared_control
+            ):
+                raise PermissionError("Server already managed by another client")
+            return self._state_payload(entry, linked_workspaces=linked_wids) if is_target else {}
 
     def start_server(
         self,
@@ -361,6 +459,7 @@ class ServerManager:
         start_dependencies: bool = True,
         wait_readiness: bool = True,
         linked_task_id: str | None = None,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
         clean = validate_server_name(name)
         profiles = self.store.load_profiles(strict=True)
@@ -368,32 +467,39 @@ class ServerManager:
             raise ValueError("Unknown server profile")
 
         actor = client_id or "owner"
-        if start_dependencies:
-            order = resolve_start_order(profiles, clean)
-        else:
-            order = [clean]
-
-        for step_name in order:
-            self._authorize_profile(profiles[step_name], client_id=client_id, client_profile=client_profile)
+        order = resolve_start_order(profiles, clean) if start_dependencies else [clean]
+        linked_wids_by_step = self._authorize_start_order(
+            profiles,
+            order,
+            clean,
+            client_id=client_id,
+            client_profile=client_profile,
+            workspace_id=workspace_id,
+        )
 
         result: dict[str, Any] = {}
         for step_name in order:
             prof = profiles[step_name]
-            with self._lock:
-                entry = self._entry_for(prof)
-                alive, _ = self._is_entry_alive(entry)
-                if alive:
-                    if step_name == clean and not self._is_owner(client_id) and entry.owner_client_id != actor and not prof.allow_shared_control:
-                        raise PermissionError("Server already managed by another client")
-                    if step_name == clean:
-                        result = self._state_payload(entry)
-                    continue
+            is_target = step_name == clean
+            existing_payload = self._running_step_result(
+                prof,
+                is_target=is_target,
+                client_id=client_id,
+                actor=actor,
+                linked_wids=linked_wids_by_step.get(clean),
+            )
+            if existing_payload is not None:
+                if is_target:
+                    result = existing_payload
+                continue
             result = self._launch_single(
                 prof,
                 client_id=actor,
-                wait_readiness=wait_readiness or step_name != clean,
-                linked_task_id=linked_task_id if step_name == clean else None,
+                wait_readiness=wait_readiness or not is_target,
+                linked_task_id=linked_task_id if is_target else None,
             )
+            if is_target:
+                result["linked_workspaces"] = list(linked_wids_by_step.get(clean, ()))
         return result
 
     def stop_server(
@@ -403,12 +509,20 @@ class ServerManager:
         client_id: str | None = "owner",
         client_profile: str = "full",
         grace_seconds: float = 2.0,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
         clean = validate_server_name(name)
         profiles = self.store.load_profiles(strict=False)
         prof = profiles.get(clean)
         if prof is not None:
             self._authorize_profile(prof, client_id=client_id, client_profile=client_profile)
+        linked_wids = self._authorize_workspace(
+            clean,
+            client_id=client_id,
+            client_profile=client_profile,
+            mode="control",
+            workspace_id=workspace_id,
+        )
 
         with self._lock:
             entry = self._entries.get(clean)
@@ -421,7 +535,7 @@ class ServerManager:
                 entry.stop_requested = True
                 entry.state.status = STATUS_STOPPED
                 entry.state.next_restart_at = None
-                return {**self._state_payload(entry), "stopped": True}
+                return {**self._state_payload(entry, linked_workspaces=linked_wids), "stopped": True}
 
             if (
                 not self._is_owner(client_id)
@@ -435,7 +549,7 @@ class ServerManager:
             handle = entry.handle
             if handle.lifecycle == "independent":
                 self._refresh_entry_state(entry)
-                payload = self._state_payload(entry)
+                payload = self._state_payload(entry, linked_workspaces=linked_wids)
                 payload["stopped"] = False
                 payload["note"] = (
                     "Independent process runs detached and is intentionally not terminated by MCP-app"
@@ -449,7 +563,7 @@ class ServerManager:
             entry.state.healthy = False
             entry.state.running = False
             entry.state.stopped_at = time.time()
-            payload = self._state_payload(entry)
+            payload = self._state_payload(entry, linked_workspaces=linked_wids)
             payload["stopped"] = True
             return payload
 
@@ -460,13 +574,16 @@ class ServerManager:
         client_id: str | None = "owner",
         client_profile: str = "full",
         wait_readiness: bool = True,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
         clean = validate_server_name(name)
         with self._lock:
             entry = self._entries.get(clean)
             running = bool(entry is not None and entry.handle is not None and entry.handle.process.poll() is None)
         if running:
-            stopped = self.stop_server(clean, client_id=client_id, client_profile=client_profile)
+            stopped = self.stop_server(
+                clean, client_id=client_id, client_profile=client_profile, workspace_id=workspace_id
+            )
             if stopped.get("lifecycle") == "independent" and stopped.get("running"):
                 raise RuntimeError("Cannot automatically restart an independent detached process")
         return self.start_server(
@@ -475,6 +592,7 @@ class ServerManager:
             client_profile=client_profile,
             start_dependencies=True,
             wait_readiness=wait_readiness,
+            workspace_id=workspace_id,
         )
 
     def _require_entry_for_read(
@@ -483,7 +601,8 @@ class ServerManager:
         *,
         client_id: str | None,
         client_profile: str,
-    ) -> _ManagedEntry:
+        workspace_id: str = "",
+    ) -> tuple[_ManagedEntry, list[str]]:
         clean = validate_server_name(name)
         prof = self.store.load_profiles(strict=False).get(clean)
         with self._lock:
@@ -495,13 +614,20 @@ class ServerManager:
                 raise ValueError("Unknown server profile")
             else:
                 self._authorize_profile(entry.profile, client_id=client_id, client_profile=client_profile)
+            linked_wids = self._authorize_workspace(
+                clean,
+                client_id=client_id,
+                client_profile=client_profile,
+                mode="read",
+                workspace_id=workspace_id,
+            )
             if (
                 not self._is_owner(client_id)
                 and entry.owner_client_id not in (None, client_id)
                 and not entry.profile.allow_shared_control
             ):
                 raise PermissionError("Server is managed by another client")
-            return entry
+            return entry, linked_wids
 
     def status_server(
         self,
@@ -509,9 +635,12 @@ class ServerManager:
         *,
         client_id: str | None = "owner",
         client_profile: str = "full",
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        entry = self._require_entry_for_read(name, client_id=client_id, client_profile=client_profile)
-        return self._state_payload(entry)
+        entry, linked_wids = self._require_entry_for_read(
+            name, client_id=client_id, client_profile=client_profile, workspace_id=workspace_id
+        )
+        return self._state_payload(entry, linked_workspaces=linked_wids)
 
     def logs_server(
         self,
@@ -522,8 +651,11 @@ class ServerManager:
         stream: Literal["stdout", "stderr"] = "stdout",
         offset: int = 0,
         limit: int = 8000,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        entry = self._require_entry_for_read(name, client_id=client_id, client_profile=client_profile)
+        entry, _ = self._require_entry_for_read(
+            name, client_id=client_id, client_profile=client_profile, workspace_id=workspace_id
+        )
         with self._lock:
             handle = entry.handle
             run_id = entry.state.run_id
@@ -573,8 +705,11 @@ class ServerManager:
         *,
         client_id: str | None = "owner",
         client_profile: str = "full",
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        entry = self._require_entry_for_read(name, client_id=client_id, client_profile=client_profile)
+        entry, _ = self._require_entry_for_read(
+            name, client_id=client_id, client_profile=client_profile, workspace_id=workspace_id
+        )
         with self._lock:
             self._refresh_entry_state(entry)
             identity: ProcessIdentity | None = entry.handle.identity if entry.handle is not None else None
@@ -593,8 +728,11 @@ class ServerManager:
         client_id: str | None = "owner",
         client_profile: str = "full",
         run_probe: bool = True,
+        workspace_id: str = "",
     ) -> dict[str, Any]:
-        entry = self._require_entry_for_read(name, client_id=client_id, client_profile=client_profile)
+        entry, _ = self._require_entry_for_read(
+            name, client_id=client_id, client_profile=client_profile, workspace_id=workspace_id
+        )
         with self._lock:
             self._refresh_entry_state(entry)
             running = entry.state.running

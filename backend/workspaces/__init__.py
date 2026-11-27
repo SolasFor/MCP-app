@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.manager import WorkspaceManager
+from backend.workspaces.server_links import WorkspaceServerCoordinator, WorkspaceServersSnapshot
 from backend.workspaces.models import (
     MAX_HISTORY_SNAPSHOTS,
     MAX_READ_BYTES,
@@ -45,6 +46,8 @@ __all__ = [
     "WorkspaceManager",
     "WorkspacePermissions",
     "WorkspaceProfile",
+    "WorkspaceServerCoordinator",
+    "WorkspaceServersSnapshot",
     "WorkspaceStore",
     "atomic_write_verified",
     "canonical_workspace_root",

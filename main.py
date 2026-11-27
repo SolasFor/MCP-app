@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import multiprocessing
 import sys
-from pathlib import Path
 
 
 def main() -> int:
@@ -25,12 +24,8 @@ def main() -> int:
         from app import APP_NAME, __version__
         from app.backend_entry import _ensure_std_streams
 
-        text = f"{APP_NAME} {__version__}"
-        idx = args.index("--version")
-        if idx + 1 < len(args) and not args[idx + 1].startswith("-"):
-            Path(args[idx + 1]).write_text(text + "\n", encoding="utf-8")
         _ensure_std_streams()
-        print(text)
+        print(f"{APP_NAME} {__version__}")
         return 0
 
     if "--apply-update" in args:

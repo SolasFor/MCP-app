@@ -164,7 +164,7 @@ def verify_windows_authenticode(
     if not trust_status:
         return AuthenticodeResult(verified=False, reason=f"WinVerifyTrust failed (0x{err_code & 0xFFFFFFFF:08X})")
 
-    thumbprint, subject = _extract_pe_signer_thumbprint(file_path)
+    thumbprint = _extract_pe_signer_thumbprint(file_path)
     if not thumbprint:
         return AuthenticodeResult(verified=False, reason="No embedded signer certificate found")
 
@@ -172,11 +172,10 @@ def verify_windows_authenticode(
     if norm_allowed and thumbprint.upper() not in norm_allowed:
         return AuthenticodeResult(
             verified=False,
-            signer_subject=subject,
             thumbprint=thumbprint,
             reason=f"Publisher certificate thumbprint {thumbprint} not in trusted allowlist",
         )
-    return AuthenticodeResult(verified=True, signer_subject=subject, thumbprint=thumbprint, reason="ok")
+    return AuthenticodeResult(verified=True, thumbprint=thumbprint, reason="ok")
 
 
 def _win_verify_trust(file_path: Path) -> tuple[bool, int]:
@@ -258,10 +257,10 @@ def _win_verify_trust(file_path: Path) -> tuple[bool, int]:
     return res == 0, res
 
 
-def _extract_pe_signer_thumbprint(file_path: Path) -> tuple[str, str]:
+def _extract_pe_signer_thumbprint(file_path: Path) -> str:
     """Query PKCS#7 embedded signer thumbprint (SHA-1 hex) via crypt32!CryptQueryObject."""
     if sys.platform != "win32":
-        return "", ""
+        return ""
     from ctypes import wintypes
 
     class _CERT_CONTEXT(ctypes.Structure):
@@ -275,7 +274,7 @@ def _extract_pe_signer_thumbprint(file_path: Path) -> tuple[str, str]:
 
     windll_obj = getattr(ctypes, "windll", None)
     if windll_obj is None:
-        return "", ""
+        return ""
     crypt32 = windll_obj.crypt32
     h_store = wintypes.HANDLE()
     h_msg = wintypes.HANDLE()
@@ -293,17 +292,17 @@ def _extract_pe_signer_thumbprint(file_path: Path) -> tuple[str, str]:
         None,
     )
     if not ok or not h_store:
-        return "", ""
+        return ""
 
     try:
         crypt32.CertEnumCertificatesInStore.restype = ctypes.POINTER(_CERT_CONTEXT)
         ctx = crypt32.CertEnumCertificatesInStore(h_store, None)
-        while ctx:
+        if ctx:
             encoded = bytes(ctx.contents.pbCertEncoded[: ctx.contents.cbCertEncoded])
             thumb = hashlib.sha1(encoded, usedforsecurity=False).hexdigest().upper()
             crypt32.CertFreeCertificateContext(ctx)
-            return thumb, ""
-        return "", ""
+            return thumb
+        return ""
     finally:
         if h_msg:
             crypt32.CryptMsgClose(h_msg)

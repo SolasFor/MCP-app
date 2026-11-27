@@ -54,7 +54,7 @@ jobs:
           foreach ($item in $required) {
             if (-not (Test-Path $item)) { throw "Missing $item" }
           }
-          python -c "from pathlib import Path; from app.updater.models import UpdateManifest; m = UpdateManifest.from_json_bytes(Path('dist/update-manifest.json').read_bytes()); assert m.version == '$version'"
+          ./.venv-build/Scripts/python.exe -c "from pathlib import Path; from app.updater.models import UpdateManifest; m = UpdateManifest.from_json_bytes(Path('dist/update-manifest.json').read_bytes()); assert m.version == '$version'"
           if ($LASTEXITCODE -ne 0) { throw "Invalid update-manifest.json schema" }
           $selftest = Get-Content "build/selftest.txt" -Raw -Encoding UTF8
           if ($selftest -notmatch 'RESULT OK') { throw "Built EXE self-test failed" }

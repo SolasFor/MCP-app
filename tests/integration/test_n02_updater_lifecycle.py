@@ -28,6 +28,7 @@ from app.updater.helper import (
     apply_portable_transaction,
     has_active_tasks,
     recover_interrupted_update_on_boot,
+    run_apply_update_cli,
     verify_handoff_token,
 )
 from app.updater.manager import UpdateManager
@@ -105,6 +106,12 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
         self.assertTrue(verify_handoff_token("sec-abc", "sec-abc", issued_at=100.0, now=110.0, ttl_seconds=120.0))
         self.assertFalse(verify_handoff_token("sec-abc", "wrong", issued_at=100.0, now=110.0, ttl_seconds=120.0))
         self.assertFalse(verify_handoff_token("sec-abc", "sec-abc", issued_at=100.0, now=300.0, ttl_seconds=120.0))
+
+        # CLI must reject plans outside APPDATA/MCPApp/updates/helper_run
+        with tempfile.TemporaryDirectory() as tmp2:
+            bad_plan = Path(tmp2) / "evil_plan.json"
+            bad_plan.write_text('{"tx_id":"../escape"}', encoding="utf-8")
+            self.assertEqual(run_apply_update_cli(["--plan", str(bad_plan)]), 2)
 
     def test_portable_swap_verify_success_and_rollback_preserves_user_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

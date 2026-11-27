@@ -5,6 +5,7 @@ import hmac
 import http.client
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -17,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator
 
-from app.paths import APP_ID
+from app.paths import APP_ID, user_data_dir
 from app.platform import get_platform
 from app.platform.base import ProcessIdentity
 from app.updater.models import (
@@ -26,11 +27,33 @@ from app.updater.models import (
     UpdaterPersistentState,
     UpdateState,
     UpdateTransaction,
+    parse_semver,
 )
 from app.updater.staging import reverify_staged_bundle
 
 UPDATER_MUTEX_NAME = "Local\\MCPApp-Updater"
 _ACTIVE_TASK_STATUSES = ("queued", "pending", "running", "cancelling")
+
+
+def _sanitize_confined_path(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
+    text = str(raw or "").strip()
+    if not text or "\x00" in text:
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, "Invalid path value")
+    resolved = os.path.realpath(os.path.abspath(text))
+    for root in allowed_roots:
+        base = os.path.realpath(os.path.abspath(str(root)))
+        if resolved == base or resolved.startswith(base + os.sep):
+            return Path(resolved)
+    raise UpdateError(UpdateBlockReason.ZIP_SECURITY, f"Path escaped allowed boundary: {resolved}")
+
+
+def _allowed_install_roots() -> tuple[Path, ...]:
+    roots: list[Path] = [Path(sys.executable).resolve().parent.parent, Path(tempfile.gettempdir())]
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app:
+        roots.append(Path(local_app) / "Programs")
+    roots.append(user_data_dir())
+    return tuple(roots)
 
 
 def _utc_now_iso() -> str:
@@ -204,21 +227,19 @@ def verify_updated_binary(
         env["APPDATA"] = str(data_dir.parent)
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            ver_file = Path(tmp) / "version.txt"
-            ver_proc = subprocess.run(
-                [str(exe), "--version", str(ver_file)],
-                env=env,
-                creationflags=flags,
-                timeout=10.0,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            ver_text = ver_file.read_text(encoding="utf-8") if ver_file.is_file() else ver_proc.stdout
-            if ver_proc.returncode != 0 or target_version not in (ver_text or ""):
-                return False
+        ver_proc = subprocess.run(
+            [str(exe), "--version"],
+            env=env,
+            creationflags=flags,
+            timeout=10.0,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ver_proc.returncode != 0 or target_version not in (ver_proc.stdout or ""):
+            return False
 
+        with tempfile.TemporaryDirectory() as tmp:
             report = Path(tmp) / "selftest.txt"
             selftest_res = subprocess.run(
                 [str(exe), "--selftest", str(report)],
@@ -416,6 +437,32 @@ def apply_installed_transaction(
         return tx
 
 
+def _try_sanitize(raw: str, roots: tuple[Path, ...]) -> Path | None:
+    if not raw:
+        return None
+    try:
+        return _sanitize_confined_path(raw, roots)
+    except UpdateError:
+        return None
+
+
+def _recover_installed_tx(
+    tx: UpdateTransaction, target_dir: Path, updates_root: Path, state_path: Path
+) -> UpdateTransaction | None:
+    rb = _try_sanitize(tx.rollback_installer, (updates_root / "rollback",))
+    if rb is None or not rb.is_file():
+        return None
+    env = dict(os.environ)
+    env["__COMPAT_LAYER"] = "RunAsInvoker"
+    rc = _default_run_installer(
+        [str(rb), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={target_dir}"],
+        env,
+    )
+    tx.state = UpdateState.ROLLED_BACK if rc == 0 else UpdateState.FAILED
+    _finalize_tx(state_path, tx)
+    return tx
+
+
 def recover_interrupted_update_on_boot(
     state_path: Path,
     updates_root: Path,
@@ -424,19 +471,19 @@ def recover_interrupted_update_on_boot(
     """Recover cleanly from an interrupted crash/power-loss update transaction at startup."""
     st = UpdaterPersistentState.load(state_path)
     tx = st.active_transaction
-    if tx is None:
-        return None
-    if tx.state not in {
+    active_states = {
         UpdateState.BACKING_UP,
         UpdateState.SWAPPING,
         UpdateState.VERIFYING_NEW,
         UpdateState.ROLLING_BACK,
         UpdateState.INSTALLING,
-    }:
+    }
+    if tx is None or tx.state not in active_states:
         return None
 
-    target_dir = install_dir or (Path(tx.install_dir) if tx.install_dir else None)
-    backup_dir = Path(tx.backup_dir) if tx.backup_dir else None
+    target_dir = install_dir or _try_sanitize(tx.install_dir, _allowed_install_roots())
+    backup_dir = _try_sanitize(tx.backup_dir, (target_dir.parent,)) if target_dir is not None else None
+
     if tx.install_type == "portable" and target_dir is not None and backup_dir is not None and backup_dir.is_dir():
         _restore_portable_backup(target_dir, backup_dir)
         tx.state = UpdateState.ROLLED_BACK
@@ -444,18 +491,10 @@ def recover_interrupted_update_on_boot(
         _finalize_tx(state_path, tx)
         return tx
 
-    if tx.install_type == "installed" and target_dir is not None and tx.rollback_installer:
-        rb = Path(tx.rollback_installer)
-        if rb.is_file():
-            env = dict(os.environ)
-            env["__COMPAT_LAYER"] = "RunAsInvoker"
-            rc = _default_run_installer(
-                [str(rb), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={target_dir}"],
-                env,
-            )
-            tx.state = UpdateState.ROLLED_BACK if rc == 0 else UpdateState.FAILED
-            _finalize_tx(state_path, tx)
-            return tx
+    if tx.install_type == "installed" and target_dir is not None:
+        recovered = _recover_installed_tx(tx, target_dir, updates_root, state_path)
+        if recovered is not None:
+            return recovered
 
     tx.state = UpdateState.FAILED
     tx.error = "Interrupted update state could not be automatically recovered"
@@ -482,7 +521,7 @@ def _parse_parent_identity(raw: object) -> ProcessIdentity | None:
 
 
 def _maybe_restart_gui(plan: dict, install_dir: Path) -> None:
-    exe = install_dir / f"{APP_ID}.exe"
+    exe = _sanitize_confined_path(str(install_dir / f"{APP_ID}.exe"), (install_dir,))
     if not plan.get("restart_gui") or not exe.is_file():
         return
     adapter = get_platform()
@@ -495,61 +534,81 @@ def _maybe_restart_gui(plan: dict, install_dir: Path) -> None:
     )
 
 
-def run_apply_update_cli(argv: list[str]) -> int:
-    """CLI handler for `MCPApp.exe --apply-update --plan <json> --handoff <token>`."""
-    plan_file = _parse_plan_arg(argv)
-    if not plan_file or not Path(plan_file).is_file():
-        return 2
-
-    plan = json.loads(Path(plan_file).read_text(encoding="utf-8"))
-    provided_token = os.environ.get("MCP_UPDATER_HANDOFF_TOKEN", "")
-    if not verify_handoff_token(
-        str(plan.get("expected_token") or ""),
-        provided_token,
-        issued_at=float(plan.get("issued_at") or 0.0),
-    ):
-        return 3
-
-    if not wait_for_parent_exit(_parse_parent_identity(plan.get("parent_identity")), timeout_s=20.0):
-        return 4
-
-    data_dir = Path(plan["data_dir"])
-    if has_active_tasks(data_dir / "tasks.sqlite3"):
-        return 5
-
-    state_path = data_dir / "updates" / "state.json"
-    install_dir = Path(plan["install_dir"])
-    install_type = str(plan["install_type"])
-    tx_id = str(plan["tx_id"])
-
+def _execute_cli_transaction(
+    plan: dict,
+    data_dir: Path,
+    updates_root: Path,
+    install_dir: Path,
+    tx_id: str,
+    source_ver: str,
+    target_ver: str,
+) -> UpdateTransaction | None:
+    state_path = updates_root / "state.json"
+    install_type = str(plan.get("install_type") or "")
     if install_type == "portable":
-        tx = apply_portable_transaction(
+        return apply_portable_transaction(
             tx_id=tx_id,
             install_dir=install_dir,
-            staged_dir=Path(plan["staged_dir"]),
+            staged_dir=updates_root / "staged" / target_ver,
             expected_hashes=plan.get("expected_hashes"),
-            source_version=str(plan["source_version"]),
-            target_version=str(plan["target_version"]),
+            source_version=source_ver,
+            target_version=target_ver,
             state_path=state_path,
             data_dir=data_dir,
         )
-    elif install_type == "installed":
-        rb_raw = str(plan.get("rollback_installer") or "")
-        tx = apply_installed_transaction(
+    if install_type == "installed":
+        installer_path = updates_root / "downloads" / f"{APP_ID}-Setup-{target_ver}.exe"
+        rb_candidate = updates_root / "rollback" / f"{APP_ID}-Setup-{source_ver}.exe"
+        return apply_installed_transaction(
             tx_id=tx_id,
             install_dir=install_dir,
-            installer_path=Path(plan["installer_path"]),
-            rollback_installer_path=Path(rb_raw) if rb_raw else None,
-            source_version=str(plan["source_version"]),
-            target_version=str(plan["target_version"]),
+            installer_path=installer_path,
+            rollback_installer_path=rb_candidate if rb_candidate.is_file() else None,
+            source_version=source_ver,
+            target_version=target_ver,
             state_path=state_path,
             data_dir=data_dir,
             expected_sha256=plan.get("expected_sha256"),
             require_authenticode=bool(plan.get("require_authenticode", True)),
             allowed_thumbprints=tuple(plan.get("allowed_thumbprints") or ()),
         )
-    else:
+    return None
+
+
+def run_apply_update_cli(argv: list[str]) -> int:
+    """CLI handler for `MCPApp.exe --apply-update --plan <json> --handoff <token>`."""
+    data_dir = Path(os.path.realpath(str(user_data_dir())))
+    updates_root = data_dir / "updates"
+    plan_path = _try_sanitize(_parse_plan_arg(argv), (updates_root / "helper_run",))
+    if plan_path is None or not plan_path.is_file():
+        return 2
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    if not isinstance(plan, dict):
+        return 2
+    if not verify_handoff_token(
+        str(plan.get("expected_token") or ""),
+        os.environ.get("MCP_UPDATER_HANDOFF_TOKEN", ""),
+        issued_at=float(plan.get("issued_at") or 0.0),
+    ):
+        return 3
+    if not wait_for_parent_exit(_parse_parent_identity(plan.get("parent_identity")), timeout_s=20.0):
+        return 4
+    if has_active_tasks(data_dir / "tasks.sqlite3"):
+        return 5
+
+    tx_id = str(plan.get("tx_id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,48}", tx_id):
+        return 6
+    try:
+        source_ver = parse_semver(str(plan.get("source_version") or "")).raw
+        target_ver = parse_semver(str(plan.get("target_version") or "")).raw
+        install_dir = _sanitize_confined_path(str(plan.get("install_dir") or ""), _allowed_install_roots())
+    except UpdateError:
         return 6
 
+    tx = _execute_cli_transaction(plan, data_dir, updates_root, install_dir, tx_id, source_ver, target_ver)
+    if tx is None:
+        return 6
     _maybe_restart_gui(plan, install_dir)
     return 0 if tx.state == UpdateState.COMMITTED else 1

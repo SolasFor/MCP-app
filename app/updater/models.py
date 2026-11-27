@@ -263,21 +263,34 @@ class UpdateTransaction:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "UpdateTransaction":
+        tx_id_raw = str(raw.get("tx_id") or "")
+        tx_id = tx_id_raw if re.fullmatch(r"[A-Za-z0-9_-]{3,48}", tx_id_raw) else ""
+        itype_raw = str(raw.get("install_type") or "portable")
+        itype: InstallType = itype_raw if itype_raw in ("dev", "installed", "portable") else "portable"  # type: ignore[assignment]
         return cls(
-            tx_id=str(raw.get("tx_id") or ""),
+            tx_id=tx_id,
             state=str(raw.get("state") or UpdateState.FAILED),
-            install_type=raw.get("install_type", "portable"),
+            install_type=itype,
             source_version=str(raw.get("source_version") or ""),
             target_version=str(raw.get("target_version") or ""),
-            install_dir=str(raw.get("install_dir") or ""),
-            backup_dir=str(raw.get("backup_dir") or ""),
-            staged_dir=str(raw.get("staged_dir") or ""),
-            rollback_installer=str(raw.get("rollback_installer") or ""),
-            data_dir=str(raw.get("data_dir") or ""),
+            install_dir=_clean_state_path(raw.get("install_dir")),
+            backup_dir=_clean_state_path(raw.get("backup_dir")),
+            staged_dir=_clean_state_path(raw.get("staged_dir")),
+            rollback_installer=_clean_state_path(raw.get("rollback_installer")),
+            data_dir=_clean_state_path(raw.get("data_dir")),
             created_at=str(raw.get("created_at") or ""),
             updated_at=str(raw.get("updated_at") or ""),
             error=str(raw.get("error") or ""),
         )
+
+
+def _clean_state_path(val: Any) -> str:
+    text = str(val or "").strip()
+    if not text or "\x00" in text:
+        return ""
+    if ".." in Path(text).parts:
+        return ""
+    return text
 
 
 @dataclass

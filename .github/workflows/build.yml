@@ -91,7 +91,7 @@ jobs:
           foreach ($file in $files) {
             if (-not (Test-Path $file)) { throw "Missing $file" }
           }
-          python -c "from pathlib import Path; from app.updater.models import UpdateManifest; m = UpdateManifest.from_json_bytes(Path('dist/update-manifest.json').read_bytes()); assert m.version == '$v'"
+          ./.venv-build/Scripts/python.exe -c "from pathlib import Path; from app.updater.models import UpdateManifest; m = UpdateManifest.from_json_bytes(Path('dist/update-manifest.json').read_bytes()); assert m.version == '$v'"
           if ($LASTEXITCODE -ne 0) { throw "Invalid update-manifest.json schema" }
       - name: Test MCPApp-Setup installer, upgrade, and uninstall in clean environment
         shell: pwsh

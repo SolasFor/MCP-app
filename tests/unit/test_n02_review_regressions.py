@@ -541,8 +541,8 @@ class N02ReviewRegressionsTests(unittest.TestCase):
                 check_active_operations(data_dir, install_dir, check_gui_mutex=False),
                 UpdateBlockReason.SCHEDULER_ACTIVE,
             )
-            # Clean history + mocked GUI mutex held must block installed mode
-            (auto_dir / "history.json").write_text("[]", encoding="utf-8")
+            # Clean real-schema history + mocked GUI mutex held must block installed mode
+            (auto_dir / "history.json").write_text('{"version": 1, "runs": []}', encoding="utf-8")
             with patch("app.updater.helper._is_gui_mutex_held", return_value=True):
                 self.assertEqual(
                     check_active_operations(data_dir, install_dir, check_gui_mutex=True),

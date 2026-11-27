@@ -732,3 +732,28 @@
   - `windows-package` (`RC Windows installer`): **PASS** (`3m02s`: https://github.com/SolasFor/MCP-app/actions/runs/46056248021/job/140699328823).
   - `SonarCloud Code Analysis`: **PASS** (`41s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=38.
 - **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`), `PRODUCTION_TRUST_ROOTS` и Windows Authenticode `.pfx` (автоустановка в релизе **BLOCKED** с кодом `MISSING_TRUST_ROOTS`), режим `installed` без подписанного кэша отката **BLOCKED** (`NO_ROLLBACK_CONTRACT`), ручной OAuth `sonarqube-cloud` MCP (**NOT_RUN**, используется SonarCloud CI/API).
+
+### Заключительное точечное исправление N02 (`N02-FINAL-01`, `N02-FINAL-02`) (2026-11-27)
+- **Базовый проверенный коммит**: `fb1ec7e2141b8110a11e5318ed10e6ce3c74a092` (`feat/n02-secure-updater`, PR #38, версия `1.0.2`).
+- **TDD воспроизведение (RED → GREEN)**:
+  - До правок в [`tests/unit/test_n02_final_regressions.py`](tests/unit/test_n02_final_regressions.py) зафиксированы воспроизводимые сбои: `HISTORY_REAL_SCHEMA_RESULT=ok`, `HISTORY_INVALID_SCHEMA_RESULT=ok`, а также отсутствие проверки доверия, привязки `install_dir`/имени backup, `active_runs` и постпроверки boot-recovery (`FAILED (failures=1, errors=3)` из `4`).
+  - После исправлений: `HISTORY_REAL_SCHEMA_RESULT=scheduler_active`, `HISTORY_INVALID_SCHEMA_RESULT=scheduler_active`, `4/4` регрессионных тестов `test_n02_final_regressions.py` перешли в `GREEN`.
+- **Исправления**:
+  - **`N02-FINAL-01` (История и живые запуски планировщика)**:
+    - В `backend/automation/scheduler.py` добавлен учёт активных выполнений `automation/active_runs.json` (`ACTIVE_RUNS_SCHEMA_VERSION = 1`, `pid` + `create_time` в `_claim_execution_slot`/`_release_slot`, прунинг мёртвых PID и `has_active_runs()`).
+    - В `app/updater/helper.py` (`check_active_operations`) добавлена строгая валидация схемы `{"version": 1, "runs": [...]}` и допустимых финальных статусов (`_has_unsafe_or_running_history`) + проверка живых выполнений (`_has_active_scheduler_runs`), symlink/reparse на `automation/`, `.automation.lock`, `active_runs.json` и `history.json` (fail-closed `SCHEDULER_ACTIVE`).
+  - **`N02-FINAL-02` (Безопасный boot-recovery)**:
+    - В `app/updater/helper.py` (`recover_interrupted_update_on_boot`, `_recover_under_lock`, `_restore_portable_backup`) введены: раздельная обработка блокировки `.updater.lock` (`ACTIVE_EXTERNAL`) без маскировки ошибок recovery; строгая загрузка `state.json` без перезаписи повреждённого файла (`BLOCKED`); проверка `TrustPolicy` (отказ при пустых `PRODUCTION_TRUST_ROOTS`) и подписанного `update-manifest.json` + `.sig`; строгая привязка к реальной `install_dir` и точному имени `.MCPApp-old-<tx_id>` без произвольных sibling-каталогов; запрет symlink/reparse внутри `install_dir`/`backup_dir`; безопасная перестановка через `.MCPApp-displaced-<tx_id>` с реальной проверкой восстановленной версии/selftest/health до присвоения `ROLLED_BACK` и откатом к исходной рабочей копии при провале без удаления backup.
+    - В `app/gui.py` (`_run_boot_update_recovery`): в dev-режиме (`not frozen`) пропуск, в frozen-режиме явная передача `Path(os.path.realpath(sys.executable)).parent` и корректная обработка `BLOCKED` без удаления данных.
+- **Проверки после финальных правок (Python `3.13.15`, `QT_QPA_PLATFORM=offscreen`)**:
+  - `compileall -q app backend tests tools`: **PASS**.
+  - `ruff check app backend tests tools`: **PASS**.
+  - `mypy` (`win32`) и `mypy --platform linux` (`83` файла): **PASS**.
+  - AST-проверка когнитивной сложности (`< 15` для `app/updater/*.py`, `app/paths.py`, `app/gui.py` и новых методов `scheduler.py`): **PASS** (`HIGH_COG: []`).
+  - `tools/check_licenses.py`: **PASS** (`38/38`); `pip_audit -r requirements.lock --no-deps --disable-pip`: **PASS** (`No known vulnerabilities found`).
+  - Полный прогон тестов: `tests/unit` **252/252 PASS** (`20.561s`), `tests/integration` **97/97 PASS** (`52.135s`), `tests/e2e` **2/2 PASS** (`8.316s`) — итого **351/351 PASS**.
+  - `graphify update .`: **PASS** (`5764 nodes, 18782 edges, 210 communities`).
+  - Изолированная frozen smoke-проверка `boot-recovery` (`D:\Coding\.mcpapp-n02-tmp`, живой `MCPApp.exe` PID `3044`/`8428` и `%APPDATA%\MCPApp` не затронуты, удалено `CLEANUP_OK`):
+    - `BOOT_SMOKE_PROD_BLOCK`: при пустом `PRODUCTION_TRUST_ROOTS` `recover_interrupted_update_on_boot` вернул `BLOCKED`, `MCPApp.exe --version` остался `'MCP app 1.0.2'`.
+    - `BOOT_SMOKE_FAIL_PRESERVED`: при повреждённой резервной копии постпроверка отклонена (`BLOCKED`), рабочая копия `'MCP app 1.0.2'` и backup сохранены.
+    - `BOOT_SMOKE_RECOVERED_OK`: реальная прерванная portable-замена (`'MCP app 1.0.3'` → frozen `'MCP app 1.0.2'`) с реальными `--version`, `--selftest` `RESULT OK`, `--headless /health == 200` завершилась `ROLLED_BACK`, `.MCPApp-displaced-*` удалён, DPAPI v2 `token.json`/`secrets.vault.enc` и N01 `schedules.json` сохранены побайтно.

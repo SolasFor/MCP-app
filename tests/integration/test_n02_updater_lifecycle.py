@@ -215,14 +215,65 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
                 self.assertEqual(compat, "RunAsInvoker")
 
     def test_boot_recovery_restores_interrupted_swap_state(self) -> None:
+        import base64
+        from app.updater.trust import canonical_manifest_bytes, sign_manifest_bytes
+
+        priv = Ed25519PrivateKey.generate()
+        priv_raw = priv.private_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PrivateFormat.Raw,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        pub_b64 = base64.b64encode(
+            priv.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii")
+        policy = TrustPolicy(
+            trust_roots=(TrustRootKey("boot-test-key", pub_b64),),
+            require_authenticode_for_installer=False,
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             app_dir = root / "MCPApp"
             backup_dir = root / ".MCPApp-old-tx-crash"
             backup_dir.mkdir()
             (backup_dir / "MCPApp.exe").write_bytes(b"RECOVERED_OLD")
-            state_path = root / "updates" / "state.json"
-            state_path.parent.mkdir(parents=True)
+            (backup_dir / "_internal").mkdir()
+            updates_dir = root / "updates"
+            m_dir = updates_dir / "manifests" / "1.0.3"
+            m_dir.mkdir(parents=True)
+            manifest_bytes = canonical_manifest_bytes(
+                {
+                    "schema_version": 1,
+                    "version": "1.0.3",
+                    "channel": "stable",
+                    "published_at": "2026-11-27T12:00:00Z",
+                    "min_supported_version": "1.0.0",
+                    "changelog": "Boot recovery test",
+                    "installer": {
+                        "name": "MCPApp-Setup-1.0.3.exe",
+                        "sha256": "a" * 64,
+                        "size": 100,
+                        "authenticode_required": False,
+                    },
+                    "portable": {
+                        "name": "MCPApp-1.0.3-portable.zip",
+                        "sha256": "b" * 64,
+                        "size": 100,
+                        "authenticode_required": False,
+                    },
+                    "publisher_thumbprints": [],
+                }
+            )
+            (m_dir / "update-manifest.json").write_bytes(manifest_bytes)
+            (m_dir / "update-manifest.json.sig").write_text(
+                json.dumps({"key_id": "boot-test-key", "signature_b64": sign_manifest_bytes(manifest_bytes, priv_raw)}),
+                encoding="utf-8",
+            )
+            state_path = updates_dir / "state.json"
             tx = UpdateTransaction(
                 tx_id="tx-crash",
                 state=UpdateState.VERIFYING_NEW,
@@ -234,7 +285,13 @@ class UpdaterLifecycleIntegrationTests(unittest.TestCase):
             )
             state_path.write_text(json.dumps({"active_transaction": tx.to_dict()}), encoding="utf-8")
 
-            recovered = recover_interrupted_update_on_boot(state_path, root / "updates")
+            recovered = recover_interrupted_update_on_boot(
+                state_path,
+                updates_dir,
+                install_dir=app_dir,
+                policy=policy,
+                verify_callback=lambda d, _dd: (d / "MCPApp.exe").read_bytes() == b"RECOVERED_OLD",
+            )
             self.assertIsNotNone(recovered)
             assert recovered is not None
             self.assertEqual(recovered.state, UpdateState.ROLLED_BACK)

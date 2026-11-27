@@ -163,22 +163,36 @@ def _run_startup_acl_recovery(data_root, lm) -> None:  # noqa: ANN001
 
 
 def _run_boot_update_recovery(data_root, lm) -> bool:  # noqa: ANN001
+    if not getattr(sys, "frozen", False):
+        return True
+    from pathlib import Path
     from app.updater.helper import recover_interrupted_update_on_boot
+    from app.updater.models import UpdateState
 
+    install_dir = Path(os.path.realpath(sys.executable)).parent
     try:
         recovered_tx = recover_interrupted_update_on_boot(
             data_root / "updates" / "state.json",
             data_root / "updates",
+            install_dir=install_dir,
         )
-        if recovered_tx is not None and recovered_tx.state == "ACTIVE_EXTERNAL":
+        if recovered_tx is None:
+            return True
+        if recovered_tx.state == "ACTIVE_EXTERNAL":
             lm.warning("app", "Active updater transaction in progress; deferring GUI startup", event_code="updater_active_defer")
             return False
-        if recovered_tx is not None:
+        if recovered_tx.state == UpdateState.BLOCKED:
             lm.warning(
                 "app",
-                f"Recovered interrupted update tx={recovered_tx.tx_id} state={recovered_tx.state}",
-                event_code="updater_boot_recovery",
+                f"Boot update recovery blocked (manual inspection required): {recovered_tx.error}",
+                event_code="updater_boot_recovery_blocked",
             )
+            return True
+        lm.warning(
+            "app",
+            f"Recovered interrupted update tx={recovered_tx.tx_id} state={recovered_tx.state}",
+            event_code="updater_boot_recovery",
+        )
     except Exception as exc:  # noqa: BLE001
         lm.warning("app", f"Boot update recovery check skipped: {exc}", event_code="updater_boot_recovery_err")
     return True

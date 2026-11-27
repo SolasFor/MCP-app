@@ -44,6 +44,18 @@ from app.updater.trust import TrustPolicy, verify_manifest_and_signature, verify
 UPDATER_MUTEX_NAME = "Local\\MCPApp-Updater"
 _GUI_MUTEX_NAME = "MCPApp-Running"
 _VERSION_RE = re.compile(r"\b(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\b")
+_TX_ID_RE = re.compile(r"[A-Za-z0-9_-]{3,48}")
+_TERMINAL_SCHEDULE_STATUSES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "cancelled",
+        "paused_revoked",
+        "skipped_idempotent",
+        "skipped_concurrency",
+        "skipped_misfire",
+    }
+)
 
 
 def _sanitize_confined_path(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
@@ -191,26 +203,96 @@ def _has_processes_inside_dir(install_dir: Path) -> bool:
     return False
 
 
+def _is_terminal_history_entry(entry: object) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    status = entry.get("status")
+    return isinstance(status, str) and status.strip() in _TERMINAL_SCHEDULE_STATUSES
+
+
+def _has_unsafe_or_running_history(hist_path: Path) -> bool:
+    if is_reparse_or_symlink(hist_path):
+        return True
+    if not hist_path.exists():
+        return False
+    if not hist_path.is_file():
+        return True
+    try:
+        raw = json.loads(hist_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(raw, dict) or set(raw.keys()) != {"version", "runs"}:
+        return True
+    if type(raw.get("version")) is not int or raw.get("version") != 1:
+        return True
+    runs = raw.get("runs")
+    return not isinstance(runs, list) or any(not _is_terminal_history_entry(entry) for entry in runs)
+
+
+def _is_active_run_process_alive(item: object) -> bool:
+    if not isinstance(item, dict):
+        return True
+    pid = item.get("pid")
+    ctime = item.get("create_time")
+    sched_id = item.get("schedule_id")
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or not isinstance(ctime, (int, float))
+        or isinstance(ctime, bool)
+        or ctime <= 0
+        or not isinstance(sched_id, str)
+        or not sched_id.strip()
+    ):
+        return True
+    try:
+        proc = psutil.Process(pid)
+        return proc.is_running() and abs(float(proc.create_time()) - float(ctime)) <= 2.0
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError):
+        return True
+
+
+def _has_active_scheduler_runs(active_path: Path) -> bool:
+    if is_reparse_or_symlink(active_path):
+        return True
+    if not active_path.exists():
+        return False
+    if not active_path.is_file():
+        return True
+    try:
+        raw = json.loads(active_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(raw, dict) or set(raw.keys()) != {"version", "active"}:
+        return True
+    if type(raw.get("version")) is not int or raw.get("version") != 1:
+        return True
+    active = raw.get("active")
+    if not isinstance(active, dict):
+        return True
+    return any(not isinstance(k, str) or not k or _is_active_run_process_alive(v) for k, v in active.items())
+
+
 def check_active_operations(
     data_dir: Path,
     install_dir: Path | None = None,
     *,
     check_gui_mutex: bool = False,
 ) -> str:
-    """Fail-closed check across TaskStore, scheduler locks/history, GUI mutex, and install-dir processes."""
+    """Fail-closed check across TaskStore, scheduler locks/active runs/history, GUI mutex, and install-dir processes."""
     if has_active_tasks(tasks_db_path(data_dir)):
         return UpdateBlockReason.ACTIVE_TASKS
     auto_dir = automation_dir_path(data_dir)
+    if (auto_dir.exists() and is_reparse_or_symlink(auto_dir)) or is_reparse_or_symlink(auto_dir / ".automation.lock"):
+        return UpdateBlockReason.SCHEDULER_ACTIVE
     if _is_lock_contended(auto_dir / ".automation.lock"):
         return UpdateBlockReason.SCHEDULER_ACTIVE
-    hist = auto_dir / "history.json"
-    if hist.exists():
-        try:
-            entries = json.loads(hist.read_text(encoding="utf-8"))
-            if isinstance(entries, list) and any(isinstance(e, dict) and e.get("status") == "running" for e in entries):
-                return UpdateBlockReason.SCHEDULER_ACTIVE
-        except (OSError, ValueError):
-            return UpdateBlockReason.SCHEDULER_ACTIVE
+    if _has_active_scheduler_runs(auto_dir / "active_runs.json"):
+        return UpdateBlockReason.SCHEDULER_ACTIVE
+    if _has_unsafe_or_running_history(auto_dir / "history.json"):
+        return UpdateBlockReason.SCHEDULER_ACTIVE
     if check_gui_mutex and _is_gui_mutex_held():
         return UpdateBlockReason.ACTIVE_TASKS
     if install_dir is not None and install_dir.exists() and _has_processes_inside_dir(install_dir):
@@ -401,32 +483,87 @@ def verify_updated_binary(
         return False
 
 
-def _restore_portable_backup(install_dir: Path, backup_dir: Path) -> None:
-    if not backup_dir.is_dir() or is_reparse_or_symlink(backup_dir):
-        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup directory missing or unsafe")
-    if not (backup_dir / f"{APP_ID}.exe").is_file():
-        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup missing application executable")
+def _has_any_reparse_inside(root_dir: Path) -> bool:
+    if is_reparse_or_symlink(root_dir):
+        return True
+    for base, dirs, files in os.walk(root_dir, followlinks=False):
+        base_path = Path(base)
+        if any(is_reparse_or_symlink(base_path / name) for name in (*dirs, *files)):
+            return True
+    return False
+
+
+def _validate_backup_dir_for_restore(install_dir: Path, backup_dir: Path, tx_id: str) -> Path:
+    if not _TX_ID_RE.fullmatch(tx_id):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Invalid transaction id for portable restore")
+    _validate_install_target(install_dir)
+    if is_reparse_or_symlink(install_dir) or is_reparse_or_symlink(install_dir.parent):
+        raise UpdateError(UpdateBlockReason.ZIP_SECURITY, "Refusing portable restore across symlink/reparse path")
+    expected = install_dir.parent / f".{install_dir.name}-old-{tx_id}"
+    if Path(backup_dir).name != expected.name or is_reparse_or_symlink(backup_dir):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup path does not match transaction")
+    if os.path.normcase(os.path.realpath(str(backup_dir))) != os.path.normcase(os.path.realpath(str(expected))):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup canonical path mismatch")
+    if not expected.is_dir() or _has_any_reparse_inside(expected):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup missing or unsafe")
+    env_bk = detect_install_environment(frozen=True, app_dir=expected)
+    if env_bk.install_type != "portable" or env_bk.block_reasons:
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Portable backup failed layout integrity check")
+    return expected
+
+
+def _safe_verify_call(verify_fn: Callable[[Path], bool], target_dir: Path) -> bool:
+    try:
+        return bool(verify_fn(target_dir))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _restore_portable_backup(
+    install_dir: Path,
+    backup_dir: Path,
+    *,
+    tx_id: str,
+    verify_fn: Callable[[Path], bool],
+) -> Path | None:
+    expected = _validate_backup_dir_for_restore(install_dir, backup_dir, tx_id)
+    displaced = install_dir.parent / f".{install_dir.name}-displaced-{tx_id}"
+    if displaced.exists() or is_reparse_or_symlink(displaced):
+        raise UpdateError(UpdateBlockReason.NO_ROLLBACK_CONTRACT, "Stale displaced directory prevents safe restore")
     if install_dir.exists():
-        broken = install_dir.with_name(f".{install_dir.name}-failed-{int(time.time())}")
-        if broken.exists():
-            shutil.rmtree(broken, ignore_errors=True)
-        install_dir.replace(broken)
-        backup_dir.replace(install_dir)
-        shutil.rmtree(broken, ignore_errors=True)
-    else:
-        backup_dir.replace(install_dir)
+        install_dir.replace(displaced)
+    expected.replace(install_dir)
+    if _safe_verify_call(verify_fn, install_dir):
+        return displaced if displaced.exists() else None
+    install_dir.replace(expected)
+    if displaced.exists():
+        displaced.replace(install_dir)
+    raise UpdateError(
+        UpdateBlockReason.NO_ROLLBACK_CONTRACT,
+        "Post-recovery verification failed; existing copy and backup preserved",
+    )
 
 
-def _rollback_portable_tx(tx: UpdateTransaction, install_dir: Path, backup_dir: Path, state_path: Path) -> UpdateTransaction:
+def _rollback_portable_tx(
+    tx: UpdateTransaction,
+    install_dir: Path,
+    backup_dir: Path,
+    state_path: Path,
+    *,
+    verify_fn: Callable[[Path], bool],
+) -> UpdateTransaction:
     tx.state = UpdateState.ROLLING_BACK
     _persist_tx(state_path, tx)
+    displaced: Path | None = None
     try:
-        _restore_portable_backup(install_dir, backup_dir)
+        displaced = _restore_portable_backup(install_dir, backup_dir, tx_id=tx.tx_id, verify_fn=verify_fn)
         tx.state = UpdateState.ROLLED_BACK
     except Exception as exc:  # noqa: BLE001
         tx.error = f"{tx.error}; rollback failed: {exc}" if tx.error else str(exc)
         tx.state = UpdateState.FAILED
     _finalize_tx(state_path, tx)
+    if displaced is not None and displaced.exists():
+        shutil.rmtree(displaced, ignore_errors=True)
     return tx
 
 
@@ -454,8 +591,14 @@ def _verify_or_rollback_portable(
     target_version: str,
     data_dir: Path | None,
     verify_callback: Callable[[Path, Path | None], bool] | None,
+    rollback_verify_callback: Callable[[Path, Path | None], bool] | None,
 ) -> UpdateTransaction:
     verifier = verify_callback or (lambda tgt, dd: verify_updated_binary(tgt, target_version, dd))
+    rb_verifier = rollback_verify_callback or (
+        (lambda tgt, dd: verify_updated_binary(tgt, tx.source_version, dd))
+        if verify_callback is None
+        else (lambda _tgt, _dd: True)
+    )
     ok = False
     try:
         ok = bool(verifier(install_dir, data_dir))
@@ -463,7 +606,13 @@ def _verify_or_rollback_portable(
         tx.error = str(exc)
     if not ok:
         tx.error = tx.error or "Post-upgrade verification failed"
-        return _rollback_portable_tx(tx, install_dir, backup_dir, state_path)
+        return _rollback_portable_tx(
+            tx,
+            install_dir,
+            backup_dir,
+            state_path,
+            verify_fn=lambda d: bool(rb_verifier(d, data_dir)),
+        )
     tx.state = UpdateState.COMMITTED
     _finalize_tx(state_path, tx, highest_seen=target_version)
     if backup_dir.exists():
@@ -482,6 +631,7 @@ def apply_portable_transaction(
     state_path: Path,
     data_dir: Path | None = None,
     verify_callback: Callable[[Path, Path | None], bool] | None = None,
+    rollback_verify_callback: Callable[[Path, Path | None], bool] | None = None,
     _lock_already_held: bool = False,
 ) -> UpdateTransaction:
     """Execute atomic portable swap retaining `.MCPApp-old-<tx_id>` until COMMITTED state is persisted."""
@@ -519,12 +669,30 @@ def apply_portable_transaction(
             candidate_dir.replace(install_dir)
         except Exception as exc:  # noqa: BLE001
             tx.error = str(exc)
-            return _rollback_portable_tx(tx, install_dir, backup_dir, state_path)
+            rb_verifier = rollback_verify_callback or (
+                (lambda tgt, dd: verify_updated_binary(tgt, source_version, dd))
+                if verify_callback is None
+                else (lambda _tgt, _dd: True)
+            )
+            return _rollback_portable_tx(
+                tx,
+                install_dir,
+                backup_dir,
+                state_path,
+                verify_fn=lambda d: bool(rb_verifier(d, data_dir)),
+            )
 
         tx.state = UpdateState.VERIFYING_NEW
         _persist_tx(state_path, tx)
         return _verify_or_rollback_portable(
-            tx, install_dir, backup_dir, state_path, target_version, data_dir, verify_callback
+            tx,
+            install_dir,
+            backup_dir,
+            state_path,
+            target_version,
+            data_dir,
+            verify_callback,
+            rollback_verify_callback,
         )
 
 
@@ -674,20 +842,219 @@ def _try_sanitize(raw: str, roots: tuple[Path, ...]) -> Path | None:
         return None
 
 
+_BOOT_PORTABLE_STATES = frozenset(
+    {
+        UpdateState.PREPARED,
+        UpdateState.BACKING_UP,
+        UpdateState.SWAPPING,
+        UpdateState.VERIFYING_NEW,
+        UpdateState.ROLLING_BACK,
+    }
+)
+_BOOT_INSTALLED_STATES = frozenset(
+    {
+        UpdateState.PREPARED,
+        UpdateState.INSTALLING,
+        UpdateState.VERIFYING_NEW,
+        UpdateState.ROLLING_BACK,
+    }
+)
+
+
+def _blocked_boot_tx(tx_id: str, error: str, *, tx: UpdateTransaction | None = None) -> UpdateTransaction:
+    if tx is not None:
+        tx.state = UpdateState.BLOCKED
+        tx.error = error
+        return tx
+    return UpdateTransaction(
+        tx_id=tx_id,
+        state=UpdateState.BLOCKED,
+        install_type="portable",
+        source_version="",
+        target_version="",
+        install_dir="",
+        error=error,
+    )
+
+
+def _finalize_blocked_tx(state_path: Path, tx: UpdateTransaction, error: str) -> UpdateTransaction:
+    blocked = _blocked_boot_tx(tx.tx_id, error, tx=tx)
+    _finalize_tx(state_path, blocked)
+    return blocked
+
+
+def _load_strict_boot_state(state_path: Path) -> tuple[UpdaterPersistentState | None, UpdateTransaction | None]:
+    if is_reparse_or_symlink(state_path):
+        return None, _blocked_boot_tx("", "Unsafe symlink/reparse state.json; refusing boot recovery")
+    if not state_path.exists():
+        return None, None
+    if not state_path.is_file():
+        return None, _blocked_boot_tx("", "Invalid state.json path; refusing boot recovery")
+    try:
+        raw = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, _blocked_boot_tx("", "Corrupted updater state.json; refusing automatic boot recovery")
+    if not isinstance(raw, dict):
+        return None, _blocked_boot_tx("", "Invalid updater state.json format; refusing boot recovery")
+    tx_raw = raw.get("active_transaction")
+    if tx_raw is None:
+        return None, None
+    if not isinstance(tx_raw, dict):
+        return None, _blocked_boot_tx("", "Invalid active_transaction entry in state.json; refusing boot recovery")
+    try:
+        highest = str(raw.get("highest_seen_version") or "0.0.0")
+        if highest != "0.0.0":
+            parse_semver(highest)
+    except ValueError:
+        return None, _blocked_boot_tx("", "Invalid highest_seen_version in state.json; refusing boot recovery")
+    return UpdaterPersistentState.load(state_path), None
+
+
+def _validate_boot_tx(tx: UpdateTransaction) -> str:
+    if not _TX_ID_RE.fullmatch(tx.tx_id):
+        return "Untrusted or missing transaction id in state.json"
+    allowed_states = _BOOT_PORTABLE_STATES if tx.install_type == "portable" else _BOOT_INSTALLED_STATES
+    if tx.state not in allowed_states:
+        return f"Unexpected interrupted transaction state: {tx.state}"
+    try:
+        src_v = parse_semver(tx.source_version)
+        tgt_v = parse_semver(tx.target_version)
+    except ValueError:
+        return "Invalid source or target version in active transaction"
+    if tgt_v <= src_v:
+        return "Active transaction does not advance version cleanly"
+    if not tx.install_dir or (tx.install_type == "portable" and tx.state != UpdateState.PREPARED and not tx.backup_dir):
+        return "Missing target or backup path in active transaction"
+    return ""
+
+
+def _verify_boot_manifest(
+    tx: UpdateTransaction,
+    st: UpdaterPersistentState,
+    updates_root: Path,
+    policy: TrustPolicy,
+) -> str:
+    if not policy.auto_install_permitted():
+        return "Automatic boot recovery blocked: production trust roots are not configured; inspect installation manually"
+    if tx.staged_dir:
+        staged_p = _try_sanitize(tx.staged_dir, (updates_root / "staged", updates_root / "downloads"))
+        if staged_p is None or is_reparse_or_symlink(staged_p):
+            return "Active transaction staged path escapes updates directory"
+    manifest_dir = updates_root / "manifests" / tx.target_version
+    manifest_path = manifest_dir / "update-manifest.json"
+    sig_path = manifest_dir / "update-manifest.json.sig"
+    if any(is_reparse_or_symlink(p) for p in (manifest_dir, manifest_path, sig_path)):
+        return "Unsafe manifest path for boot recovery verification"
+    if not (manifest_path.is_file() and sig_path.is_file()):
+        return "Signed update manifest missing; refusing unverified boot recovery"
+    try:
+        sig_raw = json.loads(sig_path.read_text(encoding="utf-8"))
+        manifest = verify_manifest_and_signature(
+            manifest_bytes=manifest_path.read_bytes(),
+            key_id=str(sig_raw.get("key_id") or ""),
+            signature_b64=str(sig_raw.get("signature_b64") or ""),
+            current_version=tx.source_version,
+            highest_seen_version=st.highest_seen_version,
+            policy=policy,
+        )
+    except (OSError, ValueError, UpdateError) as exc:
+        return f"Boot recovery manifest verification failed: {exc}"
+    if manifest.version != tx.target_version:
+        return "Signed manifest version does not match active transaction"
+    return ""
+
+
+def _bind_boot_install_dir(tx: UpdateTransaction, install_dir: Path | None) -> tuple[Path | None, str]:
+    bound = install_dir
+    if bound is None and getattr(sys, "frozen", False):
+        bound = Path(os.path.realpath(sys.executable)).parent
+    if bound is None:
+        return None, "Cannot bind boot recovery to a real installation directory"
+    tx_dir = Path(tx.install_dir)
+    if any(is_reparse_or_symlink(p) for p in (bound, bound.parent, tx_dir, tx_dir.parent)):
+        return None, "Refusing boot recovery on symlink or reparse install directory"
+    try:
+        _validate_install_target(bound)
+    except UpdateError as exc:
+        return None, str(exc)
+    if tx_dir.name != bound.name:
+        return None, "Transaction install directory does not match current installation"
+    if os.path.normcase(os.path.realpath(str(bound))) != os.path.normcase(os.path.realpath(str(tx_dir))):
+        return None, "Transaction install path mismatch against active installation"
+    return bound, ""
+
+
+def _cleanup_after_boot_rollback(
+    bound_dir: Path,
+    displaced: Path | None,
+    tx_id: str,
+) -> None:
+    if displaced is not None and displaced.exists() and not is_reparse_or_symlink(displaced):
+        shutil.rmtree(displaced, ignore_errors=True)
+    new_dir = bound_dir.parent / f".{bound_dir.name}-new-{tx_id}"
+    if new_dir.is_dir() and not is_reparse_or_symlink(new_dir):
+        shutil.rmtree(new_dir, ignore_errors=True)
+
+
+def _recover_portable_boot(
+    tx: UpdateTransaction,
+    bound_dir: Path,
+    state_path: Path,
+    updates_root: Path,
+    verifier: Callable[[Path, Path | None], bool],
+) -> UpdateTransaction:
+    if bound_dir.exists():
+        if _has_any_reparse_inside(bound_dir):
+            return _finalize_blocked_tx(state_path, tx, "Refusing portable recovery with reparse points in install dir")
+        cur_env = detect_install_environment(frozen=True, app_dir=bound_dir)
+        if cur_env.install_type != "portable" or UpdateBlockReason.FOREIGN_FILES_IN_INSTALL_DIR in cur_env.block_reasons:
+            return _finalize_blocked_tx(state_path, tx, "Install directory failed portable integrity checks")
+
+    data_dir = updates_root.parent
+    expected_backup = bound_dir.parent / f".{bound_dir.name}-old-{tx.tx_id}"
+    if tx.state == UpdateState.BACKING_UP and not expected_backup.exists() and bound_dir.is_dir():
+        if _safe_verify_call(lambda d: verifier(d, data_dir), bound_dir):
+            tx.state = UpdateState.ROLLED_BACK
+            tx.error = "Verified intact installation after interrupted BACKING_UP"
+            _finalize_tx(state_path, tx)
+            return tx
+        return _finalize_blocked_tx(state_path, tx, "Interrupted BACKING_UP failed post-recovery binary check")
+
+    try:
+        displaced = _restore_portable_backup(
+            bound_dir,
+            Path(tx.backup_dir),
+            tx_id=tx.tx_id,
+            verify_fn=lambda d: bool(verifier(d, data_dir)),
+        )
+    except UpdateError as exc:
+        return _finalize_blocked_tx(state_path, tx, str(exc))
+
+    tx.state = UpdateState.ROLLED_BACK
+    tx.error = "Recovered interrupted swap on startup"
+    _finalize_tx(state_path, tx)
+    _cleanup_after_boot_rollback(bound_dir, displaced, tx.tx_id)
+    return tx
+
+
 def _recover_installed_tx(
     tx: UpdateTransaction,
     target_dir: Path,
     updates_root: Path,
     state_path: Path,
     policy: TrustPolicy,
-) -> UpdateTransaction | None:
+    verifier: Callable[[Path, Path | None], bool],
+) -> UpdateTransaction:
+    cur_env = detect_install_environment(frozen=True, app_dir=target_dir)
+    if cur_env.install_type != "installed":
+        return _finalize_blocked_tx(state_path, tx, "Target directory is not a valid installed application root")
     verified = verify_cached_rollback_bundle(
         updates_root / "rollback",
         expected_version=tx.source_version,
         policy=policy,
     )
     if verified is None:
-        return None
+        return _finalize_blocked_tx(state_path, tx, "Verified cached rollback installer is missing; manual repair required")
     rb, _rb_sha = verified
     env = dict(os.environ)
     env["__COMPAT_LAYER"] = "RunAsInvoker"
@@ -695,9 +1062,11 @@ def _recover_installed_tx(
         [str(rb), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", f"/DIR={target_dir}"],
         env,
     )
-    data_dir = updates_root.parent
-    rb_ok = rc == 0 and verify_updated_binary(target_dir, tx.source_version, data_dir)
-    tx.state = UpdateState.ROLLED_BACK if rb_ok else UpdateState.FAILED
+    rb_ok = rc == 0 and _safe_verify_call(lambda d: verifier(d, updates_root.parent), target_dir)
+    if not rb_ok:
+        return _finalize_blocked_tx(state_path, tx, "Installed rollback verification failed; inspect installation manually")
+    tx.state = UpdateState.ROLLED_BACK
+    tx.error = "Recovered interrupted installed update on startup"
     _finalize_tx(state_path, tx)
     return tx
 
@@ -707,40 +1076,32 @@ def _recover_under_lock(
     updates_root: Path,
     install_dir: Path | None,
     policy: TrustPolicy | None,
+    verify_callback: Callable[[Path, Path | None], bool] | None,
 ) -> UpdateTransaction | None:
-    st = UpdaterPersistentState.load(state_path)
+    st, early_blocked = _load_strict_boot_state(state_path)
+    if early_blocked is not None or st is None or st.active_transaction is None:
+        return early_blocked
+
     tx = st.active_transaction
-    active_states = {
-        UpdateState.BACKING_UP,
-        UpdateState.SWAPPING,
-        UpdateState.VERIFYING_NEW,
-        UpdateState.ROLLING_BACK,
-        UpdateState.INSTALLING,
-    }
-    if tx is None or tx.state not in active_states:
-        return None
+    effective_policy = policy or TrustPolicy.production_default()
+    err = _validate_boot_tx(tx) or _verify_boot_manifest(tx, st, updates_root, effective_policy)
+    if err:
+        return _finalize_blocked_tx(state_path, tx, err)
 
-    target_dir = install_dir or _try_sanitize(tx.install_dir, _allowed_install_roots())
-    backup_dir = _try_sanitize(tx.backup_dir, (target_dir.parent,)) if target_dir is not None else None
+    bound_dir, bind_err = _bind_boot_install_dir(tx, install_dir)
+    if bound_dir is None:
+        return _finalize_blocked_tx(state_path, tx, bind_err)
 
-    if tx.install_type == "portable" and target_dir is not None and backup_dir is not None and backup_dir.is_dir():
-        _restore_portable_backup(target_dir, backup_dir)
-        tx.state = UpdateState.ROLLED_BACK
-        tx.error = "Recovered interrupted swap on startup"
+    if tx.state == UpdateState.PREPARED:
+        tx.state = UpdateState.FAILED
+        tx.error = "Interrupted before file swap; no changes applied"
         _finalize_tx(state_path, tx)
         return tx
 
-    if tx.install_type == "installed" and target_dir is not None:
-        recovered = _recover_installed_tx(
-            tx, target_dir, updates_root, state_path, policy or TrustPolicy.production_default()
-        )
-        if recovered is not None:
-            return recovered
-
-    tx.state = UpdateState.FAILED
-    tx.error = "Interrupted update state could not be automatically recovered"
-    _finalize_tx(state_path, tx)
-    return tx
+    verifier = verify_callback or (lambda d, dd: verify_updated_binary(d, tx.source_version, dd))
+    if tx.install_type == "portable":
+        return _recover_portable_boot(tx, bound_dir, state_path, updates_root, verifier)
+    return _recover_installed_tx(tx, bound_dir, updates_root, state_path, effective_policy, verifier)
 
 
 def recover_interrupted_update_on_boot(
@@ -749,16 +1110,16 @@ def recover_interrupted_update_on_boot(
     install_dir: Path | None = None,
     *,
     policy: TrustPolicy | None = None,
+    verify_callback: Callable[[Path, Path | None], bool] | None = None,
 ) -> UpdateTransaction | None:
-    """Recover cleanly from an interrupted update at startup while honoring active `.updater.lock`."""
-    try:
-        lock_cm = acquire_updater_lock(updates_root / ".updater.lock")
-    except UpdateError:
-        return None
+    """Safely recover an interrupted update on startup under `.updater.lock` with strict trust and path checks."""
+    lock_path = updates_root / ".updater.lock"
+    if any(is_reparse_or_symlink(p) for p in (updates_root, state_path, lock_path)):
+        return _blocked_boot_tx("", "Unsafe symlink/reparse updater state path")
 
+    lock_cm = acquire_updater_lock(lock_path)
     try:
-        with lock_cm:
-            return _recover_under_lock(state_path, updates_root, install_dir, policy)
+        lock_cm.__enter__()
     except UpdateError:
         return UpdateTransaction(
             tx_id="",
@@ -768,6 +1129,10 @@ def recover_interrupted_update_on_boot(
             target_version="",
             install_dir="",
         )
+    try:
+        return _recover_under_lock(state_path, updates_root, install_dir, policy, verify_callback)
+    finally:
+        lock_cm.__exit__(None, None, None)
 
 
 def _parse_plan_arg(argv: list[str]) -> str:

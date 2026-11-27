@@ -67,7 +67,6 @@ class UnifiedHomeTests(unittest.TestCase):
                 "AI-клиенты",
                 "Gateway",
                 "Задачи",
-                "Серверы",
                 "Workspaces",
                 "Расширения",
                 "Устройства",

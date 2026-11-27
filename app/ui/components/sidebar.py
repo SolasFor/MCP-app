@@ -161,6 +161,9 @@ class Sidebar(QFrame):
         if page_id in self._buttons:
             self._buttons[page_id].set_badge(count)
 
+    def button_for(self, page_id: str) -> NavButton | None:
+        return self._buttons.get(page_id)
+
     def retranslate(self) -> None:
         tip = tr("sidebar.expand" if self._collapsed else "sidebar.collapse")
         self._collapse_btn.setToolTip(tip)

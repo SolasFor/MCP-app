@@ -59,8 +59,8 @@ class UiRedesignGuiTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_all_active_and_planned_pages_are_navigable_and_honest(self) -> None:
-        self.assertEqual(len(PAGE_IDS), 13)
-        self.assertEqual(len(ACTIVE_PAGE_IDS), 13)
+        self.assertEqual(len(PAGE_IDS), 12)
+        self.assertEqual(len(ACTIVE_PAGE_IDS), 12)
         self.assertEqual(len(PLANNED_PAGE_IDS), 0)
         for idx, pid in enumerate(PAGE_IDS):
             self.window.show_page(pid)

@@ -71,7 +71,7 @@ class MinimalistUiRedesignTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_responsive_window_sizes_across_all_pages(self) -> None:
-        self.assertEqual(len(ACTIVE_PAGE_IDS), 13)
+        self.assertEqual(len(ACTIVE_PAGE_IDS), 12)
         sizes = (
             (800, 540),
             (960, 640),

@@ -273,54 +273,57 @@ def _win_verify_trust(file_path: Path) -> tuple[bool, int]:
     return res == 0, res
 
 
-def _extract_pe_signer_thumbprint(file_path: Path) -> str:
-    """Query PKCS#7 embedded signer thumbprint (SHA-1 hex) via crypt32!CryptQueryObject."""
-    if sys.platform != "win32":
-        return ""
-    from ctypes import wintypes
-
-    class _CERT_CONTEXT(ctypes.Structure):
-        _fields_ = [
-            ("dwCertEncodingType", wintypes.DWORD),
-            ("pbCertEncoded", ctypes.POINTER(ctypes.c_ubyte)),
-            ("cbCertEncoded", wintypes.DWORD),
-            ("pCertInfo", ctypes.c_void_p),
-            ("hCertStore", wintypes.HANDLE),
-        ]
-
-    windll_obj = getattr(ctypes, "windll", None)
-    if windll_obj is None:
-        return ""
-    crypt32 = windll_obj.crypt32
-    h_store = wintypes.HANDLE()
-    h_msg = wintypes.HANDLE()
-    ok = crypt32.CryptQueryObject(
-        1,  # CERT_QUERY_OBJECT_FILE
-        ctypes.c_wchar_p(str(file_path)),
-        1 << 10,  # CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED
-        1 << 1,  # CERT_QUERY_FORMAT_FLAG_BINARY
-        0,
-        None,
-        None,
-        None,
-        ctypes.byref(h_store),
-        ctypes.byref(h_msg),
-        None,
-    )
-    if not ok or not h_store:
-        return ""
-
-    try:
-        crypt32.CertEnumCertificatesInStore.restype = ctypes.POINTER(_CERT_CONTEXT)
-        ctx = crypt32.CertEnumCertificatesInStore(h_store, None)
-        if ctx:
+def _first_store_cert_thumbprint(crypt32: Any, store_handle: Any, cert_ctx_cls: Any) -> str:
+    thumb = ""
+    crypt32.CertEnumCertificatesInStore.restype = ctypes.POINTER(cert_ctx_cls)
+    ctx = crypt32.CertEnumCertificatesInStore(store_handle, None)
+    if ctx:
+        try:
             encoded = bytes(ctx.contents.pbCertEncoded[: ctx.contents.cbCertEncoded])
             thumb = hashlib.sha1(encoded, usedforsecurity=False).hexdigest().upper()
+        finally:
             crypt32.CertFreeCertificateContext(ctx)
-            return thumb
-        return ""
-    finally:
-        if h_msg:
-            crypt32.CryptMsgClose(h_msg)
-        if h_store:
-            crypt32.CertCloseStore(h_store, 0)
+    return thumb
+
+
+def _extract_pe_signer_thumbprint(file_path: Path) -> str:
+    """Query PKCS#7 embedded signer thumbprint (SHA-1 hex) via crypt32!CryptQueryObject."""
+    thumb = ""
+    windll_obj = getattr(ctypes, "windll", None) if sys.platform == "win32" else None
+    if windll_obj is not None:
+        from ctypes import wintypes
+
+        class _CERT_CONTEXT(ctypes.Structure):
+            _fields_ = [
+                ("dwCertEncodingType", wintypes.DWORD),
+                ("pbCertEncoded", ctypes.POINTER(ctypes.c_ubyte)),
+                ("cbCertEncoded", wintypes.DWORD),
+                ("pCertInfo", ctypes.c_void_p),
+                ("hCertStore", wintypes.HANDLE),
+            ]
+
+        crypt32 = windll_obj.crypt32
+        h_store = wintypes.HANDLE()
+        h_msg = wintypes.HANDLE()
+        ok = crypt32.CryptQueryObject(
+            1,  # CERT_QUERY_OBJECT_FILE
+            ctypes.c_wchar_p(str(file_path)),
+            1 << 10,  # CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED
+            1 << 1,  # CERT_QUERY_FORMAT_FLAG_BINARY
+            0,
+            None,
+            None,
+            None,
+            ctypes.byref(h_store),
+            ctypes.byref(h_msg),
+            None,
+        )
+        try:
+            if ok and h_store.value:
+                thumb = _first_store_cert_thumbprint(crypt32, h_store, _CERT_CONTEXT)
+        finally:
+            if h_msg.value:
+                crypt32.CryptMsgClose(h_msg)
+            if h_store.value:
+                crypt32.CertCloseStore(h_store, 0)
+    return thumb

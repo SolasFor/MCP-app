@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import sys
 import threading
 import time
@@ -12,6 +13,7 @@ from typing import Any, Iterator
 
 from app.platform import get_platform
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32})  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
 _REPLACE_DELAYS_S = (0.015, 0.03, 0.06, 0.12, 0.25, 0.5)
 _PATH_LOCKS_GUARD = threading.Lock()
@@ -23,6 +25,18 @@ _CROSS_LOCK_DEPTH: dict[tuple[str, int], int] = {}
 
 def _canonical_lock_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def is_reparse_or_symlink(path: Path) -> bool:
+    """Return True if ``path`` itself is a POSIX symlink or Windows reparse point/junction."""
+    try:
+        st = Path(path).lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _get_cross_thread_lock(key: str) -> threading.RLock:

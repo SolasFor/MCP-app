@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack
@@ -9,7 +10,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
-from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock
+from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock, is_reparse_or_symlink
+from app.core.secret_store import SecretStore
 from app.platform import get_platform
 from backend.servers.models import ServerProfile, validate_server_name
 from backend.servers.store import SECRETS_NAMESPACE as SERVER_SECRETS_NS
@@ -28,6 +30,10 @@ _VALID_SERVER_MODES = ("read", "control")
 _TX_FILENAME = ".n03_coordinator_tx.json"
 _SCHEDULES_FILENAME = "schedules.json"
 _AUTOMATION_LOCK_FILENAME = ".automation.lock"
+_MAX_TX_JOURNAL_BYTES = 16 * 1024 * 1024
+_MAX_PREIMAGE_FILE_BYTES = 8 * 1024 * 1024
+_MAX_MARKER_BYTES = 256
+_TX_TOP_KEYS = frozenset({"schema_version", "files", "created_secrets"})
 
 
 @dataclass(frozen=True)
@@ -308,9 +314,66 @@ def _authorize_client_server_op(
     return authorized
 
 
+def _canonical_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _assert_no_reparse_target(target: Path, label: str) -> None:
+    if is_reparse_or_symlink(target.parent) or is_reparse_or_symlink(target):
+        raise ValueError(f"Refusing symlink/reparse {label}: {target}")
+
+
+def _validate_preimage_content(kind: str, content: Any, raw_path: str) -> str | None:
+    if content is None:
+        return None
+    if not isinstance(content, str):
+        raise ValueError(f"Invalid preimage type for {raw_path!r}")
+    encoded = content.encode("utf-8")
+    if kind == "marker":
+        if len(encoded) > _MAX_MARKER_BYTES:
+            raise ValueError(f"Oversized marker preimage for {raw_path!r}")
+        return content
+    if len(encoded) > _MAX_PREIMAGE_FILE_BYTES:
+        raise ValueError(f"Oversized JSON preimage for {raw_path!r}")
+    try:
+        parsed = json.loads(content)
+    except ValueError as exc:
+        raise ValueError(f"Invalid JSON preimage for {raw_path!r}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"JSON preimage must be an object for {raw_path!r}")
+    return content
+
+
+def _extract_preimage_server_secret_keys(
+    server_store: ServerConfigStore,
+    srv_preimage: str | None,
+) -> set[tuple[str, str]]:
+    if not srv_preimage:
+        return set()
+    parsed = json.loads(srv_preimage)
+    raw_servers = parsed.get("servers")
+    if not isinstance(raw_servers, dict):
+        return set()
+    existing_keys: set[tuple[str, str]] = set()
+    for raw_prof in raw_servers.values():
+        if not isinstance(raw_prof, dict):
+            continue
+        refs = raw_prof.get("env_secret_refs")
+        if not isinstance(refs, dict):
+            continue
+        for ref in refs.values():
+            try:
+                ns, key = server_store.secret_store.parse_ref(str(ref))
+                existing_keys.add((ns, key))
+            except Exception:  # noqa: BLE001
+                pass
+    return existing_keys
+
+
 def _capture_preimages(paths: Iterable[Path]) -> dict[str, str | None]:
     snapshots: dict[str, str | None] = {}
     for p in paths:
+        _assert_no_reparse_target(p, "config file")
         if p.exists():
             snapshots[str(p)] = p.read_text(encoding="utf-8")
         else:
@@ -318,9 +381,11 @@ def _capture_preimages(paths: Iterable[Path]) -> dict[str, str | None]:
     return snapshots
 
 
-def _restore_preimages(preimages: dict[str, str | None]) -> None:
-    for raw_path, content in preimages.items():
+def _restore_preimages(preimages: Iterable[tuple[Path | str, str | None]] | dict[str, str | None]) -> None:
+    items = preimages.items() if isinstance(preimages, dict) else preimages
+    for raw_path, content in items:
         target = Path(raw_path)
+        _assert_no_reparse_target(target, "tx recovery target")
         if content is None:
             if target.exists():
                 target.unlink(missing_ok=True)
@@ -350,26 +415,127 @@ class WorkspaceServerCoordinator:
             return None
         return (self.automation_dir / _SCHEDULES_FILENAME, self.automation_dir / _AUTOMATION_LOCK_FILENAME)
 
-    def _recover_pending_tx_unlocked(self) -> None:
-        if not self._tx_path.exists():
-            return
+    def _enter_coordinator_locks(self, stack: ExitStack, *, lock_automation: bool = False) -> bool:
+        stack.enter_context(self.workspace_store.lock())
+        stack.enter_context(self.server_store.lock())
+        sched = self._schedules_paths()
+        if sched is not None and (lock_automation or self._tx_path.exists()):
+            stack.enter_context(cross_process_lock(sched[1]))
+            return True
+        return False
+
+    def _allowed_tx_targets(self) -> dict[str, tuple[Path, Literal["json", "marker"], bool]]:
+        targets: list[tuple[Path, Literal["json", "marker"], bool]] = [
+            (self.workspace_store.path, "json", False),
+            (self.workspace_store._init_marker, "marker", False),
+            (self.server_store.path, "json", False),
+            (self.server_store._init_marker, "marker", False),
+        ]
+        sched = self._schedules_paths()
+        if sched is not None:
+            targets.append((sched[0], "json", True))
+        return {_canonical_path_key(p): (p, kind, is_sched) for p, kind, is_sched in targets}
+
+    def _validate_journal_files(
+        self,
+        files_raw: Any,
+    ) -> tuple[list[tuple[Path, str | None]], bool, bool, str | None]:
+        if not isinstance(files_raw, dict):
+            raise ValueError(f"Invalid files map in coordinator tx journal: {self._tx_path}")
+        allowed = self._allowed_tx_targets()
+        seen: set[str] = set()
+        validated: list[tuple[Path, str | None]] = []
+        needs_automation = False
+        has_srv_entry = False
+        srv_preimage: str | None = None
+        srv_canon = _canonical_path_key(self.server_store.path)
+        for raw_path, content in files_raw.items():
+            if not isinstance(raw_path, str):
+                raise ValueError(f"Invalid path key in coordinator tx journal: {raw_path!r}")
+            canon = _canonical_path_key(Path(raw_path))
+            spec = allowed.get(canon)
+            if spec is None or canon in seen:
+                raise ValueError(f"Disallowed tx journal target path: {raw_path!r}")
+            seen.add(canon)
+            actual_path, kind, is_sched = spec
+            _assert_no_reparse_target(actual_path, "tx target")
+            clean_content = _validate_preimage_content(kind, content, raw_path)
+            validated.append((actual_path, clean_content))
+            if is_sched:
+                needs_automation = True
+            if canon == srv_canon:
+                has_srv_entry = True
+                srv_preimage = clean_content
+        return validated, needs_automation, has_srv_entry, srv_preimage
+
+    def _validate_journal_secrets(
+        self,
+        created_raw: Any,
+        *,
+        has_srv_entry: bool,
+        srv_preimage: str | None,
+    ) -> list[tuple[str, str]]:
+        if not isinstance(created_raw, list):
+            raise ValueError(f"Invalid created_secrets list in coordinator tx journal: {self._tx_path}")
+        if not created_raw:
+            return []
+        if not has_srv_entry:
+            raise ValueError("Coordinator tx journal with created_secrets must protect managed_servers.json")
+        existing_keys = _extract_preimage_server_secret_keys(self.server_store, srv_preimage)
+        out: list[tuple[str, str]] = []
+        for item in created_raw:
+            if not isinstance(item, list) or len(item) != 2:
+                raise ValueError(f"Invalid created_secrets item in tx journal: {item!r}")
+            ns, key = item[0], item[1]
+            if not isinstance(ns, str) or not isinstance(key, str) or ns != SERVER_SECRETS_NS:
+                raise ValueError(f"Disallowed secret namespace in tx journal: {item!r}")
+            clean_key = SecretStore._validate_key(key)
+            if "__" not in clean_key:
+                raise ValueError(f"Malformed server secret key in tx journal: {clean_key!r}")
+            validate_server_name(clean_key.split("__", 1)[0])
+            if (ns, clean_key) in existing_keys:
+                raise ValueError(f"Refusing to delete pre-existing server secret during tx recovery: {clean_key!r}")
+            out.append((ns, clean_key))
+        return out
+
+    def _read_and_validate_tx_journal(self) -> tuple[list[tuple[Path, str | None]], list[tuple[str, str]], bool]:
+        _assert_no_reparse_target(self._tx_path, "tx journal")
+        try:
+            st = self._tx_path.lstat()
+        except OSError as exc:
+            raise ValueError(f"Unreadable coordinator tx journal: {self._tx_path}") from exc
+        if st.st_size <= 0 or st.st_size > _MAX_TX_JOURNAL_BYTES:
+            raise ValueError(f"Invalid coordinator tx journal size ({st.st_size} bytes): {self._tx_path}")
         try:
             journal = json.loads(self._tx_path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
             raise ValueError(f"Corrupt pending coordinator transaction journal: {self._tx_path}") from exc
-        if not isinstance(journal, dict) or not isinstance(journal.get("files"), dict):
+        if not isinstance(journal, dict) or set(journal.keys()) != _TX_TOP_KEYS:
             raise ValueError(f"Invalid pending coordinator transaction journal: {self._tx_path}")
-        _restore_preimages(journal["files"])
-        created = journal.get("created_secrets") or []
-        _delete_secret_keys(
-            self.server_store.secret_store,
-            [(str(item[0]), str(item[1])) for item in created if isinstance(item, (list, tuple)) and len(item) == 2],
+        ver = journal.get("schema_version")
+        if type(ver) is not int or ver != 1:
+            raise ValueError(f"Unsupported coordinator tx journal schema_version: {ver!r}")
+        validated_files, needs_auto, has_srv, srv_pre = self._validate_journal_files(journal.get("files"))
+        validated_secrets = self._validate_journal_secrets(
+            journal.get("created_secrets"),
+            has_srv_entry=has_srv,
+            srv_preimage=srv_pre,
         )
-        _delete_secret_keys(
-            self.workspace_store.secret_store,
-            [(str(item[0]), str(item[1])) for item in created if isinstance(item, (list, tuple)) and len(item) == 2],
-        )
-        self._tx_path.unlink(missing_ok=True)
+        return validated_files, validated_secrets, needs_auto
+
+    def _recover_pending_tx_unlocked(self, *, automation_locked: bool = False) -> None:
+        if not os.path.lexists(self._tx_path):
+            return
+        validated_files, validated_secrets, needs_auto = self._read_and_validate_tx_journal()
+        with ExitStack() as stack:
+            if needs_auto and not automation_locked:
+                sched = self._schedules_paths()
+                if sched is None:
+                    raise ValueError("Coordinator tx journal requires automation_dir for schedules.json recovery")
+                stack.enter_context(cross_process_lock(sched[1]))
+            _restore_preimages(validated_files)
+            _delete_secret_keys(self.server_store.secret_store, validated_secrets)
+            self._tx_path.unlink(missing_ok=True)
 
     def _apply_tx_writes(self, plan: _TxMutationPlan, written_secrets: list[tuple[str, str]]) -> None:
         for ns, key, val in plan.new_secrets:
@@ -395,13 +561,9 @@ class WorkspaceServerCoordinator:
         lock_automation: bool = False,
     ) -> Any:
         with ExitStack() as stack:
-            stack.enter_context(self.workspace_store.lock())
-            stack.enter_context(self.server_store.lock())
-            sched = self._schedules_paths() if lock_automation else None
-            if sched is not None and sched[0].is_file():
-                stack.enter_context(cross_process_lock(sched[1]))
+            auto_locked = self._enter_coordinator_locks(stack, lock_automation=lock_automation)
 
-            self._recover_pending_tx_unlocked()
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
             plan = plan_fn()
             watch_paths = list(dict.fromkeys([
                 *plan.files_to_watch,
@@ -474,8 +636,9 @@ class WorkspaceServerCoordinator:
 
     def partition_servers(self) -> WorkspaceServersSnapshot:
         """Return consistent workspace-linked and unlinked ServerProfile partitions."""
-        with self.workspace_store.lock(), self.server_store.lock():
-            self._recover_pending_tx_unlocked()
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
             workspaces = self.workspace_store.load_workspaces()
             servers = self.server_store.load_profiles(strict=True)
 
@@ -821,8 +984,9 @@ class WorkspaceServerCoordinator:
             raise PermissionError(f"Invalid server access mode: {mode!r}")
         clean_srv = validate_server_name(server_name)
         try:
-            with self.workspace_store.lock(), self.server_store.lock():
-                self._recover_pending_tx_unlocked()
+            with ExitStack() as stack:
+                auto_locked = self._enter_coordinator_locks(stack)
+                self._recover_pending_tx_unlocked(automation_locked=auto_locked)
                 workspaces = self.workspace_store.load_workspaces()
                 servers = self.server_store.load_profiles(strict=True)
         except Exception as exc:  # noqa: BLE001

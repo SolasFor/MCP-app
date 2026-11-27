@@ -13,6 +13,10 @@ class AdminBackendUnavailableError(RuntimeError):
     """Raised when the local MCP backend Admin API is stopped or unreachable."""
 
 
+class AdminRequestAmbiguousError(AdminBackendUnavailableError):
+    """Raised when a request may have been accepted by backend before connection drop/timeout."""
+
+
 class AdminApiError(RuntimeError):
     """Raised when the local Admin API returns a non-connection HTTP error response."""
 
@@ -63,18 +67,29 @@ class LocalAdminClient:
                 self._port,
                 timeout=max(0.5, float(timeout)),
             )
-            conn.request(method.upper(), path, body=payload, headers=headers)
-            resp = conn.getresponse()
-            status = int(resp.status)
-            text = resp.read().decode("utf-8", errors="replace")
+            conn.connect()
         except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
-            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
-        finally:
             if conn is not None:
                 try:
                     conn.close()
                 except OSError:
                     pass
+            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
+
+        try:
+            conn.request(method.upper(), path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            text = resp.read().decode("utf-8", errors="replace")
+        except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+            raise AdminRequestAmbiguousError(
+                f"Backend Admin API response lost/timed out after request dispatch: {exc}"
+            ) from exc
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
         if status >= 400:
             msg = text

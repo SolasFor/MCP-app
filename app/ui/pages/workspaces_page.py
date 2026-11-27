@@ -28,7 +28,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.core.admin_client import AdminBackendUnavailableError, LocalAdminClient
+from app.core.admin_client import (
+    AdminBackendUnavailableError,
+    AdminRequestAmbiguousError,
+    LocalAdminClient,
+)
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
@@ -359,17 +363,33 @@ class _ServerRuntimeProxy:
         self,
         local_manager: ServerManager,
         get_admin_client: Callable[[], LocalAdminClient | None],
+        is_backend_stopped: Callable[[], bool] | None = None,
     ) -> None:
         self._local = local_manager
         self._get_client = get_admin_client
+        self._is_backend_stopped = is_backend_stopped or (lambda: True)
 
-    def _call(self, remote_fn: Callable[[LocalAdminClient], Any], local_fn: Callable[[], Any]) -> Any:
+    def _call(
+        self,
+        remote_fn: Callable[[LocalAdminClient], Any],
+        local_fn: Callable[[], Any],
+        *,
+        mutating: bool,
+    ) -> Any:
         client = self._get_client()
         if client is not None:
             try:
                 return remote_fn(client)
+            except AdminRequestAmbiguousError:
+                if mutating:
+                    raise
             except AdminBackendUnavailableError:
-                pass
+                if mutating and not self._is_backend_stopped():
+                    raise
+        elif mutating and not self._is_backend_stopped():
+            raise AdminBackendUnavailableError(
+                "Backend is active but Local Admin API is unavailable; refusing local state mutation"
+            )
         return local_fn()
 
     def list_servers(self, *, client_id: str | None = "owner", workspace_id: str = "") -> list[dict[str, Any]]:
@@ -377,6 +397,7 @@ class _ServerRuntimeProxy:
             self._call(
                 lambda c: c.list_servers(),
                 lambda: self._local.list_servers(client_id=client_id, workspace_id=workspace_id),
+                mutating=False,
             )
         )
 
@@ -385,6 +406,7 @@ class _ServerRuntimeProxy:
             self._call(
                 lambda c: c.server_status(name),
                 lambda: self._local.status_server(name, client_id=client_id, workspace_id=workspace_id),
+                mutating=False,
             )
         )
 
@@ -397,6 +419,7 @@ class _ServerRuntimeProxy:
                 lambda: self._local.start_server(
                     name, client_id=client_id, wait_readiness=wait_readiness, workspace_id=workspace_id
                 ),
+                mutating=True,
             )
         )
 
@@ -405,6 +428,7 @@ class _ServerRuntimeProxy:
             self._call(
                 lambda c: c.stop_server(name),
                 lambda: self._local.stop_server(name, client_id=client_id, workspace_id=workspace_id),
+                mutating=True,
             )
         )
 
@@ -417,6 +441,7 @@ class _ServerRuntimeProxy:
                 lambda: self._local.restart_server(
                     name, client_id=client_id, wait_readiness=wait_readiness, workspace_id=workspace_id
                 ),
+                mutating=True,
             )
         )
 
@@ -432,6 +457,7 @@ class _ServerRuntimeProxy:
                 lambda: self._local.health_server(
                     name, client_id=client_id, run_probe=run_probe, workspace_id=workspace_id
                 ),
+                mutating=bool(run_probe),
             )
         )
 
@@ -450,6 +476,7 @@ class _ServerRuntimeProxy:
                 lambda: self._local.logs_server(
                     name, client_id=client_id, stream=stream, offset=offset, limit=limit
                 ),
+                mutating=False,
             )
         )
 
@@ -458,6 +485,7 @@ class _ServerRuntimeProxy:
             self._call(
                 lambda c: c.server_metrics(name),
                 lambda: self._local.metrics_server(name, client_id=client_id),
+                mutating=False,
             )
         )
 
@@ -466,6 +494,7 @@ class _ServerRuntimeProxy:
             self._call(
                 lambda c: c.autostart_servers(),
                 lambda: self._local.start_autostart_servers(),
+                mutating=True,
             )
         )
 
@@ -529,7 +558,11 @@ class WorkspacesPage(PageScaffold):
             task_store=self.task_store,
             workspace_authorizer=self.coordinator.authorize_server_operation,
         )
-        self.runtime_proxy = _ServerRuntimeProxy(self.server_manager, self._get_admin_client)
+        self.runtime_proxy = _ServerRuntimeProxy(
+            self.server_manager,
+            self._get_admin_client,
+            self._is_backend_confirmed_stopped,
+        )
         self.manager = WorkspaceManager(
             self.store,
             self.history,
@@ -560,8 +593,13 @@ class WorkspacesPage(PageScaffold):
         self.apply_theme()
         self.reload()
 
+    def _is_backend_confirmed_stopped(self) -> bool:
+        if self._backend_running_checker is None:
+            return True
+        return not bool(self._backend_running_checker())
+
     def _get_admin_client(self) -> LocalAdminClient | None:
-        if self._backend_running_checker is not None and not self._backend_running_checker():
+        if self._backend_running_checker is not None and self._is_backend_confirmed_stopped():
             return None
         if self._admin_client_provider is None:
             return None
@@ -1483,8 +1521,15 @@ class WorkspacesPage(PageScaffold):
         if client is not None:
             try:
                 return client.run_workspace_task(wid, cname)
+            except AdminRequestAmbiguousError:
+                raise
             except AdminBackendUnavailableError:
-                pass
+                if not self._is_backend_confirmed_stopped():
+                    raise
+        elif not self._is_backend_confirmed_stopped():
+            raise AdminBackendUnavailableError(
+                "Backend is active but Local Admin API is unavailable; refusing duplicate local task run"
+            )
         return asyncio.run(self.manager.run_workspace_task(wid, cname, client_id="owner"))
 
     def run_selected_task(self) -> None:

@@ -9,11 +9,11 @@ MCP-app Server Manager manages owner-configured local development servers and ba
   - Validates parameters strictly, refuses shell metacharacters / path traversal / package-manager auto-installs (`pip`/`npm`/`npx`), and defaults to loopback binding (`127.0.0.1`).
 - **Encrypted Secret Env Vars**: Secret environment variables (`env_secret_refs`) are stored under the `servers` namespace in DPAPI-protected `SecretStore` (`secret://servers/<server>__<KEY>`), never in JSON config, logs, or metadata responses.
 - **Process & Port Ownership**:
-  - Single authoritative runtime when backend is running: GUI (`WorkspacesPage`) delegates start/stop/restart/health/logs/metrics/autostart through loopback-only `LocalAdminClient`, while `ServerManager` persists `managed_servers.runtime.json` under `.managed_servers.runtime.lock` so cross-instance concurrent starts never double-spawn and `independent` processes retain verified `ProcessIdentity(pid, create_time)` across backend restarts.
+  - Single authoritative runtime when backend is running: GUI (`WorkspacesPage`) delegates start/stop/restart/health/logs/metrics/autostart through loopback-only `LocalAdminClient` without repeating mutating calls on `AdminRequestAmbiguousError` or falling back locally while backend is active; `ServerManager` persists `managed_servers.runtime.json` (including `stop_requested` and `run_id`) under `.managed_servers.runtime.lock` so cross-instance concurrent starts never double-spawn, local supervisors respect remote stops/restarts, and `independent` processes retain verified `ProcessIdentity(pid, create_time)` across backend restarts.
   - Pre-launch port conflict check detects existing listeners without ever terminating foreign PIDs.
   - CPU/RAM/thread metrics verify `(pid, create_time)` via `ProcessIdentity` before querying `psutil`.
   - `controlled` servers run inside a process tree / Job Object and terminate cleanly on stop or owning-manager shutdown (closing GUI never kills backend-owned processes).
-  - `independent` servers launch detached and are never forcibly killed by `stop` or app exit; MCP-app reports this honestly.
+  - `independent` servers launch detached and are never forcibly killed by `stop` or app exit; MCP-app reports this honestly (automated tests track their own detached test PIDs and reap those test handles during fixture teardown).
 - **Readiness, Dependencies & Restarts**:
   - Supports `none`, `tcp`, and `http` readiness probes with bounded timeouts.
   - Topological dependency ordering (`depends_on`) with DFS cycle detection aborts startup if a dependency fails readiness.

@@ -342,9 +342,33 @@ class ServerManager:
         entry.state.linked_task_id = row.get("linked_task_id")
         entry.state.last_error = str(row.get("last_error") or "")
 
+    def _retire_local_handle(self, entry: _ManagedEntry) -> None:
+        handle = entry.handle
+        if handle is None:
+            return
+        if entry.profile.lifecycle == "controlled":
+            try:
+                self.runner.stop_managed(handle, grace_seconds=0.2)
+            except Exception:  # noqa: BLE001
+                pass
+        elif handle.job is not None:
+            self._platform.close_job(handle.job)
+        entry.handle = None
+
     def _apply_inactive_ledger_row(self, entry: _ManagedEntry, row: dict[str, Any], row_running: bool) -> bool:
+        row_mgr = str(row.get("owner_manager_id") or "")
+        row_stop = bool(row.get("stop_requested"))
         if entry.handle is not None:
-            return False
+            remote_stopped = row_stop or (
+                not row_running
+                and row_mgr not in ("", self._manager_id)
+                and entry.handle.process.poll() is not None
+            )
+            if not remote_stopped:
+                return False
+            entry.stop_requested = True
+            entry.state.next_restart_at = None
+            self._retire_local_handle(entry)
         entry.remote_manager_id = ""
         entry.state.running = False
         entry.state.healthy = False
@@ -352,6 +376,9 @@ class ServerManager:
             entry.state.status = STATUS_STOPPED
             entry.state.stopped_at = entry.state.stopped_at or time.time()
             return True
+        if row_stop:
+            entry.state.status = STATUS_STOPPED
+            entry.state.stopped_at = row.get("stopped_at") or entry.state.stopped_at or time.time()
         if row.get("run_id") and not entry.state.run_id:
             entry.state.run_id = row.get("run_id")
             entry.spool_dir = str(row.get("spool_dir") or entry.spool_dir or self.runner.spool.spool_dir)
@@ -365,7 +392,14 @@ class ServerManager:
         ctime = row.get("create_time")
         row_running = bool(row.get("running"))
         row_mgr = str(row.get("owner_manager_id") or "")
-        if row_mgr == self._manager_id and entry.handle is not None:
+        row_run_id = row.get("run_id")
+        row_stop = bool(row.get("stop_requested"))
+        if (
+            row_mgr == self._manager_id
+            and entry.handle is not None
+            and row_run_id == entry.handle.run_id
+            and not row_stop
+        ):
             return False
 
         verified = (
@@ -377,6 +411,8 @@ class ServerManager:
         )
         if verified:
             assert isinstance(pid, int) and isinstance(ctime, (int, float))
+            if entry.handle is not None and row_run_id != entry.handle.run_id:
+                self._retire_local_handle(entry)
             self._apply_verified_ledger_row(entry, row, pid, float(ctime), row_mgr, self.runner.spool.spool_dir)
             return False
         return self._apply_inactive_ledger_row(entry, row, row_running)
@@ -415,6 +451,7 @@ class ServerManager:
             "owner_client_id": st.owner_client_id,
             "owner_workspace_id": entry.owner_workspace_id,
             "owner_manager_id": owner_mgr,
+            "stop_requested": bool(entry.stop_requested),
             "run_id": st.run_id,
             "spool_dir": entry.spool_dir or str(self.runner.spool.spool_dir),
             "exit_code": st.exit_code,
@@ -428,28 +465,30 @@ class ServerManager:
             "linked_task_id": st.linked_task_id,
         }
 
+    def _existing_remote_row_alive(self, existing: Any, entry: _ManagedEntry) -> bool:
+        if not isinstance(existing, dict) or not existing.get("running"):
+            return False
+        other_mgr = str(existing.get("owner_manager_id") or "")
+        other_run = existing.get("run_id")
+        local_run = entry.handle.run_id if entry.handle is not None else entry.state.run_id
+        if other_mgr in ("", self._manager_id) and other_run == local_run:
+            return False
+        pid = existing.get("pid")
+        ctime = existing.get("create_time")
+        return (
+            isinstance(pid, int)
+            and pid > 0
+            and ctime is not None
+            and self._platform.verify_process_identity(ProcessIdentity(pid=pid, create_time=float(ctime)))
+        )
+
     def _persist_ledger_under_runtime_lock(self) -> None:
         merged = self._read_ledger_raw()
         with self._lock:
             for name, entry in self._entries.items():
                 self._refresh_entry_state(entry)
-                existing = merged.get(name)
-                if (
-                    entry.handle is None
-                    and not entry.state.running
-                    and isinstance(existing, dict)
-                    and existing.get("running")
-                    and str(existing.get("owner_manager_id") or "") not in ("", self._manager_id)
-                ):
-                    pid = existing.get("pid")
-                    ctime = existing.get("create_time")
-                    if (
-                        isinstance(pid, int)
-                        and pid > 0
-                        and ctime is not None
-                        and self._platform.verify_process_identity(ProcessIdentity(pid=pid, create_time=float(ctime)))
-                    ):
-                        continue
+                if not entry.state.running and self._existing_remote_row_alive(merged.get(name), entry):
+                    continue
                 merged[name] = self._entry_to_ledger_row(entry)
         atomic_write_json(
             self._runtime_path,
@@ -980,6 +1019,9 @@ class ServerManager:
                 self._stop_remote_controlled(entry, grace_seconds=grace_seconds)
             with self._lock:
                 self._refresh_entry_state(entry)
+                entry.stop_requested = True
+                if entry.handle is None:
+                    entry.remote_manager_id = self._manager_id
                 entry.state.status = STATUS_STOPPED
                 entry.state.healthy = False
                 entry.state.running = False
@@ -1335,6 +1377,23 @@ class ServerManager:
                 self._persist_ledger_under_runtime_lock()
 
     def _supervisor_tick(self) -> None:
+        with self._lock:
+            exited_controlled = [
+                name
+                for name, entry in self._entries.items()
+                if (
+                    entry.handle is not None
+                    and entry.profile.lifecycle == "controlled"
+                    and entry.handle.process.poll() is not None
+                )
+            ]
+        if exited_controlled:
+            try:
+                with self._runtime_lock(timeout=1.0):
+                    self._sync_from_ledger_under_runtime_lock(exited_controlled)
+            except TimeoutError:
+                pass
+
         to_restart: list[tuple[str, str, str]] = []
         now = time.time()
         with self._lock:
@@ -1367,6 +1426,7 @@ class ServerManager:
                     self.runner.stop_managed(entry.handle, grace_seconds=1.0)
                 except Exception:  # noqa: BLE001
                     pass
+                entry.handle = None
                 entry.state.running = False
                 entry.state.healthy = False
                 entry.state.status = STATUS_STOPPED

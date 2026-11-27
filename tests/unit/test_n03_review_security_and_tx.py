@@ -891,6 +891,160 @@ class N03ReviewSecurityAndTxTests(unittest.TestCase):
             wm.close()
             runner.close()
 
+    # ------------------------------------------------------------- N03-FINAL-02
+    def test_n03_final_02_tx_journal_allowlist_schema_types_symlinks_and_secrets_fail_closed(self) -> None:
+        auto_dir = self.root / "automation"
+        sched = AutomationScheduler(auto_dir)
+        sched.upsert_schedule(
+            ScheduleSpec(
+                schedule_id="sch_tx",
+                name="Start Srv",
+                trigger_type="interval",
+                interval_seconds=60,
+                tool_name="server_start",
+                arguments={"name": "srv_tx"},
+            )
+        )
+        coord = WorkspaceServerCoordinator(self.ws_store, self.srv_store, automation_dir=auto_dir)
+        self.secret_store.set_secret("owner", "owner_tok", "OWNER-KEEP")
+        self.secret_store.set_secret("workspaces", "ws_keep__K", "WS-KEEP")
+        s_old_ref = self.srv_store.set_env_secret("srv_tx", "TOKEN", "SRV-KEEP")
+        self.srv_store.upsert_profile(
+            _make_server("srv_tx", str(self.ws_dir), env_secret_refs={"TOKEN": s_old_ref})
+        )
+        self.ws_store.upsert_workspace(
+            WorkspaceProfile(
+                workspace_id="ws_keep",
+                name="Keep",
+                root_path=str(self.ws_dir),
+                linked_servers=("srv_tx",),
+            )
+        )
+        srv_path = self.srv_store.path
+        ws_path = self.ws_store.path
+        victim = self.root / "outside_victim.txt"
+        victim.write_text("DO_NOT_TOUCH", encoding="utf-8")
+        srv_before = srv_path.read_text(encoding="utf-8")
+        ws_before = ws_path.read_text(encoding="utf-8")
+        sched_before = (auto_dir / "schedules.json").read_text(encoding="utf-8")
+
+        tx_path = ws_path.parent / ".n03_coordinator_tx.json"
+
+        bad_journals: list[dict] = [
+            # Arbitrary file overwrite & null unlink outside allowlist
+            {"schema_version": 1, "files": {str(victim): "PWNED"}, "created_secrets": []},
+            {"schema_version": 1, "files": {str(victim): None}, "created_secrets": []},
+            # Unsupported schema_version / unexpected top-level key
+            {"schema_version": 99, "files": {}, "created_secrets": []},
+            {"schema_version": True, "files": {}, "created_secrets": []},
+            {"schema_version": 1, "files": {}, "created_secrets": [], "extra": 1},
+            # Mixed valid first entry + invalid second entry must be atomic (neither applied)
+            {
+                "schema_version": 1,
+                "files": {str(ws_path): json.dumps({"schema_version": 2, "workspaces": []}), str(victim): "BAD"},
+                "created_secrets": [],
+            },
+            # Non-string / non-JSON preimage content
+            {"schema_version": 1, "files": {str(ws_path): 123}, "created_secrets": []},
+            {"schema_version": 1, "files": {str(ws_path): "{bad"}, "created_secrets": []},
+            # Cross-namespace & pre-existing server secret deletion forbidden
+            {
+                "schema_version": 1,
+                "files": {str(srv_path): srv_before},
+                "created_secrets": [["owner", "owner_tok"]],
+            },
+            {
+                "schema_version": 1,
+                "files": {str(srv_path): srv_before},
+                "created_secrets": [["workspaces", "ws_keep__K"]],
+            },
+            {
+                "schema_version": 1,
+                "files": {str(srv_path): srv_before},
+                "created_secrets": [["servers", "srv_tx__TOKEN"]],
+            },
+        ]
+        for payload in bad_journals:
+            tx_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(ValueError):
+                coord.partition_servers()
+            with self.assertRaises(PermissionError):
+                coord.authorize_server_operation("srv_tx", client_id="owner", client_profile="full")
+            self.assertTrue(tx_path.exists())
+            self.assertEqual(victim.read_text(encoding="utf-8"), "DO_NOT_TOUCH")
+            self.assertEqual(srv_path.read_text(encoding="utf-8"), srv_before)
+            self.assertEqual(ws_path.read_text(encoding="utf-8"), ws_before)
+            self.assertEqual(self.secret_store.get_secret("owner", "owner_tok"), "OWNER-KEEP")
+            self.assertEqual(self.secret_store.get_secret("workspaces", "ws_keep__K"), "WS-KEEP")
+            self.assertEqual(self.secret_store.get_secret("servers", "srv_tx__TOKEN"), "SRV-KEEP")
+
+        # Symlink / reparse point check (fails closed on target reparse)
+        tx_path.write_text(
+            json.dumps({"schema_version": 1, "files": {str(srv_path): srv_before}, "created_secrets": []}),
+            encoding="utf-8",
+        )
+        with patch("backend.workspaces.server_links.is_reparse_or_symlink", side_effect=lambda p: Path(p) == srv_path):
+            with self.assertRaises(ValueError):
+                coord.partition_servers()
+        tx_path.unlink(missing_ok=True)
+
+        # Valid recovery touching schedules.json MUST acquire .automation.lock even from partition_servers()
+        mutated_sched = json.loads(sched_before)
+        mutated_sched["schedules"]["sch_tx"]["arguments"]["name"] = "srv_mutated"
+        (auto_dir / "schedules.json").write_text(json.dumps(mutated_sched), encoding="utf-8")
+        tx_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "files": {
+                        str(ws_path): ws_before,
+                        str(srv_path): srv_before,
+                        str(auto_dir / "schedules.json"): sched_before,
+                    },
+                    "created_secrets": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        auto_lock = auto_dir / ".automation.lock"
+        locked_ev = threading.Event()
+        release_ev = threading.Event()
+
+        def _hold_auto_lock() -> None:
+            with cross_process_lock(auto_lock, timeout=5.0):
+                locked_ev.set()
+                release_ev.wait(timeout=5.0)
+
+        t_hold = threading.Thread(target=_hold_auto_lock, daemon=True)
+        t_hold.start()
+        self.assertTrue(locked_ev.wait(timeout=2.0))
+        snap_done = threading.Event()
+        snap_err: list[Exception] = []
+
+        def _run_partition() -> None:
+            try:
+                coord.partition_servers()
+            except Exception as exc:  # noqa: BLE001
+                snap_err.append(exc)
+            finally:
+                snap_done.set()
+
+        t_part = threading.Thread(target=_run_partition, daemon=True)
+        t_part.start()
+        # Must still be waiting for .automation.lock!
+        self.assertFalse(snap_done.wait(timeout=0.2))
+        release_ev.set()
+        t_hold.join(timeout=3.0)
+        t_part.join(timeout=3.0)
+        self.assertEqual(snap_err, [])
+        self.assertFalse(tx_path.exists())
+        self.assertEqual(
+            json.loads((auto_dir / "schedules.json").read_text(encoding="utf-8"))["schedules"]["sch_tx"]["arguments"]["name"],
+            "srv_tx",
+        )
+        # Idempotent second recovery call
+        coord.partition_servers()
+
 
 if __name__ == "__main__":
     unittest.main()

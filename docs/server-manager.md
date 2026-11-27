@@ -1,6 +1,6 @@
-# Server Manager (`v0.9.4`)
+# Server Manager (`v1.0.2` / integrated in Workspaces)
 
-MCP-app Server Manager manages owner-configured local development servers and background services (`%APPDATA%\MCPApp\servers\managed_servers.json`) with encrypted secrets, health probes, metrics, dependency ordering, and bounded logs.
+MCP-app Server Manager manages owner-configured local development servers and background services (`%APPDATA%\MCPApp\servers\managed_servers.json`) with encrypted secrets, health probes, metrics, dependency ordering, and bounded logs. Since stage **N03**, Server Manager UI lives directly inside **Workspaces** (Linked Servers per workspace + **Unlinked Servers** tab); the standalone **Servers** sidebar tab was removed while redirecting legacy `"servers"` / `"server_manager"` / `"managed_servers"` targets to Workspaces.
 
 ## Key Capabilities
 - **Lossless Migration**: Reads legacy v1 `managed_servers.json` (`{name: {argv, cwd, lifecycle}}`) seamlessly and migrates to schema v2 without data loss or privilege widening (migrated entries default to `min_profile="full"`).
@@ -19,4 +19,5 @@ MCP-app Server Manager manages owner-configured local development servers and ba
   - Restart policies (`never`, `on-failure`, `always`) use bounded exponential backoff.
 - **MCP Tools (`backend/server.py`, `backend/tool_registry.py`)**:
   - `server_list`, `server_start`, `server_stop`, `server_restart`, `server_status`, `server_logs`, `server_metrics`, `server_health`, plus compatible `oauth_managed_server`.
-  - Per-server `min_profile` (`allowlist` | `full`), `allowed_clients`, live re-authorization before restarts, and optional `TaskManager` linkage (`linked_task_id` / `run_pre_start_task`).
+  - All `server_*` tools accept an optional `workspace_id: str = ""` context parameter and enforce cross-layer workspace permissions (`WorkspaceServerCoordinator.authorize_server_operation`) and confused-deputy checks on `depends_on` before starting processes.
+  - Per-server `min_profile` (`allowlist` | `full`), `allowed_clients`, live re-authorization before restarts, and optional `TaskManager` linkage (`linked_task_id` / `run_pre_start_task`), plus safe stopped-server ID renaming (`RenameServerDialog` / `rename_server`) syncing `depends_on`, SecretStore refs, and `linked_servers`.

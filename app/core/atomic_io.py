@@ -3,18 +3,142 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from app.platform import get_platform
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
 _TRANSIENT_REPLACE_WINERRORS = frozenset({5, 32})  # ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION
 _REPLACE_DELAYS_S = (0.015, 0.03, 0.06, 0.12, 0.25, 0.5)
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: dict[str, list[Any]] = {}
+_CROSS_LOCKS_GUARD = threading.Lock()
+_CROSS_LOCKS: dict[str, threading.RLock] = {}
+_CROSS_LOCK_DEPTH: dict[tuple[str, int], int] = {}
+
+
+def _canonical_lock_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def is_reparse_or_symlink(path: Path) -> bool:
+    """Return True if ``path`` itself is a POSIX symlink or Windows reparse point/junction."""
+    try:
+        st = Path(path).lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    attrs = getattr(st, "st_file_attributes", 0)
+    return bool(attrs & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _get_cross_thread_lock(key: str) -> threading.RLock:
+    with _CROSS_LOCKS_GUARD:
+        lock = _CROSS_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _CROSS_LOCKS[key] = lock
+        return lock
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _acquire_os_lock(fd: int, timeout: float, lock_path: Path) -> None:
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while True:
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for lock: {lock_path}") from None
+                time.sleep(0.01)
+
+    def _release_os_lock(fd: int) -> None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _acquire_os_lock(fd: int, timeout: float, lock_path: Path) -> None:
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for lock: {lock_path}") from None
+                time.sleep(0.01)
+
+    def _release_os_lock(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+
+@contextmanager
+def cross_process_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
+    """Thread-reentrant cross-process exclusive file lock with bounded timeout.
+
+    Global lock acquisition hierarchy across MCP-app stores/managers (outer -> inner):
+    1. WorkspaceStore.lock() (.workspaces.lock)
+    2. ServerConfigStore.lock() (.managed_servers.lock)
+    3. AutomationScheduler lock (.automation.lock)
+    4. ServerManager runtime lock (.managed_servers.runtime.lock)
+    5. In-memory store/manager threading.RLock (leaf lock only)
+    """
+    target = Path(lock_path)
+    key = _canonical_lock_key(target)
+    tlock = _get_cross_thread_lock(key)
+    tid = threading.get_ident()
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    wait_s = max(0.01, deadline - time.monotonic())
+    if not tlock.acquire(timeout=wait_s):
+        raise TimeoutError(f"Timed out waiting for lock: {target}")
+    try:
+        depth_key = (key, tid)
+        depth = _CROSS_LOCK_DEPTH.get(depth_key, 0)
+        if depth > 0:
+            _CROSS_LOCK_DEPTH[depth_key] = depth + 1
+            try:
+                yield
+            finally:
+                _CROSS_LOCK_DEPTH[depth_key] = depth
+            return
+
+        if not target.parent.exists():
+            ensure_private_dir(target.parent, restrict_acl=True)
+        fd = os.open(os.fspath(target), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            remaining = max(0.05, deadline - time.monotonic())
+            _acquire_os_lock(fd, remaining, target)
+            get_platform().restrict_path_acl(target, is_dir=False)
+            _CROSS_LOCK_DEPTH[depth_key] = 1
+            try:
+                yield
+            finally:
+                _CROSS_LOCK_DEPTH.pop(depth_key, None)
+                _release_os_lock(fd)
+        finally:
+            os.close(fd)
+    finally:
+        tlock.release()
 
 
 @contextmanager

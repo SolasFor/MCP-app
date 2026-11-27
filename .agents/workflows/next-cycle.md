@@ -3,7 +3,7 @@ description: Execute one approved MCP App roadmap stage with evidence and review
 ---
 
 1. Read AGENTS.md, ROADMAP.md, PROGRESS.md, relevant criteria and scope.
-2. Verify Git/worktree, stage prerequisites, baseline and owner authorization. Stop at N00 if implementation not authorized.
+2. Verify Git/worktree, stage prerequisites, baseline and owner authorization. Stop after preparation if implementation not explicitly authorized.
 3. Select minimal necessary skills/MCP from docs/antigravity-workflow.md. Use read-only discovery and official docs.
 4. Plan stage, threat model and negative tests; isolate branch/worktree. Preserve unrelated files.
 5. Implement only approved stage, tests, migrations and docs. Run focused checks, full CI at gate.

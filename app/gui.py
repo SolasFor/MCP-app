@@ -329,7 +329,7 @@ def run_gui(argv: list[str]) -> int:
 
     if not (minimized and tray_available):
         window.show_and_raise()
-    QTimer.singleShot(0, window.servers_page.start_autostart_servers)
+    QTimer.singleShot(0, window.workspaces_page.start_autostart_servers)
     if settings.start_services_on_launch and settings.active_provider != PROVIDER_NONE:
         QTimer.singleShot(0, manager.start_all)
     QTimer.singleShot(4000, window.automation_page.maybe_run_startup_auto_check)

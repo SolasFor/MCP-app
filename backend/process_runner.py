@@ -625,8 +625,14 @@ class ProcessRunner:
                 if handle.job is not None:
                     self.platform.terminate_job(handle.job, exit_code=1)
                 if handle.process.poll() is None:
-                    handle.process.kill()
+                    try:
+                        handle.process.kill()
+                    except OSError:
+                        pass
+                try:
                     handle.process.wait(timeout=2)
+                except Exception:  # noqa: BLE001
+                    handle.process.poll()
             for thread in handle._reader_threads:
                 thread.join(timeout=0.5)
             return True

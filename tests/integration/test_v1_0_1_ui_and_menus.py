@@ -41,7 +41,7 @@ from app.ui.pages.clients_page import ClientsPage
 from app.ui.pages.devices_page import DevicesPage
 from app.ui.pages.extensions_page import ExtensionsPage
 from app.ui.pages.gateway_page import GatewayPage
-from app.ui.pages.servers_page import ServerProfileDialog, ServersPage, TemplateWizardDialog
+from app.ui.pages.servers_page import RenameServerDialog, ServerProfileDialog, ServersPage, TemplateWizardDialog
 from app.ui.pages.tasks_page import TasksPage
 from app.ui.pages.workspaces_page import WorkspacesPage
 from backend.oauth_execution import ExecutionApprovals
@@ -86,8 +86,9 @@ class V101UiAndMenuTests(unittest.TestCase):
 
                     dialogs: list[QWidget] = [
                         AddMcpServerWizard(win.gateway_page.store, parent=win),
-                        ServerProfileDialog(win.servers_page.store, is_new=True, parent=win),
-                        TemplateWizardDialog(win.servers_page.store, parent=win),
+                        ServerProfileDialog(win.workspaces_page.server_store, is_new=True, parent=win),
+                        TemplateWizardDialog(win.workspaces_page.server_store, parent=win),
+                        RenameServerDialog("old_srv", {"old_srv"}, parent=win),
                     ]
                     roots: list[QWidget] = [win, *dialogs]
 

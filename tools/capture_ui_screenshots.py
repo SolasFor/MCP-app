@@ -237,6 +237,68 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             saved.append(p10)
             wiz.close()
 
+            # 11. Workspaces (with integrated linked & unlinked servers) Dark & Light at 1366x768
+            try:
+                from backend.servers.models import ReadinessConfig, ServerProfile
+                from backend.workspaces.models import WorkspacePermissions, WorkspaceProfile
+
+                sample_dir = data_dir / "sample_repo"
+                (sample_dir / "src").mkdir(parents=True, exist_ok=True)
+                (sample_dir / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+                win.workspaces_page.server_store.upsert_profile(
+                    ServerProfile(
+                        name="sample_api",
+                        display_name="Sample API",
+                        template="python_fastapi",
+                        argv=(sys.executable, "-m", "http.server", "8081"),
+                        cwd=str(sample_dir),
+                        host="127.0.0.1",
+                        port=8081,
+                        readiness=ReadinessConfig(kind="http", host="127.0.0.1", port=8081),
+                    )
+                )
+                win.workspaces_page.server_store.upsert_profile(
+                    ServerProfile(
+                        name="standalone_redis",
+                        display_name="Standalone Worker",
+                        argv=(sys.executable, "-m", "http.server", "8082"),
+                        cwd=str(data_dir),
+                        host="127.0.0.1",
+                        port=8082,
+                    )
+                )
+                win.workspaces_page.store.upsert_workspace(
+                    WorkspaceProfile(
+                        workspace_id="mcp_demo",
+                        name="MCP Demo Project",
+                        root_path=str(sample_dir),
+                        language="python",
+                        commands={"test": f'"{sys.executable}" -m unittest'},
+                        linked_servers=("sample_api",),
+                        permissions=WorkspacePermissions(read=True, write=True, delete=False, execute=True, git=True),
+                    )
+                )
+            except Exception:
+                pass
+            win.resize(1366, 768)
+            win.set_theme_mode(theme.THEME_DARK)
+            win.set_language(LANG_RU)
+            win.show_page("workspaces")
+            win.workspaces_page.detail_tabs.setCurrentIndex(2)
+            win.toasts.clear_all()
+            app.processEvents()
+            p11 = out_dir / "workspaces-dark.png"
+            win.grab().save(str(p11))
+            saved.append(p11)
+
+            win.set_theme_mode(theme.THEME_LIGHT)
+            win.show_page("workspaces")
+            win.toasts.clear_all()
+            app.processEvents()
+            p12 = out_dir / "workspaces-light.png"
+            win.grab().save(str(p12))
+            saved.append(p12)
+
             win.allow_close()
             win.close()
 

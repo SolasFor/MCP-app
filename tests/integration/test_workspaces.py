@@ -212,7 +212,7 @@ class WorkspacesIntegrationTests(unittest.TestCase):
 
             i18n.set_language(LANG_EN)
             page.retranslate()
-            self.assertEqual(page.add_btn.text(), "Add")
+            self.assertEqual(page.add_btn.text(), "Add Workspace")
             i18n.set_language(LANG_RU)
             page.retranslate()
         finally:

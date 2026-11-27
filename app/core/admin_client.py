@@ -13,6 +13,10 @@ class AdminBackendUnavailableError(RuntimeError):
     """Raised when the local MCP backend Admin API is stopped or unreachable."""
 
 
+class AdminRequestAmbiguousError(AdminBackendUnavailableError):
+    """Raised when a request may have been accepted by backend before connection drop/timeout."""
+
+
 class AdminApiError(RuntimeError):
     """Raised when the local Admin API returns a non-connection HTTP error response."""
 
@@ -63,18 +67,29 @@ class LocalAdminClient:
                 self._port,
                 timeout=max(0.5, float(timeout)),
             )
-            conn.request(method.upper(), path, body=payload, headers=headers)
-            resp = conn.getresponse()
-            status = int(resp.status)
-            text = resp.read().decode("utf-8", errors="replace")
+            conn.connect()
         except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
-            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
-        finally:
             if conn is not None:
                 try:
                     conn.close()
                 except OSError:
                     pass
+            raise AdminBackendUnavailableError(f"Backend Admin API unreachable: {exc}") from exc
+
+        try:
+            conn.request(method.upper(), path, body=payload, headers=headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            text = resp.read().decode("utf-8", errors="replace")
+        except (http.client.HTTPException, ConnectionError, TimeoutError, OSError) as exc:
+            raise AdminRequestAmbiguousError(
+                f"Backend Admin API response lost/timed out after request dispatch: {exc}"
+            ) from exc
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
         if status >= 400:
             msg = text
@@ -153,3 +168,65 @@ class LocalAdminClient:
     def export_diagnostics(self, *, timeout: float = 5.0) -> str:
         _status, text = self._request_raw("GET", "/api/v1/diagnostics/export", timeout=timeout)
         return text
+
+    def list_servers(self, *, timeout: float = 5.0) -> list[dict[str, Any]]:
+        res = self._request_json("GET", "/api/v1/servers", timeout=timeout)
+        items = res.get("servers")
+        return list(items) if isinstance(items, list) else []
+
+    def autostart_servers(self, *, timeout: float = 120.0) -> list[dict[str, Any]]:
+        res = self._request_json("POST", "/api/v1/servers/autostart", body={}, timeout=timeout)
+        items = res.get("servers")
+        return list(items) if isinstance(items, list) else []
+
+    def server_status(self, name: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/status", timeout=timeout)
+
+    def start_server(
+        self, name: str, *, workspace_id: str = "", wait_readiness: bool = True, timeout: float = 130.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json(
+            "POST",
+            f"/api/v1/servers/{quoted}/start",
+            body={"workspace_id": workspace_id, "wait_readiness": bool(wait_readiness)},
+            timeout=timeout,
+        )
+
+    def stop_server(self, name: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("POST", f"/api/v1/servers/{quoted}/stop", body={}, timeout=timeout)
+
+    def restart_server(
+        self, name: str, *, workspace_id: str = "", wait_readiness: bool = True, timeout: float = 130.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json(
+            "POST",
+            f"/api/v1/servers/{quoted}/restart",
+            body={"workspace_id": workspace_id, "wait_readiness": bool(wait_readiness)},
+            timeout=timeout,
+        )
+
+    def health_server(self, name: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("POST", f"/api/v1/servers/{quoted}/health", body={}, timeout=timeout)
+
+    def server_logs(
+        self, name: str, *, stream: str = "stdout", offset: int = 0, limit: int = 16000, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        q = urllib.parse.urlencode({"stream": stream, "offset": int(offset), "limit": int(limit)})
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/logs?{q}", timeout=timeout)
+
+    def server_metrics(self, name: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/metrics", timeout=timeout)
+
+    def run_workspace_task(self, workspace_id: str, command_name: str, *, timeout: float = 610.0) -> dict[str, Any]:
+        q_wid = urllib.parse.quote(workspace_id, safe="")
+        q_cmd = urllib.parse.quote(command_name, safe="")
+        return self._request_json(
+            "POST", f"/api/v1/workspaces/{q_wid}/tasks/{q_cmd}/run", body={}, timeout=timeout
+        )

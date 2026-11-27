@@ -5,7 +5,7 @@ import json
 import shlex
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -46,10 +46,12 @@ from backend.servers.models import (
     ReadinessConfig,
     RestartConfig,
     ServerProfile,
+    validate_server_name,
 )
 from backend.servers.store import ServerConfigStore, validate_dependencies
 from backend.servers.templates import build_profile_from_template, list_templates
 from backend.tasks.store import TaskStore
+from backend.workspaces.models import WorkspaceProfile
 
 
 def _parse_env_lines(raw: str) -> dict[str, str]:
@@ -68,6 +70,131 @@ def _parse_csv(raw: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _format_server_status(prof: ServerProfile, snap: dict[str, Any]) -> str:
+    status_key = str(snap.get("status") or "stopped")
+    status_label = tr(f"servers.status.{status_key}")
+    if snap.get("running") and prof.readiness.kind != "none":
+        health_suffix = "✓" if snap.get("healthy") else "!"
+        return f"{status_label} [{health_suffix}]"
+    return status_label
+
+
+def _append_server_row(
+    table: DataTable,
+    idx: int,
+    prof: ServerProfile,
+    snap: dict[str, Any],
+    server_manager: Any,
+    linked_map: dict[str, list[str]] | None,
+) -> None:
+    name_item = QTableWidgetItem(prof.display_name or prof.name)
+    name_item.setData(Qt.ItemDataRole.UserRole, prof.name)
+    name_item.setToolTip(prof.name)
+
+    endpoint = f"{prof.host}:{prof.port}" if prof.port else prof.host
+    metrics_text = "—"
+    if snap.get("running"):
+        m = server_manager.metrics_server(prof.name, client_id="owner")
+        metrics_text = f"{m.get('cpu_percent', 0.0):.1f}% / {m.get('memory_mb', 0.0):.1f} MB"
+    deps_text = ", ".join(prof.depends_on) or "—"
+    ws_list = linked_map.get(prof.name, []) if linked_map is not None else []
+    if ws_list:
+        deps_text = f"{deps_text} | ws:{','.join(ws_list)}"
+
+    vals = (
+        prof.template,
+        prof.lifecycle,
+        _format_server_status(prof, snap),
+        endpoint,
+        metrics_text,
+        deps_text,
+        prof.min_profile if prof.enabled else "disabled",
+    )
+    table.setItem(idx, 0, name_item)
+    for col, txt in enumerate(vals, start=1):
+        table.setItem(idx, col, QTableWidgetItem(txt))
+    table.set_row_actions_cell(idx, 8, tooltip=tr("common.actions"))
+
+
+def _append_missing_row(table: DataTable, row: int, mname: str) -> None:
+    badge = tr("workspaces.servers.missing_badge")
+    stale_item = QTableWidgetItem(f"{mname} [{badge}]")
+    stale_item.setData(Qt.ItemDataRole.UserRole, mname)
+    stale_item.setData(Qt.ItemDataRole.UserRole + 1, True)
+    table.setItem(row, 0, stale_item)
+    for col, txt in ((1, "—"), (2, "—"), (3, badge), (4, "—"), (5, "—"), (6, "—"), (7, "—")):
+        table.setItem(row, col, QTableWidgetItem(txt))
+    table.set_row_actions_cell(row, 8, tooltip=tr("common.actions"))
+
+
+def populate_server_rows(
+    table: DataTable,
+    profiles: list[ServerProfile],
+    snapshots: dict[str, dict[str, Any]],
+    server_manager: Any,
+    *,
+    missing_names: tuple[str, ...] = (),
+    linked_map: dict[str, list[str]] | None = None,
+    selected_name: str | None = None,
+) -> int:
+    """Populate a server DataTable with sorted ServerProfiles and optional stale ref rows."""
+    sorted_profiles = sorted(profiles, key=lambda p: p.name)
+    table.setRowCount(len(sorted_profiles) + len(missing_names))
+    restore_row = 0
+
+    for idx, prof in enumerate(sorted_profiles):
+        _append_server_row(table, idx, prof, snapshots.get(prof.name, {}), server_manager, linked_map)
+        if selected_name and prof.name == selected_name:
+            restore_row = idx
+
+    base_idx = len(sorted_profiles)
+    for offset, mname in enumerate(missing_names):
+        _append_missing_row(table, base_idx + offset, mname)
+    return restore_row
+
+
+def fetch_server_logs_text(name: str, stream: str, server_manager: Any) -> str:
+    safe_stream: Literal["stdout", "stderr"] = "stderr" if stream == "stderr" else "stdout"
+    try:
+        logs_res = server_manager.logs_server(
+            name, client_id="owner", stream=safe_stream, offset=0, limit=16000
+        )
+        return str(logs_res.get("text") or tr("servers.details.no_logs"))
+    except Exception:
+        return tr("servers.details.no_logs")
+
+
+def format_server_details(
+    prof: ServerProfile,
+    snap: dict[str, Any],
+    server_manager: Any,
+    redactor: SecretRedactor,
+    *,
+    linked_workspaces: list[str] | None = None,
+) -> str:
+    metrics = server_manager.metrics_server(prof.name, client_id="owner")
+    health = server_manager.health_server(prof.name, client_id="owner", run_probe=False)
+    summary: dict[str, Any] = {
+        "name": prof.name,
+        "template": prof.template,
+        "lifecycle": prof.lifecycle,
+        "argv_executable": prof.argv[0] if prof.argv else "",
+        "cwd": prof.cwd,
+        "status": snap.get("status", "stopped"),
+        "pid": snap.get("pid"),
+        "exit_code": snap.get("exit_code"),
+        "restart_count": snap.get("restart_count", 0),
+        "readiness": prof.readiness.to_dict(),
+        "health": health,
+        "metrics": metrics,
+        "secret_env_refs": list(prof.env_secret_refs.values()),
+        "last_error": snap.get("last_error", ""),
+    }
+    if linked_workspaces is not None:
+        summary["linked_workspaces"] = list(linked_workspaces)
+    return redactor.redact_text(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
 class ServerProfileDialog(SilentDialog):
     """Create or edit a managed ServerProfile without revealing saved SecretStore values."""
 
@@ -77,13 +204,18 @@ class ServerProfileDialog(SilentDialog):
         *,
         existing: ServerProfile | None = None,
         is_new: bool = True,
+        default_cwd: str = "",
+        workspaces: dict[str, WorkspaceProfile] | None = None,
+        selected_workspaces: tuple[str, ...] = (),
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._store = store
         self._base = existing or ServerProfile(name="")
         self._is_new = is_new
+        self._workspaces = workspaces
         self.saved_profile: ServerProfile | None = None
+        self.selected_workspaces: tuple[str, ...] = tuple(selected_workspaces)
 
         self.setWindowTitle(tr("servers.dlg.title_add" if is_new else "servers.dlg.title_edit"))
         self.setMinimumWidth(600)
@@ -122,7 +254,8 @@ class ServerProfileDialog(SilentDialog):
         form.addRow(tr("servers.dlg.args"), self.args_edit)
 
         cwd_row = QHBoxLayout()
-        self.cwd_edit = QLineEdit(self._base.cwd)
+        initial_cwd = self._base.cwd or (default_cwd if is_new else "")
+        self.cwd_edit = QLineEdit(initial_cwd)
         self.cwd_edit.setObjectName("UiInput")
         self.cwd_browse_btn = QPushButton(tr("servers.dlg.browse"))
         self.cwd_browse_btn.clicked.connect(self._browse_cwd)
@@ -151,6 +284,11 @@ class ServerProfileDialog(SilentDialog):
         self.lifecycle_combo.setCurrentIndex(max(self.lifecycle_combo.findData(self._base.lifecycle), 0))
         form.addRow(tr("servers.dlg.lifecycle"), self.lifecycle_combo)
 
+        self._build_probe_and_restart_rows(form)
+        self._build_access_and_env_rows(form, workspaces, selected_workspaces)
+        self._finish_dialog_buttons(layout, form)
+
+    def _build_probe_and_restart_rows(self, form: QFormLayout) -> None:
         probe_row = QHBoxLayout()
         self.readiness_combo = SafeComboBox()
         for rk in READINESS_KINDS:
@@ -184,6 +322,12 @@ class ServerProfileDialog(SilentDialog):
         restart_row.addWidget(self.backoff_spin, 1)
         form.addRow(tr("servers.dlg.restart_policy"), restart_row)
 
+    def _build_access_and_env_rows(
+        self,
+        form: QFormLayout,
+        workspaces: dict[str, WorkspaceProfile] | None,
+        selected_workspaces: tuple[str, ...],
+    ) -> None:
         self.deps_edit = QLineEdit(", ".join(self._base.depends_on))
         self.deps_edit.setObjectName("UiInput")
         form.addRow(tr("servers.dlg.deps"), self.deps_edit)
@@ -221,16 +365,26 @@ class ServerProfileDialog(SilentDialog):
         self.secret_env_edit.setPlaceholderText(hint)
         form.addRow(tr("servers.dlg.secret_env"), self.secret_env_edit)
 
+        self.linked_workspaces_edit: QLineEdit | None = None
+        if workspaces is not None:
+            self.linked_workspaces_edit = QLineEdit(", ".join(selected_workspaces))
+            self.linked_workspaces_edit.setObjectName("UiInput")
+            form.addRow(tr("servers.dlg.linked_workspaces"), self.linked_workspaces_edit)
+
         flags_row = QHBoxLayout()
         self.enabled_check = QCheckBox(tr("servers.dlg.enabled"))
         self.enabled_check.setChecked(self._base.enabled)
         self.autostart_check = QCheckBox(tr("servers.dlg.autostart"))
         self.autostart_check.setChecked(self._base.autostart)
+        self.workspace_scoped_check = QCheckBox(tr("servers.dlg.workspace_scoped"))
+        self.workspace_scoped_check.setChecked(self._base.workspace_scoped or bool(selected_workspaces))
         flags_row.addWidget(self.enabled_check)
         flags_row.addWidget(self.autostart_check)
+        flags_row.addWidget(self.workspace_scoped_check)
         flags_row.addStretch(1)
         form.addRow("", flags_row)
 
+    def _finish_dialog_buttons(self, layout: QVBoxLayout, form: QFormLayout) -> None:
         layout.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -249,60 +403,74 @@ class ServerProfileDialog(SilentDialog):
         if path:
             self.cwd_edit.setText(path)
 
+    def _build_profile_from_inputs(self, name: str) -> ServerProfile:
+        exe = self.exe_edit.text().strip()
+        extra_args = shlex.split(self.args_edit.text().strip()) if self.args_edit.text().strip() else []
+        port_val = int(self.port_spin.value()) or None
+        host = self.host_edit.text().strip() or "127.0.0.1"
+        probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        readiness = ReadinessConfig(
+            kind=str(self.readiness_combo.currentData() or "none"),
+            host=probe_host,
+            port=port_val,
+            http_path=self.health_path_edit.text().strip() or "/health",
+            timeout_seconds=float(self.readiness_timeout_spin.value()),
+        )
+        restart = RestartConfig(
+            policy=str(self.restart_combo.currentData() or "never"),
+            max_attempts=int(self.max_restarts_spin.value()),
+            base_backoff_seconds=float(self.backoff_spin.value()),
+            max_backoff_seconds=max(float(self.backoff_spin.value()) * 4.0, 30.0),
+        )
+        secret_refs = dict(self._base.env_secret_refs)
+        for k, v in _parse_env_lines(self.secret_env_edit.toPlainText()).items():
+            secret_refs[k] = self._store.set_env_secret(name, k, v)
+        return ServerProfile(
+            name=name,
+            display_name=self.display_edit.text().strip() or name,
+            template=str(self.template_combo.currentData() or "custom"),
+            template_params=dict(self._base.template_params),
+            argv=tuple([exe, *extra_args]) if exe else (),
+            cwd=self.cwd_edit.text().strip(),
+            env=_parse_env_lines(self.plain_env_edit.toPlainText()),
+            env_secret_refs=secret_refs,
+            lifecycle=str(self.lifecycle_combo.currentData() or "controlled"),
+            host=host,
+            port=port_val,
+            expose_externally=self.expose_check.isChecked(),
+            readiness=readiness,
+            depends_on=_parse_csv(self.deps_edit.text()),
+            restart=restart,
+            autostart=self.autostart_check.isChecked(),
+            enabled=self.enabled_check.isChecked(),
+            min_profile=str(self.min_profile_combo.currentData() or "full"),
+            allowed_clients=_parse_csv(self.allowed_clients_edit.text()),
+            allow_shared_control=self._base.allow_shared_control,
+            workspace_scoped=self.workspace_scoped_check.isChecked(),
+            pre_start_task_command=self.pre_start_edit.text().strip(),
+            description=self._base.description,
+        )
+
+    def _validate_selected_workspaces(self) -> tuple[str, ...]:
+        if self.linked_workspaces_edit is None or self._workspaces is None:
+            return self.selected_workspaces
+        chosen_ws = _parse_csv(self.linked_workspaces_edit.text())
+        unknown_ws = [wid for wid in chosen_ws if wid not in self._workspaces]
+        if unknown_ws:
+            raise ValueError(f"Unknown workspace(s): {', '.join(unknown_ws)}")
+        return chosen_ws
+
     def _on_accept(self) -> None:
         name = self.name_edit.text().strip()
-        exe = self.exe_edit.text().strip()
         try:
-            extra_args = shlex.split(self.args_edit.text().strip()) if self.args_edit.text().strip() else []
-            port_val = int(self.port_spin.value()) or None
-            host = self.host_edit.text().strip() or "127.0.0.1"
-            readiness_kind = str(self.readiness_combo.currentData() or "none")
-            probe_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-            readiness = ReadinessConfig(
-                kind=readiness_kind,
-                host=probe_host,
-                port=port_val,
-                http_path=self.health_path_edit.text().strip() or "/health",
-                timeout_seconds=float(self.readiness_timeout_spin.value()),
-            )
-            restart = RestartConfig(
-                policy=str(self.restart_combo.currentData() or "never"),
-                max_attempts=int(self.max_restarts_spin.value()),
-                base_backoff_seconds=float(self.backoff_spin.value()),
-                max_backoff_seconds=max(float(self.backoff_spin.value()) * 4.0, 30.0),
-            )
-            secret_refs = dict(self._base.env_secret_refs)
-            secret_updates = _parse_env_lines(self.secret_env_edit.toPlainText())
-            for k, v in secret_updates.items():
-                secret_refs[k] = self._store.set_env_secret(name, k, v)
-
-            profile = ServerProfile(
-                name=name,
-                display_name=self.display_edit.text().strip() or name,
-                template=str(self.template_combo.currentData() or "custom"),
-                argv=tuple([exe, *extra_args]) if exe else (),
-                cwd=self.cwd_edit.text().strip(),
-                env=_parse_env_lines(self.plain_env_edit.toPlainText()),
-                env_secret_refs=secret_refs,
-                lifecycle=str(self.lifecycle_combo.currentData() or "controlled"),
-                host=host,
-                port=port_val,
-                expose_externally=self.expose_check.isChecked(),
-                readiness=readiness,
-                depends_on=_parse_csv(self.deps_edit.text()),
-                restart=restart,
-                autostart=self.autostart_check.isChecked(),
-                enabled=self.enabled_check.isChecked(),
-                min_profile=str(self.min_profile_combo.currentData() or "full"),
-                allowed_clients=_parse_csv(self.allowed_clients_edit.text()),
-                pre_start_task_command=self.pre_start_edit.text().strip(),
-            )
+            profile = self._build_profile_from_inputs(name)
             profile.validate()
             profiles = self._store.load_profiles(strict=False)
             if self._is_new and profile.name in profiles:
                 raise ValueError(f"Server '{profile.name}' already exists")
             profiles[profile.name] = profile
             validate_dependencies(profiles)
+            self.selected_workspaces = self._validate_selected_workspaces()
         except Exception as exc:
             SilentMessageBox.warning(self, tr("servers.title"), str(exc))
             return
@@ -313,10 +481,20 @@ class ServerProfileDialog(SilentDialog):
 class TemplateWizardDialog(SilentDialog):
     """Create a validated ServerProfile from one of the safe built-in templates."""
 
-    def __init__(self, store: ServerConfigStore, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        store: ServerConfigStore,
+        *,
+        default_cwd: str = "",
+        workspaces: dict[str, WorkspaceProfile] | None = None,
+        selected_workspaces: tuple[str, ...] = (),
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self._store = store
+        self._workspaces = workspaces
         self.saved_profile: ServerProfile | None = None
+        self.selected_workspaces: tuple[str, ...] = tuple(selected_workspaces)
         self._templates = {item["template"]: item for item in list_templates() if item["template"] != "custom"}
 
         self.setWindowTitle(tr("servers.tpl.title"))
@@ -337,7 +515,7 @@ class TemplateWizardDialog(SilentDialog):
         form.addRow(tr("servers.dlg.template"), self.template_combo)
 
         cwd_row = QHBoxLayout()
-        self.cwd_edit = QLineEdit()
+        self.cwd_edit = QLineEdit(default_cwd)
         self.cwd_edit.setObjectName("UiInput")
         self.cwd_edit.textChanged.connect(self._update_preview)
         browse_cwd = QPushButton(tr("servers.dlg.browse"))
@@ -372,6 +550,12 @@ class TemplateWizardDialog(SilentDialog):
         self.preview_edit.setReadOnly(True)
         self.preview_edit.setObjectName("UiInput")
         form.addRow(tr("servers.tpl.preview"), self.preview_edit)
+
+        self.linked_workspaces_edit: QLineEdit | None = None
+        if workspaces is not None:
+            self.linked_workspaces_edit = QLineEdit(", ".join(selected_workspaces))
+            self.linked_workspaces_edit.setObjectName("UiInput")
+            form.addRow(tr("servers.dlg.linked_workspaces"), self.linked_workspaces_edit)
 
         layout.addLayout(form)
         buttons = QDialogButtonBox(
@@ -426,10 +610,101 @@ class TemplateWizardDialog(SilentDialog):
                 raise ValueError(f"Server '{prof.name}' already exists")
             profiles[prof.name] = prof
             validate_dependencies(profiles)
+            if self.linked_workspaces_edit is not None and self._workspaces is not None:
+                chosen_ws = _parse_csv(self.linked_workspaces_edit.text())
+                unknown_ws = [wid for wid in chosen_ws if wid not in self._workspaces]
+                if unknown_ws:
+                    raise ValueError(f"Unknown workspace(s): {', '.join(unknown_ws)}")
+                self.selected_workspaces = chosen_ws
         except Exception as exc:
             SilentMessageBox.warning(self, tr("servers.tpl.title"), str(exc))
             return
         self.saved_profile = prof
+        self.accept()
+
+
+class RenameServerDialog(SilentDialog):
+    """Rename a stopped ServerProfile ID cleanly while keeping secrets and workspace links."""
+
+    def __init__(
+        self,
+        old_name: str,
+        existing_names: set[str] | tuple[str, ...],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._old_name = old_name
+        self._existing = set(existing_names)
+        self.new_name: str | None = None
+        self.setWindowTitle(tr("servers.dlg.rename_title"))
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.old_edit = QLineEdit(old_name)
+        self.old_edit.setObjectName("UiInput")
+        self.old_edit.setReadOnly(True)
+        form.addRow(tr("servers.dlg.old_name"), self.old_edit)
+
+        self.new_name_edit = QLineEdit(old_name)
+        self.new_name_edit.setObjectName("UiInput")
+        form.addRow(tr("servers.dlg.new_name"), self.new_name_edit)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        try:
+            clean = validate_server_name(self.new_name_edit.text().strip())
+            if clean == self._old_name:
+                raise ValueError("New server ID must differ from current ID")
+            if clean in self._existing:
+                raise ValueError(f"Server '{clean}' already exists")
+        except Exception as exc:
+            SilentMessageBox.warning(self, tr("servers.dlg.rename_title"), str(exc))
+            return
+        self.new_name = clean
+        self.accept()
+
+
+class LinkServerDialog(SilentDialog):
+    """Select an existing managed ServerProfile to link to the active workspace."""
+
+    def __init__(self, available_servers: list[ServerProfile], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.selected_server: str | None = None
+        self.setWindowTitle(tr("workspaces.dlg.link_title"))
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.server_combo = SafeComboBox()
+        for prof in sorted(available_servers, key=lambda p: p.name):
+            endpoint = f" ({prof.host}:{prof.port})" if prof.port else ""
+            self.server_combo.addItem(f"{prof.name}{endpoint}", prof.name)
+        form.addRow(tr("workspaces.dlg.link_select"), self.server_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self) -> None:
+        val = str(self.server_combo.currentData() or "").strip()
+        if not val:
+            SilentMessageBox.warning(self, tr("workspaces.dlg.link_title"), tr("workspaces.dlg.link_select"))
+            return
+        self.selected_server = val
         self.accept()
 
 
@@ -570,43 +845,13 @@ class ServersPage(PageScaffold):
         self.empty_state.hide()
         self.table_card.show()
         selected_name = self._selected_name()
-        names = sorted(self._profiles)
-        self.table.setRowCount(len(names))
-        restore_row = 0
-
-        for idx, name in enumerate(names):
-            prof = self._profiles[name]
-            snap = self._snapshots.get(name, {})
-            name_item = QTableWidgetItem(prof.display_name or prof.name)
-            name_item.setData(Qt.ItemDataRole.UserRole, prof.name)
-            name_item.setToolTip(prof.name)
-
-            status_key = str(snap.get("status") or "stopped")
-            status_label = tr(f"servers.status.{status_key}")
-            if snap.get("running") and prof.readiness.kind != "none":
-                health_suffix = "✓" if snap.get("healthy") else "!"
-                status_label = f"{status_label} [{health_suffix}]"
-
-            endpoint = f"{prof.host}:{prof.port}" if prof.port else prof.host
-            metrics_text = "—"
-            if snap.get("running"):
-                m = self.server_manager.metrics_server(name, client_id="owner")
-                metrics_text = f"{m.get('cpu_percent', 0.0):.1f}% / {m.get('memory_mb', 0.0):.1f} MB"
-            deps_text = ", ".join(prof.depends_on) or "—"
-            access_text = prof.min_profile if prof.enabled else "disabled"
-
-            self.table.setItem(idx, 0, name_item)
-            self.table.setItem(idx, 1, QTableWidgetItem(prof.template))
-            self.table.setItem(idx, 2, QTableWidgetItem(prof.lifecycle))
-            self.table.setItem(idx, 3, QTableWidgetItem(status_label))
-            self.table.setItem(idx, 4, QTableWidgetItem(endpoint))
-            self.table.setItem(idx, 5, QTableWidgetItem(metrics_text))
-            self.table.setItem(idx, 6, QTableWidgetItem(deps_text))
-            self.table.setItem(idx, 7, QTableWidgetItem(access_text))
-            self.table.set_row_actions_cell(idx, 8, tooltip=tr("common.actions"))
-            if selected_name and name == selected_name:
-                restore_row = idx
-
+        restore_row = populate_server_rows(
+            self.table,
+            list(self._profiles.values()),
+            self._snapshots,
+            self.server_manager,
+            selected_name=selected_name,
+        )
         self.table.filter_rows(self.search_edit.text())
         if self.table.rowCount() > 0:
             self.table.selectRow(restore_row)
@@ -704,36 +949,11 @@ class ServersPage(PageScaffold):
             self.info_view.setPlainText(tr("servers.details.no_info"))
             return
         stream = "stderr" if self.stream_combo.currentData() == "stderr" else "stdout"
-        try:
-            logs_res = self.server_manager.logs_server(
-                name, client_id="owner", stream=stream, offset=0, limit=16000
-            )
-            self.logs_view.setPlainText(logs_res.get("text") or tr("servers.details.no_logs"))
-        except Exception:
-            self.logs_view.setPlainText(tr("servers.details.no_logs"))
-
+        self.logs_view.setPlainText(fetch_server_logs_text(name, stream, self.server_manager))
         prof = self._profiles[name]
         snap = self._snapshots.get(name, {})
-        metrics = self.server_manager.metrics_server(name, client_id="owner")
-        health = self.server_manager.health_server(name, client_id="owner", run_probe=False)
-        summary = {
-            "name": prof.name,
-            "template": prof.template,
-            "lifecycle": prof.lifecycle,
-            "argv_executable": prof.argv[0] if prof.argv else "",
-            "cwd": prof.cwd,
-            "status": snap.get("status", "stopped"),
-            "pid": snap.get("pid"),
-            "exit_code": snap.get("exit_code"),
-            "restart_count": snap.get("restart_count", 0),
-            "readiness": prof.readiness.to_dict(),
-            "health": health,
-            "metrics": metrics,
-            "secret_env_refs": list(prof.env_secret_refs.values()),
-            "last_error": snap.get("last_error", ""),
-        }
         self.info_view.setPlainText(
-            self._redactor.redact_text(json.dumps(summary, indent=2, ensure_ascii=False))
+            format_server_details(prof, snap, self.server_manager, self._redactor)
         )
 
     def add_server(self) -> None:

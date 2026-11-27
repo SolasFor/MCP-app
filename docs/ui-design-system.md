@@ -28,13 +28,13 @@
   - `app/ui/theme.py` — `ThemeManager`, генерация `@1x/@2x` SVG/QPainter переключателей и QSS.
   - `app/ui/i18n.py` — живая локализация **RU / EN** с контролем паритета ключей.
   - `app/ui/components/` — `Sidebar`, `CommandPaletteDialog`, `DataTable`, `LogViewerWidget`, `ToastManager`, `Card`, `Badge`, `EmptyState`, `ErrorBanner`.
-  - `app/ui/pages/` — активные страницы (`HomePage`, `ConnectionsPage`, `ClientsPage`, `SecurityPage`, `LogsPage`, `SettingsPage`) и честные заглушки дорожной карты `PlannedPage` (`v0.9.2–v0.9.9`).
+  - `app/ui/pages/` — модульные страницы **12 основных разделов** (`HomePage`, `ConnectionsPage`, `ClientsPage`, `GatewayPage`, `TasksPage`, единый `WorkspacesPage` с привязанными/непривязанными серверами, `ExtensionsPage`, `DevicesPage`, `SecurityPage`, `LogsPage`, `SettingsPage`, `AutomationPage`).
 
 ## Горячие клавиши и доступность
 
-- `Ctrl+K` — Command Palette (быстрый поиск страниц, переключение темы/языка, запуск/остановка Engine).
+- `Ctrl+K` — Command Palette (быстрый поиск страниц, включая переход в Workspaces по запросам `"servers"`/`"серверы"`, переключение темы/языка, запуск/остановка Engine).
 - `Ctrl+B` — свернуть/развернуть боковую панель.
-- `Ctrl+1` … `Ctrl+6` — переход по активным разделам (`Главная`, `Подключения`, `AI-клиенты`, `Безопасность`, `Журналы`, `Настройки`).
+- `Ctrl+1` … `Ctrl+9` — переход по активным разделам (`Главная`, `Подключения`, `AI-клиенты`, `Gateway`, `Задачи`, `Workspaces`, `Расширения`, `Безопасность`, `Журналы`).
 - `Ctrl+Q` — выход из приложения.
 - Настройки темы, языка, ширины боковой панели и геометрии окна сохраняются в `%APPDATA%\MCPApp\settings.json`; на Windows настроено `PassThrough` HiDPI-масштабирование (проверено при `100%`, `125%`, `150%`, `200%`).
 
@@ -47,3 +47,7 @@
 ![Подключения — тёмная тема (EN)](screenshots/connections-dark.png)
 
 ![Журналы — светлая тема (RU)](screenshots/logs-light.png)
+
+![Workspaces и серверы — тёмная тема (RU)](screenshots/workspaces-dark.png)
+
+![Workspaces и серверы — светлая тема (RU)](screenshots/workspaces-light.png)

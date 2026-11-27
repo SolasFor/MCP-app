@@ -73,7 +73,7 @@ def _check_qt() -> str:
     from app.ui.pages.connections_page import ConnectionsPage  # noqa: F401
     from app.ui.pages.gateway_page import GatewayPage  # noqa: F401
     from app.ui.pages.tasks_page import TasksPage  # noqa: F401
-    from app.ui.pages.servers_page import ServersPage  # noqa: F401
+    from app.ui.pages.servers_page import LinkServerDialog, RenameServerDialog, ServerProfileDialog, TemplateWizardDialog  # noqa: F401
     from app.ui.pages.workspaces_page import WorkspacesPage  # noqa: F401
     from app.ui.pages.extensions_page import ExtensionsPage  # noqa: F401
     from app.ui.pages.devices_page import DevicesPage  # noqa: F401

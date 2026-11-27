@@ -6,8 +6,8 @@
 |---|---|---|---|
 | N00 | Подготовка окружения и инструкций | v1.0.2 | VERIFIED (подготовка и проверка AG завершены; остаточное ограничение: `sonarqube-cloud` MCP требует ручного OAuth, используется SonarCloud CI/API) |
 | N01 | Baseline-аудит и точечные исправления P0/P1 | N00 | MERGED (PR #37, 32086cc; независимые 10/10 lifecycle tests) |
-| N02 | Безопасное автообновление | N01 | IN_PROGRESS (PR #38 на независимой приёмке; автоустановка в релизе заблокирована до внесения `PRODUCTION_TRUST_ROOTS` / Authenticode, а режим `installed` дополнительно заблокирован без проверенного кэша отката) |
-| N03 | Server Manager внутри Workspaces; убрать отдельную навигацию «Серверы» | N01 | TODO |
+| N02 | Безопасное автообновление | N01 | MERGED (PR #38, 4b9bedb; production auto-install/boot-recovery BLOCKED, отдельный gate docs/auto-update.md) |
+| N03 | Server Manager внутри Workspaces; убрать отдельную навигацию «Серверы» | N01 | VERIFIED (ветка `feat/n03-workspace-servers`, ожидает независимой приёмки ChatGPT / merge PR; production gates N02 сохранены) |
 | N04 | Мастер добавления Workspaces | N03 | TODO |
 | N05 | Мастер SSH-подключения устройств | N01 | TODO |
 | N06 | Центр безопасности | N01 | TODO |

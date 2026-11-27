@@ -114,10 +114,6 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
 
         w = self.window
         cases = (
-            (w.servers_page, w.servers_page.logs_view, w.servers_page.info_view,
-             "servers.details.logs_title", "servers.details.info_title"),
-            (w.workspaces_page, w.workspaces_page.tree_widget, w.workspaces_page.details_view,
-             "workspaces.details.tree_title", "workspaces.details.git_title"),
             (w.extensions_page, w.extensions_page.ui_preview, w.extensions_page.logs_view,
              "extensions.details.ui", "extensions.details.logs"),
             (w.tasks_page, w.tasks_page.logs_view, w.tasks_page.artifact_view,
@@ -145,9 +141,22 @@ class AcceptanceWave2GuiTests(unittest.TestCase):
                     self.assertGreater(tabs.currentWidget().height(), 0)
                 search = page.search_input if page is w.extensions_page else page.search_edit
                 self.assertTrue(search.isClearButtonEnabled())
+            ws = w.workspaces_page
+            self.assertEqual(ws.collection_tabs.count(), 2)
+            self.assertEqual(ws.detail_tabs.count(), 5)
+            ws_keys = (
+                "workspaces.details.tree_title",
+                "workspaces.details.git_title",
+                "workspaces.details.servers_title",
+                "workspaces.details.server_logs_title",
+                "workspaces.details.server_info_title",
+            )
+            for idx, key in enumerate(ws_keys):
+                self.assertEqual(ws.detail_tabs.tabText(idx), tr(key))
+            self.assertTrue(ws.search_edit.isClearButtonEnabled())
+            self.assertTrue(ws.logs_header.title_label.isHidden())
             self.assertTrue(w.tasks_page.logs_header.title_label.isHidden())
             self.assertTrue(w.tasks_page.art_header.title_label.isHidden())
-            self.assertTrue(w.servers_page.logs_header.title_label.isHidden())
             self.assertEqual(w.extensions_page.collection_tabs.count(), 2)
             self.assertTrue(w.extensions_page.collection_tabs.widget(0).isAncestorOf(
                 w.extensions_page.installed_table

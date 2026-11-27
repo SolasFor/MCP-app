@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from dataclasses import replace
+from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock
 from app.core.secret_store import SecretStore
 from app.platform import get_platform
 from backend.workspaces.models import (
@@ -87,26 +89,57 @@ class WorkspaceStore:
         self.secret_store = secret_store or SecretStore(self.path.parent / "secrets")
         self._lock = threading.RLock()
         self._platform = get_platform()
+        self._init_marker = self.path.parent / f".{self.path.name}.initialized"
 
-    def _read_raw(self) -> dict[str, Any]:
+    def lock(self, timeout: float = 10.0):
+        """Return a thread-reentrant cross-process lock covering this workspace store."""
+        return cross_process_lock(self.path.with_name(".workspaces.lock"), timeout=timeout)
+
+    def _has_prior_init_evidence(self) -> bool:
+        if self._init_marker.exists():
+            return True
+        if self.path.with_suffix(self.path.suffix + ".v1.bak").exists():
+            return True
+        history_dir = self.path.parent / "history"
+        return history_dir.is_dir() and any(history_dir.glob("*.json"))
+
+    def _read_raw_document(self) -> tuple[int, dict[str, Any]]:
         if not self.path.exists():
-            return {}
+            if self._has_prior_init_evidence():
+                raise ValueError(f"Workspace configuration file is missing after initialization: {self.path}")
+            return SCHEMA_VERSION, {}
         with self.path.open(encoding="utf-8-sig") as fh:
             raw = fh.read(MAX_CONFIG_BYTES + 1)
         if len(raw) > MAX_CONFIG_BYTES:
             raise ValueError("Workspace configuration exceeds size limit")
         if not raw.strip():
-            return {}
+            raise ValueError(f"Empty workspace configuration file: {self.path}")
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError("Invalid workspace configuration format")
+        if "schema_version" in parsed:
+            ver = parsed.get("schema_version")
+            if isinstance(ver, bool) or not isinstance(ver, int) or ver not in (1, SCHEMA_VERSION):
+                raise ValueError(f"Unsupported workspace schema_version: {ver!r}")
+            version = ver
+        else:
+            version = 1
         ws_map = parsed.get("workspaces") if "workspaces" in parsed else parsed
         if not isinstance(ws_map, dict) or len(ws_map) > MAX_WORKSPACES:
             raise ValueError("Invalid workspaces dictionary")
+        return version, ws_map
+
+    def _read_raw(self) -> dict[str, Any]:
+        _, ws_map = self._read_raw_document()
         return ws_map
 
+    def detect_schema_version(self) -> int:
+        with self.lock(), self._lock:
+            version, _ = self._read_raw_document()
+            return version
+
     def load_workspaces(self) -> dict[str, WorkspaceProfile]:
-        with self._lock:
+        with self.lock(), self._lock:
             raw_map = self._read_raw()
             out: dict[str, WorkspaceProfile] = {}
             for wid, entry in raw_map.items():
@@ -120,14 +153,13 @@ class WorkspaceStore:
         return self.load_workspaces().get(clean)
 
     def save_workspaces(self, profiles: Mapping[str, WorkspaceProfile]) -> None:
-        with self._lock:
+        with self.lock(), self._lock:
             if len(profiles) > MAX_WORKSPACES:
                 raise ValueError(f"Workspace count exceeds limit ({MAX_WORKSPACES})")
             for wid, prof in profiles.items():
                 if prof.workspace_id != wid:
                     raise ValueError("Workspace key mismatch")
                 prof.validate()
-            from app.core.atomic_io import atomic_write_json
 
             payload = {
                 "schema_version": SCHEMA_VERSION,
@@ -137,18 +169,20 @@ class WorkspaceStore:
                 },
             }
             atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
+            if not self._init_marker.exists():
+                atomic_write_text(self._init_marker, "1\n", restrict_acl=True)
 
     def upsert_workspace(self, profile: WorkspaceProfile) -> None:
         profile.validate()
         canonical_workspace_root(profile.root_path)
-        with self._lock:
+        with self.lock(), self._lock:
             profiles = self.load_workspaces()
             profiles[profile.workspace_id] = profile
             self.save_workspaces(profiles)
 
     def delete_workspace(self, workspace_id: str, *, delete_secrets: bool = True) -> bool:
         clean = validate_workspace_id(workspace_id)
-        with self._lock:
+        with self.lock(), self._lock:
             profiles = self.load_workspaces()
             removed = profiles.pop(clean, None)
             if removed is None:
@@ -163,6 +197,30 @@ class WorkspaceStore:
                     except Exception:  # noqa: BLE001
                         pass
             return True
+
+    def append_linked_task(
+        self,
+        workspace_id: str,
+        task_id: str,
+        *,
+        max_items: int = 50,
+    ) -> WorkspaceProfile | None:
+        """Append a recorded TaskManager task_id to a workspace's linked_tasks cleanly."""
+        clean_wid = validate_workspace_id(workspace_id)
+        clean_tid = (task_id or "").strip()
+        if not clean_tid:
+            return None
+        with self.lock(), self._lock:
+            profiles = self.load_workspaces()
+            prof = profiles.get(clean_wid)
+            if prof is None:
+                return None
+            existing = [t for t in prof.linked_tasks if t != clean_tid]
+            existing.append(clean_tid)
+            updated = replace(prof, linked_tasks=tuple(existing[-max(1, int(max_items)):]))
+            profiles[clean_wid] = updated
+            self.save_workspaces(profiles)
+            return updated
 
     def set_env_secret(self, workspace_id: str, env_key: str, value: str) -> str:
         clean = validate_workspace_id(workspace_id)
@@ -216,7 +274,7 @@ class WorkspaceStore:
         """Import workspace profiles from redacted export without importing plaintext secrets."""
         if not isinstance(payload, dict) or not isinstance(payload.get("workspaces"), dict):
             raise ValueError("Invalid workspace export payload")
-        with self._lock:
+        with self.lock(), self._lock:
             existing = self.load_workspaces()
             imported: list[str] = []
             skipped: list[str] = []

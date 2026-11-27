@@ -257,6 +257,54 @@ class TaskStore:
             assert row is not None
             return self._row_to_record(row), False
 
+    def create_running_task(
+        self,
+        *,
+        owner_client_id: str,
+        profile: str,
+        title: str,
+        spec: TaskSpec,
+        task_id: str | None = None,
+    ) -> TaskRecord:
+        """Insert a directly-executed running task (never picked up by the async queue dispatcher)."""
+        spec.validate()
+        encrypted = self._cipher.encrypt(spec.to_json().encode("utf-8"))
+        now = time.time()
+        clean_id = (task_id or "").strip() or f"tsk_{secrets.token_hex(8)}"
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT INTO tasks(
+                    task_id, owner_client_id, profile, kind, title, status,
+                    priority, idempotency_key, created_at, started_at, timeout_seconds,
+                    spool_run_id, artifact_refs_json, parent_task_id, cancel_requested,
+                    spec_encrypted
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    clean_id,
+                    owner_client_id,
+                    profile,
+                    spec.kind,
+                    title[:160],
+                    STATUS_RUNNING,
+                    0,
+                    "",
+                    now,
+                    now,
+                    int(spec.timeout),
+                    clean_id,
+                    "[]",
+                    None,
+                    0,
+                    encrypted,
+                ),
+            )
+            row = db.execute("SELECT * FROM tasks WHERE task_id=?", (clean_id,)).fetchone()
+            assert row is not None
+            return self._row_to_record(row)
+
     def get_task(self, task_id: str) -> TaskRecord | None:
         with self._db() as db:
             row = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()

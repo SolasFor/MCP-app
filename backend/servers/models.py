@@ -189,6 +189,7 @@ class ServerProfile:
     min_profile: str = "full"
     allowed_clients: tuple[str, ...] = ()
     allow_shared_control: bool = False
+    workspace_scoped: bool = False
     pre_start_task_command: str = ""
     template_params: dict[str, Any] = field(default_factory=dict)
     description: str = ""
@@ -297,6 +298,7 @@ class ServerProfile:
             "min_profile": self.min_profile,
             "allowed_clients": list(self.allowed_clients),
             "allow_shared_control": bool(self.allow_shared_control),
+            "workspace_scoped": bool(self.workspace_scoped),
             "pre_start_task_command": self.pre_start_task_command,
             "template_params": dict(self.template_params),
             "description": self.description,
@@ -347,6 +349,7 @@ class ServerProfile:
             min_profile=str(data.get("min_profile") or "full").strip() or "full",
             allowed_clients=tuple(str(c).strip() for c in raw_clients if str(c).strip()),
             allow_shared_control=bool(data.get("allow_shared_control", False)),
+            workspace_scoped=bool(data.get("workspace_scoped", False)),
             pre_start_task_command=str(data.get("pre_start_task_command") or ""),
             template_params=dict(raw_tparams),
             description=str(data.get("description") or "").strip(),

@@ -7,7 +7,7 @@ from typing import Any
 
 from app.core.secret_store import SecretStore
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_WORKSPACES = 64
 MAX_CONFIG_BYTES = 512 * 1024
 
@@ -18,11 +18,23 @@ MAX_SEARCH_MATCHES = 200
 MAX_HISTORY_SNAPSHOTS = 20
 
 WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+SERVER_LINK_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 WORKSPACE_MIN_PROFILES = ("allowlist", "full")
 PERMISSION_FLAGS = ("read", "write", "delete", "execute", "git")
+
+
+def _dedupe_str_tuple(items: Any) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in items or ():
+        val = str(raw).strip()
+        if val and val not in seen:
+            seen.add(val)
+            out.append(val)
+    return tuple(out)
 
 
 def validate_workspace_id(workspace_id: str) -> str:
@@ -138,6 +150,13 @@ class WorkspaceProfile:
         for pat in self.exclude_patterns:
             if not isinstance(pat, str) or not pat.strip() or "\x00" in pat:
                 raise ValueError("Invalid exclude pattern")
+        self._validate_linked_servers(self.linked_servers)
+
+    @staticmethod
+    def _validate_linked_servers(linked_servers: tuple[str, ...]) -> None:
+        for srv_name in linked_servers:
+            if not isinstance(srv_name, str) or not SERVER_LINK_RE.fullmatch(srv_name):
+                raise ValueError(f"Invalid linked server name: {srv_name!r}")
 
     def permissions_for(self, client_id: str) -> WorkspacePermissions:
         return self.client_permissions.get(client_id, self.permissions)
@@ -194,9 +213,9 @@ class WorkspaceProfile:
             commands={str(k): str(v) for k, v in raw_cmds.items()},
             env={str(k): str(v) for k, v in raw_env.items()},
             env_secret_refs={str(k): str(v) for k, v in raw_refs.items()},
-            linked_servers=tuple(str(x).strip() for x in (data.get("linked_servers") or ()) if str(x).strip()),
-            linked_tasks=tuple(str(x).strip() for x in (data.get("linked_tasks") or ()) if str(x).strip()),
-            linked_extensions=tuple(str(x).strip() for x in (data.get("linked_extensions") or ()) if str(x).strip()),
+            linked_servers=_dedupe_str_tuple(data.get("linked_servers")),
+            linked_tasks=_dedupe_str_tuple(data.get("linked_tasks")),
+            linked_extensions=_dedupe_str_tuple(data.get("linked_extensions")),
             exclude_patterns=tuple(str(x).strip() for x in (data.get("exclude_patterns") or ()) if str(x).strip()),
             permissions=WorkspacePermissions.from_dict(data.get("permissions")),
             client_permissions={

@@ -60,7 +60,6 @@ from app.ui.pages import (
     LogsPage,
     PlannedPage,
     SecurityPage,
-    ServersPage,
     SettingsPage,
     TasksPage,
     WorkspacesPage,
@@ -79,15 +78,20 @@ NAV_SPECS: tuple[NavItemSpec, ...] = (
     NavItemSpec("clients", "nav.clients", "clients", "primary", shortcut="Ctrl+3"),
     NavItemSpec("gateway", "nav.gateway", "gateway", "primary", shortcut="Ctrl+4"),
     NavItemSpec("tasks", "nav.tasks", "tasks", "primary", shortcut="Ctrl+5"),
-    NavItemSpec("servers", "nav.servers", "servers", "primary", shortcut="Ctrl+6"),
-    NavItemSpec("workspaces", "nav.workspaces", "workspaces", "primary", shortcut="Ctrl+7"),
-    NavItemSpec("extensions", "nav.extensions", "extensions", "primary", shortcut=""),
+    NavItemSpec("workspaces", "nav.workspaces", "workspaces", "primary", shortcut="Ctrl+6"),
+    NavItemSpec("extensions", "nav.extensions", "extensions", "primary", shortcut="Ctrl+7"),
     NavItemSpec("devices", "nav.devices", "devices", "primary", shortcut=""),
     NavItemSpec("security", "nav.security", "security", "primary", shortcut="Ctrl+8"),
     NavItemSpec("logs", "nav.logs", "logs", "primary", shortcut="Ctrl+9"),
     NavItemSpec("settings", "nav.settings", "settings", "primary", shortcut=""),
     NavItemSpec("automation", "nav.automation", "automation", "primary", shortcut=""),
 )
+
+_LEGACY_PAGE_REDIRECTS: dict[str, str] = {
+    "servers": "workspaces",
+    "server_manager": "workspaces",
+    "managed_servers": "workspaces",
+}
 
 PAGE_IDS: tuple[str, ...] = tuple(spec.page_id for spec in NAV_SPECS)
 ACTIVE_PAGE_IDS: tuple[str, ...] = tuple(spec.page_id for spec in NAV_SPECS if spec.section == "primary")
@@ -100,8 +104,8 @@ PAGE_CONNECTIONS = PAGE_IDS.index("connections")
 PAGE_CLIENTS = PAGE_IDS.index("clients")
 PAGE_GATEWAY = PAGE_IDS.index("gateway")
 PAGE_TASKS = PAGE_IDS.index("tasks")
-PAGE_SERVERS = PAGE_IDS.index("servers")
 PAGE_WORKSPACES = PAGE_IDS.index("workspaces")
+PAGE_SERVERS = PAGE_WORKSPACES
 PAGE_EXTENSIONS = PAGE_IDS.index("extensions")
 PAGE_DEVICES = PAGE_IDS.index("devices")
 PAGE_SECURITY = PAGE_IDS.index("security")
@@ -175,15 +179,17 @@ class MainWindow(QMainWindow):
             artifacts_dir=manager.tasks_artifacts_dir(),
             redactor=manager._redactor,
         )
-        self.servers_page = ServersPage(
-            config_path=manager.managed_servers_path(),
-            tasks_db_path=manager.tasks_db_path(),
-            redactor=manager._redactor,
-        )
         self.workspaces_page = WorkspacesPage(
             config_path=manager.workspaces_config_path(),
             history_dir=manager.workspaces_history_dir(),
+            servers_config_path=manager.managed_servers_path(),
+            tasks_db_path=manager.tasks_db_path(),
+            tasks_spool_dir=manager.tasks_spool_dir(),
+            tasks_artifacts_dir=manager.tasks_artifacts_dir(),
+            automation_dir=manager.automation_dir(),
             redactor=manager._redactor,
+            admin_client_provider=manager.admin_client,
+            backend_running_checker=manager.is_backend_running,
         )
         self.extensions_page = ExtensionsPage(
             extensions_dir=manager.extensions_dir(),
@@ -213,7 +219,6 @@ class MainWindow(QMainWindow):
             "clients": self.clients_page,
             "gateway": self.gateway_page,
             "tasks": self.tasks_page,
-            "servers": self.servers_page,
             "workspaces": self.workspaces_page,
             "extensions": self.extensions_page,
             "devices": self.devices_page,
@@ -343,12 +348,9 @@ class MainWindow(QMainWindow):
         tsk.status_message.connect(self.toasts.show_toast)
         tsk.task_finished.connect(self.task_notification.emit)
 
-        srv = self.servers_page
-        srv.config_changed.connect(self.manager.refresh_server_secrets)
-        srv.status_message.connect(self.toasts.show_toast)
-
         ws = self.workspaces_page
         ws.config_changed.connect(self.manager.refresh_workspace_secrets)
+        ws.config_changed.connect(self.manager.refresh_server_secrets)
         ws.status_message.connect(self.toasts.show_toast)
 
         self.automation_page.status_message.connect(self.toasts.show_toast)
@@ -399,11 +401,15 @@ class MainWindow(QMainWindow):
                 )
 
     # ================================================================== navigation & palette
+    def current_page_id(self) -> str:
+        return self._current_page_id
+
     def show_page(self, target: int | str) -> None:
         if isinstance(target, int):
             page_id = PAGE_IDS[target] if 0 <= target < len(PAGE_IDS) else "home"
         else:
-            page_id = target if target in self._pages_by_id else "home"
+            mapped = _LEGACY_PAGE_REDIRECTS.get(target, target)
+            page_id = mapped if mapped in self._pages_by_id else "home"
         index = PAGE_IDS.index(page_id)
         self._current_page_id = page_id
         self._ensure_page_themed(page_id)
@@ -422,8 +428,6 @@ class MainWindow(QMainWindow):
             self.gateway_page.reload()
         elif page_id == "tasks":
             self.tasks_page.reload()
-        elif page_id == "servers":
-            self.servers_page.reload()
         elif page_id == "workspaces":
             self.workspaces_page.reload()
         elif page_id == "extensions":
@@ -440,17 +444,20 @@ class MainWindow(QMainWindow):
         if theme.manager().apply_to_widget(page) and hasattr(page, "apply_theme"):
             page.apply_theme()  # type: ignore[attr-defined]
 
-    def open_command_palette(self) -> None:
+    def build_palette_actions(self) -> list[PaletteAction]:
         actions: list[PaletteAction] = []
         nav_cat = tr("nav.section.primary")
         for spec in NAV_SPECS:
+            keywords = spec.page_id
+            if spec.page_id == "workspaces":
+                keywords = "workspaces servers server_manager managed_servers серверы менеджер серверов проекты"
             actions.append(
                 PaletteAction(
                     action_id=f"nav.{spec.page_id}",
                     title=tr(spec.i18n_key),
                     category=nav_cat,
                     shortcut=spec.shortcut,
-                    keywords=spec.page_id,
+                    keywords=keywords,
                     callback=lambda pid=spec.page_id: self.show_page(pid),
                 )
             )
@@ -494,8 +501,14 @@ class MainWindow(QMainWindow):
                 ),
             ]
         )
-        dlg = CommandPaletteDialog(actions, self)
-        dlg.exec()
+        return actions
+
+    def open_command_palette(self) -> None:
+        dlg = CommandPaletteDialog(self.build_palette_actions(), self)
+        try:
+            dlg.exec()
+        finally:
+            dlg.deleteLater()
 
     # ================================================================== theme & i18n
     def set_theme_mode(self, mode: str) -> None:
@@ -1329,7 +1342,6 @@ class MainWindow(QMainWindow):
                 except (TypeError, RuntimeError):
                     pass
             self._desktop_poll.stop()
-            self.servers_page.shutdown()
             self.workspaces_page.shutdown()
             self.extensions_page.shutdown()
             self.devices_page.shutdown()

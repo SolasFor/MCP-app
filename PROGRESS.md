@@ -570,6 +570,10 @@
     - `--selftest`: **PASS** (`Qt 6.12.1`, `WindowsPlatformAdapter`, `cloudflared 2026.11.2`, `Starlette`, `RESULT OK`).
     - `--headless` (порт `18981`, одноразовый профиль на `D:`): **PASS** (`/health` HTTP `200`, неавторизованный `POST /mcp` HTTP `401`, созданы `token.json` и `secrets\secrets.key`).
     - `--repair-acl` (одноразовый повреждённый профиль на `D:`): **PASS** (`exit=0`, `detected_issues=1`, `ok=true`, SHA-256 `token.json` сохранён).
+- **PR #37 и облачный CI** ([PR #37](https://github.com/SolasFor/MCP-app/pull/37), `feat/n01-baseline-audit` → `main`, статус: **OPEN**, merge и релиз не выполнялись; PR #32 не изменялся):
+  - `MCP transport checks`: `Verify & Test (ubuntu-latest)` **PASS** (`1m19s`: https://github.com/SolasFor/MCP-app/actions/runs/45992282940/job/140482862810), `Verify & Test (windows-latest)` **PASS** (`3m19s`: https://github.com/SolasFor/MCP-app/actions/runs/45992282940/job/140482862442).
+  - `RC Windows installer (no publish)`: PR `windows-package` **PASS** (`2m40s`: https://github.com/SolasFor/MCP-app/actions/runs/45992282908/job/140482862878), ручной dispatch **PASS** (https://github.com/SolasFor/MCP-app/actions/runs/45992281011).
+  - `SonarCloud Code Analysis`: **PASS** (`39s`, Quality Gate `OK`, `new_security_rating=1`, `new_reliability_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=37.
 - Незавершённые проверки (`BLOCKED` / `NOT_RUN`, без имитации `PASS`):
   - Подписание Authenticode (`.pfx`): **BLOCKED** (сертификат владельца отсутствует).
   - Локальный `Inno Setup` (`iscc.exe`): **NOT_RUN** локально (отсутствует на хосте; проверяется через GitHub Actions `rc-windows.yml`).

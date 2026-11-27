@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import hmac
+import inspect
+import json
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -11,6 +13,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 _ALLOWED_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+_ALLOWED_CLIENT_IPS = frozenset({"127.0.0.1", "::1", "localhost"})
 _TUNNEL_HEADERS = (
     "cf-ray",
     "cf-connecting-ip",
@@ -28,77 +31,225 @@ def _extract_token(request: Request) -> str:
     return (request.headers.get("x-mcp-admin-token") or "").strip()
 
 
+def _authorize_request(
+    request: Request,
+    admin_tokens: dict[str, frozenset[str]],
+    required_scope: str,
+) -> Response | None:
+    host_hdr = (request.headers.get("host") or "").strip().lower()
+    try:
+        hostname = urlsplit(f"http://{host_hdr}").hostname or ""
+    except ValueError:
+        return JSONResponse({"error": "Invalid Host header"}, status_code=403)
+    if hostname not in _ALLOWED_HOSTS:
+        return JSONResponse({"error": "Admin API is strictly loopback-only"}, status_code=403)
+    if any(hdr in request.headers for hdr in _TUNNEL_HEADERS):
+        return JSONResponse({"error": "Forwarded/tunnel headers rejected on Admin API"}, status_code=403)
+    if request.client and request.client.host not in _ALLOWED_CLIENT_IPS:
+        return JSONResponse({"error": "Non-loopback client address rejected"}, status_code=403)
+
+    presented = _extract_token(request)
+    if not presented:
+        return JSONResponse({"error": "Missing admin credentials"}, status_code=401)
+
+    matched_scopes: frozenset[str] | None = None
+    presented_b = presented.encode("utf-8")
+    for expected_tok, scopes in admin_tokens.items():
+        if expected_tok and hmac.compare_digest(presented_b, expected_tok.encode("utf-8")):
+            matched_scopes = scopes
+            break
+    if matched_scopes is None:
+        return JSONResponse({"error": "Invalid admin credentials"}, status_code=401)
+    if required_scope not in matched_scopes:
+        return JSONResponse({"error": f"Insufficient admin scope (requires {required_scope})"}, status_code=403)
+    return None
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _read_json_object(request: Request) -> dict[str, Any]:
+    raw = await request.body()
+    if not raw.strip():
+        return {}
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError("Request JSON body must be an object")
+    return parsed
+
+
+class _AdminEndpoints:
+    """Endpoint methods extracted from factory closure to keep handler complexity low."""
+
+    def __init__(
+        self,
+        *,
+        admin_tokens: dict[str, frozenset[str]],
+        snapshot_provider: Callable[[], dict[str, Any]],
+        scheduler_list_provider: Callable[[], list[dict[str, Any]]],
+        scheduler_trigger_fn: Callable[[str], Any],
+        diagnostics_export_fn: Callable[[], str],
+        scheduler_history_provider: Callable[[], list[dict[str, Any]]] | None,
+        scheduler_upsert_fn: Callable[[dict[str, Any]], dict[str, Any]] | None,
+        scheduler_delete_fn: Callable[[str], bool] | None,
+        scheduler_enable_fn: Callable[[str, bool], dict[str, Any]] | None,
+        scheduler_event_fn: Callable[[str, dict[str, Any]], Any] | None,
+    ) -> None:
+        self._tokens = admin_tokens
+        self._snapshot = snapshot_provider
+        self._list = scheduler_list_provider
+        self._trigger = scheduler_trigger_fn
+        self._diag = diagnostics_export_fn
+        self._history = scheduler_history_provider
+        self._upsert = scheduler_upsert_fn
+        self._delete = scheduler_delete_fn
+        self._enable = scheduler_enable_fn
+        self._event = scheduler_event_fn
+
+    def _deny(self, request: Request, scope: str) -> Response | None:
+        return _authorize_request(request, self._tokens, scope)
+
+    async def get_monitoring(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        return denied if denied is not None else JSONResponse(self._snapshot())
+
+    async def get_schedules(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        payload: dict[str, Any] = {"schedules": self._list()}
+        if self._history is not None:
+            payload["history"] = self._history()
+        return JSONResponse(payload)
+
+    async def get_schedule_history(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        runs = self._history() if self._history is not None else []
+        return JSONResponse({"runs": runs})
+
+    async def upsert_schedule(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._upsert is None:
+            return JSONResponse({"error": "Schedule mutation not configured"}, status_code=501)
+        try:
+            body = await _read_json_object(request)
+            saved = await _maybe_await(self._upsert(body))
+            return JSONResponse({"schedule": saved})
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def delete_schedule(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._delete is None:
+            return JSONResponse({"error": "Schedule deletion not configured"}, status_code=501)
+        sid = request.path_params["schedule_id"]
+        try:
+            removed = await _maybe_await(self._delete(sid))
+            return JSONResponse({"removed": bool(removed)})
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+
+    async def set_schedule_enabled(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._enable is None:
+            return JSONResponse({"error": "Schedule enable toggle not configured"}, status_code=501)
+        sid = request.path_params["schedule_id"]
+        try:
+            body = await _read_json_object(request)
+            updated = await _maybe_await(self._enable(sid, bool(body.get("enabled", True))))
+            return JSONResponse({"schedule": updated})
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except PermissionError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def trigger_schedule(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        sid = request.path_params["schedule_id"]
+        try:
+            res = await _maybe_await(self._trigger(sid))
+            return JSONResponse(res)
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+
+    async def dispatch_event(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._event is None:
+            return JSONResponse({"error": "Event dispatch not configured"}, status_code=501)
+        try:
+            body = await _read_json_object(request)
+            event_name = str(body.get("event_name") or "").strip()
+            if not event_name:
+                return JSONResponse({"error": "event_name is required"}, status_code=400)
+            payload = body.get("payload")
+            if payload is not None and not isinstance(payload, dict):
+                return JSONResponse({"error": "payload must be a JSON object"}, status_code=400)
+            runs = await _maybe_await(self._event(event_name, payload or {}))
+            return JSONResponse({"runs": list(runs or ())})
+        except (ValueError, json.JSONDecodeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def export_diagnostics(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        return Response(content=self._diag(), media_type="application/json")
+
+
 def build_admin_app(
     *,
     admin_tokens: dict[str, frozenset[str]],
     snapshot_provider: Callable[[], dict[str, Any]],
     scheduler_list_provider: Callable[[], list[dict[str, Any]]],
-    scheduler_trigger_fn: Callable[[str], dict[str, Any]],
+    scheduler_trigger_fn: Callable[[str], Any],
     diagnostics_export_fn: Callable[[], str],
+    scheduler_history_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    scheduler_upsert_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    scheduler_delete_fn: Callable[[str], bool] | None = None,
+    scheduler_enable_fn: Callable[[str, bool], dict[str, Any]] | None = None,
+    scheduler_event_fn: Callable[[str, dict[str, Any]], Any] | None = None,
 ) -> Starlette:
     """Create Starlette app enforcing loopback Host, no tunnel headers, and scoped bearer auth."""
-
-    def _authorize(request: Request, required_scope: str) -> Response | None:
-        host_hdr = (request.headers.get("host") or "").strip().lower()
-        try:
-            hostname = urlsplit(f"http://{host_hdr}").hostname or ""
-        except ValueError:
-            return JSONResponse({"error": "Invalid Host header"}, status_code=403)
-        if hostname not in _ALLOWED_HOSTS:
-            return JSONResponse({"error": "Admin API is strictly loopback-only"}, status_code=403)
-        for hdr in _TUNNEL_HEADERS:
-            if hdr in request.headers:
-                return JSONResponse({"error": "Forwarded/tunnel headers rejected on Admin API"}, status_code=403)
-        if request.client and request.client.host not in ("127.0.0.1", "::1", "localhost"):
-            return JSONResponse({"error": "Non-loopback client address rejected"}, status_code=403)
-
-        presented = _extract_token(request)
-        if not presented:
-            return JSONResponse({"error": "Missing admin credentials"}, status_code=401)
-
-        matched_scopes: frozenset[str] | None = None
-        for expected_tok, scopes in admin_tokens.items():
-            if expected_tok and hmac.compare_digest(presented.encode("utf-8"), expected_tok.encode("utf-8")):
-                matched_scopes = scopes
-                break
-        if matched_scopes is None:
-            return JSONResponse({"error": "Invalid admin credentials"}, status_code=401)
-        if required_scope not in matched_scopes:
-            return JSONResponse({"error": f"Insufficient admin scope (requires {required_scope})"}, status_code=403)
-        return None
-
-    async def get_monitoring(request: Request) -> Response:
-        denied = _authorize(request, "admin:read")
-        if denied is not None:
-            return denied
-        return JSONResponse(snapshot_provider())
-
-    async def get_schedules(request: Request) -> Response:
-        denied = _authorize(request, "admin:read")
-        if denied is not None:
-            return denied
-        return JSONResponse({"schedules": scheduler_list_provider()})
-
-    async def trigger_schedule(request: Request) -> Response:
-        denied = _authorize(request, "admin:write")
-        if denied is not None:
-            return denied
-        sid = request.path_params["schedule_id"]
-        try:
-            return JSONResponse(scheduler_trigger_fn(sid))
-        except KeyError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=404)
-
-    async def export_diagnostics(request: Request) -> Response:
-        denied = _authorize(request, "admin:read")
-        if denied is not None:
-            return denied
-        return Response(content=diagnostics_export_fn(), media_type="application/json")
-
+    ep = _AdminEndpoints(
+        admin_tokens=admin_tokens,
+        snapshot_provider=snapshot_provider,
+        scheduler_list_provider=scheduler_list_provider,
+        scheduler_trigger_fn=scheduler_trigger_fn,
+        diagnostics_export_fn=diagnostics_export_fn,
+        scheduler_history_provider=scheduler_history_provider,
+        scheduler_upsert_fn=scheduler_upsert_fn,
+        scheduler_delete_fn=scheduler_delete_fn,
+        scheduler_enable_fn=scheduler_enable_fn,
+        scheduler_event_fn=scheduler_event_fn,
+    )
     routes = [
-        Route("/api/v1/monitoring", get_monitoring, methods=["GET"]),
-        Route("/api/v1/schedules", get_schedules, methods=["GET"]),
-        Route("/api/v1/schedules/{schedule_id}/run", trigger_schedule, methods=["POST"]),
-        Route("/api/v1/diagnostics/export", export_diagnostics, methods=["GET"]),
+        Route("/api/v1/monitoring", ep.get_monitoring, methods=["GET"]),
+        Route("/api/v1/schedules", ep.get_schedules, methods=["GET"]),
+        Route("/api/v1/schedules", ep.upsert_schedule, methods=["POST"]),
+        Route("/api/v1/schedules/history", ep.get_schedule_history, methods=["GET"]),
+        Route("/api/v1/schedules/{schedule_id}", ep.delete_schedule, methods=["DELETE"]),
+        Route("/api/v1/schedules/{schedule_id}/enabled", ep.set_schedule_enabled, methods=["POST"]),
+        Route("/api/v1/schedules/{schedule_id}/run", ep.trigger_schedule, methods=["POST"]),
+        Route("/api/v1/events", ep.dispatch_event, methods=["POST"]),
+        Route("/api/v1/diagnostics/export", ep.export_diagnostics, methods=["GET"]),
     ]
     return Starlette(routes=routes)

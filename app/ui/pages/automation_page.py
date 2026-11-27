@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app import __version__
+from app.core.admin_client import AdminBackendUnavailableError, LocalAdminClient
 from app.core.atomic_io import atomic_write_text
 from app.core.redaction import SecretRedactor
 from app.paths import user_data_dir
@@ -269,6 +271,7 @@ class AutomationPage(PageScaffold):
     """Automation Scheduler, Monitoring, MCP Playground, Backup/Restore & Staged Updater."""
 
     status_message = pyqtSignal(str, str)
+    _run_completed = pyqtSignal(str, object, str)
 
     def __init__(
         self,
@@ -277,6 +280,8 @@ class AutomationPage(PageScaffold):
         config_root: Path | None = None,
         redactor: SecretRedactor | None = None,
         playground_runner: Callable[[str, dict[str, Any], str], dict[str, Any]] | None = None,
+        admin_client_provider: Callable[[], LocalAdminClient | None] | None = None,
+        backend_running_checker: Callable[[], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
@@ -284,10 +289,17 @@ class AutomationPage(PageScaffold):
         self._config_root = Path(config_root) if config_root else user_data_dir()
         self._redactor = redactor or SecretRedactor()
         self._playground_runner = playground_runner
+        self._admin_client_provider = admin_client_provider
+        self._backend_running_checker = backend_running_checker
+        # Read/offline-config facade only (executor=None): never executes tools locally in GUI.
         self.scheduler = AutomationScheduler(self._automation_dir, redactor=self._redactor)
         self.metrics = MetricsRegistry()
         self.updater = StagedUpdater(self._automation_dir / "updates")
         self._schedules: list[dict[str, Any]] = []
+        self._pending_lock = threading.Lock()
+        self._pending_threads: set[threading.Thread] = set()
+        self._shutting_down = False
+        self._run_completed.connect(self._on_run_completed)
 
         self.set_header(tr("automation.title"), tr("automation.lead"))
 
@@ -509,42 +521,65 @@ class AutomationPage(PageScaffold):
         col.addStretch(1)
         return page
 
+    def _get_admin_client(self) -> LocalAdminClient | None:
+        if self._backend_running_checker is not None and not self._backend_running_checker():
+            return None
+        if self._admin_client_provider is None:
+            return None
+        return self._admin_client_provider()
+
+    def _fetch_schedules_and_history(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        client = self._get_admin_client()
+        if client is not None:
+            try:
+                return client.list_schedules_and_history(timeout=3.0)
+            except AdminBackendUnavailableError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                self.status_message.emit(
+                    self._redactor.redact_text(str(exc)) or type(exc).__name__, "error"
+                )
+        return self.scheduler.list_schedules(), self.scheduler.list_history(limit=25)
+
+    @staticmethod
+    def _format_schedule_row(sp: dict[str, Any]) -> list[str]:
+        trig = sp.get("trigger_type", "")
+        if trig == "cron":
+            trig_desc = f"cron ({sp.get('cron_expr', '')})"
+        elif trig == "interval":
+            trig_desc = f"every {sp.get('interval_seconds', 0)}s"
+        elif trig == "event":
+            trig_desc = f"event ({sp.get('event_name', '')})"
+        else:
+            trig_desc = trig
+        is_active = bool(sp.get("enabled") and sp.get("live_execution_approved", True))
+        status = "active" if is_active else f"paused ({sp.get('paused_reason') or 'approval required'})"
+        return [
+            str(sp.get("schedule_id", "")),
+            str(sp.get("name", "")),
+            trig_desc,
+            str(sp.get("tool_name", "")),
+            str(sp.get("timezone_name", "UTC")),
+            status,
+        ]
+
     # ------------------------------------------------------------------ actions
     def _reload_schedules_table(self) -> None:
-        self._schedules = self.scheduler.list_schedules()
+        self._schedules, hist = self._fetch_schedules_and_history()
         has = bool(self._schedules)
         self.schedules_table.setVisible(has)
         self.empty_state.setVisible(not has)
         self.schedules_table.setRowCount(len(self._schedules))
         for r, sp in enumerate(self._schedules):
-            trig = sp.get("trigger_type", "")
-            if trig == "cron":
-                trig_desc = f"cron ({sp.get('cron_expr', '')})"
-            elif trig == "interval":
-                trig_desc = f"every {sp.get('interval_seconds', 0)}s"
-            elif trig == "event":
-                trig_desc = f"event ({sp.get('event_name', '')})"
-            else:
-                trig_desc = trig
-            status = "active" if sp.get("enabled") else f"paused ({sp.get('paused_reason', '')})"
-            vals = [
-                str(sp.get("schedule_id", "")),
-                str(sp.get("name", "")),
-                trig_desc,
-                str(sp.get("tool_name", "")),
-                str(sp.get("timezone_name", "UTC")),
-                status,
-            ]
-            for c, v in enumerate(vals):
+            for c, v in enumerate(self._format_schedule_row(sp)):
                 self.schedules_table.setItem(r, c, QTableWidgetItem(v))
             self.schedules_table.set_row_actions_cell(r, 6, tooltip=tr("common.actions"))
         self.schedules_table.resizeColumnsToContents()
-        hist = self.scheduler.list_history(limit=25)
         self.history_view.setPlainText(
             "\n".join(
                 f"[{h.get('status')}] {h.get('schedule_id')} ({h.get('trigger')}) "
                 f"{h.get('error') or h.get('result_summary') or ''}"
-                for h in hist
+                for h in hist[-25:]
             )
         )
 
@@ -564,7 +599,24 @@ class AutomationPage(PageScaffold):
     def _build_schedule_menu(self, row: int) -> list[MenuActionSpec]:
         if not (0 <= row < len(self._schedules)):
             return []
-        sid = str(self._schedules[row]["schedule_id"])
+        row_data = self._schedules[row]
+        sid = str(row_data["schedule_id"])
+        is_active = bool(row_data.get("enabled") and row_data.get("live_execution_approved", True))
+        toggle_action = (
+            MenuActionSpec(
+                key="pause",
+                label=tr("automation.sched.pause"),
+                callback=lambda s=sid: self._toggle_schedule_enabled(s, False),
+                icon_name="stop",
+            )
+            if is_active
+            else MenuActionSpec(
+                key="enable",
+                label=tr("automation.sched.enable"),
+                callback=lambda s=sid: self._toggle_schedule_enabled(s, True),
+                icon_name="check",
+            )
+        )
         return [
             MenuActionSpec(
                 key="run",
@@ -572,6 +624,7 @@ class AutomationPage(PageScaffold):
                 callback=lambda s=sid: self._run_schedule(s),
                 icon_name="play",
             ),
+            toggle_action,
             MenuActionSpec(
                 key="copy_id",
                 label=tr("common.copy_id"),
@@ -599,7 +652,11 @@ class AutomationPage(PageScaffold):
         self.refresh_monitoring()
 
     def create_schedule(self, spec: ScheduleSpec) -> dict[str, Any]:
-        saved = self.scheduler.upsert_schedule(spec, actor_id="owner", actor_profile="full")
+        client = self._get_admin_client()
+        if client is not None:
+            saved = client.upsert_schedule(spec.to_dict())
+        else:
+            saved = self.scheduler.upsert_schedule(spec, actor_id="owner", actor_profile="full")
         self.status_message.emit(tr("automation.toast.saved", name=spec.name), "ok")
         self.reload()
         return saved
@@ -607,7 +664,12 @@ class AutomationPage(PageScaffold):
     def open_add_schedule_dialog(self) -> None:
         dlg = ScheduleDialog(self)
         if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.saved_spec is not None:
-            self.create_schedule(dlg.saved_spec)
+            try:
+                self.create_schedule(dlg.saved_spec)
+            except Exception as exc:  # noqa: BLE001
+                self.status_message.emit(
+                    self._redactor.redact_text(str(exc)) or type(exc).__name__, "error"
+                )
 
     def _selected_schedule_id(self) -> str | None:
         row = self.schedules_table.currentRow()
@@ -615,20 +677,102 @@ class AutomationPage(PageScaffold):
             return str(self._schedules[row]["schedule_id"])
         return None
 
-    def _run_schedule(self, sid: str) -> None:
-        res = self.scheduler.trigger_now(sid, trigger="manual_ui")
-        self.status_message.emit(tr("automation.toast.ran", sid=sid, status=res.get("status", "")), "info")
+    def _on_run_completed(self, sid: str, result: object, err: str) -> None:
+        if self._shutting_down:
+            return
+        if err:
+            self.status_message.emit(err, "error")
+        elif isinstance(result, dict):
+            status = str(result.get("status") or "")
+            level = (
+                "ok"
+                if status == "succeeded"
+                else ("warn" if status.startswith("skipped") else "error")
+            )
+            self.status_message.emit(tr("automation.toast.ran", sid=sid, status=status), level)
         self.reload()
+
+    def _run_schedule_worker(self, client: LocalAdminClient, sid: str) -> None:
+        try:
+            res = client.trigger_schedule(sid)
+            self._run_completed.emit(sid, res, "")
+        except AdminBackendUnavailableError:
+            self._run_completed.emit(sid, None, tr("automation.toast.backend_unavailable"))
+        except Exception as exc:  # noqa: BLE001
+            msg = self._redactor.redact_text(str(exc)) or type(exc).__name__
+            self._run_completed.emit(sid, None, msg)
+        finally:
+            cur = threading.current_thread()
+            with self._pending_lock:
+                self._pending_threads.discard(cur)
+
+    def _run_schedule(self, sid: str) -> None:
+        client = self._get_admin_client()
+        if client is None:
+            self.status_message.emit(tr("automation.toast.backend_unavailable"), "error")
+            return
+        self.status_message.emit(tr("automation.toast.sched_running", sid=sid), "info")
+        th = threading.Thread(
+            target=self._run_schedule_worker,
+            args=(client, sid),
+            name=f"ui-sched-run-{sid}",
+            daemon=True,
+        )
+        with self._pending_lock:
+            self._pending_threads.add(th)
+        th.start()
+
+    def wait_for_pending_runs(self, timeout: float = 5.0) -> bool:
+        """Pump Qt events until background UI trigger calls finish (for deterministic tests)."""
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        app = QApplication.instance()
+        while time.monotonic() < deadline:
+            with self._pending_lock:
+                remaining = len(self._pending_threads)
+            if app is not None:
+                app.processEvents()
+            if remaining == 0:
+                if app is not None:
+                    app.processEvents()
+                return True
+            time.sleep(0.02)
+        return False
 
     def run_selected_schedule(self) -> None:
         sid = self._selected_schedule_id()
         if sid:
             self._run_schedule(sid)
 
+    def _toggle_schedule_enabled(self, sid: str, enabled: bool) -> None:
+        try:
+            client = self._get_admin_client()
+            if client is not None:
+                client.set_schedule_enabled(sid, enabled)
+            else:
+                self.scheduler.set_schedule_enabled(
+                    sid, enabled, actor_id="owner", actor_profile="full"
+                )
+            key = "automation.toast.sched_enabled" if enabled else "automation.toast.sched_paused"
+            self.status_message.emit(tr(key, sid=sid), "ok")
+            self.reload()
+        except Exception as exc:  # noqa: BLE001
+            self.status_message.emit(
+                self._redactor.redact_text(str(exc)) or type(exc).__name__, "error"
+            )
+
     def _delete_schedule(self, sid: str) -> None:
-        self.scheduler.remove_schedule(sid, actor_id="owner", actor_profile="full")
-        self.status_message.emit(tr("automation.toast.deleted", sid=sid), "ok")
-        self.reload()
+        try:
+            client = self._get_admin_client()
+            if client is not None:
+                client.delete_schedule(sid)
+            else:
+                self.scheduler.remove_schedule(sid, actor_id="owner", actor_profile="full")
+            self.status_message.emit(tr("automation.toast.deleted", sid=sid), "ok")
+            self.reload()
+        except Exception as exc:  # noqa: BLE001
+            self.status_message.emit(
+                self._redactor.redact_text(str(exc)) or type(exc).__name__, "error"
+            )
 
     def delete_selected_schedule(self) -> None:
         sid = self._selected_schedule_id()
@@ -787,7 +931,12 @@ class AutomationPage(PageScaffold):
 
     def shutdown(self) -> None:
         """Clean hook for MainWindow shutdown lifecycle."""
-        return
+        self._shutting_down = True
+        with self._pending_lock:
+            threads = list(self._pending_threads)
+        for th in threads:
+            if th.is_alive():
+                th.join(timeout=1.0)
 
     def apply_theme(self) -> None:
         self.empty_state.apply_theme()

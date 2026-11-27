@@ -200,6 +200,8 @@ class MainWindow(QMainWindow):
             automation_dir=manager.automation_dir(),
             config_root=user_data_dir(),
             redactor=manager._redactor,
+            admin_client_provider=manager.admin_client,
+            backend_running_checker=manager.is_backend_running,
         )
 
         self._pages_by_id: dict[str, QWidget] = {

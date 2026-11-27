@@ -156,6 +156,7 @@ class Release100E2ETests(unittest.TestCase):
 
             sched = AutomationScheduler(
                 root / "automation",
+                executor=lambda sp, _idem: {"ok": True, "tool": sp.tool_name},
                 permission_checker=lambda sp: (
                     exec_app.client_approved(sp.client_id),
                     "" if exec_app.client_approved(sp.client_id) else "Revoked",

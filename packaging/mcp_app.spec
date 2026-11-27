@@ -46,6 +46,7 @@ hiddenimports = [
     "app.platform.posix",
     "app.core.atomic_io",
     "app.core.acl_recovery",
+    "app.core.admin_client",
     "app.core.secret_store",
     "app.core.redaction",
     "app.core.logging_manager",

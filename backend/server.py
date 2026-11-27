@@ -9,7 +9,6 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import weakref
 from contextlib import asynccontextmanager
@@ -554,7 +553,10 @@ _AUTOMATION_DEFAULT_DIR = (
     / "automation"
 )
 AUTOMATION_DIR = Path(os.environ.get("MCP_AUTOMATION_DIR") or _AUTOMATION_DEFAULT_DIR)
+ADMIN_HOST = "127.0.0.1"
+ADMIN_PORT = int(os.environ.get("MCP_ADMIN_PORT", "0") or "0")
 ADMIN_TOKEN = (os.environ.get("MCP_ADMIN_TOKEN") or "").strip() or secrets.token_urlsafe(24)
+_SCHEDULER_POLL_SECONDS = max(0.05, float(os.environ.get("MCP_SCHEDULER_TICK_SECONDS", "1.0") or "1.0"))
 REDACTOR.register(ADMIN_TOKEN)
 # All remote tools use one server-wide Bearer token at present. Keep privileged
 # tools unregistered unless an administrator explicitly opts in.
@@ -3713,27 +3715,14 @@ def write_workspace_file(relative_path: str, content: str) -> str:
     return "✅ Файл сохранён в разрешённой рабочей папке."
 
 
-def _run_coro_sync(coro: Any) -> Any:
-    """Execute an async coroutine safely whether or not an event loop is active on this thread."""
+def _purge_stale_ephemeral_oauth_clients() -> int:
+    """Remove any orphaned sched-owner-* or playground-ephemeral-* OAuth clients."""
+    if oauth_provider is None or oauth_provider.store is None:
+        return 0
     try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    result_box: list[Any] = []
-    err_box: list[BaseException] = []
-
-    def _runner() -> None:
-        try:
-            result_box.append(asyncio.run(coro))
-        except BaseException as exc:  # noqa: BLE001
-            err_box.append(exc)
-
-    th = threading.Thread(target=_runner, daemon=True)
-    th.start()
-    th.join()
-    if err_box:
-        raise err_box[0]
-    return result_box[0] if result_box else None
+        return oauth_provider.store.purge_ephemeral_clients()
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _extract_scheduled_tool_output(res: Any) -> dict[str, Any]:
@@ -3813,20 +3802,22 @@ async def _invoke_owner_scheduled_tool_async(spec: ScheduleSpec, args: dict[str,
         client_name="MCP Scheduler (owner ephemeral)",
         redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
     )
-    oauth_provider.store.save_client(client_info)
-    oauth_provider.store.mark_approved(ephemeral_id)
-    oauth_execution.set_client_profile(ephemeral_id, owner_profile)
     tok = AccessToken(
         token=secrets.token_urlsafe(12),
         client_id=ephemeral_id,
         scopes=[READ_SCOPE],
         resource=RESOURCE_URL,
     )
-    token_ctx = auth_context_var.set(AuthenticatedUser(tok))
+    token_ctx = None
     try:
+        oauth_provider.store.save_client(client_info)
+        oauth_provider.store.mark_approved(ephemeral_id)
+        oauth_execution.set_client_profile(ephemeral_id, owner_profile)
+        token_ctx = auth_context_var.set(AuthenticatedUser(tok))
         return await mcp.call_tool(spec.tool_name, args)
     finally:
-        auth_context_var.reset(token_ctx)
+        if token_ctx is not None:
+            auth_context_var.reset(token_ctx)
         try:
             oauth_provider.store.revoke_client(ephemeral_id)
         except Exception:  # noqa: BLE001
@@ -3856,15 +3847,15 @@ async def _invoke_scheduled_tool_async(spec: ScheduleSpec) -> Any:
         auth_context_var.reset(token_ctx)
 
 
-def _execute_scheduled_tool(spec: ScheduleSpec, idem_key: str) -> dict[str, Any]:
-    """Authorize and execute one due scheduled MCP/Gateway tool under strict principal scoping."""
+async def _execute_scheduled_tool_async(spec: ScheduleSpec, idem_key: str) -> dict[str, Any]:
+    """Authorize and execute one due scheduled MCP/Gateway tool on the active server event loop."""
     t0 = time.monotonic()
     allowed, reason = _scheduler_permission_check(spec)
     if not allowed:
         METRICS_REGISTRY.record_call(spec.tool_name, (time.monotonic() - t0) * 1000.0, error=True)
         raise PermissionError(reason or f"Unauthorized scheduled execution for {spec.tool_name}")
     try:
-        res = _run_coro_sync(_invoke_scheduled_tool_async(spec))
+        res = await _invoke_scheduled_tool_async(spec)
         out = _extract_scheduled_tool_output(res)
         METRICS_REGISTRY.record_call(spec.tool_name, (time.monotonic() - t0) * 1000.0, error=False)
         out["idempotency_key"] = idem_key
@@ -3874,7 +3865,7 @@ def _execute_scheduled_tool(spec: ScheduleSpec, idem_key: str) -> dict[str, Any]
         raise
 
 
-AUTOMATION_SCHEDULER._executor = _execute_scheduled_tool
+AUTOMATION_SCHEDULER._async_executor = _execute_scheduled_tool_async
 
 
 # ==========================================
@@ -3932,9 +3923,16 @@ def build_app():
                         await SESSION_TRACKER.check_and_notify()
 
             watcher_task = asyncio.create_task(_watch())
+            _purge_stale_ephemeral_oauth_clients()
+            AUTOMATION_SCHEDULER.start_background_loop(
+                poll_interval=_SCHEDULER_POLL_SECONDS,
+                startup_hook=_purge_stale_ephemeral_oauth_clients,
+            )
             try:
                 yield
             finally:
+                await AUTOMATION_SCHEDULER.stop_background_loop()
+                _purge_stale_ephemeral_oauth_clients()
                 stop_event.set()
                 watcher_task.cancel()
                 try:
@@ -3947,6 +3945,17 @@ def build_app():
     # появляется до того, как SDK проверит авторизацию.
     app.add_middleware(HybridAuthMiddleware)
     return app
+
+
+def _admin_upsert_schedule(body: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(body)
+    payload["client_id"] = "owner"
+    spec = ScheduleSpec.from_dict(payload)
+    return AUTOMATION_SCHEDULER.upsert_schedule(spec, actor_id="owner", actor_profile="full")
+
+
+async def _admin_emit_event(event_name: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return await AUTOMATION_SCHEDULER.emit_event_async(event_name, payload=payload)
 
 
 def build_local_admin_app(*, read_only_token: str = ""):
@@ -3979,8 +3988,17 @@ def build_local_admin_app(*, read_only_token: str = ""):
         admin_tokens=tokens,
         snapshot_provider=_snapshot,
         scheduler_list_provider=AUTOMATION_SCHEDULER.list_schedules,
-        scheduler_trigger_fn=lambda sid: AUTOMATION_SCHEDULER.trigger_now(sid, trigger="admin_api"),
+        scheduler_trigger_fn=lambda sid: AUTOMATION_SCHEDULER.trigger_now_async(sid, trigger="admin_api"),
         diagnostics_export_fn=_export_diag,
+        scheduler_history_provider=AUTOMATION_SCHEDULER.list_history,
+        scheduler_upsert_fn=_admin_upsert_schedule,
+        scheduler_delete_fn=lambda sid: AUTOMATION_SCHEDULER.remove_schedule(
+            sid, actor_id="owner", actor_profile="full"
+        ),
+        scheduler_enable_fn=lambda sid, en: AUTOMATION_SCHEDULER.set_schedule_enabled(
+            sid, en, actor_id="owner", actor_profile="full"
+        ),
+        scheduler_event_fn=_admin_emit_event,
     )
 
 
@@ -4065,26 +4083,28 @@ async def invoke_playground_tool(
             }
 
     ephemeral_id = f"{client_id}-{secrets.token_hex(4)}"
-    created_ephemeral = False
-    if tool_name != "server_info" and oauth_provider is not None and oauth_execution is not None:
-        client_info = OAuthClientInformationFull(
-            client_id=ephemeral_id,
-            client_name="MCP Playground (ephemeral)",
-            redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
-        )
-        oauth_provider.store.save_client(client_info)
-        oauth_provider.store.mark_approved(ephemeral_id)
-        oauth_execution.set_client_profile(ephemeral_id, profile)
-        created_ephemeral = True
-
+    need_ephemeral = tool_name != "server_info" and oauth_provider is not None and oauth_execution is not None
     tok = AccessToken(
-        token="playground-token",
-        client_id=ephemeral_id if created_ephemeral else client_id,
+        token=secrets.token_urlsafe(12),
+        client_id=ephemeral_id if need_ephemeral else client_id,
         scopes=[READ_SCOPE],
         resource=RESOURCE_URL,
     )
-    auth_token = auth_context_var.set(AuthenticatedUser(tok))
+    created_ephemeral = False
+    auth_token = None
     try:
+        if need_ephemeral:
+            assert oauth_provider is not None and oauth_execution is not None
+            client_info = OAuthClientInformationFull(
+                client_id=ephemeral_id,
+                client_name="MCP Playground (ephemeral)",
+                redirect_uris=[AnyHttpUrl("http://127.0.0.1/callback")],
+            )
+            created_ephemeral = True
+            oauth_provider.store.save_client(client_info)
+            oauth_provider.store.mark_approved(ephemeral_id)
+            oauth_execution.set_client_profile(ephemeral_id, profile)
+        auth_token = auth_context_var.set(AuthenticatedUser(tok))
         res = await mcp.call_tool(tool_name, dict(arguments or {}))
         elapsed = (time.monotonic() - t0) * 1000.0
         is_err = bool(getattr(res, "isError", False) or getattr(res, "is_error", False))
@@ -4128,12 +4148,31 @@ async def invoke_playground_tool(
             "error": REDACTOR.redact_text(str(exc)) or type(exc).__name__,
         }
     finally:
-        auth_context_var.reset(auth_token)
+        if auth_token is not None:
+            auth_context_var.reset(auth_token)
         if created_ephemeral and oauth_provider is not None:
             try:
                 oauth_provider.store.revoke_client(ephemeral_id)
             except Exception:  # noqa: BLE001
                 pass
+
+
+async def _serve_with_local_admin(main_server: Any, admin_server: Any | None) -> None:
+    """Run main MCP server and strictly loopback Admin API server on the same asyncio loop."""
+    admin_task: asyncio.Task[None] | None = None
+    if admin_server is not None:
+        admin_server.install_signal_handlers = lambda: None
+        admin_task = asyncio.create_task(admin_server.serve(), name="mcp-local-admin-api")
+    try:
+        await main_server.serve()
+    finally:
+        if admin_server is not None:
+            admin_server.should_exit = True
+        if admin_task is not None:
+            try:
+                await asyncio.wait_for(admin_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                admin_task.cancel()
 
 
 def main() -> None:
@@ -4189,9 +4228,24 @@ def main() -> None:
         logger.info(f"Токен: из MCP_SECRET_TOKEN ({masked})")
 
     import uvicorn
+    main_server = uvicorn.Server(uvicorn.Config(build_app(), host=HOST, port=PORT))
+    admin_server = (
+        uvicorn.Server(
+            uvicorn.Config(
+                build_local_admin_app(),
+                host=ADMIN_HOST,
+                port=ADMIN_PORT,
+                access_log=False,
+                log_level="warning",
+            )
+        )
+        if ADMIN_PORT > 0
+        else None
+    )
     try:
-        uvicorn.run(build_app(), host=HOST, port=PORT)
+        asyncio.run(_serve_with_local_admin(main_server, admin_server))
     finally:
+        _purge_stale_ephemeral_oauth_clients()
         try:
             asyncio.run(TASK_MANAGER.close())
         except Exception:

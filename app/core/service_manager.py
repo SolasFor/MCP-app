@@ -37,11 +37,13 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import secrets
 import socket
 import threading
 import time
 from enum import Enum
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 import psutil
@@ -63,6 +65,7 @@ from app.config import (
 )
 from app.core import domain_state, token_store
 from app.core import proxy as px
+from app.core.admin_client import LocalAdminClient
 from app.core.edge_relay import ProxyBridge
 from app.core.health import HealthMonitor
 from app.core.logging_manager import get_logging_manager, infer_level
@@ -239,6 +242,10 @@ class ServiceManager(QObject):
         self._diagnosis_ready.connect(self._on_diagnosis)
 
         self._token_storage_error = ""
+        self._admin_token = secrets.token_urlsafe(32)
+        self._admin_port = 0
+        self._redactor.register(self._admin_token, allow_short=True)
+        self._logging.register_secret(self._admin_token)
         self._token = self._load_or_create_token()
         if self._token:
             self._redactor.register(self._token, allow_short=True)
@@ -812,12 +819,16 @@ class ServiceManager(QObject):
     def _server_env(self) -> dict[str, str]:
         import base64
 
+        if self._admin_port <= 0:
+            self._admin_port = _allocate_loopback_port()
         s = self.settings
         ident = self.connection_identity
         owner_b64 = base64.b64encode(self._token.encode("utf-8")).decode("ascii")
         return {
             "MCP_SECRET_TOKEN": self.bearer_transport_token,
             "MCP_OWNER_SECRET_B64": owner_b64,
+            "MCP_ADMIN_PORT": str(self._admin_port),
+            "MCP_ADMIN_TOKEN": self._admin_token,
             "MCP_LANGUAGE": str(getattr(s, "language", "ru") or "ru"),
             "MCP_PUBLIC_URL": ident.oauth_resource_url,
             "MCP_PATH": s.mcp_path,
@@ -951,6 +962,29 @@ class ServiceManager(QObject):
         except Exception:
             pass
 
+    def is_backend_running(self) -> bool:
+        return self.server.is_alive()
+
+    def admin_client(self) -> LocalAdminClient | None:
+        if not self.server.is_alive() or self._admin_port <= 0:
+            return None
+        return LocalAdminClient(port=self._admin_port, token=self._admin_token)
+
+    def _emit_scheduler_event_async(
+        self, event_name: str, payload: dict[str, Any] | None = None
+    ) -> None:
+        client = self.admin_client()
+        if client is None:
+            return
+
+        def _send() -> None:
+            try:
+                client.emit_event(event_name, payload or {}, timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_send, name="sched-event", daemon=True).start()
+
     def _start_server(self) -> None:
         self.refresh_gateway_secrets()
         self.refresh_server_secrets()
@@ -960,6 +994,7 @@ class ServiceManager(QObject):
         program, args = backend_command()
         workdir = self.settings.backend_workdir or str(default_backend_workdir())
         Path(workdir).mkdir(parents=True, exist_ok=True)
+        self._admin_port = _allocate_loopback_port()
         env = self._server_env()
         self._server_url = env["MCP_PUBLIC_URL"]
         self.server.start(program, args, workdir=workdir, env=env)
@@ -1034,6 +1069,12 @@ class ServiceManager(QObject):
             self._logging.info("tunnel", f"Tailscale Funnel active: {msg}", event_code="tailscale_active")
             self._log(f"✔ Tailscale Funnel активен: {msg}")
             self.public_url_changed.emit(self.public_url)
+            self._emit_scheduler_event_async(
+                "tunnel.started", {"provider": PROVIDER_TAILSCALE, "url": self.public_url}
+            )
+            self._emit_scheduler_event_async(
+                "tunnel.ready", {"provider": PROVIDER_TAILSCALE, "url": self.public_url}
+            )
             if self.server.is_alive() and self._server_url != self.oauth_resource_url:
                 self._restart_server_only("обновлён публичный адрес Tailscale")
             self._recompute()
@@ -1123,6 +1164,12 @@ class ServiceManager(QObject):
                     for warn in warnings:
                         self._log(f"⚠ {warn}")
                     self.public_url_changed.emit(self.public_url)
+                    self._emit_scheduler_event_async(
+                        "tunnel.started", {"provider": PROVIDER_NGROK, "url": self.public_url}
+                    )
+                    self._emit_scheduler_event_async(
+                        "tunnel.ready", {"provider": PROVIDER_NGROK, "url": self.public_url}
+                    )
                     if self.server.is_alive() and self._server_url != self.oauth_resource_url:
                         self._restart_server_only("обновлён публичный адрес ngrok")
                     self._recompute()
@@ -1360,6 +1407,14 @@ class ServiceManager(QObject):
             if self._healthy_at[name] is None:
                 self._healthy_at[name] = time.monotonic()
             self._log("✔ Сервер отвечает" if name == SERVER else f"✔ Транспорт подключён ({self.active_provider})")
+            if name == TUNNEL:
+                self._emit_scheduler_event_async(
+                    "tunnel.started", {"provider": self.active_provider, "url": self.public_url}
+                )
+                if self.public_url:
+                    self._emit_scheduler_event_async(
+                        "tunnel.ready", {"provider": self.active_provider, "url": self.public_url}
+                    )
         self.service_state_changed.emit(name, state)
         self._recompute()
 
@@ -1593,6 +1648,13 @@ def _config_hostnames(path: Path) -> list[str]:
     except OSError:
         return []
     return [h.lower() for h in _HOSTNAME_RE.findall(text)]
+
+
+def _allocate_loopback_port() -> int:
+    """Pick an unused ephemeral TCP port on 127.0.0.1 for the local-only Admin API."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _port_owner(host: str, port: int) -> str | None:

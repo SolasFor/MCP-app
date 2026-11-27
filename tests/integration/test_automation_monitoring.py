@@ -274,6 +274,8 @@ class AutomationMonitoringIntegrationTests(unittest.TestCase):
                 redactor=SecretRedactor(["secret-gui-val"]),
             )
             try:
+                toasts: list[tuple[str, str]] = []
+                page.status_message.connect(lambda msg, lvl: toasts.append((msg, lvl)))
                 spec = ScheduleSpec(
                     schedule_id="gui-job",
                     name="GUI Job",
@@ -284,7 +286,8 @@ class AutomationMonitoringIntegrationTests(unittest.TestCase):
                 self.assertEqual(page.schedules_table.rowCount(), 1)
                 page.schedules_table.selectRow(0)
                 page.run_selected_schedule()
-                self.assertIn("succeeded", page.history_view.toPlainText())
+                self.assertTrue(any(lvl == "error" for _, lvl in toasts), toasts)
+                self.assertNotIn("succeeded", page.history_view.toPlainText())
 
                 pg_ok = page.run_playground(tool_name="server_info", arguments={}, profile="safe")
                 self.assertTrue(pg_ok["allowed"])

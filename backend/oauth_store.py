@@ -444,6 +444,37 @@ class OAuthStore:
             self._clear_exec_records(db, self.issuer, client_id)
             return cursor.rowcount > 0
 
+    def purge_ephemeral_clients(
+        self, prefixes: tuple[str, ...] = ("sched-owner-", "playground-ephemeral-")
+    ) -> int:
+        """Remove any leftover temporary execution principals (e.g., after an abrupt crash)."""
+        clean_prefixes = tuple(p for p in prefixes if p)
+        if not clean_prefixes:
+            return 0
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT client_id FROM clients WHERE issuer=?", (self.issuer,)
+            ).fetchall()
+            targets = [
+                str(r[0])
+                for r in rows
+                if any(str(r[0]).startswith(pref) for pref in clean_prefixes)
+            ]
+            if not targets:
+                return 0
+            db.execute("BEGIN IMMEDIATE")
+            removed = 0
+            for cid in targets:
+                cur = db.execute(
+                    "DELETE FROM clients WHERE issuer=? AND client_id=?", (self.issuer, cid)
+                )
+                db.execute(
+                    "DELETE FROM tokens WHERE issuer=? AND client_id=?", (self.issuer, cid)
+                )
+                self._clear_exec_records(db, self.issuer, cid)
+                removed += int(cur.rowcount or 0)
+            return removed
+
     def save_token(self, token: AccessToken | RefreshToken, kind: str, family: str) -> None:
         if kind not in ("access", "refresh"):
             raise ValueError("Invalid token type")

@@ -184,7 +184,12 @@ class MainWindow(QMainWindow):
             history_dir=manager.workspaces_history_dir(),
             servers_config_path=manager.managed_servers_path(),
             tasks_db_path=manager.tasks_db_path(),
+            tasks_spool_dir=manager.tasks_spool_dir(),
+            tasks_artifacts_dir=manager.tasks_artifacts_dir(),
+            automation_dir=manager.automation_dir(),
             redactor=manager._redactor,
+            admin_client_provider=manager.admin_client,
+            backend_running_checker=manager.is_backend_running,
         )
         self.extensions_page = ExtensionsPage(
             extensions_dir=manager.extensions_dir(),

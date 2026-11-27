@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from app.core.atomic_io import atomic_write_json, cross_process_lock
+from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock
 from app.core.secret_store import SecretStore
 from app.platform import get_platform
 from backend.servers.models import (
@@ -84,44 +84,55 @@ class ServerConfigStore:
         self.secret_store = secret_store or SecretStore(self.path.parent / "secrets")
         self._lock = threading.RLock()
         self._platform = get_platform()
+        self._init_marker = self.path.parent / f".{self.path.name}.initialized"
 
     def lock(self, timeout: float = 10.0):
         """Return a thread-reentrant cross-process lock covering this server store."""
         return cross_process_lock(self.path.with_name(".managed_servers.lock"), timeout=timeout)
 
+    def _has_prior_init_evidence(self) -> bool:
+        return (
+            self._init_marker.exists()
+            or self.path.with_suffix(self.path.suffix + ".v1.bak").exists()
+        )
+
+    @staticmethod
+    def _extract_version_and_map(parsed: dict[str, Any]) -> tuple[int, Any]:
+        if "schema_version" not in parsed:
+            return 1, parsed
+        ver = parsed.get("schema_version")
+        if isinstance(ver, bool) or not isinstance(ver, int) or ver not in (1, SCHEMA_VERSION):
+            raise ValueError(f"Unsupported managed server schema_version: {ver!r}")
+        return ver, parsed.get("servers")
+
     def _read_raw_document(self, source: Path | None = None) -> tuple[int, dict[str, Any]]:
         target = source or self.path
         if not target.exists():
+            if source is None and self._has_prior_init_evidence():
+                raise ValueError(f"Managed server configuration file is missing after initialization: {target}")
             return SCHEMA_VERSION, {}
         with target.open(encoding="utf-8-sig") as fh:
             raw = fh.read(MAX_CONFIG_BYTES + 1)
         if len(raw) > MAX_CONFIG_BYTES:
             raise ValueError("Managed server configuration is too large")
         if not raw.strip():
-            return SCHEMA_VERSION, {}
+            raise ValueError("Managed server configuration file is empty")
         parsed = json.loads(raw)
         if not isinstance(parsed, dict):
             raise ValueError("Invalid managed server configuration")
 
-        if "servers" in parsed and "schema_version" in parsed and isinstance(parsed.get("servers"), dict):
-            version = int(parsed.get("schema_version") or SCHEMA_VERSION)
-            servers_map = parsed["servers"]
-        else:
-            # Legacy v1 format: flat {name: {"argv": [...], "cwd": ..., "lifecycle": ...}}
-            version = 1
-            servers_map = parsed
-
+        version, servers_map = self._extract_version_and_map(parsed)
         if not isinstance(servers_map, dict) or len(servers_map) > MAX_SERVERS:
             raise ValueError("Invalid managed server configuration")
         return version, servers_map
 
     def detect_schema_version(self) -> int:
-        with self._lock:
+        with self.lock(), self._lock:
             version, _ = self._read_raw_document()
             return version
 
     def load_profiles(self, *, strict: bool = True) -> dict[str, ServerProfile]:
-        with self._lock:
+        with self.lock(), self._lock:
             _version, raw_map = self._read_raw_document()
             profiles: dict[str, ServerProfile] = {}
             for name, entry in raw_map.items():
@@ -139,7 +150,7 @@ class ServerConfigStore:
         return self.load_profiles(strict=True).get(name)
 
     def save_profiles(self, profiles: Mapping[str, ServerProfile]) -> None:
-        with self._lock, self.lock():
+        with self.lock(), self._lock:
             if len(profiles) > MAX_SERVERS:
                 raise ValueError(f"Server count exceeds maximum ({MAX_SERVERS})")
             for name, prof in profiles.items():
@@ -156,17 +167,19 @@ class ServerConfigStore:
                 },
             }
             atomic_write_json(self.path, payload, indent=2, restrict_acl=True)
+            if not self._init_marker.exists():
+                atomic_write_text(self._init_marker, "1\n", restrict_acl=True)
 
     def upsert_profile(self, profile: ServerProfile) -> None:
         profile.validate()
-        with self._lock, self.lock():
+        with self.lock(), self._lock:
             profiles = self.load_profiles(strict=True)
             profiles[profile.name] = profile
             self.save_profiles(profiles)
 
     def delete_profile(self, name: str, *, delete_secrets: bool = True) -> bool:
         clean = validate_server_name(name)
-        with self._lock, self.lock():
+        with self.lock(), self._lock:
             profiles = self.load_profiles(strict=True)
             removed = profiles.pop(clean, None)
             if removed is None:
@@ -202,7 +215,7 @@ class ServerConfigStore:
         if not source.is_file():
             return {"imported": [], "skipped": [], "total": 0, "backup_path": ""}
 
-        with self._lock, self.lock():
+        with self.lock(), self._lock:
             src_version, raw_map = self._read_raw_document(source)
             in_place = source.resolve() == self.path.resolve()
             existing = {} if (in_place and src_version == 1) else (

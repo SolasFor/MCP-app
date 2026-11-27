@@ -5,7 +5,7 @@ import json
 import shlex
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -84,7 +84,7 @@ def _append_server_row(
     idx: int,
     prof: ServerProfile,
     snap: dict[str, Any],
-    server_manager: ServerManager,
+    server_manager: Any,
     linked_map: dict[str, list[str]] | None,
 ) -> None:
     name_item = QTableWidgetItem(prof.display_name or prof.name)
@@ -131,7 +131,7 @@ def populate_server_rows(
     table: DataTable,
     profiles: list[ServerProfile],
     snapshots: dict[str, dict[str, Any]],
-    server_manager: ServerManager,
+    server_manager: Any,
     *,
     missing_names: tuple[str, ...] = (),
     linked_map: dict[str, list[str]] | None = None,
@@ -153,10 +153,11 @@ def populate_server_rows(
     return restore_row
 
 
-def fetch_server_logs_text(name: str, stream: str, server_manager: ServerManager) -> str:
+def fetch_server_logs_text(name: str, stream: str, server_manager: Any) -> str:
+    safe_stream: Literal["stdout", "stderr"] = "stderr" if stream == "stderr" else "stdout"
     try:
         logs_res = server_manager.logs_server(
-            name, client_id="owner", stream=stream, offset=0, limit=16000
+            name, client_id="owner", stream=safe_stream, offset=0, limit=16000
         )
         return str(logs_res.get("text") or tr("servers.details.no_logs"))
     except Exception:
@@ -166,7 +167,7 @@ def fetch_server_logs_text(name: str, stream: str, server_manager: ServerManager
 def format_server_details(
     prof: ServerProfile,
     snap: dict[str, Any],
-    server_manager: ServerManager,
+    server_manager: Any,
     redactor: SecretRedactor,
     *,
     linked_workspaces: list[str] | None = None,
@@ -375,8 +376,11 @@ class ServerProfileDialog(SilentDialog):
         self.enabled_check.setChecked(self._base.enabled)
         self.autostart_check = QCheckBox(tr("servers.dlg.autostart"))
         self.autostart_check.setChecked(self._base.autostart)
+        self.workspace_scoped_check = QCheckBox(tr("servers.dlg.workspace_scoped"))
+        self.workspace_scoped_check.setChecked(self._base.workspace_scoped or bool(selected_workspaces))
         flags_row.addWidget(self.enabled_check)
         flags_row.addWidget(self.autostart_check)
+        flags_row.addWidget(self.workspace_scoped_check)
         flags_row.addStretch(1)
         form.addRow("", flags_row)
 
@@ -442,6 +446,7 @@ class ServerProfileDialog(SilentDialog):
             min_profile=str(self.min_profile_combo.currentData() or "full"),
             allowed_clients=_parse_csv(self.allowed_clients_edit.text()),
             allow_shared_control=self._base.allow_shared_control,
+            workspace_scoped=self.workspace_scoped_check.isChecked(),
             pre_start_task_command=self.pre_start_edit.text().strip(),
             description=self._base.description,
         )

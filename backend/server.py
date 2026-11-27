@@ -487,6 +487,11 @@ WORKSPACE_STORE = WorkspaceStore(
 WORKSPACE_HISTORY = WorkspaceHistory(
     Path(os.environ.get("MCP_WORKSPACES_HISTORY_DIR") or (_WORKSPACES_DEFAULT_DIR / "history"))
 )
+_AUTOMATION_DEFAULT_DIR = (
+    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
+    / "automation"
+)
+AUTOMATION_DIR = Path(os.environ.get("MCP_AUTOMATION_DIR") or _AUTOMATION_DEFAULT_DIR)
 MANAGED_SERVERS = ManagedServers(
     Path(os.environ.get("MCP_MANAGED_SERVERS_PATH") or _SERVERS_DEFAULT_PATH),
     runner=PROCESS_RUNNER,
@@ -498,6 +503,7 @@ SERVER_MANAGER = MANAGED_SERVERS.manager
 WORKSPACE_SERVER_COORDINATOR = WorkspaceServerCoordinator(
     WORKSPACE_STORE,
     MANAGED_SERVERS.store,
+    automation_dir=AUTOMATION_DIR,
 )
 try:
     WORKSPACE_SERVER_COORDINATOR.ensure_migrated()
@@ -510,6 +516,7 @@ WORKSPACE_MANAGER = WorkspaceManager(
     runner=PROCESS_RUNNER,
     redactor=REDACTOR,
     task_store=TASK_STORE,
+    spool_dir=PROCESS_RUNNER.spool.spool_dir,
     artifacts_dir=Path(os.environ.get("MCP_TASKS_ARTIFACTS_DIR") or (_TASKS_DEFAULT_DIR / "artifacts")),
     coordinator=WORKSPACE_SERVER_COORDINATOR,
     server_manager=SERVER_MANAGER,
@@ -563,11 +570,6 @@ GATEWAY_ROUTER = GatewayRouter(
     redactor=REDACTOR,
 )
 METRICS_REGISTRY = MetricsRegistry()
-_AUTOMATION_DEFAULT_DIR = (
-    Path(os.environ.get("MCP_OAUTH_STORE_PATH") or default_store_path()).parent.parent
-    / "automation"
-)
-AUTOMATION_DIR = Path(os.environ.get("MCP_AUTOMATION_DIR") or _AUTOMATION_DEFAULT_DIR)
 ADMIN_HOST = "127.0.0.1"
 ADMIN_PORT = int(os.environ.get("MCP_ADMIN_PORT", "0") or "0")
 ADMIN_TOKEN = (os.environ.get("MCP_ADMIN_TOKEN") or "").strip() or secrets.token_urlsafe(24)
@@ -1507,7 +1509,36 @@ def _authorize_managed_server(
     return profile_mode
 
 
-def _server_auth_rechecker(client_id: str, srv_profile) -> None:
+def _live_client_authorizer(client_id: str | None, tool_name: str) -> str:
+    """Re-verify live OAuth client approval, Emergency Stop, and active profile before spawn."""
+    if client_id in (None, "", "owner"):
+        return "full"
+    if not OAUTH_ENABLED or oauth_provider is None or oauth_execution is None:
+        raise PermissionError("OAuth execution is unavailable")
+    if oauth_execution.emergency_stopped():
+        raise PermissionError("Emergency stop is active")
+    if not oauth_execution.client_approved(client_id):
+        raise PermissionError("OAuth client is not approved")
+    profile_mode = oauth_execution.profile_for(client_id)
+    tok = AccessToken(
+        token="live-auth-check",
+        client_id=client_id,
+        scopes=[READ_SCOPE],
+        resource=RESOURCE_URL,
+    )
+    allowed = allowed_tools(
+        oauth_provider.store,
+        tok,
+        oauth_execution,
+        DEFAULT_REGISTRY,
+        desktop_policy_store=DESKTOP_POLICY_STORE,
+    )
+    if tool_name not in allowed:
+        raise PermissionError(f"Client {client_id!r} is not authorized for {tool_name}")
+    return profile_mode
+
+
+def _server_auth_rechecker(client_id: str, srv_profile, workspace_id: str = "") -> None:
     if oauth_provider is None or oauth_execution is None:
         raise PermissionError("OAuth server management is unavailable")
     if oauth_execution.emergency_stopped():
@@ -1523,10 +1554,13 @@ def _server_auth_rechecker(client_id: str, srv_profile) -> None:
         client_id=client_id,
         client_profile=profile_mode,
         mode="control",
+        workspace_id=workspace_id,
     )
 
 
 SERVER_MANAGER.auth_rechecker = _server_auth_rechecker
+SERVER_MANAGER.live_client_authorizer = _live_client_authorizer
+WORKSPACE_MANAGER.live_client_authorizer = _live_client_authorizer
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -3126,6 +3160,16 @@ def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
     profile = oauth_execution.profile_for(client_id)
     if profile not in ("allowlist", "full"):
         raise PermissionError("Background tasks are disabled in safe mode")
+    if spec.workspace_id and spec.workspace_command:
+        _live_client_authorizer(client_id, WS_RUN_TASK)
+        WORKSPACE_MANAGER._authorize_live(
+            spec.workspace_id,
+            client_id=client_id,
+            fallback_profile=profile,
+            required=("read", "execute"),
+            tool_name=WS_RUN_TASK,
+        )
+        return profile
     if spec.kind == "windows":
         max_to = 600 if profile == "full" else 15
         if not (1 <= spec.timeout <= max_to) or (profile != "full" and spec.shell != "cmd"):
@@ -3206,6 +3250,7 @@ TASK_MANAGER = TaskManager(
     redactor=REDACTOR,
     auth_rechecker=_task_auth_rechecker,
     command_executor=_task_command_executor,
+    workspace_task_executor=WORKSPACE_MANAGER.execute_restarted_task,
 )
 
 
@@ -4078,6 +4123,24 @@ def build_local_admin_app(*, read_only_token: str = ""):
             sid, en, actor_id="owner", actor_profile="full"
         ),
         scheduler_event_fn=_admin_emit_event,
+        server_list_provider=lambda: SERVER_MANAGER.list_servers(client_id="owner"),
+        server_status_fn=lambda n: SERVER_MANAGER.status_server(n, client_id="owner"),
+        server_start_fn=lambda n, wid, wait_r: SERVER_MANAGER.start_server(
+            n, client_id="owner", workspace_id=wid, wait_readiness=wait_r
+        ),
+        server_stop_fn=lambda n: SERVER_MANAGER.stop_server(n, client_id="owner"),
+        server_restart_fn=lambda n, wid, wait_r: SERVER_MANAGER.restart_server(
+            n, client_id="owner", workspace_id=wid, wait_readiness=wait_r
+        ),
+        server_health_fn=lambda n: SERVER_MANAGER.health_server(n, client_id="owner", run_probe=True),
+        server_logs_fn=lambda n, st, off, lim: SERVER_MANAGER.logs_server(
+            n, client_id="owner", stream=st, offset=off, limit=lim
+        ),
+        server_metrics_fn=lambda n: SERVER_MANAGER.metrics_server(n, client_id="owner"),
+        server_autostart_fn=SERVER_MANAGER.start_autostart_servers,
+        workspace_run_task_fn=lambda wid, cname: WORKSPACE_MANAGER.run_workspace_task(
+            wid, cname, client_id="owner"
+        ),
     )
 
 
@@ -4336,6 +4399,7 @@ def main() -> None:
             pass
         REMOTE_MANAGER.close()
         EXTENSION_MANAGER.shutdown_all()
+        WORKSPACE_MANAGER.close()
         MANAGED_SERVERS.close()
         PROCESS_RUNNER.close()
         _LOGGING_MGR.shutdown(timeout=1.5)

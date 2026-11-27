@@ -153,3 +153,65 @@ class LocalAdminClient:
     def export_diagnostics(self, *, timeout: float = 5.0) -> str:
         _status, text = self._request_raw("GET", "/api/v1/diagnostics/export", timeout=timeout)
         return text
+
+    def list_servers(self, *, timeout: float = 5.0) -> list[dict[str, Any]]:
+        res = self._request_json("GET", "/api/v1/servers", timeout=timeout)
+        items = res.get("servers")
+        return list(items) if isinstance(items, list) else []
+
+    def autostart_servers(self, *, timeout: float = 120.0) -> list[dict[str, Any]]:
+        res = self._request_json("POST", "/api/v1/servers/autostart", body={}, timeout=timeout)
+        items = res.get("servers")
+        return list(items) if isinstance(items, list) else []
+
+    def server_status(self, name: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/status", timeout=timeout)
+
+    def start_server(
+        self, name: str, *, workspace_id: str = "", wait_readiness: bool = True, timeout: float = 130.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json(
+            "POST",
+            f"/api/v1/servers/{quoted}/start",
+            body={"workspace_id": workspace_id, "wait_readiness": bool(wait_readiness)},
+            timeout=timeout,
+        )
+
+    def stop_server(self, name: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("POST", f"/api/v1/servers/{quoted}/stop", body={}, timeout=timeout)
+
+    def restart_server(
+        self, name: str, *, workspace_id: str = "", wait_readiness: bool = True, timeout: float = 130.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json(
+            "POST",
+            f"/api/v1/servers/{quoted}/restart",
+            body={"workspace_id": workspace_id, "wait_readiness": bool(wait_readiness)},
+            timeout=timeout,
+        )
+
+    def health_server(self, name: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("POST", f"/api/v1/servers/{quoted}/health", body={}, timeout=timeout)
+
+    def server_logs(
+        self, name: str, *, stream: str = "stdout", offset: int = 0, limit: int = 16000, timeout: float = 5.0
+    ) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        q = urllib.parse.urlencode({"stream": stream, "offset": int(offset), "limit": int(limit)})
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/logs?{q}", timeout=timeout)
+
+    def server_metrics(self, name: str, *, timeout: float = 5.0) -> dict[str, Any]:
+        quoted = urllib.parse.quote(name, safe="")
+        return self._request_json("GET", f"/api/v1/servers/{quoted}/metrics", timeout=timeout)
+
+    def run_workspace_task(self, workspace_id: str, command_name: str, *, timeout: float = 610.0) -> dict[str, Any]:
+        q_wid = urllib.parse.quote(workspace_id, safe="")
+        q_cmd = urllib.parse.quote(command_name, safe="")
+        return self._request_json(
+            "POST", f"/api/v1/workspaces/{q_wid}/tasks/{q_cmd}/run", body={}, timeout=timeout
+        )

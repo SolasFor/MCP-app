@@ -69,6 +69,8 @@ class TaskSpec:
     host: str = ""
     user: str = ""
     port: int = 22
+    workspace_id: str = ""
+    workspace_command: str = ""
 
     def validate(self) -> None:
         if self.kind not in ("windows", "ssh"):
@@ -88,18 +90,20 @@ class TaskSpec:
                 raise ValueError("SSH port must be within 1..65535.")
 
     def to_json(self) -> str:
-        return json.dumps(
-            {
-                "kind": self.kind,
-                "command": self.command,
-                "shell": self.shell,
-                "timeout": int(self.timeout),
-                "host": self.host,
-                "user": self.user,
-                "port": int(self.port),
-            },
-            ensure_ascii=False,
-        )
+        payload: dict[str, Any] = {
+            "kind": self.kind,
+            "command": self.command,
+            "shell": self.shell,
+            "timeout": int(self.timeout),
+            "host": self.host,
+            "user": self.user,
+            "port": int(self.port),
+        }
+        if self.workspace_id:
+            payload["workspace_id"] = self.workspace_id
+        if self.workspace_command:
+            payload["workspace_command"] = self.workspace_command
+        return json.dumps(payload, ensure_ascii=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "TaskSpec":
@@ -116,6 +120,8 @@ class TaskSpec:
             host=str(data.get("host") or ""),
             user=str(data.get("user") or ""),
             port=int(data.get("port", 22)),
+            workspace_id=str(data.get("workspace_id") or ""),
+            workspace_command=str(data.get("workspace_command") or ""),
         )
 
 

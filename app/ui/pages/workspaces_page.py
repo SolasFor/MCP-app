@@ -5,8 +5,9 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.core.admin_client import AdminBackendUnavailableError, LocalAdminClient
 from app.core.redaction import SecretRedactor
 from app.core.secret_store import SecretStore
 from app.paths import user_data_dir
@@ -48,6 +50,7 @@ from app.ui.pages.servers_page import (
     format_server_details,
     populate_server_rows,
 )
+from backend.process_runner import ProcessRunner
 from backend.servers.manager import ServerManager
 from backend.servers.models import ServerProfile
 from backend.servers.store import ServerConfigStore
@@ -349,6 +352,124 @@ class WorkspaceProfileDialog(SilentDialog):
         self.accept()
 
 
+class _ServerRuntimeProxy:
+    """Delegates server runtime calls to backend Admin API when running, else local ServerManager."""
+
+    def __init__(
+        self,
+        local_manager: ServerManager,
+        get_admin_client: Callable[[], LocalAdminClient | None],
+    ) -> None:
+        self._local = local_manager
+        self._get_client = get_admin_client
+
+    def _call(self, remote_fn: Callable[[LocalAdminClient], Any], local_fn: Callable[[], Any]) -> Any:
+        client = self._get_client()
+        if client is not None:
+            try:
+                return remote_fn(client)
+            except AdminBackendUnavailableError:
+                pass
+        return local_fn()
+
+    def list_servers(self, *, client_id: str | None = "owner", workspace_id: str = "") -> list[dict[str, Any]]:
+        return list(
+            self._call(
+                lambda c: c.list_servers(),
+                lambda: self._local.list_servers(client_id=client_id, workspace_id=workspace_id),
+            )
+        )
+
+    def status_server(self, name: str, *, client_id: str | None = "owner", workspace_id: str = "") -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.server_status(name),
+                lambda: self._local.status_server(name, client_id=client_id, workspace_id=workspace_id),
+            )
+        )
+
+    def start_server(
+        self, name: str, *, client_id: str | None = "owner", wait_readiness: bool = True, workspace_id: str = ""
+    ) -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.start_server(name, workspace_id=workspace_id, wait_readiness=wait_readiness),
+                lambda: self._local.start_server(
+                    name, client_id=client_id, wait_readiness=wait_readiness, workspace_id=workspace_id
+                ),
+            )
+        )
+
+    def stop_server(self, name: str, *, client_id: str | None = "owner", workspace_id: str = "") -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.stop_server(name),
+                lambda: self._local.stop_server(name, client_id=client_id, workspace_id=workspace_id),
+            )
+        )
+
+    def restart_server(
+        self, name: str, *, client_id: str | None = "owner", wait_readiness: bool = True, workspace_id: str = ""
+    ) -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.restart_server(name, workspace_id=workspace_id, wait_readiness=wait_readiness),
+                lambda: self._local.restart_server(
+                    name, client_id=client_id, wait_readiness=wait_readiness, workspace_id=workspace_id
+                ),
+            )
+        )
+
+    def health_server(
+        self, name: str, *, client_id: str | None = "owner", run_probe: bool = True, workspace_id: str = ""
+    ) -> dict[str, Any]:
+        def _remote(c: LocalAdminClient) -> dict[str, Any]:
+            return c.health_server(name) if run_probe else c.server_status(name)
+
+        return dict(
+            self._call(
+                _remote,
+                lambda: self._local.health_server(
+                    name, client_id=client_id, run_probe=run_probe, workspace_id=workspace_id
+                ),
+            )
+        )
+
+    def logs_server(
+        self,
+        name: str,
+        *,
+        client_id: str | None = "owner",
+        stream: Literal["stdout", "stderr"] = "stdout",
+        offset: int = 0,
+        limit: int = 8000,
+    ) -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.server_logs(name, stream=stream, offset=offset, limit=limit),
+                lambda: self._local.logs_server(
+                    name, client_id=client_id, stream=stream, offset=offset, limit=limit
+                ),
+            )
+        )
+
+    def metrics_server(self, name: str, *, client_id: str | None = "owner") -> dict[str, Any]:
+        return dict(
+            self._call(
+                lambda c: c.server_metrics(name),
+                lambda: self._local.metrics_server(name, client_id=client_id),
+            )
+        )
+
+    def start_autostart_servers(self) -> list[dict[str, Any]]:
+        return list(
+            self._call(
+                lambda c: c.autostart_servers(),
+                lambda: self._local.start_autostart_servers(),
+            )
+        )
+
+
 class WorkspacesPage(PageScaffold):
     """Unified Workspaces + Managed Servers page with linked & unlinked server parity."""
 
@@ -365,7 +486,12 @@ class WorkspacesPage(PageScaffold):
         servers_config_path: Path | None = None,
         servers_secrets_dir: Path | None = None,
         tasks_db_path: Path | None = None,
+        tasks_spool_dir: Path | None = None,
+        tasks_artifacts_dir: Path | None = None,
+        automation_dir: Path | None = None,
         redactor: SecretRedactor | None = None,
+        admin_client_provider: Callable[[], LocalAdminClient | None] | None = None,
+        backend_running_checker: Callable[[], bool] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(scroll=False, parent=parent)
@@ -375,7 +501,11 @@ class WorkspacesPage(PageScaffold):
         self._history_dir = history_dir or (ws_base / "history")
         self._servers_config_path = servers_config_path or (user_data_dir() / "servers" / "managed_servers.json")
         self._tasks_db_path = tasks_db_path or (user_data_dir() / "tasks" / "tasks.sqlite3")
+        resolved_spool = tasks_spool_dir or (self._tasks_db_path.parent / "spool")
+        resolved_artifacts = tasks_artifacts_dir or (self._tasks_db_path.parent / "artifacts")
         self._redactor = redactor or SecretRedactor()
+        self._admin_client_provider = admin_client_provider
+        self._backend_running_checker = backend_running_checker
 
         ws_secret_store = SecretStore(secrets_dir) if secrets_dir is not None else None
         srv_secret_store = SecretStore(servers_secrets_dir) if servers_secrets_dir is not None else None
@@ -383,21 +513,31 @@ class WorkspacesPage(PageScaffold):
         self.server_store = ServerConfigStore(self._servers_config_path, secret_store=srv_secret_store)
         self.history = WorkspaceHistory(self._history_dir)
         self.task_store = TaskStore(self._tasks_db_path)
-        self.coordinator = WorkspaceServerCoordinator(self.store, self.server_store)
+        self.coordinator = WorkspaceServerCoordinator(
+            self.store,
+            self.server_store,
+            automation_dir=automation_dir,
+        )
         self._config_error = ""
         self._try_initial_migration()
 
+        self._local_runner = ProcessRunner(spool_dir=resolved_spool, redactor=self._redactor)
         self.server_manager = ServerManager(
             self.server_store,
+            runner=self._local_runner,
             redactor=self._redactor,
             task_store=self.task_store,
             workspace_authorizer=self.coordinator.authorize_server_operation,
         )
+        self.runtime_proxy = _ServerRuntimeProxy(self.server_manager, self._get_admin_client)
         self.manager = WorkspaceManager(
             self.store,
             self.history,
+            runner=self._local_runner,
             redactor=self._redactor,
             task_store=self.task_store,
+            spool_dir=resolved_spool,
+            artifacts_dir=resolved_artifacts,
             coordinator=self.coordinator,
             server_manager=self.server_manager,
         )
@@ -419,6 +559,13 @@ class WorkspacesPage(PageScaffold):
         self.retranslate()
         self.apply_theme()
         self.reload()
+
+    def _get_admin_client(self) -> LocalAdminClient | None:
+        if self._backend_running_checker is not None and not self._backend_running_checker():
+            return None
+        if self._admin_client_provider is None:
+            return None
+        return self._admin_client_provider()
 
     def _try_initial_migration(self) -> None:
         try:
@@ -651,7 +798,7 @@ class WorkspacesPage(PageScaffold):
         for secret in self.server_store.collect_secret_values():
             self._redactor.register(secret)
         try:
-            items = self.server_manager.list_servers(client_id="owner")
+            items = self.runtime_proxy.list_servers(client_id="owner")
             self._snapshots = {str(item["name"]): item for item in items}
         except Exception:  # noqa: BLE001
             self._snapshots = {}
@@ -703,7 +850,7 @@ class WorkspacesPage(PageScaffold):
             self.unlinked_table,
             unlinked,
             self._snapshots,
-            self.server_manager,
+            self.runtime_proxy,
             selected_name=self._active_server_name,
         )
         self.unlinked_table.filter_rows(self.search_edit.text())
@@ -730,7 +877,7 @@ class WorkspacesPage(PageScaffold):
             self.ws_servers_table,
             linked,
             self._snapshots,
-            self.server_manager,
+            self.runtime_proxy,
             missing_names=missing,
             linked_map=snap.server_to_workspaces,
             selected_name=self._active_server_name,
@@ -968,8 +1115,8 @@ class WorkspacesPage(PageScaffold):
             self.logs_view.setPlainText(tr("servers.details.no_logs"))
             self.info_view.setPlainText(tr("servers.details.no_info"))
             return
-        stream = "stderr" if self.stream_combo.currentData() == "stderr" else "stdout"
-        self.logs_view.setPlainText(fetch_server_logs_text(name, stream, self.server_manager))
+        stream: Literal["stdout", "stderr"] = "stderr" if self.stream_combo.currentData() == "stderr" else "stdout"
+        self.logs_view.setPlainText(fetch_server_logs_text(name, stream, self.runtime_proxy))
         prof = self._server_profiles[name]
         snap = self._snapshots.get(name, {})
         linked = self._snapshot.server_to_workspaces.get(name, []) if self._snapshot else []
@@ -977,7 +1124,7 @@ class WorkspacesPage(PageScaffold):
             format_server_details(
                 prof,
                 snap,
-                self.server_manager,
+                self.runtime_proxy,
                 self._redactor,
                 linked_workspaces=linked,
             )
@@ -1144,19 +1291,37 @@ class WorkspacesPage(PageScaffold):
             parent=self,
         )
         if dlg.exec() and dlg.saved_profile is not None:
-            self._sync_server_workspace_links(dlg.saved_profile.name, dlg.selected_workspaces)
             self.save_server_profile(dlg.saved_profile)
+            self._sync_server_workspace_links(
+                dlg.saved_profile.name,
+                dlg.selected_workspaces,
+                allow_unscoped_access=not dlg.saved_profile.workspace_scoped,
+            )
 
-    def _sync_server_workspace_links(self, server_name: str, target_workspaces: tuple[str, ...]) -> None:
+    def _sync_server_workspace_links(
+        self,
+        server_name: str,
+        target_workspaces: tuple[str, ...],
+        *,
+        allow_unscoped_access: bool = False,
+    ) -> None:
         target_set = set(target_workspaces)
+        changed = False
         for wid, ws in list(self._profiles.items()):
             if wid in target_set and server_name not in ws.linked_servers:
                 self.coordinator.link_server(wid, server_name)
+                changed = True
             elif wid not in target_set and server_name in ws.linked_servers:
-                self.coordinator.unlink_server(wid, server_name)
+                self.coordinator.unlink_server(
+                    wid, server_name, allow_unscoped_access=allow_unscoped_access
+                )
+                changed = True
+        if changed:
+            self.config_changed.emit()
+            self.reload()
 
     def rename_server_profile(self, old_name: str, new_name: str) -> ServerProfile:
-        renamed = self.coordinator.rename_server(old_name, new_name, server_manager=self.server_manager)
+        renamed = self.coordinator.rename_server(old_name, new_name, server_manager=self.runtime_proxy)
         if self._active_server_name == old_name:
             self._active_server_name = new_name
         self.config_changed.emit()
@@ -1210,7 +1375,7 @@ class WorkspacesPage(PageScaffold):
         if ans != SilentMessageBox.StandardButton.Yes:
             return
         try:
-            self.coordinator.delete_server_and_unlink(name, server_manager=self.server_manager)
+            self.coordinator.delete_server_and_unlink(name, server_manager=self.runtime_proxy)
             if self._active_server_name == name:
                 self._active_server_name = None
             self.config_changed.emit()
@@ -1269,11 +1434,16 @@ class WorkspacesPage(PageScaffold):
 
     def _run_server_op(self, kind: str, name: str) -> None:
         self._active_server_name = name
+        wid = self._selected_id() or ""
         ops = {
-            "start": lambda: self.server_manager.start_server(name, client_id="owner", wait_readiness=True),
-            "stop": lambda: self.server_manager.stop_server(name, client_id="owner"),
-            "restart": lambda: self.server_manager.restart_server(name, client_id="owner", wait_readiness=True),
-            "health": lambda: self.server_manager.health_server(name, client_id="owner", run_probe=True),
+            "start": lambda: self.runtime_proxy.start_server(
+                name, client_id="owner", wait_readiness=True, workspace_id=wid
+            ),
+            "stop": lambda: self.runtime_proxy.stop_server(name, client_id="owner"),
+            "restart": lambda: self.runtime_proxy.restart_server(
+                name, client_id="owner", wait_readiness=True, workspace_id=wid
+            ),
+            "health": lambda: self.runtime_proxy.health_server(name, client_id="owner", run_probe=True),
         }
         fn = ops.get(kind)
         if fn is not None:
@@ -1308,6 +1478,15 @@ class WorkspacesPage(PageScaffold):
         except Exception as exc:
             SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
 
+    def _run_workspace_task_via_admin_or_local(self, wid: str, cname: str) -> dict[str, Any]:
+        client = self._get_admin_client()
+        if client is not None:
+            try:
+                return client.run_workspace_task(wid, cname)
+            except AdminBackendUnavailableError:
+                pass
+        return asyncio.run(self.manager.run_workspace_task(wid, cname, client_id="owner"))
+
     def run_selected_task(self) -> None:
         wid = self._selected_id()
         cname = str(self.cmd_combo.currentData() or "")
@@ -1316,7 +1495,7 @@ class WorkspacesPage(PageScaffold):
         self._spawn_op(
             "task",
             f"{wid}:{cname}",
-            lambda: asyncio.run(self.manager.run_workspace_task(wid, cname, client_id="owner")),
+            lambda: self._run_workspace_task_via_admin_or_local(wid, cname),
         )
 
     def wait_for_pending_ops(self, timeout: float = 10.0) -> bool:
@@ -1332,7 +1511,7 @@ class WorkspacesPage(PageScaffold):
         return not self._pending_threads
 
     def start_autostart_servers(self) -> None:
-        self.server_manager.start_autostart_servers()
+        self.runtime_proxy.start_autostart_servers()
         self.reload()
 
     def shutdown(self) -> None:
@@ -1340,6 +1519,7 @@ class WorkspacesPage(PageScaffold):
         self.wait_for_pending_ops(timeout=3.0)
         self.server_manager.close()
         self.manager.close()
+        self._local_runner.close()
 
     # ------------------------------ i18n & Theme ------------------------------
     def retranslate(self) -> None:

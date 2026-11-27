@@ -38,7 +38,7 @@ if sys.platform == "win32":
     import msvcrt
 
     def _acquire_os_lock(fd: int, timeout: float, lock_path: Path) -> None:
-        deadline = time.monotonic() + max(0.5, timeout)
+        deadline = time.monotonic() + max(0.05, float(timeout))
         while True:
             os.lseek(fd, 0, os.SEEK_SET)
             try:
@@ -59,8 +59,15 @@ else:
     import fcntl
 
     def _acquire_os_lock(fd: int, timeout: float, lock_path: Path) -> None:
-        del timeout, lock_path
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for lock: {lock_path}") from None
+                time.sleep(0.01)
 
     def _release_os_lock(fd: int) -> None:
         try:
@@ -71,12 +78,24 @@ else:
 
 @contextmanager
 def cross_process_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]:
-    """Thread-reentrant cross-process exclusive file lock for atomic config updates."""
+    """Thread-reentrant cross-process exclusive file lock with bounded timeout.
+
+    Global lock acquisition hierarchy across MCP-app stores/managers (outer -> inner):
+    1. WorkspaceStore.lock() (.workspaces.lock)
+    2. ServerConfigStore.lock() (.managed_servers.lock)
+    3. AutomationScheduler lock (.automation.lock)
+    4. ServerManager runtime lock (.managed_servers.runtime.lock)
+    5. In-memory store/manager threading.RLock (leaf lock only)
+    """
     target = Path(lock_path)
     key = _canonical_lock_key(target)
     tlock = _get_cross_thread_lock(key)
     tid = threading.get_ident()
-    with tlock:
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    wait_s = max(0.01, deadline - time.monotonic())
+    if not tlock.acquire(timeout=wait_s):
+        raise TimeoutError(f"Timed out waiting for lock: {target}")
+    try:
         depth_key = (key, tid)
         depth = _CROSS_LOCK_DEPTH.get(depth_key, 0)
         if depth > 0:
@@ -93,7 +112,8 @@ def cross_process_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]
         try:
             if os.fstat(fd).st_size == 0:
                 os.write(fd, b"\0")
-            _acquire_os_lock(fd, timeout, target)
+            remaining = max(0.05, deadline - time.monotonic())
+            _acquire_os_lock(fd, remaining, target)
             get_platform().restrict_path_acl(target, is_dir=False)
             _CROSS_LOCK_DEPTH[depth_key] = 1
             try:
@@ -103,6 +123,8 @@ def cross_process_lock(lock_path: Path, timeout: float = 10.0) -> Iterator[None]
                 _release_os_lock(fd)
         finally:
             os.close(fd)
+    finally:
+        tlock.release()
 
 
 @contextmanager

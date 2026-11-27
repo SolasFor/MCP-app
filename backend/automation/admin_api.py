@@ -1,6 +1,7 @@
 """Localhost-only authenticated admin REST API (monitoring, schedules, redacted diagnostics)."""
 from __future__ import annotations
 
+import asyncio
 import hmac
 import inspect
 import json
@@ -97,6 +98,16 @@ class _AdminEndpoints:
         scheduler_delete_fn: Callable[[str], bool] | None,
         scheduler_enable_fn: Callable[[str, bool], dict[str, Any]] | None,
         scheduler_event_fn: Callable[[str, dict[str, Any]], Any] | None,
+        server_list_provider: Callable[[], list[dict[str, Any]]] | None = None,
+        server_status_fn: Callable[[str], dict[str, Any]] | None = None,
+        server_start_fn: Callable[[str, str, bool], dict[str, Any]] | None = None,
+        server_stop_fn: Callable[[str], dict[str, Any]] | None = None,
+        server_restart_fn: Callable[[str, str, bool], dict[str, Any]] | None = None,
+        server_health_fn: Callable[[str], dict[str, Any]] | None = None,
+        server_logs_fn: Callable[[str, str, int, int], dict[str, Any]] | None = None,
+        server_metrics_fn: Callable[[str], dict[str, Any]] | None = None,
+        server_autostart_fn: Callable[[], list[dict[str, Any]]] | None = None,
+        workspace_run_task_fn: Callable[[str, str], Any] | None = None,
     ) -> None:
         self._tokens = admin_tokens
         self._snapshot = snapshot_provider
@@ -108,6 +119,16 @@ class _AdminEndpoints:
         self._delete = scheduler_delete_fn
         self._enable = scheduler_enable_fn
         self._event = scheduler_event_fn
+        self._srv_list = server_list_provider
+        self._srv_status = server_status_fn
+        self._srv_start = server_start_fn
+        self._srv_stop = server_stop_fn
+        self._srv_restart = server_restart_fn
+        self._srv_health = server_health_fn
+        self._srv_logs = server_logs_fn
+        self._srv_metrics = server_metrics_fn
+        self._srv_autostart = server_autostart_fn
+        self._ws_run_task = workspace_run_task_fn
 
     def _deny(self, request: Request, scope: str) -> Response | None:
         return _authorize_request(request, self._tokens, scope)
@@ -214,6 +235,159 @@ class _AdminEndpoints:
             return denied
         return Response(content=self._diag(), media_type="application/json")
 
+    @staticmethod
+    def _error_response(exc: BaseException) -> Response:
+        if isinstance(exc, PermissionError):
+            return JSONResponse({"error": str(exc)}, status_code=403)
+        if isinstance(exc, KeyError):
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        if isinstance(exc, ValueError):
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def list_servers(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        if self._srv_list is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            items = await asyncio.to_thread(self._srv_list)
+            return JSONResponse({"servers": list(items)})
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def autostart_servers(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._srv_autostart is None:
+            return JSONResponse({"error": "Server autostart not configured"}, status_code=501)
+        try:
+            items = await asyncio.to_thread(self._srv_autostart)
+            return JSONResponse({"servers": list(items)})
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_status(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        if self._srv_status is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            res = await asyncio.to_thread(self._srv_status, request.path_params["server_name"])
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_start(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._srv_start is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            body = await _read_json_object(request)
+            res = await asyncio.to_thread(
+                self._srv_start,
+                request.path_params["server_name"],
+                str(body.get("workspace_id") or ""),
+                bool(body.get("wait_readiness", True)),
+            )
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_stop(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._srv_stop is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            res = await asyncio.to_thread(self._srv_stop, request.path_params["server_name"])
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_restart(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._srv_restart is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            body = await _read_json_object(request)
+            res = await asyncio.to_thread(
+                self._srv_restart,
+                request.path_params["server_name"],
+                str(body.get("workspace_id") or ""),
+                bool(body.get("wait_readiness", True)),
+            )
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_health(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._srv_health is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            res = await asyncio.to_thread(self._srv_health, request.path_params["server_name"])
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_logs(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        if self._srv_logs is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            stream = "stderr" if request.query_params.get("stream") == "stderr" else "stdout"
+            offset = int(request.query_params.get("offset", "0") or "0")
+            limit = int(request.query_params.get("limit", "16000") or "16000")
+            res = await asyncio.to_thread(
+                self._srv_logs,
+                request.path_params["server_name"],
+                stream,
+                offset,
+                limit,
+            )
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def server_metrics(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:read")
+        if denied is not None:
+            return denied
+        if self._srv_metrics is None:
+            return JSONResponse({"error": "Server runtime not configured"}, status_code=501)
+        try:
+            res = await asyncio.to_thread(self._srv_metrics, request.path_params["server_name"])
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
+    async def run_workspace_task(self, request: Request) -> Response:
+        denied = self._deny(request, "admin:write")
+        if denied is not None:
+            return denied
+        if self._ws_run_task is None:
+            return JSONResponse({"error": "Workspace task runner not configured"}, status_code=501)
+        try:
+            wid = request.path_params["workspace_id"]
+            cname = request.path_params["command_name"]
+            res = await _maybe_await(self._ws_run_task(wid, cname))
+            return JSONResponse(res)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(exc)
+
 
 def build_admin_app(
     *,
@@ -227,6 +401,16 @@ def build_admin_app(
     scheduler_delete_fn: Callable[[str], bool] | None = None,
     scheduler_enable_fn: Callable[[str, bool], dict[str, Any]] | None = None,
     scheduler_event_fn: Callable[[str, dict[str, Any]], Any] | None = None,
+    server_list_provider: Callable[[], list[dict[str, Any]]] | None = None,
+    server_status_fn: Callable[[str], dict[str, Any]] | None = None,
+    server_start_fn: Callable[[str, str, bool], dict[str, Any]] | None = None,
+    server_stop_fn: Callable[[str], dict[str, Any]] | None = None,
+    server_restart_fn: Callable[[str, str, bool], dict[str, Any]] | None = None,
+    server_health_fn: Callable[[str], dict[str, Any]] | None = None,
+    server_logs_fn: Callable[[str, str, int, int], dict[str, Any]] | None = None,
+    server_metrics_fn: Callable[[str], dict[str, Any]] | None = None,
+    server_autostart_fn: Callable[[], list[dict[str, Any]]] | None = None,
+    workspace_run_task_fn: Callable[[str, str], Any] | None = None,
 ) -> Starlette:
     """Create Starlette app enforcing loopback Host, no tunnel headers, and scoped bearer auth."""
     ep = _AdminEndpoints(
@@ -240,6 +424,16 @@ def build_admin_app(
         scheduler_delete_fn=scheduler_delete_fn,
         scheduler_enable_fn=scheduler_enable_fn,
         scheduler_event_fn=scheduler_event_fn,
+        server_list_provider=server_list_provider,
+        server_status_fn=server_status_fn,
+        server_start_fn=server_start_fn,
+        server_stop_fn=server_stop_fn,
+        server_restart_fn=server_restart_fn,
+        server_health_fn=server_health_fn,
+        server_logs_fn=server_logs_fn,
+        server_metrics_fn=server_metrics_fn,
+        server_autostart_fn=server_autostart_fn,
+        workspace_run_task_fn=workspace_run_task_fn,
     )
     routes = [
         Route("/api/v1/monitoring", ep.get_monitoring, methods=["GET"]),
@@ -251,5 +445,15 @@ def build_admin_app(
         Route("/api/v1/schedules/{schedule_id}/run", ep.trigger_schedule, methods=["POST"]),
         Route("/api/v1/events", ep.dispatch_event, methods=["POST"]),
         Route("/api/v1/diagnostics/export", ep.export_diagnostics, methods=["GET"]),
+        Route("/api/v1/servers", ep.list_servers, methods=["GET"]),
+        Route("/api/v1/servers/autostart", ep.autostart_servers, methods=["POST"]),
+        Route("/api/v1/servers/{server_name}/status", ep.server_status, methods=["GET"]),
+        Route("/api/v1/servers/{server_name}/start", ep.server_start, methods=["POST"]),
+        Route("/api/v1/servers/{server_name}/stop", ep.server_stop, methods=["POST"]),
+        Route("/api/v1/servers/{server_name}/restart", ep.server_restart, methods=["POST"]),
+        Route("/api/v1/servers/{server_name}/health", ep.server_health, methods=["POST"]),
+        Route("/api/v1/servers/{server_name}/logs", ep.server_logs, methods=["GET"]),
+        Route("/api/v1/servers/{server_name}/metrics", ep.server_metrics, methods=["GET"]),
+        Route("/api/v1/workspaces/{workspace_id}/tasks/{command_name}/run", ep.run_workspace_task, methods=["POST"]),
     ]
     return Starlette(routes=routes)

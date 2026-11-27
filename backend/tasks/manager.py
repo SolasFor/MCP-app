@@ -40,6 +40,7 @@ class TaskManager:
         spool: OutputSpoolManager | None = None,
         auth_rechecker: AuthRecheckFn | None = None,
         command_executor: CommandExecutorFn | None = None,
+        workspace_task_executor: CommandExecutorFn | None = None,
         max_global_concurrent: int = 4,
         max_per_client_concurrent: int = 2,
         max_queued_per_client: int = 20,
@@ -56,6 +57,7 @@ class TaskManager:
 
         self._auth_rechecker = auth_rechecker
         self._command_executor = command_executor
+        self._workspace_task_executor = workspace_task_executor
         self.max_global_concurrent = max(1, int(max_global_concurrent))
         self.max_per_client_concurrent = max(1, int(max_per_client_concurrent))
         self.max_queued_per_client = max(1, int(max_queued_per_client))
@@ -138,10 +140,17 @@ class TaskManager:
                     )
                     return
 
-            if self._command_executor is None:
+            if spec.workspace_id and spec.workspace_command:
+                if self._workspace_task_executor is not None:
+                    res = await self._workspace_task_executor(rec, spec)
+                elif self._command_executor is not None:
+                    res = await self._command_executor(rec, spec)
+                else:
+                    raise PermissionError("Workspace task executor is unavailable")
+            elif self._command_executor is None:
                 raise RuntimeError("TaskManager has no command executor configured")
-
-            res = await self._command_executor(rec, spec)
+            else:
+                res = await self._command_executor(rec, spec)
             latest = self.store.get_task(rec.task_id)
             was_cancel_flagged = bool(latest and latest.cancel_requested)
 

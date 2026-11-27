@@ -1023,7 +1023,7 @@ def _scheduler_permission_check(spec: ScheduleSpec) -> tuple[bool, str]:
         if not oauth_execution.client_approved(spec.client_id):
             return (False, f"Client {spec.client_id!r} is not approved")
         tok = AccessToken(
-            token="sched-check",
+            token=secrets.token_urlsafe(12),
             client_id=spec.client_id,
             scopes=[READ_SCOPE],
             resource=RESOURCE_URL,
@@ -3817,7 +3817,7 @@ async def _invoke_owner_scheduled_tool_async(spec: ScheduleSpec, args: dict[str,
     oauth_provider.store.mark_approved(ephemeral_id)
     oauth_execution.set_client_profile(ephemeral_id, owner_profile)
     tok = AccessToken(
-        token="sched-owner-exec",
+        token=secrets.token_urlsafe(12),
         client_id=ephemeral_id,
         scopes=[READ_SCOPE],
         resource=RESOURCE_URL,
@@ -3838,7 +3838,7 @@ async def _invoke_scheduled_tool_async(spec: ScheduleSpec) -> Any:
     if spec.client_id == "owner":
         return await _invoke_owner_scheduled_tool_async(spec, args)
     tok = AccessToken(
-        token="sched-exec",
+        token=secrets.token_urlsafe(12),
         client_id=spec.client_id,
         scopes=[READ_SCOPE],
         resource=RESOURCE_URL,

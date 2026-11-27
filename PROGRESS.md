@@ -537,3 +537,10 @@
 - Devices now uses the shared management toolbar and resizable registry/diagnostics panels.
 - Devices and Extensions use compact 28px action buttons and separate localized instruction dialogs instead of page lead text; original security notices are preserved in the guides.
 - Validation: Ruff, mypy (74 files), 31 targeted integration tests including RU/EN guide content, remote management and extension workflows. Manual visual acceptance pending.
+
+## N00 — подготовка следующего цикла
+- База main v1.0.2 f8ba86f (релиз опубликован), ветка chore/next-cycle-prep создана и fast-forward; пользовательские Graphify-файлы и изменения AGENTS/.gitignore сохранены, оригинальные пять файлов проверены по SHA-256 до добавления новых инструкций. Старые worktrees не изменялись.
+- Подготовлены ROADMAP N00–N13, исторический архив, AGENTS/DESIGN, критерии приёмки, архитектура обновления, tooling guide, project rule/workflow, полный ANTIGRAVITY_PROMPT. Реализация функций не начата.
+- AG config: пять нужных плагинов enabled, Swarm/Vercel disabled; глобальные настройки, ключи и разрешения не изменены. Наличие файлов/конфигов не означает live MCP доступ. Sonar scanner не в PATH; SonarCloud — предпочтительный путь. Проверки live внутри AG: NOT_RUN.
+- Следующее действие: открыть проект в AG на подготовленной ветке, передать ANTIGRAVITY_PROMPT.md для N00 verification; после отдельного разрешения выполнить N01. Реальные внешние интеграции и visual acceptance остаются отдельными проверками.
+- Baseline: Ruff full scope PASS; configured mypy PASS (74 files); acceptance_wave2_gui PASS (9 tests). PR #36 SonarCloud, Linux, Windows and RC installer all PASS; release v1.0.2 verified with 4 assets. Full fresh local unit/integration and live AG checks NOT_RUN (N01/N00 verification).

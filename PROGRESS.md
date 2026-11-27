@@ -647,4 +647,12 @@
     - `MCPApp.exe`: `8,479,332` Б, SHA-256 `b5148710134f66097db0d1769f827b6e0a6b95ffb4b92708c799d67f3e0f3099`.
     - `--selftest`: **PASS** (`RESULT OK`).
     - `--headless` с `MCP_ADMIN_PORT` и `MCP_ADMIN_TOKEN`: **PASS** (`POST /api/v1/schedules` + `POST /api/v1/schedules/exe-live-check/run` -> `succeeded`).
-- **PR #37 / CI / незавершённые проверки**: ожидается обновление PR #37 и прогон GitHub Actions + SonarCloud Quality Gate после финального push.
+- **PR #37 / CI / незавершённые проверки**:
+  - Обновлён [PR #37](https://github.com/SolasFor/MCP-app/pull/37) (`feat/n01-baseline-audit` → `main`, статус: **OPEN**; PR #32 не затрагивался, merge в `main` и публикация релиза не выполнялись, N02 не начинался).
+  - Облачный CI и SonarCloud Quality Gate на кодовом коммите `c66baafa50a347e7dfe6a8fcfb5cc56a733d2766` (после `bebce09`):
+    - `Verify & Test (ubuntu-latest)`: **PASS** (`1m52s`: https://github.com/SolasFor/MCP-app/actions/runs/46039215493/job/140642339045).
+    - `Verify & Test (windows-latest)`: **PASS** (`2m28s`: https://github.com/SolasFor/MCP-app/actions/runs/46039215493/job/140642339348).
+    - `windows-package` (`RC Windows installer`): **PASS** (`3m32s`: https://github.com/SolasFor/MCP-app/actions/runs/46039215291/job/140642338799).
+    - `SonarCloud Code Analysis`: **PASS** (`44s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.8%`, `new_security_hotspots_reviewed=100.0%`): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=37.
+  - `BLOCKED`/`NOT_RUN`: Authenticode `.pfx`, локальный `ISCC.exe` (`Setup.exe` проверен в `windows-package`), второй live GUI при запущенном `MCPApp-Running`, live облачные туннели/SaaS AI-клиенты/внешний SSH, ручной OAuth для `sonarqube-cloud` MCP.
+  - **Вывод**: этап N01 (включая `N01-FINAL-01`) полностью закрыт и готов к финальной приёмке и одобрению merge [PR #37](https://github.com/SolasFor/MCP-app/pull/37) владельцем перед переходом к N02.

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -18,7 +19,7 @@ import paramiko
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
-from app.core.atomic_io import atomic_write_json, is_reparse_or_symlink, try_init_private_dir
+from app.core.atomic_io import atomic_write_bytes, is_reparse_or_symlink, try_init_private_dir
 from app.platform import get_platform
 from backend.remote.host_keys import (
     ApprovedHostKey,
@@ -33,6 +34,12 @@ from backend.remote.models import (
     validate_device_id,
     validate_host,
     validate_ssh_username,
+)
+from backend.remote.store import (
+    MAX_DEVICES_FILE_BYTES,
+    MAX_INIT_MARKER_BYTES,
+    MAX_KNOWN_HOSTS_FILE_BYTES,
+    _assert_no_reparse_ancestors,
 )
 
 if TYPE_CHECKING:
@@ -80,6 +87,19 @@ class SSHConfigImportReport:
     path: str
     candidates: tuple[SSHConfigHostCandidate, ...]
     warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResolvedSSHTarget:
+    """Validated effective SSH target resolved prior to authorization and execution."""
+
+    requested_host: str
+    effective_host: str
+    effective_user: str
+    effective_port: int
+    key_filename: str = ""
+    via_ssh_config: bool = False
+    config_alias: str = ""
 
 
 @dataclass(frozen=True)
@@ -273,6 +293,63 @@ def _build_import_candidate(
         duplicate_reason=dup_reason,
         diagnostics=tuple(diags),
     )
+
+
+def _build_resolved_ssh_target_from_opts(
+    alias: str,
+    opts: dict[str, str],
+    clean_host: str,
+    clean_user: str,
+    port: int,
+) -> ResolvedSSHTarget:
+    effective_host = validate_host(opts.get("hostname") or alias)
+    cfg_user = validate_ssh_username(opts.get("user") or "", required=False)
+    raw_port = opts.get("port") or "22"
+    if not raw_port.isdigit():
+        raise ValueError(f"Invalid Port {raw_port!r} in OpenSSH config for {alias!r}")
+    cfg_port = int(raw_port)
+    if not (1 <= cfg_port <= 65535):
+        raise ValueError(f"Out-of-range Port {cfg_port} in OpenSSH config for {alias!r}")
+    return ResolvedSSHTarget(
+        requested_host=clean_host,
+        effective_host=effective_host,
+        effective_user=clean_user or cfg_user,
+        effective_port=cfg_port if (port == 22 and cfg_port != 22) else port,
+        key_filename=_resolve_identity_path(opts.get("identityfile") or ""),
+        via_ssh_config=True,
+        config_alias=alias,
+    )
+
+
+def resolve_effective_ssh_target(
+    host: str,
+    user: str = "",
+    port: int = 22,
+    *,
+    ssh_config_path: Path | None = None,
+) -> ResolvedSSHTarget:
+    """Resolve explicit OpenSSH config alias -> effective `(host, user, port, key)` before auth."""
+    clean_host = validate_host(host)
+    clean_user = validate_ssh_username(user, required=False)
+    if type(port) is not int or not (1 <= port <= 65535):
+        raise ValueError(f"Invalid SSH port: {port!r}")
+
+    cfg_path = Path(ssh_config_path).expanduser() if ssh_config_path is not None else (Path.home() / ".ssh" / "config")
+    default_target = ResolvedSSHTarget(
+        requested_host=clean_host,
+        effective_host=clean_host,
+        effective_user=clean_user,
+        effective_port=port,
+    )
+    if is_reparse_or_symlink(cfg_path) or is_reparse_or_symlink(cfg_path.parent) or not cfg_path.is_file():
+        return default_target
+    if cfg_path.stat().st_size > _MAX_SSH_CONFIG_BYTES:
+        raise ValueError("OpenSSH config exceeds safety size limit")
+    blocks, _ = _parse_ssh_config_blocks(cfg_path.read_text(encoding="utf-8", errors="replace"))
+    for alias, opts, _diags in blocks:
+        if alias.casefold() == clean_host.casefold():
+            return _build_resolved_ssh_target_from_opts(alias, opts, clean_host, clean_user, port)
+    return default_target
 
 
 def inspect_ssh_config(
@@ -658,23 +735,24 @@ def prepare_device_wizard_preview(
     """Validate draft against store, compute effective permissions & exact preview snapshot (zero writes)."""
     _validate_preview_inputs(draft, approved_host_key, password)
     with store.lock():
-        existing = store.load_all(strict=True)
-        _check_conflicts(existing, draft)
-        normalized = replace(
-            draft,
-            strict_host_key=True,
-            known_hosts_path=str(store.managed_known_hosts_path),
-            pinned_host_key_algorithm=approved_host_key.key_algorithm,
-            pinned_host_key_sha256=approved_host_key.fingerprint_sha256,
-            pinned_host_key_base64=approved_host_key.public_key_base64,
-        )
-        snap = _plan_snapshot_for_draft(
-            store,
-            normalized,
-            approved_host_key,
-            password=password,
-            passphrase=passphrase,
-        )
+        with store._lock:
+            existing = store.load_all(strict=True)
+            _check_conflicts(existing, draft)
+            normalized = replace(
+                draft,
+                strict_host_key=True,
+                known_hosts_path=str(store.managed_known_hosts_path),
+                pinned_host_key_algorithm=approved_host_key.key_algorithm,
+                pinned_host_key_sha256=approved_host_key.fingerprint_sha256,
+                pinned_host_key_base64=approved_host_key.public_key_base64,
+            )
+            snap = _plan_snapshot_for_draft(
+                store,
+                normalized,
+                approved_host_key,
+                password=password,
+                passphrase=passphrase,
+            )
     eff_lines, warnings, summary = _format_preview_summary(
         normalized, approved_host_key, snap, password=password, passphrase=passphrase
     )
@@ -688,11 +766,15 @@ def prepare_device_wizard_preview(
     )
 
 
-def _capture_preimage(path: Path) -> dict[str, Any]:
-    if is_reparse_or_symlink(path):
-        raise PermissionError(f"Refusing symlink/reparse target: {path}")
-    if path.exists():
+def _capture_preimage(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    _assert_no_reparse_ancestors(path, "preimage target")
+    if os.path.lexists(path):
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            raise ValueError(f"Preimage exceeds safety limit or is non-regular file: {path}")
         raw = path.read_bytes()
+        if len(raw) > max_bytes:
+            raise ValueError(f"Preimage exceeds safety limit: {path}")
         return {"path": str(path), "existed": True, "content_b64": base64.b64encode(raw).decode("ascii")}
     return {"path": str(path), "existed": False, "content_b64": None}
 
@@ -702,21 +784,17 @@ def _restore_preimages_and_secrets(
     preimages: list[dict[str, Any]],
     created_secrets: list[tuple[str, str]],
 ) -> None:
-    from app.core.atomic_io import atomic_write_bytes
-
     for item in preimages:
         target = Path(item["path"])
+        _assert_no_reparse_ancestors(target, "rollback target")
         if item["existed"]:
-            raw = base64.b64decode(item["content_b64"].encode("ascii"))
+            raw = base64.b64decode(item["content_b64"].encode("ascii"), validate=True)
             atomic_write_bytes(target, raw, restrict_acl=True)
         else:
             target.unlink(missing_ok=True)
     sec_store = store._secret_store()
     for ns, key in created_secrets:
-        try:
-            sec_store.delete_secret(ns, key)
-        except Exception:  # noqa: BLE001
-            pass
+        sec_store.delete_secret(ns, key)
 
 
 def _secret_key_from_ref(store: DeviceStore, ref: str) -> tuple[str, str] | None:
@@ -733,9 +811,11 @@ def _prepare_planned_secrets(
     auth_method: str,
     password: str,
     passphrase: str,
+    *,
+    tx_id: str,
 ) -> tuple[str, str, list[tuple[str, str]]]:
-    pwd_suffix = secrets.token_hex(4) if (auth_method == "password_ref" and password) else ""
-    pass_suffix = secrets.token_hex(4) if (auth_method == "key" and passphrase) else ""
+    pwd_suffix = tx_id if (auth_method == "password_ref" and password) else ""
+    pass_suffix = tx_id if (auth_method == "key" and passphrase) else ""
     created: list[tuple[str, str]] = []
     if pwd_suffix:
         created.append(("ssh", f"{device_id}__password__{pwd_suffix}"))
@@ -764,54 +844,54 @@ def commit_device_wizard_plan(
         pinned_host_key_base64=approved_host_key.public_key_base64,
     )
     with store.lock():
-        existing = store.load_all(strict=True)
-        _check_conflicts(existing, normalized)
-        cur_snap = _plan_snapshot_for_draft(
-            store, normalized, approved_host_key, password=password, passphrase=passphrase
-        )
-        if cur_snap.plan_fingerprint != expected_snapshot.plan_fingerprint:
-            raise WizardStalePlanError(
-                "Wizard draft, host key, credentials, or device registry changed after preview; refresh preview first."
+        with store._lock:
+            existing = store.load_all(strict=True)
+            _check_conflicts(existing, normalized)
+            cur_snap = _plan_snapshot_for_draft(
+                store, normalized, approved_host_key, password=password, passphrase=passphrase
             )
+            if cur_snap.plan_fingerprint != expected_snapshot.plan_fingerprint:
+                raise WizardStalePlanError(
+                    "Wizard draft, host key, credentials, or device registry changed after preview; refresh preview first."
+                )
 
-        preimages = [
-            _capture_preimage(p)
-            for p in (store.path, store.managed_known_hosts_path, store._init_marker)
-        ]
-        pwd_suffix, pass_suffix, created_secrets = _prepare_planned_secrets(
-            normalized.device_id, normalized.auth_method, password, passphrase
-        )
-        atomic_write_json(
-            store.tx_journal_path,
-            {
-                "schema_version": 1,
-                "files": preimages,
-                "created_secrets": [[ns, k] for ns, k in created_secrets],
-            },
-            indent=2,
-            restrict_acl=True,
-        )
-        try:
-            pwd_ref = (
-                store.set_secret(normalized.device_id, "password", password, suffix=pwd_suffix)
-                if pwd_suffix
-                else normalized.password_ref
+            tx_id = secrets.token_hex(12)
+            preimages = [
+                _capture_preimage(store.path, max_bytes=MAX_DEVICES_FILE_BYTES),
+                _capture_preimage(store.managed_known_hosts_path, max_bytes=MAX_KNOWN_HOSTS_FILE_BYTES),
+                _capture_preimage(store._init_marker, max_bytes=MAX_INIT_MARKER_BYTES),
+            ]
+            pwd_suffix, pass_suffix, created_secrets = _prepare_planned_secrets(
+                normalized.device_id, normalized.auth_method, password, passphrase, tx_id=tx_id
             )
-            pass_ref = (
-                store.set_secret(normalized.device_id, "passphrase", passphrase, suffix=pass_suffix)
-                if pass_suffix
-                else normalized.passphrase_ref
+            store.write_tx_journal(
+                tx_id=tx_id,
+                op="wizard_commit",
+                device_id=normalized.device_id,
+                preimages=preimages,
+                created_secrets=created_secrets,
             )
-            final_profile = replace(normalized, password_ref=pwd_ref, passphrase_ref=pass_ref)
-            upsert_managed_known_host_entry(store.managed_known_hosts_path, approved_host_key)
-            existing[final_profile.device_id] = final_profile
-            store.save_all(existing)
-        except BaseException:
-            _restore_preimages_and_secrets(store, preimages, created_secrets)
+            try:
+                pwd_ref = (
+                    store.set_secret(normalized.device_id, "password", password, suffix=pwd_suffix)
+                    if pwd_suffix
+                    else normalized.password_ref
+                )
+                pass_ref = (
+                    store.set_secret(normalized.device_id, "passphrase", passphrase, suffix=pass_suffix)
+                    if pass_suffix
+                    else normalized.passphrase_ref
+                )
+                final_profile = replace(normalized, password_ref=pwd_ref, passphrase_ref=pass_ref)
+                upsert_managed_known_host_entry(store.managed_known_hosts_path, approved_host_key)
+                existing[final_profile.device_id] = final_profile
+                store.save_all(existing)
+            except BaseException:
+                _restore_preimages_and_secrets(store, preimages, created_secrets)
+                store.tx_journal_path.unlink(missing_ok=True)
+                raise
             store.tx_journal_path.unlink(missing_ok=True)
-            raise
-        store.tx_journal_path.unlink(missing_ok=True)
-        return final_profile
+            return final_profile
 
 
 def rotate_device_host_key(
@@ -823,42 +903,48 @@ def rotate_device_host_key(
     clean_id = validate_device_id(device_id)
     load_public_host_key(approved_host_key.key_algorithm, approved_host_key.public_key_base64)
     with store.lock():
-        existing = store.load_all(strict=True)
-        dev = existing.get(clean_id)
-        if dev is None:
-            raise KeyError(f"Unknown device: {clean_id}")
-        if (dev.host, dev.port) != (approved_host_key.host, approved_host_key.port):
-            raise ValueError("Rotated host key endpoint does not match device profile")
+        with store._lock:
+            existing = store.load_all(strict=True)
+            dev = existing.get(clean_id)
+            if dev is None:
+                raise KeyError(f"Unknown device: {clean_id}")
+            if (dev.host, dev.port) != (approved_host_key.host, approved_host_key.port):
+                raise ValueError("Rotated host key endpoint does not match device profile")
 
-        watch = [store.path, store._init_marker, store.managed_known_hosts_path]
-        preimages = [_capture_preimage(p) for p in watch]
-        atomic_write_json(
-            store.tx_journal_path,
-            {"schema_version": 1, "files": preimages, "created_secrets": []},
-            indent=2,
-            restrict_acl=True,
-        )
-        try:
-            upsert_managed_known_host_entry(
-                store.managed_known_hosts_path,
-                approved_host_key,
-                replace_existing=True,
+            tx_id = secrets.token_hex(12)
+            preimages = [
+                _capture_preimage(store.path, max_bytes=MAX_DEVICES_FILE_BYTES),
+                _capture_preimage(store.managed_known_hosts_path, max_bytes=MAX_KNOWN_HOSTS_FILE_BYTES),
+                _capture_preimage(store._init_marker, max_bytes=MAX_INIT_MARKER_BYTES),
+            ]
+            store.write_tx_journal(
+                tx_id=tx_id,
+                op="host_key_rotate",
+                device_id=clean_id,
+                preimages=preimages,
+                created_secrets=[],
             )
-            updated = replace(
-                dev,
-                known_hosts_path=str(store.managed_known_hosts_path),
-                pinned_host_key_algorithm=approved_host_key.key_algorithm,
-                pinned_host_key_sha256=approved_host_key.fingerprint_sha256,
-                pinned_host_key_base64=approved_host_key.public_key_base64,
-            )
-            existing[clean_id] = updated
-            store.save_all(existing)
-        except BaseException:
-            _restore_preimages_and_secrets(store, preimages, [])
+            try:
+                upsert_managed_known_host_entry(
+                    store.managed_known_hosts_path,
+                    approved_host_key,
+                    replace_existing=True,
+                )
+                updated = replace(
+                    dev,
+                    known_hosts_path=str(store.managed_known_hosts_path),
+                    pinned_host_key_algorithm=approved_host_key.key_algorithm,
+                    pinned_host_key_sha256=approved_host_key.fingerprint_sha256,
+                    pinned_host_key_base64=approved_host_key.public_key_base64,
+                )
+                existing[clean_id] = updated
+                store.save_all(existing)
+            except BaseException:
+                _restore_preimages_and_secrets(store, preimages, [])
+                store.tx_journal_path.unlink(missing_ok=True)
+                raise
             store.tx_journal_path.unlink(missing_ok=True)
-            raise
-        store.tx_journal_path.unlink(missing_ok=True)
-        return updated
+            return updated
 
 
 def compute_preview_secret_cleanup(store: DeviceStore, old_refs: tuple[str, ...]) -> None:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import getpass
 import inspect
 import secrets
 import threading
@@ -14,9 +15,12 @@ from app.core.redaction import SecretRedactor
 from backend.remote.models import (
     DeviceProfile,
     RemoteJobRecord,
+    canonical_endpoint_key,
     contains_shell_metacharacters,
     validate_device_id,
+    validate_host,
     validate_service_name,
+    validate_ssh_username,
 )
 from backend.remote.ssh_client import SSHConnectionError, SSHConnectionManager
 from backend.remote.store import DeviceStore
@@ -145,6 +149,72 @@ class RemoteManager:
             if not device.allowed_commands or cmd not in device.allowed_commands:
                 raise PermissionError("Command is not in device allowed_commands allowlist")
         return cmd
+
+    @staticmethod
+    def _device_allows_legacy_ssh(
+        dev: DeviceProfile,
+        *,
+        effective_user: str,
+        command: str,
+        client_id: str,
+        client_profile: str,
+        from_oauth: bool,
+    ) -> bool:
+        if not dev.enabled or not dev.permissions.execute:
+            return False
+        if dev.username:
+            actual_user = effective_user or validate_ssh_username(getpass.getuser(), required=False)
+            if actual_user != dev.username:
+                return False
+        try:
+            if from_oauth:
+                RemoteManager._enforce_oauth_device_access(dev, dev.device_id, client_id, client_profile)
+            RemoteManager._validate_command_for_profile(
+                dev,
+                command,
+                client_id=client_id,
+                client_profile=client_profile,
+                from_oauth=from_oauth,
+            )
+        except PermissionError:
+            return False
+        return True
+
+    def authorize_legacy_ssh_endpoint(
+        self,
+        *,
+        effective_host: str,
+        effective_port: int,
+        effective_user: str,
+        command: str,
+        client_id: str,
+        client_profile: str,
+        from_oauth: bool = True,
+    ) -> None:
+        """Enforce registered DeviceProfile deny-by-default and execute permissions for legacy SSH tools."""
+        clean_host = validate_host(effective_host)
+        target_key = canonical_endpoint_key(clean_host, int(effective_port), "")[:2]
+        devices = self.store.load_all(strict=True)
+        matching = [
+            dev
+            for dev in devices.values()
+            if canonical_endpoint_key(dev.host, dev.port, "")[:2] == target_key
+        ]
+        if not matching:
+            return
+        for dev in matching:
+            if self._device_allows_legacy_ssh(
+                dev,
+                effective_user=effective_user,
+                command=command,
+                client_id=client_id,
+                client_profile=client_profile,
+                from_oauth=from_oauth,
+            ):
+                return
+        raise PermissionError(
+            f"Target SSH endpoint {clean_host}:{effective_port} is restricted by DeviceProfile permissions"
+        )
 
     def list_devices(
         self,
@@ -291,6 +361,13 @@ class RemoteManager:
                     from_oauth=from_oauth,
                     tool_name="ssh_task_start",
                 )
+                if (
+                    live_dev.host,
+                    live_dev.port,
+                    live_dev.username,
+                    live_dev.pinned_host_key_sha256,
+                ) != (dev.host, dev.port, dev.username, dev.pinned_host_key_sha256):
+                    raise PermissionError("Device SSH endpoint or host key pin changed before task dispatch")
                 live_cmd = self._validate_command_for_profile(
                     live_dev, cmd, client_id=client_id, client_profile=live_prof, from_oauth=from_oauth
                 )

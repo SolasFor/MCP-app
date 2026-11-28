@@ -209,9 +209,12 @@ class N05SSHDeviceWizardE2ETests(unittest.TestCase):
                     }
                 },
             })
+            from app.core.tunnels.base import BoundedCliResult
+
             wiz.ts_consent_chk.setChecked(True)
             with patch("backend.remote.discovery._find_tailscale", return_value="tailscale"), patch(
-                "backend.remote.discovery.run_cli_capture", return_value=(0, ts_json, "")
+                "backend.remote.discovery.run_cli_capture_bounded",
+                return_value=BoundedCliResult(returncode=0, stdout=ts_json, stderr=""),
             ):
                 wiz.start_tailscale_discovery()
                 _pump_until(self.app, lambda: not wiz.is_busy() and wiz.ts_list.count() == 1)

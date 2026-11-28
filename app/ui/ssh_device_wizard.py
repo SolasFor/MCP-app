@@ -791,7 +791,12 @@ class SSHDeviceWizardDialog(SilentDialog):
     def start_tailscale_discovery(self) -> None:
         if not self.ts_consent_chk.isChecked():
             return
-        self._run_worker("tailscale", lambda: discover_tailscale_ssh_peers(owner_consent=True))
+        cancel_ev = threading.Event()
+        self._run_worker(
+            "tailscale",
+            lambda: discover_tailscale_ssh_peers(owner_consent=True, cancel_event=cancel_ev),
+        )
+        self._cancel_event = cancel_ev
 
     def _handle_tailscale_result(self, payload: object, error: str) -> None:
         self.ts_list.clear()

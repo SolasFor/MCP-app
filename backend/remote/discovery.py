@@ -3,14 +3,18 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
-from app.core.tunnels.base import run_cli_capture
+from app.core.redaction import SecretRedactor
+from app.core.tunnels.base import run_cli_capture_bounded
 from app.core.tunnels.tailscale import _find_tailscale
+
+_TS_KEY_RE = re.compile(r"tskey-[A-Za-z0-9_-]{8,}", re.IGNORECASE)
 
 _CGNAT_NET = ipaddress.IPv4Network((0x64400000, 10))  # RFC 6598 100.64.0.0/10 CGNAT
 
@@ -290,11 +294,22 @@ def _collect_tailscale_peers(peer_map: object) -> tuple[TailscalePeerCandidate, 
     return tuple(peers)
 
 
+def _sanitize_cli_error(stderr: str, stdout: str) -> str:
+    raw = (stderr or stdout or "").strip()
+    if not raw:
+        return "tailscale status failed"
+    first_line = raw.splitlines()[0].strip()
+    scrubbed = _TS_KEY_RE.sub("tskey-[REDACTED]", first_line)
+    clean = SecretRedactor().redact_text(scrubbed)
+    return (clean or "tailscale status failed")[:200]
+
+
 def discover_tailscale_ssh_peers(
     *,
     owner_consent: bool,
     configured_cli_path: str = "",
     limits: SSHNetworkDiscoveryLimits | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> TailscaleDiscoveryResult:
     """Read local `tailscale status --json` (never runs `up`/`login` or mutates ACLs/routes)."""
     if not owner_consent:
@@ -308,13 +323,36 @@ def discover_tailscale_ssh_peers(
             detail="Tailscale CLI was not found on this machine. Use manual SSH host entry.",
         )
     try:
-        rc, out, err = run_cli_capture([exe, "status", "--json"], timeout=6.0)
+        res = run_cli_capture_bounded(
+            [exe, "status", "--json"],
+            timeout=min(6.0, float(cfg.total_deadline_s)),
+            max_stdout_bytes=cfg.max_tailscale_json_bytes,
+            max_stderr_bytes=64 * 1024,
+            cancel_event=cancel_event,
+        )
     except OSError as exc:
-        return TailscaleDiscoveryResult(available=False, status="error", detail=f"Unable to run tailscale CLI: {type(exc).__name__}")
-    if rc != 0:
-        msg = (err or out or "tailscale status failed").strip().splitlines()[0][:240]
-        return TailscaleDiscoveryResult(available=True, status="not_running", detail=msg)
-    data, parse_err = _parse_tailscale_status_json(out, cfg.max_tailscale_json_bytes)
+        return TailscaleDiscoveryResult(
+            available=False,
+            status="error",
+            detail=f"Unable to run tailscale CLI: {type(exc).__name__}",
+        )
+    if res.cancelled:
+        return TailscaleDiscoveryResult(available=True, status="cancelled", detail="Tailscale discovery cancelled")
+    if res.timed_out:
+        return TailscaleDiscoveryResult(available=True, status="error", detail="Tailscale status command timed out")
+    if res.stdout_limit_exceeded or res.stderr_limit_exceeded:
+        return TailscaleDiscoveryResult(
+            available=True,
+            status="error",
+            detail="Tailscale status output exceeded 1 MiB safety limit",
+        )
+    if res.returncode != 0:
+        return TailscaleDiscoveryResult(
+            available=True,
+            status="not_running",
+            detail=_sanitize_cli_error(res.stderr, res.stdout),
+        )
+    data, parse_err = _parse_tailscale_status_json(res.stdout, cfg.max_tailscale_json_bytes)
     if parse_err or data is None:
         return TailscaleDiscoveryResult(available=True, status="error", detail=parse_err)
     peers = _collect_tailscale_peers(data.get("Peer"))

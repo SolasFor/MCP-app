@@ -547,8 +547,11 @@ Host !blocked srv-ok
                 }
             },
         })
+        from app.core.tunnels.base import BoundedCliResult
+
         with patch("backend.remote.discovery._find_tailscale", return_value="tailscale"), patch(
-            "backend.remote.discovery.run_cli_capture", return_value=(0, sample_json, "")
+            "backend.remote.discovery.run_cli_capture_bounded",
+            return_value=BoundedCliResult(returncode=0, stdout=sample_json, stderr=""),
         ) as mock_cli:
             res_ts = discover_tailscale_ssh_peers(owner_consent=True)
             self.assertTrue(res_ts.available)
@@ -744,11 +747,15 @@ Host !blocked srv-ok
     def test_wal_crash_recovery_legacy_rotation_cancellation_legacy_sync_and_ipv6(self) -> None:
         # 1. WAL crash recovery restores preimages, deletes orphan secret, and removes tx journal
         preimage_json = json.dumps({"version": 2, "devices": {}}).encode("utf-8")
+        tx_id = "0123456789abcdef01234567"
         self.store.path.write_bytes(b"{CORRUPTED_UNFINISHED_TX")
-        self.secrets.set_secret("ssh", "orphan_dev__password__deadbeef", "secret-val")
+        self.secrets.set_secret("ssh", f"orphan_dev__password__{tx_id}", "secret-val")
         self.store.tx_journal_path.write_text(
             json.dumps({
-                "schema_version": 1,
+                "schema_version": 2,
+                "tx_id": tx_id,
+                "op": "wizard_commit",
+                "device_id": "orphan_dev",
                 "files": [
                     {
                         "path": str(self.store.path),
@@ -760,8 +767,13 @@ Host !blocked srv-ok
                         "existed": False,
                         "content_b64": None,
                     },
+                    {
+                        "path": str(self.store._init_marker),
+                        "existed": False,
+                        "content_b64": None,
+                    },
                 ],
-                "created_secrets": [["ssh", "orphan_dev__password__deadbeef"]],
+                "created_secrets": [["ssh", f"orphan_dev__password__{tx_id}"]],
             }),
             encoding="utf-8",
         )

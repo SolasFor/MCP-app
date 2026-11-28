@@ -8,7 +8,7 @@
    - **Ручной ввод**: `device_id`, имя, группа, `host`, `port`, `username` (строгая валидация против option/URL/shell injection).
    - **Импорт OpenSSH Config (`inspect_ssh_config`)**: read-only разбор явных `Host`-блоков (отключены wildcard/negation-шаблоны, `Match`, `ProxyCommand`, `ProxyJump`, `LocalCommand`, `RemoteCommand`, `Include` и прочие директивы выполнения), показ диагностик и дедупликация по ID и каноническому endpoint `(host, port, username)`.
    - **Ограниченное обнаружение в локальной сети (opt-in)**: только после явного подтверждения владельца (`owner_consent=True`), строго в приватных/CGNAT/ULA/loopback диапазонах (`IPv4 >= /24`, `IPv6 >= /120`, не более `256` адресов, без DNS и публичного интернета). Найденные хосты имеют статус `Not trusted / Not auth`.
-   - **Tailscale peers (opt-in)**: read-only чтение `tailscale status --json` при наличии локального CLI и явного согласия владельца (никогда не вызывает `tailscale up/login` и не меняет маршруты/ACL).
+   - **Tailscale peers (opt-in)**: read-only чтение `tailscale status --json` при наличии локального CLI и явного согласия владельца через поточно-ограниченный захват `run_cli_capture_bounded` (жёсткий потоковый лимит `1 МБ` на stdout, `64 КБ` на stderr, общий deadline и `cancel_event`, верификация принадлежности процесса `ProcessIdentity` до завершения и редактирование секретов в диагностике; никогда не вызывает `tailscale up/login` и не меняет маршруты/ACL).
 2. **Шаг 2 — Проверка SSH Host Key ДО аутентификации**:
    - Отдельное pre-auth рукопожатие (`probe_ssh_host_key`) выполняет **0 пакетов аутентификации**.
    - **Запрещён слепой TOFU и `AutoAddPolicy` (`RejectPolicy` всегда)**. Для продолжения обязательна независимая out-of-band сверка пользователем: ввод `SHA256:...` отпечатка или OpenSSH публичного ключа `<algorithm> <base64>` + явная отметка подтверждения (`verify_independent_host_key`).
@@ -22,7 +22,7 @@
 5. **Шаг 5 — Разрешения, deny-by-default, предпросмотр и атомарный WAL-коммит**:
    - **Новые и импортированные устройства создаются deny-by-default**: `allow_oauth_clients=False` и все флаги `DevicePermissions` выключены (`False`). Существующие legacy-профили v1 (без поля `allow_oauth_clients`) сохраняют совместимое поведение при обновлении.
    - Перед записью формируется полный редактируемый предпросмотр с привязкой к точному криптографическому снимку (`SSHDevicePlanSnapshot` / `WizardStalePlanError`).
-   - Коммит (`commit_device_wizard_plan`) защищён WAL-журналом `.n05_device_tx.json`: атомарно обновляются `devices.json`, app-managed `<data_dir>/remote/known_hosts` и ссылки `SecretStore("ssh")` (`set_secret` с уникальным суффиксом), с автоматическим откатом при сбое или аварийном перезапуске. Кнопка **«Отмена»** очищает временные поля и не записывает ни одного файла/секрета.
+   - Коммит (`commit_device_wizard_plan`) защищён WAL-журналом v2 `.n05_device_tx.json`: перед любыми изменениями целиком проверяются структура, `tx_id`, операция, канонические пути без дубликатов и symlink/junction во всех сегментах путей, JSON/байтовые preimages (согласованные лимиты записи и восстановления) и привязка `created_secrets` (`<device_id>__(password|passphrase)__<tx_id>`). Восстановление (`recover_pending_tx_unlocked`) никогда не удаляет секреты, использовавшиеся до транзакции или сохраняемыми профилями, и не удаляет журнал до полного завершения отката. Кнопка **«Отмена»** очищает временные поля и не записывает ни одного файла/секрета.
 
 ## Границы доверия: app-managed `known_hosts`, `~/.ssh/known_hosts` и anti-downgrade pin
 
@@ -41,7 +41,7 @@
 | **`full`** *(полный доступ)* | Только при `allow_oauth_clients=True`, разрешении клиента и включённом `DevicePermissions.*` | Произвольные SSH-команды от имени SSH-пользователя **без подтверждения каждого вызова**; поддельный OAuth `client_id="owner"` заблокирован; живой отзыв клиента останавливает даже ещё не стартовавший `ssh_task_start` worker |
 
 - Внутренний режим владельца GUI (`from_oauth=False, client_id="owner"`) проверяет `DevicePermissions` на действиях, не требуя `allow_oauth_clients=True`.
-- Legacy-инструмент `oauth_ssh_command` (в `server.py`) сохранён совместимым, дополнительно валидирует `host`/`port`/`user` через модели `backend/remote/models.py`, читает `~/.ssh/config` безопасно через `inspect_ssh_config` и использует `RejectPolicy()`.
+- Legacy-инструменты `oauth_ssh_command`, SSH `task_start`/`task_restart`, планировщик и `run_ssh_command` заранее резолвят `~/.ssh/config` (`resolve_effective_ssh_target`) до авторизации, проверяют фактический эффективный endpoint `(host, user, port)`, сохраняют привязку в `TaskSpec`, блокируют изменение цели до запуска/рестарта и уважают политику зарегистрированных `DeviceProfile` без превращения `full` в `allowlist` и без потери совместимости разрешённых алиасов; `_sync_ssh_exec` подключается строго по проверенному target и всегда использует `RejectPolicy()`.
 
 ## Прочие инварианты
 

@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -121,6 +123,221 @@ def run_cli_capture(
         kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
     proc = subprocess.run(cmd, **kwargs)
     return int(proc.returncode), proc.stdout, proc.stderr
+
+
+@dataclass(frozen=True)
+class BoundedCliResult:
+    """Result of streaming bounded subprocess capture with hard byte, deadline, and cancel limits."""
+
+    returncode: int | None
+    stdout: str
+    stderr: str
+    stdout_bytes_read: int = 0
+    stderr_bytes_read: int = 0
+    stdout_limit_exceeded: bool = False
+    stderr_limit_exceeded: bool = False
+    timed_out: bool = False
+    cancelled: bool = False
+
+
+def _read_bounded_stream(
+    stream: Any,
+    limit: int,
+    chunk_size: int,
+    abort_event: threading.Event,
+    buf: bytearray,
+    stats: dict[str, Any],
+    key: str,
+) -> None:
+    try:
+        while not abort_event.is_set():
+            remaining = (limit + 1) - len(buf)
+            if remaining <= 0:
+                stats[f"{key}_exceeded"] = True
+                abort_event.set()
+                return
+            to_read = min(chunk_size, remaining)
+            read_fn = getattr(stream, "read1", stream.read)
+            chunk = read_fn(to_read)
+            if not chunk:
+                return
+            buf.extend(chunk)
+            stats[f"{key}_read"] += len(chunk)
+            if len(buf) > limit:
+                stats[f"{key}_exceeded"] = True
+                abort_event.set()
+                return
+    except (OSError, ValueError):
+        return
+
+
+def _kill_and_reap(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        proc.kill()
+        proc.wait(timeout=2.0)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _terminate_owned_cli_process(proc: subprocess.Popen[bytes], ident: ProcessIdentity | None) -> None:
+    if proc.poll() is not None:
+        return
+    platform = get_platform()
+    if ident is not None:
+        if not platform.verify_process_identity(ident):
+            return
+        platform.terminate_process_tree(ident, grace_seconds=0.4, include_parent=True)
+    elif proc.poll() is None:
+        _kill_and_reap(proc)
+        return
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        if ident is not None and platform.verify_process_identity(ident):
+            _kill_and_reap(proc)
+
+
+def _close_stream_quietly(stream: Any) -> None:
+    if stream is None:
+        return
+    try:
+        stream.close()
+    except OSError:
+        pass
+
+
+def _finalize_bounded_cli_process(
+    proc: subprocess.Popen[bytes],
+    ident: ProcessIdentity | None,
+    t_out: threading.Thread,
+    t_err: threading.Thread,
+    *,
+    force_terminate: bool,
+) -> None:
+    if force_terminate or proc.poll() is None:
+        _terminate_owned_cli_process(proc, ident)
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        pass
+    t_out.join(timeout=2.0)
+    t_err.join(timeout=2.0)
+    _close_stream_quietly(proc.stdout)
+    _close_stream_quietly(proc.stderr)
+    if t_out.is_alive():
+        t_out.join(timeout=0.5)
+    if t_err.is_alive():
+        t_err.join(timeout=0.5)
+
+
+def _wait_for_bounded_cli(
+    proc: subprocess.Popen[bytes],
+    t_out: threading.Thread,
+    t_err: threading.Thread,
+    abort_event: threading.Event,
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> tuple[bool, bool]:
+    timed_out = False
+    cancelled = False
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            abort_event.set()
+            break
+        if abort_event.is_set():
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            abort_event.set()
+            break
+        if proc.poll() is not None and not t_out.is_alive() and not t_err.is_alive():
+            break
+        abort_event.wait(timeout=min(0.02, max(0.001, remaining)))
+    return timed_out, cancelled
+
+
+def run_cli_capture_bounded(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 8.0,
+    max_stdout_bytes: int = 1024 * 1024,
+    max_stderr_bytes: int = 64 * 1024,
+    cancel_event: threading.Event | None = None,
+    chunk_size: int = 8192,
+) -> BoundedCliResult:
+    """Run a CLI subprocess streaming stdout/stderr with hard byte limits, total deadline, and cancellation."""
+    if max_stdout_bytes < 1 or max_stderr_bytes < 1 or timeout <= 0:
+        raise ValueError("Invalid bounded CLI capture limits")
+    if cancel_event is not None and cancel_event.is_set():
+        return BoundedCliResult(returncode=None, stdout="", stderr="", cancelled=True)
+
+    merged_env = dict(os.environ)
+    if env:
+        merged_env.update(env)
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": merged_env,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+
+    proc: subprocess.Popen[bytes] = subprocess.Popen(cmd, **popen_kwargs)
+    ident = get_platform().capture_process_identity(proc.pid)
+    out_buf, err_buf = bytearray(), bytearray()
+    stats: dict[str, Any] = {
+        "stdout_read": 0,
+        "stderr_read": 0,
+        "stdout_exceeded": False,
+        "stderr_exceeded": False,
+    }
+    abort_event = threading.Event()
+    t_out = threading.Thread(
+        target=_read_bounded_stream,
+        args=(proc.stdout, max_stdout_bytes, max(256, chunk_size), abort_event, out_buf, stats, "stdout"),
+        daemon=True,
+    )
+    t_err = threading.Thread(
+        target=_read_bounded_stream,
+        args=(proc.stderr, max_stderr_bytes, max(256, chunk_size), abort_event, err_buf, stats, "stderr"),
+        daemon=True,
+    )
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    cancelled = False
+    try:
+        timed_out, cancelled = _wait_for_bounded_cli(
+            proc,
+            t_out,
+            t_err,
+            abort_event,
+            time.monotonic() + float(timeout),
+            cancel_event,
+        )
+    finally:
+        force_stop = timed_out or cancelled or stats["stdout_exceeded"] or stats["stderr_exceeded"]
+        _finalize_bounded_cli_process(proc, ident, t_out, t_err, force_terminate=force_stop)
+
+    aborted = timed_out or cancelled or stats["stdout_exceeded"] or stats["stderr_exceeded"]
+    stdout_text = "" if aborted else bytes(out_buf).decode("utf-8", errors="replace")
+    stderr_text = "" if aborted else bytes(err_buf).decode("utf-8", errors="replace")
+    return BoundedCliResult(
+        returncode=proc.returncode,
+        stdout=stdout_text,
+        stderr=stderr_text,
+        stdout_bytes_read=int(stats["stdout_read"]),
+        stderr_bytes_read=int(stats["stderr_read"]),
+        stdout_limit_exceeded=bool(stats["stdout_exceeded"]),
+        stderr_limit_exceeded=bool(stats["stderr_exceeded"]),
+        timed_out=timed_out,
+        cancelled=cancelled,
+    )
 
 
 class RouteOwnershipStore:

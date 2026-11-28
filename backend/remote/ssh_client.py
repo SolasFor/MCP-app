@@ -11,6 +11,7 @@ import socket
 import stat
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -44,6 +45,21 @@ class SSHAuthDiagnosticError(PermissionError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True)
+class SSHTrustPolicy:
+    """Resolved host-key trust policy for an SSH endpoint."""
+
+    registered: bool = False
+    known_hosts_path: str = ""
+    pinned: tuple[str, str, str] | None = None
+    device_ids: tuple[str, ...] = ()
+
+
+def _assert_safe_known_hosts_path(path: Path) -> None:
+    if is_reparse_or_symlink(path) or is_reparse_or_symlink(path.parent):
+        raise PermissionError("Refusing symlink or reparse point known_hosts path")
 
 
 _PARAMIKO_KEY_CLASSES: tuple[tuple[type[Any], type[paramiko.PKey]], ...] = (
@@ -326,6 +342,48 @@ class SSHConnectionManager:
             raise PermissionError(f"SSH host key CHANGED/MISMATCHED for {host}:{port}")
 
     @staticmethod
+    def _validate_pinned_policy(host: str, port: int, policy: SSHTrustPolicy) -> paramiko.PKey:
+        assert policy.pinned is not None
+        expected_alg, expected_sha, expected_b64 = policy.pinned
+        try:
+            expected_pkey = load_public_host_key(expected_alg, expected_b64)
+        except ValueError as exc:
+            raise PermissionError(str(exc)) from exc
+        if compute_host_key_sha256(expected_pkey) != expected_sha:
+            raise PermissionError("Pinned SSH host key SHA-256 mismatch")
+        if policy.known_hosts_path:
+            kh_check = inspect_known_hosts(
+                host,
+                port,
+                expected_pkey,
+                known_hosts_path=policy.known_hosts_path,
+                include_system_known_hosts=False,
+            )
+            if kh_check.status == "host_key_changed":
+                raise PermissionError(
+                    f"SSH host key CHANGED in known_hosts for {host}:{port} (refusing connection)"
+                )
+        return expected_pkey
+
+    @staticmethod
+    def validate_host_key_trust_policy(*, host: str, port: int, policy: SSHTrustPolicy) -> paramiko.PKey | None:
+        """Validate a resolved SSH host-key trust policy fail-closed before connecting."""
+        if policy.known_hosts_path:
+            _assert_safe_known_hosts_path(Path(policy.known_hosts_path).expanduser())
+        if policy.pinned and any(policy.pinned):
+            return SSHConnectionManager._validate_pinned_policy(host, port, policy)
+        if not policy.known_hosts_path:
+            return None
+        kh_path = Path(policy.known_hosts_path).expanduser()
+        if not kh_path.is_file():
+            return None
+        try:
+            paramiko.HostKeys(str(kh_path))
+        except (OSError, paramiko.SSHException) as exc:
+            raise PermissionError(f"Unreadable known_hosts file: {type(exc).__name__}") from exc
+        return None
+
+    @staticmethod
     def _configure_pinned_trust(
         client: paramiko.SSHClient,
         *,
@@ -334,18 +392,13 @@ class SSHConnectionManager:
         known_hosts_path: str,
         pinned: tuple[str, str, str],
     ) -> tuple[paramiko.PKey, Any]:
-        expected_alg, expected_sha, expected_b64 = pinned
-        expected_pkey = load_public_host_key(expected_alg, expected_b64)
-        if compute_host_key_sha256(expected_pkey) != expected_sha:
-            raise PermissionError("Pinned SSH host key SHA-256 mismatch")
-        if known_hosts_path:
-            kh_check = inspect_known_hosts(
-                host, port, expected_pkey, known_hosts_path=known_hosts_path, include_system_known_hosts=False
-            )
-            if kh_check.status == "host_key_changed":
-                raise PermissionError(
-                    f"SSH host key CHANGED in known_hosts for {host}:{port} (refusing connection)"
-                )
+        expected_alg = pinned[0]
+        expected_pkey = SSHConnectionManager.validate_host_key_trust_policy(
+            host=host,
+            port=port,
+            policy=SSHTrustPolicy(registered=True, known_hosts_path=known_hosts_path, pinned=pinned),
+        )
+        assert expected_pkey is not None
         host_keys = client.get_host_keys()
         host_keys.clear()
         host_keys.add(format_known_hosts_host(host, port), expected_alg, expected_pkey)
@@ -367,13 +420,18 @@ class SSHConnectionManager:
             return SSHConnectionManager._configure_pinned_trust(
                 client, host=host, port=port, known_hosts_path=known_hosts_path, pinned=pinned
             )
-        if not known_hosts_path:
-            try:
-                client.load_system_host_keys()
-            except OSError:
-                pass
-        known_hosts = Path(known_hosts_path).expanduser() if known_hosts_path else (Path.home() / ".ssh" / "known_hosts")
-        if not is_reparse_or_symlink(known_hosts) and known_hosts.is_file():
+        if known_hosts_path:
+            kh_path = Path(known_hosts_path).expanduser()
+            _assert_safe_known_hosts_path(kh_path)
+            if kh_path.is_file():
+                client.load_host_keys(str(kh_path))
+            return None, None
+        try:
+            client.load_system_host_keys()
+        except OSError:
+            pass
+        known_hosts = Path.home() / ".ssh" / "known_hosts"
+        if not is_reparse_or_symlink(known_hosts) and not is_reparse_or_symlink(known_hosts.parent) and known_hosts.is_file():
             client.load_host_keys(str(known_hosts))
         return None, None
 
@@ -541,6 +599,9 @@ class SSHConnectionManager:
             else None
         )
         strict_key_load = bool(device.auth_method == "key" and device.key_path and Path(device.key_path).expanduser().exists())
+        effective_kh = device.known_hosts_path
+        if not effective_kh and pinned is not None and self._store.managed_known_hosts_path.exists():
+            effective_kh = str(self._store.managed_known_hosts_path)
         return self._connect_with_params(
             host=device.host,
             port=device.port,
@@ -549,7 +610,7 @@ class SSHConnectionManager:
             key_path=device.key_path,
             password=password,
             passphrase=passphrase,
-            known_hosts_path=device.known_hosts_path,
+            known_hosts_path=effective_kh,
             pinned=pinned,
             timeout=timeout,
             strict_key_load=strict_key_load,

@@ -95,6 +95,7 @@ if __package__:
     from .extensions import ExtensionManager, ExtensionStore
     from .remote import DeviceStore, RemoteManager, SSHConnectionError
     from .remote.onboarding import ResolvedSSHTarget, resolve_effective_ssh_target
+    from .remote.ssh_client import SSHConnectionManager, SSHTrustPolicy
     from .automation import (
         AutomationScheduler,
         MetricsRegistry,
@@ -248,6 +249,7 @@ else:
     from extensions import ExtensionManager, ExtensionStore
     from remote import DeviceStore, RemoteManager, SSHConnectionError
     from remote.onboarding import ResolvedSSHTarget, resolve_effective_ssh_target
+    from remote.ssh_client import SSHConnectionManager, SSHTrustPolicy
     from automation import (
         AutomationScheduler,
         MetricsRegistry,
@@ -908,7 +910,7 @@ def _authorize_resolved_ssh_target(
     *,
     command: str,
     expected_profile: str,
-) -> None:
+) -> SSHTrustPolicy:
     """Authorize the exact resolved effective SSH endpoint (and alias if translated) fail-closed."""
     if oauth_execution is None:
         raise PermissionError("OAuth execution policy is unavailable")
@@ -933,7 +935,7 @@ def _authorize_resolved_ssh_target(
             expected_profile=expected_profile,
         ):
             raise PermissionError("SSH host alias or command is not permitted in the active profile")
-    REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
+    return REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
         effective_host=target.effective_host,
         effective_port=target.effective_port,
         effective_user=target.effective_user,
@@ -3176,7 +3178,9 @@ async def oauth_ssh_command(
         target = resolve_effective_ssh_target(host, user, port)
         if not 1 <= timeout <= (600 if profile == "full" else 12):
             raise PermissionError("SSH timeout is outside the active profile")
-        _authorize_resolved_ssh_target(client_id, target, command=command, expected_profile=profile)
+        trust_policy = _authorize_resolved_ssh_target(
+            client_id, target, command=command, expected_profile=profile
+        )
     except (ValueError, PermissionError):
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,
@@ -3191,9 +3195,11 @@ async def oauth_ssh_command(
         live_target = resolve_effective_ssh_target(host, user, port)
         if live_target != target:
             raise PermissionError("SSH effective target changed after authorization")
-        _authorize_resolved_ssh_target(
+        live_trust = _authorize_resolved_ssh_target(
             live_client, live_target, command=command, expected_profile=profile
         )
+        if live_trust != trust_policy:
+            raise PermissionError("SSH host-key trust policy changed after authorization")
 
     action_id = secrets.token_hex(8)
     started = time.monotonic()
@@ -3209,6 +3215,7 @@ async def oauth_ssh_command(
                     host, user, command, port, timeout,
                     cancel_event=cancel_ev, register_transport=reg_cb,
                     resolved_target=target,
+                    trust_policy=trust_policy,
                 ),
                 client_id=client_id,
                 pre_dispatch_check=recheck_before_spawn,
@@ -3264,6 +3271,17 @@ def _resolve_and_verify_ssh_task_target(spec: TaskSpec) -> ResolvedSSHTarget:
     return live_target
 
 
+def _verify_ssh_task_trust_pin(spec: TaskSpec, trust_policy: SSHTrustPolicy) -> None:
+    if spec.effective_host_key_sha256:
+        live_sha = trust_policy.pinned[1] if trust_policy.pinned else ""
+        if live_sha != spec.effective_host_key_sha256:
+            raise PermissionError("SSH host key pin changed after task creation")
+    if spec.effective_known_hosts_path:
+        norm = REMOTE_MANAGER._normalize_known_hosts_path
+        if norm(trust_policy.known_hosts_path) != norm(spec.effective_known_hosts_path):
+            raise PermissionError("SSH known_hosts trust source changed after task creation")
+
+
 def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
     """Fail-closed live check for task submission, dispatch, and restart."""
     if oauth_provider is None or oauth_execution is None:
@@ -3301,9 +3319,10 @@ def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
             target = _resolve_and_verify_ssh_task_target(spec)
         except ValueError as exc:
             raise PermissionError(f"Invalid SSH target: {exc}") from exc
-        _authorize_resolved_ssh_target(
+        trust_policy = _authorize_resolved_ssh_target(
             client_id, target, command=spec.command, expected_profile=profile
         )
+        _verify_ssh_task_trust_pin(spec, trust_policy)
     return profile
 
 
@@ -3346,12 +3365,17 @@ async def _task_command_executor(rec: TaskRecord, spec: TaskSpec) -> CommandResu
                 script_path.unlink(missing_ok=True)
 
     target = _resolve_and_verify_ssh_task_target(spec)
+    trust_policy = _authorize_resolved_ssh_target(
+        rec.owner_client_id, target, command=spec.command, expected_profile=profile
+    )
+    _verify_ssh_task_trust_pin(spec, trust_policy)
     async with PROCESS_RUNNER.request_slot():
         out = await PROCESS_RUNNER.run_ssh(
             lambda cancel_ev, reg_cb: _sync_ssh_exec(
                 spec.host, spec.user, spec.command, spec.port, spec.timeout,
                 cancel_event=cancel_ev, register_transport=reg_cb,
                 resolved_target=target,
+                trust_policy=trust_policy,
             ),
             client_id=rec.owner_client_id,
             pre_dispatch_check=pre_dispatch,
@@ -3561,6 +3585,14 @@ async def task_start(
                     suggestion=f"Укажите timeout от 1 до {max_to} сек. либо опустите параметр, чтобы использовать значение по умолчанию ({max_to if profile != 'full' else 60} сек.).",
                 )
         resolved_ssh = _resolve_ssh_spec_args(host, user, port) if kind == "ssh" else None
+        initial_trust = (
+            REMOTE_MANAGER.resolve_legacy_ssh_trust_policy(
+                effective_host=resolved_ssh.effective_host,
+                effective_port=resolved_ssh.effective_port,
+            )
+            if resolved_ssh is not None
+            else None
+        )
         if kind == "windows" and os.name == "nt" and profile == "full":
             _resolve_windows_shell_executable(shell)
         spec = TaskSpec(
@@ -3577,6 +3609,10 @@ async def task_start(
             effective_key_path=resolved_ssh.key_filename if resolved_ssh is not None else "",
             via_ssh_config=resolved_ssh.via_ssh_config if resolved_ssh is not None else False,
             config_alias=resolved_ssh.config_alias if resolved_ssh is not None else "",
+            effective_host_key_sha256=(
+                initial_trust.pinned[1] if initial_trust is not None and initial_trust.pinned else ""
+            ),
+            effective_known_hosts_path=(initial_trust.known_hosts_path if initial_trust is not None else ""),
         )
         spec.validate()
         profile = _authorize_task_spec(client_id, spec)
@@ -3867,6 +3903,51 @@ async def run_local_command(command: str, timeout: int = 30, cwd: str | None = N
     except OSError as exc:
         return f"❌ Не удалось запустить разрешённую программу: {type(exc).__name__}"
 
+def _connect_legacy_ssh_client(
+    client: paramiko.SSHClient,
+    *,
+    actual_host: str,
+    actual_port: int,
+    actual_user: str | None,
+    key_filename: str | None,
+    trust_policy: SSHTrustPolicy | None,
+) -> None:
+    live_policy = REMOTE_MANAGER.resolve_legacy_ssh_trust_policy(
+        effective_host=actual_host,
+        effective_port=actual_port,
+    )
+    if trust_policy is not None and live_policy != trust_policy:
+        raise PermissionError("SSH host-key trust policy changed after authorization")
+    expected_pkey, transport_factory = SSHConnectionManager._prepare_host_key_trust(
+        client,
+        host=actual_host,
+        port=actual_port,
+        known_hosts_path=live_policy.known_hosts_path,
+        pinned=live_policy.pinned,
+    )
+    connect_kwargs: dict[str, Any] = {
+        "hostname": actual_host,
+        "port": actual_port,
+        "username": actual_user,
+        "key_filename": key_filename,
+        "timeout": 10,
+        "banner_timeout": 10,
+    }
+    if transport_factory is not None:
+        connect_kwargs["transport_factory"] = transport_factory
+    try:
+        client.connect(**connect_kwargs)
+    except paramiko.BadHostKeyException as exc:
+        raise PermissionError(f"SSH host key CHANGED for {actual_host}:{actual_port} (refusing connection)") from exc
+    except paramiko.SSHException as exc:
+        translated = SSHConnectionManager._translate_ssh_exception(exc, actual_host, actual_port)
+        if isinstance(translated, PermissionError):
+            raise translated from exc
+        raise
+    if expected_pkey is not None:
+        SSHConnectionManager._verify_connected_pin(client, expected_pkey, actual_host, actual_port)
+
+
 def _sync_ssh_exec(
     host: str,
     user: str,
@@ -3877,6 +3958,7 @@ def _sync_ssh_exec(
     cancel_event=None,
     register_transport=None,
     resolved_target: ResolvedSSHTarget | None = None,
+    trust_policy: SSHTrustPolicy | None = None,
 ) -> str:
     from backend.remote.models import validate_host as _val_host, validate_ssh_username as _val_user
 
@@ -3886,14 +3968,6 @@ def _sync_ssh_exec(
     if not (1 <= port_num <= 65535):
         raise ValueError(f"Invalid SSH port: {port_num}")
 
-    client = paramiko.SSHClient()
-    known_hosts = Path.home() / ".ssh" / "known_hosts"
-    client.load_system_host_keys()
-    if known_hosts.is_file() and not known_hosts.is_symlink():
-        client.load_host_keys(str(known_hosts))
-    # Never trust unknown SSH hosts silently, even in Advanced mode.
-    client.set_missing_host_key_policy(paramiko.RejectPolicy())
-
     if resolved_target is not None:
         actual_host = _val_host(resolved_target.effective_host)
         actual_user = _val_user(resolved_target.effective_user, required=False) or None
@@ -3902,12 +3976,20 @@ def _sync_ssh_exec(
     else:
         actual_host, actual_user, actual_port, key_filename = clean_host, clean_user or None, port_num, None
 
+    client = paramiko.SSHClient()
     try:
         if cancel_event is not None and cancel_event.is_set():
             return "❌ SSH command cancelled."
         if register_transport is not None:
             register_transport(client, None)
-        client.connect(hostname=actual_host, port=actual_port, username=actual_user, key_filename=key_filename, timeout=10, banner_timeout=10)
+        _connect_legacy_ssh_client(
+            client,
+            actual_host=actual_host,
+            actual_port=actual_port,
+            actual_user=actual_user,
+            key_filename=key_filename,
+            trust_policy=trust_policy,
+        )
         if cancel_event is not None and cancel_event.is_set():
             return "❌ SSH command cancelled."
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -3957,7 +4039,7 @@ async def run_ssh_command(host: str, command: str, user: str = "", port: int = 2
     if not (1 <= target.effective_port <= 65535) or len(command) > 2000 or not command.strip():
         return "❌ Отказано: недопустимый порт или команда."
     try:
-        REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
+        trust_policy = REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
             effective_host=target.effective_host,
             effective_port=target.effective_port,
             effective_user=target.effective_user,
@@ -3979,6 +4061,7 @@ async def run_ssh_command(host: str, command: str, user: str = "", port: int = 2
             port,
             timeout,
             resolved_target=target,
+            trust_policy=trust_policy,
         )
     except Exception as exc:
         logger.warning("SSH call failed: %s", type(exc).__name__)

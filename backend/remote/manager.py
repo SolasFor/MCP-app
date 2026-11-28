@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import getpass
 import inspect
+import os
 import secrets
 import threading
 import time
@@ -22,7 +23,7 @@ from backend.remote.models import (
     validate_service_name,
     validate_ssh_username,
 )
-from backend.remote.ssh_client import SSHConnectionError, SSHConnectionManager
+from backend.remote.ssh_client import SSHConnectionError, SSHConnectionManager, SSHTrustPolicy
 from backend.remote.store import DeviceStore
 
 
@@ -180,6 +181,61 @@ class RemoteManager:
             return False
         return True
 
+    @staticmethod
+    def _normalize_known_hosts_path(raw: str) -> str:
+        clean = (raw or "").strip()
+        if not clean:
+            return ""
+        return os.path.normcase(os.path.abspath(os.path.expanduser(clean)))
+
+    def _extract_device_trust(self, dev: DeviceProfile) -> tuple[tuple[str, str, str] | None, str]:
+        pinned = (
+            (
+                dev.pinned_host_key_algorithm,
+                dev.pinned_host_key_sha256,
+                dev.pinned_host_key_base64,
+            )
+            if dev.has_pinned_host_key()
+            else None
+        )
+        kh = dev.known_hosts_path
+        if not kh and pinned is not None and self.store.managed_known_hosts_path.exists():
+            kh = str(self.store.managed_known_hosts_path)
+        return pinned, kh
+
+    def _merge_endpoint_trust(
+        self, clean_host: str, port_num: int, matching: list[DeviceProfile]
+    ) -> SSHTrustPolicy:
+        first_pin, first_kh = self._extract_device_trust(matching[0])
+        first_norm_kh = self._normalize_known_hosts_path(first_kh)
+        for dev in matching[1:]:
+            pin, kh = self._extract_device_trust(dev)
+            if pin != first_pin or self._normalize_known_hosts_path(kh) != first_norm_kh:
+                raise PermissionError(
+                    f"Conflicting SSH host-key trust policies across registered devices for {clean_host}:{port_num}"
+                )
+        policy = SSHTrustPolicy(
+            registered=True,
+            known_hosts_path=first_kh,
+            pinned=first_pin,
+            device_ids=tuple(sorted(d.device_id for d in matching)),
+        )
+        SSHConnectionManager.validate_host_key_trust_policy(host=clean_host, port=port_num, policy=policy)
+        return policy
+
+    def resolve_legacy_ssh_trust_policy(self, *, effective_host: str, effective_port: int) -> SSHTrustPolicy:
+        """Resolve unified SSH host-key trust policy for an endpoint against DeviceStore."""
+        clean_host = validate_host(effective_host)
+        port_num = int(effective_port)
+        target_key = canonical_endpoint_key(clean_host, port_num, "")[:2]
+        devices = self.store.load_all(strict=True)
+        matching = [
+            dev for dev in devices.values() if canonical_endpoint_key(dev.host, dev.port, "")[:2] == target_key
+        ]
+        if not matching:
+            return SSHTrustPolicy(registered=False)
+        return self._merge_endpoint_trust(clean_host, port_num, matching)
+
     def authorize_legacy_ssh_endpoint(
         self,
         *,
@@ -190,10 +246,11 @@ class RemoteManager:
         client_id: str,
         client_profile: str,
         from_oauth: bool = True,
-    ) -> None:
-        """Enforce registered DeviceProfile deny-by-default and execute permissions for legacy SSH tools."""
+    ) -> SSHTrustPolicy:
+        """Enforce registered DeviceProfile permissions and unified host-key trust for legacy SSH tools."""
         clean_host = validate_host(effective_host)
-        target_key = canonical_endpoint_key(clean_host, int(effective_port), "")[:2]
+        port_num = int(effective_port)
+        target_key = canonical_endpoint_key(clean_host, port_num, "")[:2]
         devices = self.store.load_all(strict=True)
         matching = [
             dev
@@ -201,7 +258,8 @@ class RemoteManager:
             if canonical_endpoint_key(dev.host, dev.port, "")[:2] == target_key
         ]
         if not matching:
-            return
+            return SSHTrustPolicy(registered=False)
+        policy = self._merge_endpoint_trust(clean_host, port_num, matching)
         for dev in matching:
             if self._device_allows_legacy_ssh(
                 dev,
@@ -211,9 +269,9 @@ class RemoteManager:
                 client_profile=client_profile,
                 from_oauth=from_oauth,
             ):
-                return
+                return policy
         raise PermissionError(
-            f"Target SSH endpoint {clean_host}:{effective_port} is restricted by DeviceProfile permissions"
+            f"Target SSH endpoint {clean_host}:{port_num} is restricted by DeviceProfile permissions"
         )
 
     def list_devices(

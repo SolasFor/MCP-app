@@ -47,7 +47,7 @@ def _make_server(
     return ServerProfile(
         name=name,
         display_name=f"Display {name}",
-        argv=(sys.executable, "-c", "import time; time.sleep(0.1)"),
+        argv=(sys.executable, "-c", "import time; time.sleep(30)"),
         cwd=cwd,
         env=env or {},
         env_secret_refs=env_secret_refs or {},

@@ -30,6 +30,7 @@
   `pinned_host_key_algorithm`, `pinned_host_key_sha256`, `pinned_host_key_base64`.
 - Пользовательский `~/.ssh/known_hosts` используется read-only для диагностики конфликтов и совместимости с legacy-профилями без `known_hosts_path` / pin — MCP App никогда не перезаписывает пользовательский `~/.ssh/known_hosts`.
 - Во время runtime-подключений `SSHConnectionManager` передаёт pinned `transport_factory` с приоритетом алгоритма ключа (anti-downgrade защита) и перепроверяет байты предъявленного ключа после рукопожатия до отправки учётных данных.
+- Единый контракт доверия распространяется и на все legacy/фоновые SSH-пути (`oauth_ssh_command`, `run_ssh_command`, `task_start`, `task_restart`, Automation Scheduler): для зарегистрированных `DeviceProfile` используется строго утверждённый pin и `known_hosts_path` устройства через `SSHConnectionManager._prepare_host_key_trust` (`RejectPolicy` + pinned `transport_factory` + `_verify_connected_pin`), игнорируя посторонние ключи в `~/.ssh/known_hosts`; при конфликтующих источниках доверия (расходящиеся профили одного endpoint, конфликт pin с `known_hosts_path`, symlink/reparse `known_hosts`) выполнение завершается fail closed до аутентификации, а для незарегистрированных endpoints сохраняется строгий контракт `~/.ssh/known_hosts` + совместимость `Full Access`.
 - Логи, предпросмотр, `device_list` и `device_info` никогда не содержат `password`, `passphrase`, `password_ref` или `passphrase_ref` для OAuth-клиентов.
 
 ## Матрица доступа OAuth и live revoke

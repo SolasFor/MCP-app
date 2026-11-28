@@ -77,6 +77,8 @@ class TaskSpec:
     effective_key_path: str = ""
     via_ssh_config: bool = False
     config_alias: str = ""
+    effective_host_key_sha256: str = ""
+    effective_known_hosts_path: str = ""
 
     def _validate_ssh(self) -> None:
         if not (self.host or "").strip():
@@ -100,6 +102,25 @@ class TaskSpec:
         if self.kind == "ssh":
             self._validate_ssh()
 
+    def _populate_ssh_payload(self, payload: dict[str, Any]) -> None:
+        if self.kind != "ssh" or not self.effective_host:
+            return
+        payload["effective_host"] = self.effective_host
+        payload["effective_user"] = self.effective_user
+        payload["effective_port"] = int(self.effective_port or self.port)
+        optional_fields = (
+            ("effective_key_path", self.effective_key_path),
+            ("effective_host_key_sha256", self.effective_host_key_sha256),
+            ("effective_known_hosts_path", self.effective_known_hosts_path),
+        )
+        for key, value in optional_fields:
+            if value:
+                payload[key] = value
+        if self.via_ssh_config:
+            payload["via_ssh_config"] = True
+            if self.config_alias:
+                payload["config_alias"] = self.config_alias
+
     def to_json(self) -> str:
         payload: dict[str, Any] = {
             "kind": self.kind,
@@ -114,16 +135,7 @@ class TaskSpec:
             payload["workspace_id"] = self.workspace_id
         if self.workspace_command:
             payload["workspace_command"] = self.workspace_command
-        if self.kind == "ssh" and self.effective_host:
-            payload["effective_host"] = self.effective_host
-            payload["effective_user"] = self.effective_user
-            payload["effective_port"] = int(self.effective_port or self.port)
-            if self.effective_key_path:
-                payload["effective_key_path"] = self.effective_key_path
-            if self.via_ssh_config:
-                payload["via_ssh_config"] = True
-                if self.config_alias:
-                    payload["config_alias"] = self.config_alias
+        self._populate_ssh_payload(payload)
         return json.dumps(payload, ensure_ascii=False)
 
     @classmethod
@@ -149,6 +161,8 @@ class TaskSpec:
             effective_key_path=str(data.get("effective_key_path") or ""),
             via_ssh_config=bool(data.get("via_ssh_config", False)),
             config_alias=str(data.get("config_alias") or ""),
+            effective_host_key_sha256=str(data.get("effective_host_key_sha256") or ""),
+            effective_known_hosts_path=str(data.get("effective_known_hosts_path") or ""),
         )
 
 

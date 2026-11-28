@@ -835,5 +835,389 @@ class N0503BoundedTailscaleDiscoveryTests(unittest.TestCase):
             _terminate_owned_cli_process(fake_proc, fake_ident)  # type: ignore[arg-type]
 
 
+def _gen_ed25519_keypair():
+    import io
+    import paramiko
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.OpenSSH,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    return paramiko.Ed25519Key.from_private_key(io.StringIO(pem)), pem
+
+
+class N05FinalUnifiedSSHTrustContractTests(unittest.TestCase):
+    """RED/GREEN verification of unified SSH host-key trust across RemoteManager and legacy paths."""
+
+    def setUp(self) -> None:
+        from backend import server as srv
+        from backend.execution_audit import ExecutionAudit
+        from backend.oauth_execution import ExecutionApprovals
+        from backend.oauth_provider import LocalConsentOAuthProvider
+        from backend.process_runner import ProcessRunner
+        from backend.remote.host_keys import compute_host_key_sha256
+        from backend.remote.manager import RemoteManager
+        from backend.remote.models import format_known_hosts_host
+        from backend.tasks import TaskManager, TaskStore
+
+        self.srv = srv
+        self.compute_sha256 = compute_host_key_sha256
+        self.format_kh_host = format_known_hosts_host
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.home_dir = self.root / "home"
+        self.ssh_dir = self.home_dir / ".ssh"
+        self.ssh_dir.mkdir(parents=True)
+        self.user_kh = self.ssh_dir / "known_hosts"
+
+        self.orig_oauth = srv.oauth_provider
+        self.orig_exec = srv.oauth_execution
+        self.orig_remote_mgr = srv.REMOTE_MANAGER
+        self.orig_allowed_hosts = srv.ALLOWED_HOSTS
+        self.orig_exec_audit = srv.EXEC_AUDIT
+        self.orig_task_mgr = srv.TASK_MANAGER
+        self.orig_task_store = srv.TASK_STORE
+        self.orig_runner = srv.PROCESS_RUNNER
+
+        self.sec_store = SecretStore(self.root / "secrets")
+        self.dev_store = DeviceStore(self.root / "remote" / "devices.json", secret_store=self.sec_store)
+        self.remote_mgr = RemoteManager(self.dev_store, redactor=srv.REDACTOR)
+        self.runner = ProcessRunner(spool_dir=self.root / "spool", redactor=srv.REDACTOR)
+
+        self.oauth_prov = LocalConsentOAuthProvider(
+            "http://127.0.0.1:8765",
+            "http://127.0.0.1:8765/mcp",
+            "owner-tok",
+            store_path=self.root / "oauth.sqlite3",
+            default_profile=PROFILE_ALLOWLIST,
+        )
+        self.oauth_store = self.oauth_prov.store
+        self.exec_approvals = ExecutionApprovals(self.oauth_store, default_profile=PROFILE_ALLOWLIST)
+        self.exec_audit = ExecutionAudit(self.root / "audit.jsonl")
+        self.task_store = TaskStore(self.root / "tasks.sqlite3")
+        self.task_mgr = TaskManager(
+            self.task_store,
+            self.runner,
+            artifacts_dir=self.root / "task_artifacts",
+            redactor=srv.REDACTOR,
+            auth_rechecker=srv._task_auth_rechecker,
+            command_executor=srv._task_command_executor,
+        )
+
+        srv.oauth_provider = self.oauth_prov
+        srv.oauth_execution = self.exec_approvals
+        srv.REMOTE_MANAGER = self.remote_mgr
+        srv.ALLOWED_HOSTS = frozenset({"127.0.0.1"})
+        srv.EXEC_AUDIT = self.exec_audit
+        srv.TASK_STORE = self.task_store
+        srv.TASK_MANAGER = self.task_mgr
+        srv.PROCESS_RUNNER = self.runner
+
+        for cid, prof in (("c-allow", PROFILE_ALLOWLIST), ("c-full", PROFILE_FULL)):
+            self.oauth_store.save_client(
+                OAuthClientInformationFull(
+                    client_id=cid,
+                    client_name=cid,
+                    redirect_uris=["http://127.0.0.1/cb"],
+                    token_endpoint_auth_method="none",
+                )
+            )
+            self.oauth_store.mark_approved(cid)
+            self.exec_approvals.set_client_profile(cid, prof)
+
+        self.key_a, _ = _gen_ed25519_keypair()
+        self.key_b, _ = _gen_ed25519_keypair()
+        self.client_key, client_pem = _gen_ed25519_keypair()
+        self.client_key_path = self.ssh_dir / "id_ed25519"
+        self.client_key_path.write_text(client_pem, encoding="utf-8")
+
+        self.ssh_srv = LocalSSHServer(
+            self.root / "sftp",
+            username="ops",
+            password="unused-password",
+            authorized_pubkeys=(self.client_key,),
+            host_key=self.key_b,
+        )
+        self.ssh_srv.start()
+        self.cfg_path = self.ssh_dir / "config"
+        self.cfg_path.write_text(
+            f"Host 127.0.0.1\n  User ops\n  Port {self.ssh_srv.port}\n  IdentityFile {self.client_key_path}\n",
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.ssh_srv.stop()
+        try:
+            asyncio.run(self.task_mgr.close())
+        except Exception:
+            pass
+        self.srv.oauth_provider = self.orig_oauth
+        self.srv.oauth_execution = self.orig_exec
+        self.srv.REMOTE_MANAGER = self.orig_remote_mgr
+        self.srv.ALLOWED_HOSTS = self.orig_allowed_hosts
+        self.srv.EXEC_AUDIT = self.orig_exec_audit
+        self.srv.TASK_MANAGER = self.orig_task_mgr
+        self.srv.TASK_STORE = self.orig_task_store
+        self.srv.PROCESS_RUNNER = self.orig_runner
+        self.runner.close()
+        self.exec_audit.close()
+        self.remote_mgr.close()
+        self.tmp.cleanup()
+
+    def _run_as_client(self, client_id: str, coro):
+        from mcp.server.auth.middleware.auth_context import AuthenticatedUser, auth_context_var
+        from mcp.server.auth.provider import AccessToken
+        from backend.oauth_provider import READ_SCOPE
+
+        tok = auth_context_var.set(
+            AuthenticatedUser(
+                AccessToken(
+                    token="tok",
+                    client_id=client_id,
+                    scopes=[READ_SCOPE],
+                    resource="http://127.0.0.1:8765/mcp",
+                )
+            )
+        )
+        try:
+            return asyncio.run(coro)
+        finally:
+            auth_context_var.reset(tok)
+
+    def _write_known_hosts_line(self, path: Path, pkey) -> None:
+        host_entry = self.format_kh_host("127.0.0.1", self.ssh_srv.port)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{host_entry} {pkey.get_name()} {pkey.get_base64()}\n", encoding="utf-8")
+
+    def _make_pinned_device(self, device_id: str, pkey, *, kh_path: Path | None = None) -> DeviceProfile:
+        kh = kh_path or self.dev_store.managed_known_hosts_path
+        return DeviceProfile(
+            device_id=device_id,
+            name=f"Device {device_id}",
+            host="127.0.0.1",
+            port=self.ssh_srv.port,
+            username="ops",
+            auth_method="key",
+            key_path=str(self.client_key_path),
+            known_hosts_path=str(kh),
+            pinned_host_key_algorithm=pkey.get_name(),
+            pinned_host_key_sha256=self.compute_sha256(pkey),
+            pinned_host_key_base64=pkey.get_base64(),
+            enabled=True,
+            allow_oauth_clients=True,
+            min_profile="allowlist",
+            permissions=DevicePermissions(execute=True),
+            allowed_commands=("echo ok",),
+        )
+
+    async def _await_task_terminal(self, task_id: str) -> dict:
+        deadline = time.monotonic() + 8.0
+        st: dict = {}
+        while time.monotonic() < deadline:
+            st = await self.srv.task_status(task_id)
+            if st.get("status") in ("succeeded", "failed", "cancelled", "interrupted"):
+                return st
+            await asyncio.sleep(0.02)
+        return st
+
+    def test_registered_pinned_device_rejects_mismatched_key_in_system_known_hosts_across_all_paths(self) -> None:
+        from backend.automation.scheduler import ScheduleSpec
+
+        managed_kh = self.dev_store.managed_known_hosts_path
+        self._write_known_hosts_line(managed_kh, self.key_a)
+        self._write_known_hosts_line(self.user_kh, self.key_b)
+        self.dev_store.upsert(self._make_pinned_device("dev_pin_a", self.key_a, kh_path=managed_kh))
+        self.exec_approvals.set_policy(windows="", hosts="127.0.0.1", ssh_commands="echo ok")
+
+        sched_spec = ScheduleSpec(
+            schedule_id="sched-ssh-pin",
+            name="SSH Pin Check",
+            tool_name="oauth_ssh_command",
+            arguments={"host": "127.0.0.1", "user": "ops", "port": self.ssh_srv.port, "command": "echo ok"},
+            trigger_type="interval",
+            interval_seconds=60,
+            client_id="c-allow",
+        )
+
+        async def _flow() -> None:
+            # Server presents key_b (trusted in user known_hosts) while device is pinned to key_a:
+            # EVERY path must reject key_b BEFORE sending auth packets.
+            with self.assertRaises(PermissionError):
+                self.remote_mgr.ssh_execute(
+                    "dev_pin_a", "echo ok", client_id="c-allow", client_profile="allowlist", from_oauth=True
+                )
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            res_oauth = await self.srv.oauth_ssh_command(
+                "127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port
+            )
+            self.assertIn("❌", res_oauth)
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            res_legacy = await self.srv.run_ssh_command(
+                "127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port
+            )
+            self.assertIn("❌", res_legacy)
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            started = await self.srv.task_start(
+                command="echo ok", kind="ssh", host="127.0.0.1", user="ops", port=self.ssh_srv.port
+            )
+            st_failed = await self._await_task_terminal(started["task_id"])
+            self.assertEqual(st_failed["status"], "failed")
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            with self.assertRaises(RuntimeError) as sched_ctx:
+                await self.srv._execute_scheduled_tool_async(sched_spec, "idem-key-b")
+            self.assertIn("❌", str(sched_ctx.exception))
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            # Rotate server to approved key_a (absent from user ~/.ssh/known_hosts!) -> all paths succeed
+            self.ssh_srv.rotate_host_key(self.key_a)
+            res_ok = await self.srv.oauth_ssh_command(
+                "127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port
+            )
+            self.assertIn("Exit code: 0", res_ok)
+
+            res_legacy_ok = await self.srv.run_ssh_command(
+                "127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port
+            )
+            self.assertIn("Exit code: 0", res_legacy_ok)
+
+            created_ok = await self.srv.task_start(
+                command="echo ok", kind="ssh", host="127.0.0.1", user="ops", port=self.ssh_srv.port
+            )
+            tid_ok = created_ok["task_id"]
+            st_ok = await self._await_task_terminal(tid_ok)
+            self.assertEqual(st_ok["status"], "succeeded")
+
+            sched_ok = await self.srv._execute_scheduled_tool_async(sched_spec, "idem-key-a")
+            self.assertIn("Exit code: 0", sched_ok.get("text", ""))
+
+            # Rotate server back to unpinned key_b -> task_restart worker rejects key_b pre-auth
+            self.ssh_srv.rotate_host_key(self.key_b)
+            attempts_before = len(self.ssh_srv.auth_attempts)
+            restarted_info = await self.srv.task_restart(tid_ok)
+            self.assertFalse(getattr(restarted_info, "is_error", False))
+            st_restarted = await self._await_task_terminal(restarted_info["task_id"])
+            self.assertEqual(st_restarted["status"], "failed")
+            self.assertEqual(len(self.ssh_srv.auth_attempts), attempts_before)
+
+            # Mutating device pin in DeviceStore fails closed immediately on task_restart
+            self.dev_store.upsert(self._make_pinned_device("dev_pin_a", self.key_b, kh_path=managed_kh))
+            restarted_pin_drift = await self.srv.task_restart(tid_ok)
+            self.assertTrue(getattr(restarted_pin_drift, "is_error", False))
+            await self.task_mgr.close()
+
+        with patch.object(Path, "home", return_value=self.home_dir):
+            self._run_as_client("c-allow", _flow())
+
+    def test_conflicting_trust_sources_fail_closed_across_all_paths(self) -> None:
+        from backend.automation.scheduler import ScheduleSpec
+
+        managed_kh = self.dev_store.managed_known_hosts_path
+        alt_kh = self.root / "remote" / "alt_known_hosts"
+        self._write_known_hosts_line(managed_kh, self.key_a)
+        self._write_known_hosts_line(alt_kh, self.key_b)
+        self.exec_approvals.set_policy(windows="", hosts="127.0.0.1", ssh_commands="echo ok")
+
+        sched_spec = ScheduleSpec(
+            schedule_id="sched-ssh-conflict",
+            name="SSH Conflict",
+            tool_name="oauth_ssh_command",
+            arguments={"host": "127.0.0.1", "user": "ops", "port": self.ssh_srv.port, "command": "echo ok"},
+            trigger_type="interval",
+            interval_seconds=60,
+            client_id="c-allow",
+        )
+
+        # Case 1: Two registered DeviceProfiles disagree on pinned host key for same endpoint
+        self.dev_store.upsert(self._make_pinned_device("dev_1", self.key_a, kh_path=managed_kh))
+        self.dev_store.upsert(self._make_pinned_device("dev_2", self.key_b, kh_path=alt_kh))
+
+        with patch.object(Path, "home", return_value=self.home_dir):
+            with self.assertRaises(PermissionError):
+                self.remote_mgr.authorize_legacy_ssh_endpoint(
+                    effective_host="127.0.0.1",
+                    effective_port=self.ssh_srv.port,
+                    effective_user="ops",
+                    command="echo ok",
+                    client_id="c-allow",
+                    client_profile="allowlist",
+                    from_oauth=True,
+                )
+            res_oauth = self._run_as_client(
+                "c-allow", self.srv.oauth_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("недоступны", res_oauth)
+            res_legacy = asyncio.run(
+                self.srv.run_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("Отказано", res_legacy)
+            res_task = self._run_as_client(
+                "c-allow",
+                self.srv.task_start(command="echo ok", kind="ssh", host="127.0.0.1", user="ops", port=self.ssh_srv.port),
+            )
+            self.assertTrue(getattr(res_task, "is_error", False))
+            ok_sched, _ = self.srv._scheduler_permission_check(sched_spec)
+            self.assertFalse(ok_sched)
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+        # Case 2: Single registered DeviceProfile whose pin conflicts with its own known_hosts_path
+        self.dev_store.remove("dev_2")
+        self._write_known_hosts_line(managed_kh, self.key_b)
+        with patch.object(Path, "home", return_value=self.home_dir):
+            with self.assertRaises(PermissionError):
+                self.remote_mgr.ssh_execute("dev_1", "echo ok", client_id="c-allow", client_profile="allowlist", from_oauth=True)
+            res_oauth2 = self._run_as_client(
+                "c-allow", self.srv.oauth_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("недоступны", res_oauth2)
+            res_legacy2 = asyncio.run(
+                self.srv.run_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("Отказано", res_legacy2)
+            ok_sched2, _ = self.srv._scheduler_permission_check(sched_spec)
+            self.assertFalse(ok_sched2)
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+        # Case 3: Reparse/symlink known_hosts_path fails closed
+        self._write_known_hosts_line(managed_kh, self.key_a)
+        with (
+            patch.object(Path, "home", return_value=self.home_dir),
+            patch("backend.remote.ssh_client.is_reparse_or_symlink", return_value=True),
+        ):
+            with self.assertRaises(PermissionError):
+                self.remote_mgr.authorize_legacy_ssh_endpoint(
+                    effective_host="127.0.0.1",
+                    effective_port=self.ssh_srv.port,
+                    effective_user="ops",
+                    command="echo ok",
+                    client_id="c-allow",
+                    client_profile="allowlist",
+                    from_oauth=True,
+                )
+
+    def test_unregistered_legacy_endpoint_preserves_strict_known_hosts_and_full_access(self) -> None:
+        with patch.object(Path, "home", return_value=self.home_dir):
+            # Unknown host key in user known_hosts -> rejected pre-auth even in Full Access
+            res_unknown = self._run_as_client(
+                "c-full", self.srv.oauth_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("❌", res_unknown)
+            self.assertEqual(self.ssh_srv.auth_attempts, [])
+
+            # Trusted in user known_hosts -> Full Access works without prompts
+            self._write_known_hosts_line(self.user_kh, self.key_b)
+            res_full = self._run_as_client(
+                "c-full", self.srv.oauth_ssh_command("127.0.0.1", "echo ok", user="ops", port=self.ssh_srv.port)
+            )
+            self.assertIn("Exit code: 0", res_full)
+
+
 if __name__ == "__main__":
     unittest.main()

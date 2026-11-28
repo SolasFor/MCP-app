@@ -32,6 +32,7 @@ from backend.servers.models import (
 )
 from backend.servers.probes import check_port_conflict, collect_process_metrics, probe_readiness
 from backend.servers.store import ServerConfigStore, resolve_start_order
+from backend.workspaces.path_security import canonical_workspace_root
 
 _PROFILE_RANK = {"safe": 0, "allowlist": 1, "full": 2}
 
@@ -113,6 +114,10 @@ class ServerManager:
             return
         if not profile.enabled:
             raise PermissionError(f"Server {profile.name!r} is disabled")
+        if profile.workspace_scoped and self.workspace_authorizer is None:
+            raise PermissionError(
+                f"Server {profile.name!r} is workspace-scoped and requires workspace authorization"
+            )
         rank = _PROFILE_RANK.get(client_profile, 0)
         needed = _PROFILE_RANK.get(profile.min_profile, 2)
         if rank < needed:
@@ -598,6 +603,12 @@ class ServerManager:
         pre_spawn_check: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         argv, cwd = profile.validate_launchable()
+        canon_cwd = canonical_workspace_root(cwd)
+        raw_digests = profile.template_params.get("manifest_digests")
+        if isinstance(raw_digests, dict) and raw_digests:
+            from backend.workspaces.discovery import verify_manifest_digests
+
+            verify_manifest_digests(canon_cwd, raw_digests)
         merged_env, secret_vals = self.store.resolve_profile_env(profile)
         for secret in secret_vals:
             self.redactor.register(secret)

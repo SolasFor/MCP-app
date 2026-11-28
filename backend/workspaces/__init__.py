@@ -1,6 +1,30 @@
 """MCP-app Workspaces package (v0.9.5)."""
 from __future__ import annotations
 
+from backend.workspaces.compose_yaml import (
+    ComposeServiceSummary,
+    ComposeStaticSummary,
+    ComposeYamlError,
+    ComposeYamlSecurityError,
+    parse_safe_compose_yaml,
+)
+from backend.workspaces.discovery import (
+    CommandProposal,
+    DiagnosticItem,
+    DiscoveryCancelledError,
+    DiscoveryLimits,
+    ManifestDriftError,
+    ServerProposal,
+    SubprojectCandidate,
+    WizardAdditionPreview,
+    WizardConflictError,
+    WizardPlanSnapshot,
+    WizardStalePlanError,
+    WorkspaceDiscoveryResult,
+    analyze_workspace_directory,
+    discover_projects_in_directory,
+    verify_manifest_digests,
+)
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.manager import WorkspaceManager
 from backend.workspaces.server_links import WorkspaceServerCoordinator, WorkspaceServersSnapshot
@@ -30,6 +54,14 @@ from backend.workspaces.path_security import (
 from backend.workspaces.store import WorkspaceStore, detect_workspace_metadata
 
 __all__ = [
+    "CommandProposal",
+    "ComposeServiceSummary",
+    "ComposeStaticSummary",
+    "ComposeYamlError",
+    "ComposeYamlSecurityError",
+    "DiagnosticItem",
+    "DiscoveryCancelledError",
+    "DiscoveryLimits",
     "FileVersionConflictError",
     "GitIgnoreMatcher",
     "MAX_HISTORY_SNAPSHOTS",
@@ -38,10 +70,18 @@ __all__ = [
     "MAX_TREE_ENTRIES",
     "MAX_WORKSPACES",
     "MAX_WRITE_BYTES",
+    "ManifestDriftError",
     "PERMISSION_FLAGS",
     "PathSecurityError",
     "SCHEMA_VERSION",
+    "ServerProposal",
+    "SubprojectCandidate",
     "WORKSPACE_MIN_PROFILES",
+    "WizardAdditionPreview",
+    "WizardConflictError",
+    "WizardPlanSnapshot",
+    "WizardStalePlanError",
+    "WorkspaceDiscoveryResult",
     "WorkspaceHistory",
     "WorkspaceManager",
     "WorkspacePermissions",
@@ -49,10 +89,14 @@ __all__ = [
     "WorkspaceServerCoordinator",
     "WorkspaceServersSnapshot",
     "WorkspaceStore",
+    "analyze_workspace_directory",
     "atomic_write_verified",
     "canonical_workspace_root",
     "detect_workspace_metadata",
+    "discover_projects_in_directory",
     "is_reparse_or_link",
+    "parse_safe_compose_yaml",
     "read_verified_bytes",
     "resolve_workspace_path",
+    "verify_manifest_digests",
 ]

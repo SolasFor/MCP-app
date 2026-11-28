@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,6 +11,10 @@ from dataclasses import replace
 from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock
 from app.core.secret_store import SecretStore
 from app.platform import get_platform
+from backend.workspaces.discovery import (
+    analyze_workspace_directory,
+    compute_current_manifest_digests,
+)
 from backend.workspaces.models import (
     ENV_KEY_RE,
     MAX_CONFIG_BYTES,
@@ -26,58 +28,25 @@ from backend.workspaces.path_security import canonical_workspace_root
 SECRETS_NAMESPACE = "workspaces"
 
 
-def detect_workspace_metadata(root_path: str | Path) -> dict[str, Any]:
+def detect_workspace_metadata(
+    root_path: str | Path,
+    *,
+    allow_parent_git_lookup: bool = False,
+) -> dict[str, Any]:
     """Inspect a local directory (read-only) to suggest language, Git root, venv/Node, and commands."""
-    root = canonical_workspace_root(root_path)
-    language = "generic"
-    if (root / "pyproject.toml").is_file() or (root / "requirements.txt").is_file() or any(root.glob("*.py")):
-        language = "python"
-    elif (root / "package.json").is_file():
-        language = "typescript" if (root / "tsconfig.json").is_file() else "javascript"
-    elif (root / "Cargo.toml").is_file():
-        language = "rust"
-    elif (root / "go.mod").is_file():
-        language = "go"
-
-    git_root = ""
-    cur: Path | None = root
-    while cur is not None:
-        if (cur / ".git").exists():
-            git_root = str(cur)
-            break
-        if cur.parent == cur:
-            break
-        cur = cur.parent
-
-    python_venv = ""
-    for venv_name in (".venv", "venv", ".venv-build"):
-        candidate = root / venv_name
-        if candidate.is_dir():
-            py_bin = candidate / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-            if py_bin.is_file():
-                python_venv = str(candidate)
-                break
-
-    node_path = shutil.which("node") or ""
-
-    commands: dict[str, str] = {}
-    if language == "python":
-        py_cmd = "python"
-        if (root / "tests").is_dir():
-            commands["test"] = f"{py_cmd} -m unittest discover -s tests -p \"test_*.py\" -v"
-        elif (root / "pyproject.toml").is_file():
-            commands["test"] = f"{py_cmd} -m pytest"
-    elif language in ("javascript", "typescript") and (root / "package.json").is_file():
-        commands["test"] = "node --test"
-
+    res = analyze_workspace_directory(
+        root_path,
+        allow_parent_git_lookup=allow_parent_git_lookup,
+        include_subprojects=False,
+    )
     return {
-        "root_path": str(root),
-        "name": root.name or "workspace",
-        "language": language,
-        "git_root": git_root,
-        "python_venv": python_venv,
-        "node_path": node_path,
-        "commands": commands,
+        "root_path": res.root_path,
+        "name": res.name,
+        "language": res.language,
+        "git_root": res.git_root,
+        "python_venv": res.python_venv,
+        "node_path": res.node_path,
+        "commands": {c.name: c.command for c in res.commands if c.selected},
     }
 
 
@@ -218,6 +187,25 @@ class WorkspaceStore:
             existing = [t for t in prof.linked_tasks if t != clean_tid]
             existing.append(clean_tid)
             updated = replace(prof, linked_tasks=tuple(existing[-max(1, int(max_items)):]))
+            profiles[clean_wid] = updated
+            self.save_workspaces(profiles)
+            return updated
+
+    def refresh_manifest_digests(self, workspace_id: str) -> WorkspaceProfile:
+        """Explicitly re-hash approved manifests for an existing workspace after owner review."""
+        clean_wid = validate_workspace_id(workspace_id)
+        with self.lock(), self._lock:
+            profiles = self.load_workspaces()
+            prof = profiles.get(clean_wid)
+            if prof is None:
+                raise KeyError(f"Unknown workspace: {clean_wid!r}")
+            root = canonical_workspace_root(prof.root_path)
+            if prof.manifest_digests:
+                new_digests = compute_current_manifest_digests(root, prof.manifest_digests.keys())
+            else:
+                res = analyze_workspace_directory(root, include_subprojects=False)
+                new_digests = dict(res.manifest_digests)
+            updated = replace(prof, manifest_digests=new_digests)
             profiles[clean_wid] = updated
             self.save_workspaces(profiles)
             return updated

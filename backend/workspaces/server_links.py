@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,11 +17,21 @@ from backend.servers.models import ServerProfile, validate_server_name
 from backend.servers.store import SECRETS_NAMESPACE as SERVER_SECRETS_NS
 from backend.servers.store import SCHEMA_VERSION as SRV_SCHEMA_VERSION
 from backend.servers.store import ServerConfigStore
+from backend.workspaces.discovery import (
+    WizardAdditionPreview,
+    WizardConflictError,
+    WizardPlanSnapshot,
+    WizardStalePlanError,
+    compute_registry_fingerprint,
+    compute_root_identity,
+    verify_manifest_digests,
+)
 from backend.workspaces.models import (
     SCHEMA_VERSION as WS_SCHEMA_VERSION,
     WorkspaceProfile,
     validate_workspace_id,
 )
+from backend.workspaces.path_security import canonical_workspace_root
 from backend.workspaces.store import SECRETS_NAMESPACE as WS_SECRETS_NS
 from backend.workspaces.store import WorkspaceStore
 
@@ -87,7 +97,7 @@ def _workspace_allows_client(
     client_profile: str,
     required_perms: tuple[str, ...],
 ) -> bool:
-    if not ws.enabled:
+    if not ws.enabled or not ws.allow_oauth_clients:
         return False
     if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(ws.min_profile, 1):
         return False
@@ -1011,3 +1021,267 @@ class WorkspaceServerCoordinator:
             required=required,
             workspace_id=workspace_id,
         )
+
+    @staticmethod
+    def _normalize_new_wizard_server(srv: ServerProfile) -> ServerProfile:
+        normalized = replace(
+            srv,
+            workspace_scoped=True,
+            autostart=False,
+            expose_externally=False,
+            env_secret_refs={},
+            min_profile="full",
+        )
+        normalized.validate()
+        return normalized
+
+    @staticmethod
+    def _inspect_root_relations(
+        canon_root: Path,
+        root_ident: tuple[int, int] | None,
+        workspaces: dict[str, WorkspaceProfile],
+    ) -> tuple[list[str], list[str]]:
+        conflicts: list[str] = []
+        nested: list[str] = []
+        canon_norm = os.path.normcase(str(canon_root))
+        for wid, existing in sorted(workspaces.items()):
+            try:
+                ex_canon = canonical_workspace_root(existing.root_path)
+            except Exception:  # noqa: BLE001
+                continue
+            ex_norm = os.path.normcase(str(ex_canon))
+            ex_ident = compute_root_identity(ex_canon)
+            same_ident = root_ident is not None and ex_ident is not None and root_ident == ex_ident
+            if canon_norm == ex_norm or same_ident:
+                conflicts.append(f"Directory is already registered under workspace '{wid}'")
+            elif canon_root.is_relative_to(ex_canon) or ex_canon.is_relative_to(canon_root):
+                nested.append(wid)
+        return conflicts, nested
+
+    @staticmethod
+    def _inspect_server_conflicts(
+        new_servers: list[ServerProfile],
+        link_existing_servers: list[str],
+        servers: dict[str, ServerProfile],
+    ) -> list[str]:
+        conflicts: list[str] = []
+        existing_srv_cf = {sname.casefold(): sname for sname in servers}
+        seen_new: set[str] = set()
+        for srv in new_servers:
+            low = srv.name.casefold()
+            if low in seen_new:
+                conflicts.append(f"Duplicate new server name '{srv.name}'")
+            seen_new.add(low)
+            if low in existing_srv_cf:
+                conflicts.append(f"Server '{srv.name}' conflicts with existing '{existing_srv_cf[low]}'")
+        for sname in link_existing_servers:
+            if sname not in servers:
+                conflicts.append(f"Existing server '{sname}' does not exist")
+        return conflicts
+
+    @staticmethod
+    def _collect_addition_warnings(profile: WorkspaceProfile, nested: list[str]) -> list[str]:
+        warnings: list[str] = []
+        if profile.allow_oauth_clients and not profile.allowed_clients:
+            warnings.append("All approved OAuth clients meeting min_profile will be allowed")
+        if profile.permissions.execute:
+            warnings.append("Named workspace command execution is enabled")
+        if nested:
+            warnings.append(f"Nested relationship with existing workspace(s): {', '.join(nested)}")
+        return warnings
+
+    @staticmethod
+    def _inspect_addition_conflicts(
+        profile: WorkspaceProfile,
+        new_servers: list[ServerProfile],
+        link_existing_servers: list[str],
+        workspaces: dict[str, WorkspaceProfile],
+        servers: dict[str, ServerProfile],
+    ) -> tuple[Path, tuple[int, int] | None, list[str], list[str], list[str]]:
+        profile.validate()
+        canon_root = canonical_workspace_root(profile.root_path)
+        root_ident = compute_root_identity(canon_root)
+
+        conflicts: list[str] = []
+        existing_wid_cf = {wid.casefold(): wid for wid in workspaces}
+        matched = existing_wid_cf.get(profile.workspace_id.casefold())
+        if matched is not None:
+            conflicts.append(f"Workspace ID '{profile.workspace_id}' conflicts with existing '{matched}'")
+
+        root_conflicts, nested = WorkspaceServerCoordinator._inspect_root_relations(
+            canon_root, root_ident, workspaces
+        )
+        conflicts.extend(root_conflicts)
+        conflicts.extend(
+            WorkspaceServerCoordinator._inspect_server_conflicts(new_servers, link_existing_servers, servers)
+        )
+        warnings = WorkspaceServerCoordinator._collect_addition_warnings(profile, nested)
+        return canon_root, root_ident, conflicts, nested, warnings
+
+    @staticmethod
+    def _effective_permissions_summary(profile: WorkspaceProfile) -> dict[str, Any]:
+        if not profile.allow_oauth_clients:
+            oauth_mode = "deny_all"
+        elif profile.allowed_clients:
+            oauth_mode = "allowlist_clients"
+        else:
+            oauth_mode = "all_approved_clients"
+        return {
+            **profile.permissions.to_dict(),
+            "allow_oauth_clients": bool(profile.allow_oauth_clients),
+            "oauth_mode": oauth_mode,
+            "allowed_clients": list(profile.allowed_clients),
+            "min_profile": profile.min_profile,
+            "trust_git_hooks": bool(profile.trust_git_hooks),
+        }
+
+    def prepare_addition_preview(
+        self,
+        profile: WorkspaceProfile,
+        *,
+        new_servers: Iterable[ServerProfile] = (),
+        link_existing_servers: Iterable[str] = (),
+        expected_manifest_digests: Mapping[str, str] | None = None,
+        expected_root_identity: tuple[int, int] | None = None,
+    ) -> WizardAdditionPreview:
+        """Build a consistent non-mutating preview + state fingerprint for the Workspace Wizard."""
+        normalized_new = [self._normalize_new_wizard_server(s) for s in new_servers]
+        normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
+
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+
+        canon_root, root_ident, conflicts, nested, warnings = self._inspect_addition_conflicts(
+            profile, normalized_new, normalized_links, workspaces, servers
+        )
+        if expected_root_identity is not None and root_ident != expected_root_identity:
+            raise WizardStalePlanError("Workspace directory identity changed on disk since analysis")
+        digests = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        if digests:
+            verify_manifest_digests(canon_root, digests)
+
+        combined_links = _dedupe_preserve([*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links])
+        preview_profile = replace(profile, root_path=str(canon_root), linked_servers=combined_links, manifest_digests=digests)
+        snapshot = WizardPlanSnapshot(
+            state_fingerprint=compute_registry_fingerprint(workspaces, servers),
+            root_path=str(canon_root),
+            root_identity=root_ident,
+            manifest_digests=digests,
+            existing_workspace_ids=tuple(sorted(workspaces)),
+            existing_server_names=tuple(sorted(servers)),
+        )
+        return WizardAdditionPreview(
+            profile=preview_profile,
+            new_servers=tuple(normalized_new),
+            link_existing_servers=tuple(normalized_links),
+            conflicts=tuple(conflicts),
+            nested_workspaces=tuple(nested),
+            warnings=tuple(warnings),
+            effective_permissions=self._effective_permissions_summary(preview_profile),
+            snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _verify_commit_preconditions(
+        profile: WorkspaceProfile,
+        normalized_new: list[ServerProfile],
+        normalized_links: list[str],
+        workspaces: dict[str, WorkspaceProfile],
+        servers: dict[str, ServerProfile],
+        *,
+        expected_state_fingerprint: str,
+        expected_root_identity: tuple[int, int] | None,
+        expected_manifest_digests: Mapping[str, str] | None,
+        acknowledge_nested: bool,
+        ack_nested_set: set[str],
+    ) -> tuple[Path, dict[str, str]]:
+        if compute_registry_fingerprint(workspaces, servers) != expected_state_fingerprint:
+            raise WizardStalePlanError(
+                "Workspace or server registry changed since preview; refresh preview before committing"
+            )
+        canon_root, root_ident, conflicts, nested, _warnings = WorkspaceServerCoordinator._inspect_addition_conflicts(
+            profile, normalized_new, normalized_links, workspaces, servers
+        )
+        if expected_root_identity is not None and root_ident != expected_root_identity:
+            raise WizardStalePlanError("Workspace root directory changed on disk since preview")
+        digests = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        if digests:
+            verify_manifest_digests(canon_root, digests)
+        if conflicts:
+            raise WizardConflictError("; ".join(conflicts))
+        if nested and (not acknowledge_nested or (ack_nested_set and ack_nested_set != set(nested))):
+            raise WizardConflictError(
+                f"Nested workspace relationship detected ({', '.join(nested)}); explicit acknowledgement required"
+            )
+        return canon_root, digests
+
+    def commit_workspace_addition(
+        self,
+        profile: WorkspaceProfile,
+        *,
+        new_servers: Iterable[ServerProfile] = (),
+        link_existing_servers: Iterable[str] = (),
+        expected_state_fingerprint: str,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_manifest_digests: Mapping[str, str] | None = None,
+        acknowledge_nested: bool = False,
+        expected_nested_ids: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Atomically commit a wizard workspace, new scoped servers, and explicit links without autostart."""
+        normalized_new = [self._normalize_new_wizard_server(s) for s in new_servers]
+        normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
+        ack_nested_set = {str(x).strip() for x in expected_nested_ids if str(x).strip()}
+
+        def _plan() -> _TxMutationPlan:
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+            canon_root, digests = self._verify_commit_preconditions(
+                profile,
+                normalized_new,
+                normalized_links,
+                workspaces,
+                servers,
+                expected_state_fingerprint=expected_state_fingerprint,
+                expected_root_identity=expected_root_identity,
+                expected_manifest_digests=expected_manifest_digests,
+                acknowledge_nested=acknowledge_nested,
+                ack_nested_set=ack_nested_set,
+            )
+
+            srv_changed = False
+            for srv in normalized_new:
+                servers[srv.name] = srv
+                srv_changed = True
+            for sname in normalized_links:
+                existing_srv = servers[sname]
+                if not existing_srv.workspace_scoped:
+                    servers[sname] = replace(existing_srv, workspace_scoped=True)
+                    srv_changed = True
+
+            combined_links = _dedupe_preserve(
+                [*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links]
+            )
+            final_ws = replace(
+                profile,
+                root_path=str(canon_root),
+                linked_servers=combined_links,
+                manifest_digests=digests,
+            )
+            final_ws.validate()
+            workspaces[final_ws.workspace_id] = final_ws
+
+            return _TxMutationPlan(
+                files_to_watch=(self.server_store.path, self.workspace_store.path),
+                save_servers=servers if srv_changed else None,
+                save_workspaces=workspaces,
+                result={
+                    "workspace": final_ws,
+                    "created_servers": [s.name for s in normalized_new],
+                    "linked_servers": list(combined_links),
+                },
+            )
+
+        return self._run_tx(_plan)

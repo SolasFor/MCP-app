@@ -510,6 +510,7 @@ try:
 except Exception as _mig_exc:  # noqa: BLE001
     logger.warning("Workspace/Server migration check failed closed: %s", type(_mig_exc).__name__)
 SERVER_MANAGER.workspace_authorizer = WORKSPACE_SERVER_COORDINATOR.authorize_server_operation
+SERVER_MANAGER.manifest_verifier = WORKSPACE_SERVER_COORDINATOR.verify_server_manifests
 WORKSPACE_MANAGER = WorkspaceManager(
     WORKSPACE_STORE,
     WORKSPACE_HISTORY,

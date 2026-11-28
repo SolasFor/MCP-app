@@ -18,6 +18,7 @@ from app.core.redaction import SecretRedactor
 from backend.output_stream import decode_process_bytes
 from backend.process_runner import ProcessRunner
 from backend.workspaces import git_ops
+from backend.workspaces.discovery import verify_manifest_digests
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.models import (
     MAX_READ_BYTES,
@@ -159,6 +160,8 @@ class WorkspaceManager:
         assert isinstance(client_id, str)
         if not prof.enabled:
             raise PermissionError(f"Workspace {clean!r} is disabled")
+        if not prof.allow_oauth_clients:
+            raise PermissionError(f"Workspace {clean!r} denies OAuth client access")
         if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(prof.min_profile, 1):
             raise PermissionError(
                 f"Workspace {clean!r} requires at least {prof.min_profile} access profile"
@@ -208,6 +211,7 @@ class WorkspaceManager:
                 "has_python_venv": bool(prof.python_venv),
                 "commands": sorted(prof.commands),
                 "permissions": perms.to_dict(),
+                "allow_oauth_clients": bool(prof.allow_oauth_clients),
                 "enabled": prof.enabled,
             })
         return items
@@ -265,6 +269,7 @@ class WorkspaceManager:
             "linked_extensions": list(prof.linked_extensions),
             "exclude_patterns": list(prof.exclude_patterns),
             "permissions": perms.to_dict(),
+            "allow_oauth_clients": bool(prof.allow_oauth_clients),
             "trust_git_hooks": prof.trust_git_hooks,
             "description": prof.description,
         }
@@ -963,16 +968,23 @@ class WorkspaceManager:
             required=("read", "execute"),
         )
         root = canonical_workspace_root(prof.root_path)
+        self._verify_workspace_manifests(prof, root)
         env = self._redact_payload_secrets(prof)
-        _raw_cmd, argv = self._prepare_workspace_command(prof, cname, env)
+        raw_cmd, argv = self._prepare_workspace_command(prof, cname, env)
 
         def recheck() -> None:
-            self._authorize_live(
+            fresh_prof, _lp = self._authorize_live(
                 wid,
                 client_id=rec.owner_client_id,
                 fallback_profile=rec.profile,
                 required=("read", "execute"),
             )
+            fresh_root = canonical_workspace_root(fresh_prof.root_path)
+            if os.path.normcase(str(fresh_root)) != os.path.normcase(str(root)):
+                raise ValueError("Workspace root directory changed before dispatch")
+            if fresh_prof.commands.get(cname) != raw_cmd:
+                raise ValueError("Workspace command definition changed before dispatch")
+            self._verify_workspace_manifests(fresh_prof, fresh_root)
 
         return await self.runner.run_command(
             argv,
@@ -1003,6 +1015,8 @@ class WorkspaceManager:
             path_parts.append(os.environ["PATH"])
         effective_path = os.pathsep.join(path_parts)
         env["PATH"] = effective_path
+        if os.name == "nt":
+            env["NoDefaultCurrentDirectoryInExePath"] = "1"
         return effective_path
 
     def _prepare_workspace_command(
@@ -1023,6 +1037,10 @@ class WorkspaceManager:
         resolved_exe = shutil.which(argv[0], path=effective_path)
         if not resolved_exe:
             raise ValueError(f"Command executable {argv[0]!r} not found in workspace toolchain PATH")
+        if os.name == "nt" and Path(resolved_exe).suffix.lower() in (".cmd", ".bat"):
+            for arg in argv[1:]:
+                if any(ch in arg for ch in ("&", "|", "<", ">", "^", "\r", "\n", "\x00")):
+                    raise ValueError("Unsafe shell metacharacter in Windows batch command argument")
         argv[0] = resolved_exe
         return raw_cmd, argv
 
@@ -1033,6 +1051,11 @@ class WorkspaceManager:
             return
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
+
+    @staticmethod
+    def _verify_workspace_manifests(prof: WorkspaceProfile, root: Path) -> None:
+        if prof.manifest_guarded or prof.manifest_digests or prof.wizard_servers:
+            verify_manifest_digests(root, prof.manifest_digests, check_unexpected_significant=True)
 
     async def run_workspace_task(
         self,
@@ -1050,16 +1073,23 @@ class WorkspaceManager:
             required=("read", "execute"),
         )
         root = canonical_workspace_root(prof.root_path)
+        self._verify_workspace_manifests(prof, root)
         env = self._redact_payload_secrets(prof)
         raw_cmd, argv = self._prepare_workspace_command(prof, command_name, env)
 
         def recheck() -> None:
-            self._authorize_live(
+            fresh_prof, _lp = self._authorize_live(
                 workspace_id,
                 client_id=client_id,
                 fallback_profile=client_profile,
                 required=("read", "execute"),
             )
+            fresh_root = canonical_workspace_root(fresh_prof.root_path)
+            if os.path.normcase(str(fresh_root)) != os.path.normcase(str(root)):
+                raise ValueError("Workspace root directory changed before dispatch")
+            if fresh_prof.commands.get(command_name) != raw_cmd:
+                raise ValueError("Workspace command definition changed before dispatch")
+            self._verify_workspace_manifests(fresh_prof, fresh_root)
 
         bounded_timeout = max(1, min(int(timeout), 600))
         task_id = self._record_task_start(

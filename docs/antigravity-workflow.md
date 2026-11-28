@@ -36,3 +36,6 @@ Claude Opus high reasoning либо Carbon (при доступности). Supe
 
 ## N03 — профиль запуска
 Claude Opus high reasoning либо Carbon как единственный оркестратор (при доступности). Superpowers/TDD, Ponytail, Graphify AST, один из UI/UX Pro Max или Impeccable, Break UI, Context7, SonarCloud CI и GitHub. Проверить AG Installed при старте, не менять глобальные настройки. Sonar MCP OAuth остаётся NOT_RUN, PR-check допустим. Текущий план ANTIGRAVITY_PROMPT.md.
+
+## N04 — профиль запуска
+Claude Opus high reasoning либо Carbon как единственный оркестратор (при доступности). Superpowers/TDD, Ponytail, Graphify AST, один основной UI/UX Pro Max или Impeccable, Break UI, Context7, SonarCloud CI и GitHub. Проверить AG Installed; Sonar MCP OAuth остаётся NOT_RUN, PR-check допустим. Не менять глобальные настройки. Discovery только read-only, не исполнять анализируемые проекты. План ANTIGRAVITY_PROMPT.md.

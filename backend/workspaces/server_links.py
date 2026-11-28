@@ -1,10 +1,11 @@
 """Workspace <-> Managed Server linkage, transactional config updates, and cross-layer authorization."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -17,11 +18,33 @@ from backend.servers.models import ServerProfile, validate_server_name
 from backend.servers.store import SECRETS_NAMESPACE as SERVER_SECRETS_NS
 from backend.servers.store import SCHEMA_VERSION as SRV_SCHEMA_VERSION
 from backend.servers.store import ServerConfigStore
+from backend.workspaces.discovery import (
+    ServerProposal,
+    WizardAdditionPreview,
+    WizardConflictError,
+    WizardPlanSnapshot,
+    WizardStalePlanError,
+    WorkspaceDiscoveryResult,
+    analyze_workspace_directory,
+    compute_discovery_proposal_fingerprint,
+    compute_registry_fingerprint,
+    compute_root_identity,
+    extract_decision_warnings,
+    redact_discovery_text,
+)
+from backend.workspaces.manifest_policy import (
+    ManifestDriftError,
+    ManifestReapprovalPreview,
+    build_manifest_change_items,
+    collect_significant_manifest_digests,
+    verify_manifest_digests,
+)
 from backend.workspaces.models import (
     SCHEMA_VERSION as WS_SCHEMA_VERSION,
     WorkspaceProfile,
     validate_workspace_id,
 )
+from backend.workspaces.path_security import canonical_workspace_root
 from backend.workspaces.store import SECRETS_NAMESPACE as WS_SECRETS_NS
 from backend.workspaces.store import WorkspaceStore
 
@@ -87,7 +110,7 @@ def _workspace_allows_client(
     client_profile: str,
     required_perms: tuple[str, ...],
 ) -> bool:
-    if not ws.enabled:
+    if not ws.enabled or not ws.allow_oauth_clients:
         return False
     if _PROFILE_RANK.get(client_profile, 0) < _PROFILE_RANK.get(ws.min_profile, 1):
         return False
@@ -220,11 +243,14 @@ def _rewrite_workspace_links_map(
 ) -> bool:
     changed = False
     for wid, ws in list(workspaces.items()):
-        if old_name not in ws.linked_servers:
+        in_linked = old_name in ws.linked_servers
+        in_wiz = old_name in ws.wizard_servers
+        if not in_linked and not in_wiz:
             continue
         workspaces[wid] = replace(
             ws,
             linked_servers=_dedupe_preserve([new_name if s == old_name else s for s in ws.linked_servers]),
+            wizard_servers=_dedupe_preserve([new_name if s == old_name else s for s in ws.wizard_servers]),
         )
         changed = True
     return changed
@@ -894,10 +920,11 @@ class WorkspaceServerCoordinator:
             workspaces = self.workspace_store.load_workspaces()
             ws_changed = False
             for wid, ws in list(workspaces.items()):
-                if clean_srv in ws.linked_servers:
+                if clean_srv in ws.linked_servers or clean_srv in ws.wizard_servers:
                     workspaces[wid] = replace(
                         ws,
                         linked_servers=tuple(s for s in ws.linked_servers if s != clean_srv),
+                        wizard_servers=tuple(s for s in ws.wizard_servers if s != clean_srv),
                     )
                     ws_changed = True
 
@@ -1011,3 +1038,975 @@ class WorkspaceServerCoordinator:
             required=required,
             workspace_id=workspace_id,
         )
+
+    @staticmethod
+    def _normalize_new_wizard_server(
+        srv: ServerProfile,
+        *,
+        workspace_id: str = "",
+        manifest_digests: Mapping[str, str] | None = None,
+    ) -> ServerProfile:
+        tp = dict(srv.template_params)
+        if workspace_id:
+            tp["wizard_managed_workspace_id"] = workspace_id
+        tp["manifest_guarded"] = True
+        tp["manifest_digests"] = dict(
+            manifest_digests if manifest_digests is not None else tp.get("manifest_digests") or {}
+        )
+        normalized = replace(
+            srv,
+            workspace_scoped=True,
+            autostart=False,
+            expose_externally=False,
+            env_secret_refs={},
+            min_profile="full",
+            template_params=tp,
+        )
+        normalized.validate()
+        return normalized
+
+    @staticmethod
+    def _inspect_root_relations(
+        canon_root: Path,
+        root_ident: tuple[int, int] | None,
+        workspaces: dict[str, WorkspaceProfile],
+    ) -> tuple[list[str], list[str]]:
+        conflicts: list[str] = []
+        nested: list[str] = []
+        canon_norm = os.path.normcase(str(canon_root))
+        for wid, existing in sorted(workspaces.items()):
+            try:
+                ex_canon = canonical_workspace_root(existing.root_path)
+            except Exception:  # noqa: BLE001
+                continue
+            ex_norm = os.path.normcase(str(ex_canon))
+            ex_ident = compute_root_identity(ex_canon)
+            same_ident = root_ident is not None and ex_ident is not None and root_ident == ex_ident
+            if canon_norm == ex_norm or same_ident:
+                conflicts.append(f"Directory is already registered under workspace '{wid}'")
+            elif canon_root.is_relative_to(ex_canon) or ex_canon.is_relative_to(canon_root):
+                nested.append(wid)
+        return conflicts, nested
+
+    @staticmethod
+    def _inspect_server_conflicts(
+        new_servers: list[ServerProfile],
+        link_existing_servers: list[str],
+        servers: dict[str, ServerProfile],
+    ) -> list[str]:
+        conflicts: list[str] = []
+        existing_srv_cf = {sname.casefold(): sname for sname in servers}
+        seen_new: set[str] = set()
+        for srv in new_servers:
+            low = srv.name.casefold()
+            if low in seen_new:
+                conflicts.append(f"Duplicate new server name '{srv.name}'")
+            seen_new.add(low)
+            if low in existing_srv_cf:
+                conflicts.append(f"Server '{srv.name}' conflicts with existing '{existing_srv_cf[low]}'")
+        for sname in link_existing_servers:
+            if sname not in servers:
+                conflicts.append(f"Existing server '{sname}' does not exist")
+        return conflicts
+
+    @staticmethod
+    def _collect_addition_warnings(
+        profile: WorkspaceProfile,
+        nested: list[str],
+        discovered: WorkspaceDiscoveryResult | None = None,
+    ) -> list[str]:
+        warnings: list[str] = []
+        if profile.allow_oauth_clients and not profile.allowed_clients:
+            warnings.append("All approved OAuth clients meeting min_profile will be allowed")
+        if profile.permissions.execute:
+            warnings.append("Named workspace command execution is enabled")
+        if nested:
+            warnings.append(f"Nested relationship with existing workspace(s): {', '.join(nested)}")
+        if discovered is not None:
+            warnings.extend(_collect_reapproval_lifecycle_warnings(discovered))
+        return list(dict.fromkeys(warnings))
+
+    @staticmethod
+    def _inspect_addition_conflicts(
+        profile: WorkspaceProfile,
+        new_servers: list[ServerProfile],
+        link_existing_servers: list[str],
+        workspaces: dict[str, WorkspaceProfile],
+        servers: dict[str, ServerProfile],
+        *,
+        discovered: WorkspaceDiscoveryResult | None = None,
+    ) -> tuple[Path, tuple[int, int] | None, list[str], list[str], list[str]]:
+        profile.validate()
+        canon_root = canonical_workspace_root(profile.root_path)
+        root_ident = compute_root_identity(canon_root)
+
+        conflicts: list[str] = []
+        existing_wid_cf = {wid.casefold(): wid for wid in workspaces}
+        matched = existing_wid_cf.get(profile.workspace_id.casefold())
+        if matched is not None:
+            conflicts.append(f"Workspace ID '{profile.workspace_id}' conflicts with existing '{matched}'")
+
+        root_conflicts, nested = WorkspaceServerCoordinator._inspect_root_relations(
+            canon_root, root_ident, workspaces
+        )
+        conflicts.extend(root_conflicts)
+        conflicts.extend(
+            WorkspaceServerCoordinator._inspect_server_conflicts(new_servers, link_existing_servers, servers)
+        )
+        warnings = WorkspaceServerCoordinator._collect_addition_warnings(profile, nested, discovered=discovered)
+        return canon_root, root_ident, conflicts, nested, warnings
+
+    @staticmethod
+    def _effective_permissions_summary(profile: WorkspaceProfile) -> dict[str, Any]:
+        if not profile.allow_oauth_clients:
+            oauth_mode = "deny_all"
+        elif profile.allowed_clients:
+            oauth_mode = "allowlist_clients"
+        else:
+            oauth_mode = "all_approved_clients"
+        return {
+            **profile.permissions.to_dict(),
+            "allow_oauth_clients": bool(profile.allow_oauth_clients),
+            "oauth_mode": oauth_mode,
+            "allowed_clients": list(profile.allowed_clients),
+            "min_profile": profile.min_profile,
+            "trust_git_hooks": bool(profile.trust_git_hooks),
+        }
+
+    def prepare_addition_preview(
+        self,
+        profile: WorkspaceProfile,
+        *,
+        new_servers: Iterable[ServerProfile] = (),
+        link_existing_servers: Iterable[str] = (),
+        expected_manifest_digests: Mapping[str, str] | None = None,
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_discovery: WorkspaceDiscoveryResult | None = None,
+    ) -> WizardAdditionPreview:
+        """Build a consistent non-mutating preview + full proposal fingerprint for the Workspace Wizard."""
+        digests_seed = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        normalized_new = [
+            self._normalize_new_wizard_server(
+                s, workspace_id=profile.workspace_id, manifest_digests=digests_seed
+            )
+            for s in new_servers
+        ]
+        normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
+
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+
+        canon_root = canonical_workspace_root(profile.root_path)
+        root_ident = compute_root_identity(canon_root)
+        if expected_root_identity is not None and root_ident != expected_root_identity:
+            raise WizardStalePlanError("Workspace directory identity changed on disk since analysis")
+        verify_manifest_digests(canon_root, digests_seed, check_unexpected_significant=True)
+        live_discovered = analyze_workspace_directory(canon_root, include_subprojects=False)
+        live_prop_fp = compute_discovery_proposal_fingerprint(live_discovered)
+        if expected_discovery is not None and compute_discovery_proposal_fingerprint(expected_discovery) != live_prop_fp:
+            raise WizardStalePlanError("Project proposals, runtime, or warnings changed on disk since analysis")
+
+        canon_root, root_ident, conflicts, nested, warnings = self._inspect_addition_conflicts(
+            profile,
+            normalized_new,
+            normalized_links,
+            workspaces,
+            servers,
+            discovered=live_discovered,
+        )
+        decision_warnings = extract_decision_warnings(live_discovered)
+        combined_links = _dedupe_preserve([*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links])
+        wiz_servers = _dedupe_preserve([*profile.wizard_servers, *(s.name for s in normalized_new)])
+        preview_profile = replace(
+            profile,
+            root_path=str(canon_root),
+            linked_servers=combined_links,
+            manifest_digests=digests_seed,
+            manifest_guarded=True,
+            wizard_servers=wiz_servers,
+        )
+        plan_fp = _compute_addition_plan_fingerprint(
+            preview_profile, normalized_new, normalized_links, warnings, nested, decision_warnings
+        )
+        snapshot = WizardPlanSnapshot(
+            state_fingerprint=compute_registry_fingerprint(workspaces, servers),
+            root_path=str(canon_root),
+            root_identity=root_ident,
+            manifest_digests=digests_seed,
+            existing_workspace_ids=tuple(sorted(workspaces)),
+            existing_server_names=tuple(sorted(servers)),
+            proposal_fingerprint=live_prop_fp,
+            plan_fingerprint=plan_fp,
+            proposed_commands=dict(preview_profile.commands),
+            proposed_language=preview_profile.language,
+            proposed_python_venv=preview_profile.python_venv,
+            proposed_node_path=preview_profile.node_path,
+            proposed_git_root=preview_profile.git_root,
+            server_proposals=live_discovered.server_proposals,
+            linked_servers=combined_links,
+            updatable_servers=wiz_servers,
+            decision_warnings=decision_warnings,
+        )
+        return WizardAdditionPreview(
+            profile=preview_profile,
+            new_servers=tuple(normalized_new),
+            link_existing_servers=tuple(normalized_links),
+            conflicts=tuple(conflicts),
+            nested_workspaces=tuple(nested),
+            warnings=tuple(warnings),
+            effective_permissions=self._effective_permissions_summary(preview_profile),
+            snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _verify_commit_preconditions(
+        profile: WorkspaceProfile,
+        normalized_new: list[ServerProfile],
+        normalized_links: list[str],
+        workspaces: dict[str, WorkspaceProfile],
+        servers: dict[str, ServerProfile],
+        *,
+        expected_state_fingerprint: str,
+        expected_root_identity: tuple[int, int] | None,
+        expected_manifest_digests: Mapping[str, str] | None,
+        acknowledge_nested: bool,
+        ack_nested_set: set[str],
+    ) -> tuple[Path, dict[str, str], list[str]]:
+        if compute_registry_fingerprint(workspaces, servers) != expected_state_fingerprint:
+            raise WizardStalePlanError(
+                "Workspace or server registry changed since preview; refresh preview before committing"
+            )
+        canon_root, root_ident, conflicts, nested, _warnings = WorkspaceServerCoordinator._inspect_addition_conflicts(
+            profile, normalized_new, normalized_links, workspaces, servers
+        )
+        if expected_root_identity is not None and root_ident != expected_root_identity:
+            raise WizardStalePlanError("Workspace root directory changed on disk since preview")
+        digests = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        verify_manifest_digests(canon_root, digests, check_unexpected_significant=True)
+        if conflicts:
+            raise WizardConflictError("; ".join(conflicts))
+        if nested and (not acknowledge_nested or (ack_nested_set and ack_nested_set != set(nested))):
+            raise WizardConflictError(
+                f"Nested workspace relationship detected ({', '.join(nested)}); explicit acknowledgement required"
+            )
+        return canon_root, digests, nested
+
+    def commit_workspace_addition(
+        self,
+        profile: WorkspaceProfile,
+        *,
+        new_servers: Iterable[ServerProfile] = (),
+        link_existing_servers: Iterable[str] = (),
+        expected_state_fingerprint: str = "",
+        expected_root_identity: tuple[int, int] | None = None,
+        expected_manifest_digests: Mapping[str, str] | None = None,
+        expected_snapshot: WizardPlanSnapshot | None = None,
+        acknowledge_nested: bool = False,
+        expected_nested_ids: Iterable[str] = (),
+    ) -> dict[str, Any]:
+        """Atomically commit a wizard workspace, new scoped servers, and explicit links without autostart."""
+        if expected_snapshot is None and not expected_state_fingerprint:
+            raise WizardStalePlanError("Missing preview snapshot or state fingerprint for workspace commit")
+        digests_seed = dict(
+            expected_snapshot.manifest_digests
+            if expected_snapshot is not None
+            else (expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        )
+        eff_state_fp = expected_snapshot.state_fingerprint if expected_snapshot is not None else expected_state_fingerprint
+        eff_root_id = expected_snapshot.root_identity if expected_snapshot is not None else expected_root_identity
+        normalized_new = [
+            self._normalize_new_wizard_server(
+                s, workspace_id=profile.workspace_id, manifest_digests=digests_seed
+            )
+            for s in new_servers
+        ]
+        normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
+        ack_nested_set = {str(x).strip() for x in expected_nested_ids if str(x).strip()}
+
+        def _plan() -> _TxMutationPlan:
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+            canon_root, digests, nested = self._verify_commit_preconditions(
+                profile,
+                normalized_new,
+                normalized_links,
+                workspaces,
+                servers,
+                expected_state_fingerprint=eff_state_fp,
+                expected_root_identity=eff_root_id,
+                expected_manifest_digests=digests_seed,
+                acknowledge_nested=acknowledge_nested,
+                ack_nested_set=ack_nested_set,
+            )
+
+            combined_links = _dedupe_preserve(
+                [*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links]
+            )
+            wiz_servers = _dedupe_preserve([*profile.wizard_servers, *(s.name for s in normalized_new)])
+            final_ws = replace(
+                profile,
+                root_path=str(canon_root),
+                linked_servers=combined_links,
+                manifest_digests=digests,
+                manifest_guarded=True,
+                wizard_servers=wiz_servers,
+            )
+            final_ws.validate()
+            if expected_snapshot is not None:
+                _verify_addition_snapshot_proposals(
+                    final_ws, canon_root, normalized_new, normalized_links, nested, expected_snapshot
+                )
+
+            srv_changed = False
+            for srv in normalized_new:
+                servers[srv.name] = replace(
+                    srv,
+                    template_params={
+                        **srv.template_params,
+                        "wizard_managed_workspace_id": profile.workspace_id,
+                        "manifest_guarded": True,
+                        "manifest_digests": dict(digests),
+                    },
+                )
+                srv_changed = True
+            for sname in normalized_links:
+                existing_srv = servers[sname]
+                if not existing_srv.workspace_scoped:
+                    servers[sname] = replace(existing_srv, workspace_scoped=True)
+                    srv_changed = True
+
+            workspaces[final_ws.workspace_id] = final_ws
+            return _TxMutationPlan(
+                files_to_watch=(self.server_store.path, self.workspace_store.path),
+                save_servers=servers if srv_changed else None,
+                save_workspaces=workspaces,
+                result={
+                    "workspace": final_ws,
+                    "created_servers": [s.name for s in normalized_new],
+                    "linked_servers": list(combined_links),
+                },
+            )
+
+        return self._run_tx(_plan)
+
+    @staticmethod
+    def _classify_linked_servers_for_reapproval(
+        ws: WorkspaceProfile,
+        canon_root: Path,
+        servers: Mapping[str, ServerProfile],
+        server_to_workspaces: Mapping[str, list[str]],
+    ) -> tuple[list[str], list[str]]:
+        updatable: list[str] = []
+        skipped: list[str] = []
+        root_norm = os.path.normcase(str(canon_root))
+        for sname in ws.linked_servers:
+            srv = servers.get(sname)
+            if srv is None:
+                skipped.append(sname)
+                continue
+            tp = srv.template_params
+            managed_here = (sname in ws.wizard_servers) or (tp.get("wizard_managed_workspace_id") == ws.workspace_id)
+            exclusive = len(server_to_workspaces.get(sname, [])) <= 1
+            try:
+                srv_cwd_norm = os.path.normcase(str(canonical_workspace_root(srv.cwd)))
+            except Exception:  # noqa: BLE001
+                srv_cwd_norm = ""
+            if managed_here and exclusive and srv_cwd_norm == root_norm:
+                updatable.append(sname)
+            else:
+                skipped.append(sname)
+        return updatable, skipped
+
+    @staticmethod
+    def _compute_command_and_runtime_diffs(
+        ws: WorkspaceProfile,
+        discovered: Any,
+    ) -> tuple[
+        dict[str, str],
+        dict[str, tuple[str, str]],
+        tuple[str, ...],
+        dict[str, str],
+        dict[str, tuple[str, str]],
+    ]:
+        proposed_cmds = {
+            c.name: redact_discovery_text(c.command)
+            for c in discovered.commands
+            if c.selected and c.command.strip()
+        }
+        added_cmds = {k: v for k, v in proposed_cmds.items() if k not in ws.commands}
+        changed_cmds = {
+            k: (redact_discovery_text(ws.commands[k]), v)
+            for k, v in proposed_cmds.items()
+            if k in ws.commands and ws.commands[k] != v
+        }
+        unmatched = tuple(sorted(k for k in ws.commands if k not in proposed_cmds))
+        runtime_changes: dict[str, tuple[str, str]] = {}
+        for attr, disc_val in (
+            ("language", discovered.language),
+            ("python_venv", discovered.python_venv),
+            ("node_path", discovered.node_path),
+            ("git_root", discovered.git_root),
+        ):
+            cur_val = str(getattr(ws, attr, "") or "")
+            new_val = str(disc_val or "")
+            if cur_val != new_val:
+                runtime_changes[attr] = (cur_val, new_val)
+        return added_cmds, changed_cmds, unmatched, proposed_cmds, runtime_changes
+
+    @staticmethod
+    def _single_server_param_diff(srv: ServerProfile, prop: Any) -> dict[str, Any]:
+        diff: dict[str, Any] = {}
+        if prop.port != srv.port:
+            diff["port"] = [srv.port, prop.port]
+        eff_exe = _effective_proposal_executable(srv, prop)
+        if eff_exe and srv.argv and eff_exe != srv.argv[0]:
+            diff["executable"] = [srv.argv[0], eff_exe]
+        cur_entry = str(
+            srv.template_params.get("entrypoint")
+            or srv.template_params.get("framework")
+            or srv.template_params.get("compose_file")
+            or ""
+        )
+        if prop.entrypoint and ((cur_entry and cur_entry != prop.entrypoint) or (not cur_entry and prop.entrypoint not in srv.argv[1:])):
+            diff["entrypoint"] = prop.entrypoint
+        return diff
+
+    @staticmethod
+    def _compute_server_param_diffs(
+        updatable_names: list[str],
+        servers: Mapping[str, ServerProfile],
+        discovered: Any,
+    ) -> dict[str, dict[str, Any]]:
+        by_template = {prop.template: prop for prop in discovered.server_proposals}
+        changes: dict[str, dict[str, Any]] = {}
+        for sname in updatable_names:
+            srv = servers.get(sname)
+            prop = by_template.get(srv.template) if srv is not None else None
+            if srv is None or prop is None:
+                continue
+            diff = WorkspaceServerCoordinator._single_server_param_diff(srv, prop)
+            if diff:
+                changes[sname] = diff
+        return changes
+
+    @staticmethod
+    def _verify_single_server_digests(
+        profile: ServerProfile,
+        workspaces: Mapping[str, WorkspaceProfile],
+        canon_cwd: Path,
+        wiz_wids: list[str],
+    ) -> None:
+        tp = profile.template_params
+        raw_digests = tp.get("manifest_digests")
+        if not isinstance(raw_digests, dict):
+            raise ManifestDriftError(
+                f"Server {profile.name!r} is missing approved manifest_digests; re-approve workspace before starting"
+            )
+        verify_manifest_digests(canon_cwd, raw_digests, check_unexpected_significant=True)
+        owner_wid = str(tp.get("wizard_managed_workspace_id") or "").strip()
+        if not owner_wid and len(wiz_wids) == 1:
+            owner_wid = wiz_wids[0]
+        owner_ws = workspaces.get(owner_wid) if owner_wid else None
+        if owner_ws is None or not owner_ws.manifest_guarded:
+            return
+        try:
+            owner_root = canonical_workspace_root(owner_ws.root_path)
+        except Exception:  # noqa: BLE001
+            owner_root = canon_cwd
+        if os.path.normcase(str(owner_root)) == os.path.normcase(str(canon_cwd)) and owner_ws.manifest_digests != raw_digests:
+            raise ManifestDriftError(
+                f"Server {profile.name!r} manifest approval does not match workspace {owner_wid!r}; "
+                "review and re-approve manifests together"
+            )
+
+    def verify_server_manifests(self, profile: ServerProfile, *, workspace_id: str = "") -> None:
+        """Fail closed if a wizard-managed server's manifests drifted, disappeared, or diverged from its workspace."""
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+
+        tp = profile.template_params
+        canon_cwd = canonical_workspace_root(profile.cwd)
+        linked_wids = [wid for wid, ws in sorted(workspaces.items()) if profile.name in ws.linked_servers]
+        wiz_wids = [wid for wid, ws in sorted(workspaces.items()) if profile.name in ws.wizard_servers]
+        is_srv_guarded = (
+            bool(tp.get("manifest_guarded"))
+            or bool(tp.get("wizard_managed_workspace_id"))
+            or ("manifest_digests" in tp)
+            or bool(wiz_wids)
+        )
+        if is_srv_guarded:
+            self._verify_single_server_digests(profile, workspaces, canon_cwd, wiz_wids)
+
+        check_wid = workspace_id or (linked_wids[0] if len(linked_wids) == 1 else "")
+        ws_target = workspaces.get(check_wid)
+        if ws_target is not None and (ws_target.manifest_guarded or ws_target.manifest_digests or ws_target.wizard_servers):
+            ws_root = canonical_workspace_root(ws_target.root_path)
+            verify_manifest_digests(ws_root, ws_target.manifest_digests, check_unexpected_significant=True)
+
+    def _build_reapproval_analysis(
+        self,
+        ws: WorkspaceProfile,
+        workspaces: Mapping[str, WorkspaceProfile],
+        servers: Mapping[str, ServerProfile],
+    ) -> dict[str, Any]:
+        canon_root = canonical_workspace_root(ws.root_path)
+        root_ident = compute_root_identity(canon_root)
+        discovered = analyze_workspace_directory(canon_root, include_subprojects=False)
+        full_digests, hash_issues = collect_significant_manifest_digests(
+            canon_root, existing_digests=discovered.manifest_digests
+        )
+        changes = build_manifest_change_items(ws.manifest_digests, full_digests, hash_issues)
+        server_to_ws = _build_server_to_workspaces_map(workspaces, servers)
+        updatable, skipped = self._classify_linked_servers_for_reapproval(ws, canon_root, servers, server_to_ws)
+        added_cmds, changed_cmds, unmatched_cmds, proposed_cmds, runtime_changes = (
+            self._compute_command_and_runtime_diffs(ws, discovered)
+        )
+        srv_param_changes = self._compute_server_param_diffs(updatable, servers, discovered)
+        lifecycle_warnings = _collect_reapproval_lifecycle_warnings(discovered)
+        blocking = _collect_reapproval_blocking_errors(hash_issues, discovered.diagnostics)
+        decision_warnings = extract_decision_warnings(discovered)
+        proposal_fp = compute_discovery_proposal_fingerprint(discovered)
+        plan_fp = _compute_reapproval_plan_fingerprint(
+            workspace_id=ws.workspace_id,
+            linked_servers=ws.linked_servers,
+            changes=changes,
+            new_digests=full_digests,
+            proposed_cmds=proposed_cmds,
+            added_cmds=added_cmds,
+            changed_cmds=changed_cmds,
+            unmatched_cmds=unmatched_cmds,
+            runtime_changes=runtime_changes,
+            discovered=discovered,
+            updatable=updatable,
+            skipped=skipped,
+            srv_param_changes=srv_param_changes,
+            lifecycle_warnings=lifecycle_warnings,
+            blocking=blocking,
+            decision_warnings=decision_warnings,
+        )
+        return {
+            "canon_root": canon_root,
+            "root_ident": root_ident,
+            "discovered": discovered,
+            "full_digests": full_digests,
+            "changes": changes,
+            "updatable": tuple(updatable),
+            "skipped": tuple(skipped),
+            "added_cmds": added_cmds,
+            "changed_cmds": changed_cmds,
+            "unmatched_cmds": unmatched_cmds,
+            "proposed_cmds": proposed_cmds,
+            "runtime_changes": runtime_changes,
+            "srv_param_changes": srv_param_changes,
+            "lifecycle_warnings": lifecycle_warnings,
+            "blocking": blocking,
+            "decision_warnings": decision_warnings,
+            "proposal_fp": proposal_fp,
+            "plan_fp": plan_fp,
+        }
+
+    def prepare_manifest_reapproval(self, workspace_id: str) -> ManifestReapprovalPreview:
+        """Analyze current manifests vs approved baseline and return a redacted, snapshot-bound re-approval preview."""
+        clean_wid = validate_workspace_id(workspace_id)
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+
+        ws = workspaces.get(clean_wid)
+        if ws is None:
+            raise KeyError(f"Unknown workspace: {clean_wid!r}")
+        ctx = self._build_reapproval_analysis(ws, workspaces, servers)
+        discovered = ctx["discovered"]
+        snapshot = WizardPlanSnapshot(
+            state_fingerprint=compute_registry_fingerprint(workspaces, servers),
+            root_path=str(ctx["canon_root"]),
+            root_identity=ctx["root_ident"],
+            manifest_digests=ctx["full_digests"],
+            existing_workspace_ids=tuple(sorted(workspaces)),
+            existing_server_names=tuple(sorted(servers)),
+            proposal_fingerprint=ctx["proposal_fp"],
+            plan_fingerprint=ctx["plan_fp"],
+            proposed_commands=dict(ctx["proposed_cmds"]),
+            proposed_language=discovered.language,
+            proposed_python_venv=discovered.python_venv,
+            proposed_node_path=discovered.node_path,
+            proposed_git_root=discovered.git_root,
+            server_proposals=discovered.server_proposals,
+            linked_servers=ws.linked_servers,
+            updatable_servers=ctx["updatable"],
+            decision_warnings=ctx["decision_warnings"],
+        )
+        return ManifestReapprovalPreview(
+            workspace_id=ws.workspace_id,
+            workspace_name=ws.name,
+            root_path=str(ctx["canon_root"]),
+            manifest_changes=ctx["changes"],
+            new_digests=ctx["full_digests"],
+            added_commands=ctx["added_cmds"],
+            changed_commands=ctx["changed_cmds"],
+            unmatched_existing_commands=ctx["unmatched_cmds"],
+            proposed_commands=ctx["proposed_cmds"],
+            runtime_changes=ctx["runtime_changes"],
+            proposed_language=discovered.language,
+            proposed_python_venv=discovered.python_venv,
+            proposed_node_path=discovered.node_path,
+            proposed_git_root=discovered.git_root,
+            updatable_servers=ctx["updatable"],
+            skipped_servers=ctx["skipped"],
+            server_param_changes=ctx["srv_param_changes"],
+            lifecycle_warnings=ctx["lifecycle_warnings"],
+            effective_permissions=self._effective_permissions_summary(ws),
+            diagnostics=discovered.diagnostics,
+            blocking_errors=ctx["blocking"],
+            snapshot=snapshot,
+            has_changes=bool(
+                ctx["changes"]
+                or ctx["added_cmds"]
+                or ctx["changed_cmds"]
+                or ctx["runtime_changes"]
+                or ctx["srv_param_changes"]
+            ),
+        )
+
+    def commit_manifest_reapproval(
+        self,
+        workspace_id: str,
+        *,
+        expected_snapshot: WizardPlanSnapshot,
+        apply_command_updates: bool = False,
+        apply_runtime_updates: bool = False,
+        apply_server_updates: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically re-approve workspace and exclusive wizard server manifest digests bound to `expected_snapshot`."""
+        clean_wid = validate_workspace_id(workspace_id)
+
+        def _plan() -> _TxMutationPlan:
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+            ws = workspaces.get(clean_wid)
+            if ws is None:
+                raise KeyError(f"Unknown workspace: {clean_wid!r}")
+            _verify_reapproval_snapshot(ws, workspaces, servers, expected_snapshot)
+            live_ctx = self._build_reapproval_analysis(ws, workspaces, servers)
+            _verify_reapproval_live_match(ws, expected_snapshot, live_ctx)
+
+            approved_digests = dict(expected_snapshot.manifest_digests)
+            workspaces[clean_wid] = _build_reapproved_workspace(
+                ws,
+                approved_digests,
+                expected_snapshot,
+                apply_command_updates=apply_command_updates,
+                apply_runtime_updates=apply_runtime_updates,
+            )
+            updatable = tuple(expected_snapshot.updatable_servers)
+            skipped = tuple(live_ctx["skipped"])
+            srv_changed = _apply_reapproved_server_updates(
+                clean_wid,
+                updatable,
+                servers,
+                approved_digests,
+                expected_snapshot.server_proposals,
+                apply_server_updates=apply_server_updates,
+            )
+            return _TxMutationPlan(
+                files_to_watch=(self.server_store.path, self.workspace_store.path),
+                save_servers=servers if srv_changed else None,
+                save_workspaces=workspaces,
+                result={
+                    "workspace": workspaces[clean_wid],
+                    "updated_servers": list(updatable),
+                    "skipped_servers": list(skipped),
+                    "manifest_digests": approved_digests,
+                },
+            )
+
+        return self._run_tx(_plan)
+
+
+def _hash_canonical_json(payload: Any) -> str:
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _effective_proposal_executable(srv: ServerProfile, prop: Any) -> str:
+    candidate = str(getattr(prop, "executable", "") or "").strip()
+    if candidate and Path(candidate).is_absolute():
+        return candidate
+    if srv.argv:
+        return srv.argv[0]
+    return candidate
+
+
+def _compute_addition_plan_fingerprint(
+    preview_profile: WorkspaceProfile,
+    normalized_new: Sequence[ServerProfile],
+    normalized_links: Sequence[str],
+    warnings: Sequence[str],
+    nested: Sequence[str],
+    decision_warnings: Sequence[str],
+) -> str:
+    return _hash_canonical_json(
+        {
+            "workspace": preview_profile.to_dict(),
+            "new_servers": [s.to_dict() for s in normalized_new],
+            "link_existing_servers": list(normalized_links),
+            "warnings": list(warnings),
+            "nested": list(nested),
+            "decision_warnings": list(decision_warnings),
+        }
+    )
+
+
+def _compute_reapproval_plan_fingerprint(
+    *,
+    workspace_id: str,
+    linked_servers: Sequence[str],
+    changes: Sequence[Any],
+    new_digests: Mapping[str, str],
+    proposed_cmds: Mapping[str, str],
+    added_cmds: Mapping[str, str],
+    changed_cmds: Mapping[str, tuple[str, str]],
+    unmatched_cmds: Sequence[str],
+    runtime_changes: Mapping[str, tuple[str, str]],
+    discovered: WorkspaceDiscoveryResult,
+    updatable: Sequence[str],
+    skipped: Sequence[str],
+    srv_param_changes: Mapping[str, Any],
+    lifecycle_warnings: Sequence[str],
+    blocking: Sequence[str],
+    decision_warnings: Sequence[str],
+) -> str:
+    return _hash_canonical_json(
+        {
+            "workspace_id": workspace_id,
+            "linked_servers": list(linked_servers),
+            "manifest_changes": [(c.rel_path, c.status, c.old_sha256, c.new_sha256) for c in changes],
+            "new_digests": {k: new_digests[k] for k in sorted(new_digests)},
+            "proposed_commands": {k: proposed_cmds[k] for k in sorted(proposed_cmds)},
+            "added_commands": {k: added_cmds[k] for k in sorted(added_cmds)},
+            "changed_commands": {k: list(changed_cmds[k]) for k in sorted(changed_cmds)},
+            "unmatched_existing_commands": list(unmatched_cmds),
+            "runtime_changes": {k: list(runtime_changes[k]) for k in sorted(runtime_changes)},
+            "proposed_language": discovered.language,
+            "proposed_python_venv": discovered.python_venv,
+            "proposed_node_path": discovered.node_path,
+            "proposed_git_root": discovered.git_root,
+            "updatable_servers": list(updatable),
+            "skipped_servers": list(skipped),
+            "server_param_changes": srv_param_changes,
+            "lifecycle_warnings": list(lifecycle_warnings),
+            "blocking_errors": list(blocking),
+            "decision_warnings": list(decision_warnings),
+        }
+    )
+
+
+def _verify_addition_snapshot_proposals(
+    final_ws: WorkspaceProfile,
+    canon_root: Path,
+    normalized_new: list[ServerProfile],
+    normalized_links: list[str],
+    nested: list[str],
+    expected_snapshot: WizardPlanSnapshot,
+) -> None:
+    if not expected_snapshot.proposal_fingerprint or not expected_snapshot.plan_fingerprint:
+        raise WizardStalePlanError("Preview snapshot is missing proposal/plan fingerprints; refresh preview")
+    if os.path.normcase(str(canon_root)) != os.path.normcase(expected_snapshot.root_path):
+        raise WizardStalePlanError("Workspace root path differs from approved preview snapshot")
+    live_discovered = analyze_workspace_directory(canon_root, include_subprojects=False)
+    if compute_discovery_proposal_fingerprint(live_discovered) != expected_snapshot.proposal_fingerprint:
+        raise WizardStalePlanError(
+            "Project proposals, runtime, or warnings changed on disk since preview; refresh preview before committing"
+        )
+    warnings = WorkspaceServerCoordinator._collect_addition_warnings(final_ws, nested, discovered=live_discovered)
+    decision_warnings = extract_decision_warnings(live_discovered)
+    live_plan_fp = _compute_addition_plan_fingerprint(
+        final_ws, normalized_new, normalized_links, warnings, nested, decision_warnings
+    )
+    if live_plan_fp != expected_snapshot.plan_fingerprint:
+        raise WizardStalePlanError(
+            "Workspace addition configuration differs from approved preview; refresh preview before committing"
+        )
+
+
+def _verify_reapproval_live_match(
+    ws: WorkspaceProfile,
+    expected_snapshot: WizardPlanSnapshot,
+    live_ctx: Mapping[str, Any],
+) -> None:
+    if live_ctx["blocking"]:
+        raise ManifestDriftError("; ".join(live_ctx["blocking"]))
+    if live_ctx["full_digests"] != expected_snapshot.manifest_digests:
+        raise ManifestDriftError(
+            "Significant manifests changed on disk since preview; refresh preview before approving"
+        )
+    if (
+        live_ctx["proposal_fp"] != expected_snapshot.proposal_fingerprint
+        or live_ctx["plan_fp"] != expected_snapshot.plan_fingerprint
+        or live_ctx["updatable"] != expected_snapshot.updatable_servers
+        or ws.linked_servers != expected_snapshot.linked_servers
+    ):
+        raise WizardStalePlanError(
+            "Project proposals, runtime, servers, or warnings changed since preview; refresh preview before approving"
+        )
+
+
+def _build_server_to_workspaces_map(
+    workspaces: Mapping[str, WorkspaceProfile],
+    servers: Mapping[str, ServerProfile],
+) -> dict[str, list[str]]:
+    server_to_ws: dict[str, list[str]] = {name: [] for name in servers}
+    for wid, other_ws in workspaces.items():
+        for sname in other_ws.linked_servers:
+            server_to_ws.setdefault(sname, []).append(wid)
+    return server_to_ws
+
+
+def _collect_reapproval_lifecycle_warnings(discovered: Any) -> tuple[str, ...]:
+    msgs = [
+        *(d.message for d in discovered.diagnostics if d.code == "LIFECYCLE_HOOK_PRESENT"),
+        *(f"{c.name}: {c.warning}" for c in discovered.commands if c.warning),
+    ]
+    return tuple(dict.fromkeys(redact_discovery_text(msg) for msg in msgs if msg))
+
+
+def _collect_reapproval_blocking_errors(
+    hash_issues: Iterable[tuple[str, str]],
+    diagnostics: Iterable[Any],
+) -> tuple[str, ...]:
+    blocking: list[str] = [f"{rel}: {redact_discovery_text(msg)}" for rel, msg in hash_issues]
+    for diag in diagnostics:
+        if diag.code in ("MANIFEST_TOO_LARGE", "MANIFEST_PARSE_ERROR") or diag.level == "error":
+            blocking.append(f"{diag.source or diag.code}: {redact_discovery_text(diag.message)}")
+    return tuple(dict.fromkeys(blocking))
+
+
+def _verify_reapproval_snapshot(
+    ws: WorkspaceProfile,
+    workspaces: Mapping[str, WorkspaceProfile],
+    servers: Mapping[str, ServerProfile],
+    expected_snapshot: WizardPlanSnapshot,
+) -> Path:
+    if not expected_snapshot.proposal_fingerprint or not expected_snapshot.plan_fingerprint:
+        raise WizardStalePlanError("Approval snapshot is missing proposal/plan fingerprints; refresh preview")
+    if compute_registry_fingerprint(workspaces, servers) != expected_snapshot.state_fingerprint:
+        raise WizardStalePlanError(
+            "Workspace or server configuration changed since preview; refresh preview before approving"
+        )
+    canon_root = canonical_workspace_root(ws.root_path)
+    if os.path.normcase(str(canon_root)) != os.path.normcase(expected_snapshot.root_path):
+        raise WizardStalePlanError("Workspace root path changed since preview")
+    if compute_root_identity(canon_root) != expected_snapshot.root_identity:
+        raise WizardStalePlanError("Workspace directory identity changed since preview")
+    verify_manifest_digests(canon_root, expected_snapshot.manifest_digests, check_unexpected_significant=True)
+    return canon_root
+
+
+def _build_reapproved_workspace(
+    ws: WorkspaceProfile,
+    approved_digests: dict[str, str],
+    expected_snapshot: WizardPlanSnapshot,
+    *,
+    apply_command_updates: bool,
+    apply_runtime_updates: bool,
+) -> WorkspaceProfile:
+    ws_kwargs: dict[str, Any] = {
+        "manifest_digests": approved_digests,
+        "manifest_guarded": True,
+    }
+    if apply_command_updates:
+        merged_cmds = dict(ws.commands)
+        for cname, cmd_line in expected_snapshot.proposed_commands.items():
+            clean_cmd = cmd_line.strip()
+            if clean_cmd:
+                merged_cmds[cname] = clean_cmd
+        ws_kwargs["commands"] = merged_cmds
+    if apply_runtime_updates:
+        ws_kwargs.update(
+            language=expected_snapshot.proposed_language,
+            python_venv=expected_snapshot.proposed_python_venv,
+            node_path=expected_snapshot.proposed_node_path,
+            git_root=expected_snapshot.proposed_git_root,
+        )
+    updated_ws = replace(ws, **ws_kwargs)
+    updated_ws.validate()
+    return updated_ws
+
+
+def _rebuild_server_from_approved_proposal(srv: ServerProfile, prop: ServerProposal) -> ServerProfile | None:
+    from backend.servers.templates import build_profile_from_template
+
+    eff_exe = _effective_proposal_executable(srv, prop)
+    try:
+        rebuilt = build_profile_from_template(
+            name=srv.name,
+            template=srv.template,
+            cwd=srv.cwd,
+            host=srv.host,
+            port=prop.port if prop.port is not None else srv.port,
+            expose_externally=srv.expose_externally,
+            executable=eff_exe,
+            entrypoint=prop.entrypoint,
+            extra_args=prop.extra_args,
+            lifecycle=srv.lifecycle,
+            readiness_kind=srv.readiness.kind,
+            health_path=srv.readiness.http_path,
+            restart_policy=srv.restart.policy,
+            autostart=False,
+            min_profile=srv.min_profile,
+            allowed_clients=srv.allowed_clients,
+            depends_on=srv.depends_on,
+            display_name=srv.display_name,
+            description=srv.description,
+        )
+    except ValueError:
+        return None
+    merged_env = {**rebuilt.env, **srv.env}
+    return replace(
+        rebuilt,
+        env=merged_env,
+        env_secret_refs=dict(srv.env_secret_refs),
+        workspace_scoped=srv.workspace_scoped,
+        template_params={**srv.template_params, **rebuilt.template_params},
+    )
+
+
+def _apply_reapproved_server_updates(
+    workspace_id: str,
+    updatable: Iterable[str],
+    servers: dict[str, ServerProfile],
+    approved_digests: dict[str, str],
+    server_proposals: Sequence[ServerProposal],
+    *,
+    apply_server_updates: bool,
+) -> bool:
+    prop_by_tpl = {prop.template: prop for prop in server_proposals} if apply_server_updates else {}
+    changed = False
+    for sname in updatable:
+        srv = servers[sname]
+        updated_srv = srv
+        if apply_server_updates and srv.template in prop_by_tpl:
+            prop = prop_by_tpl[srv.template]
+            rebuilt = _rebuild_server_from_approved_proposal(srv, prop)
+            if rebuilt is not None:
+                updated_srv = rebuilt
+            elif prop.port is not None:
+                updated_srv = replace(srv, port=prop.port)
+        new_tp = {
+            **updated_srv.template_params,
+            "wizard_managed_workspace_id": workspace_id,
+            "manifest_guarded": True,
+            "manifest_digests": dict(approved_digests),
+        }
+        updated_srv = replace(updated_srv, template_params=new_tp)
+        updated_srv.validate()
+        servers[sname] = updated_srv
+        changed = True
+    return changed

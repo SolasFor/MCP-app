@@ -919,3 +919,8 @@
   - Локальный `ISCC.exe` (Inno Setup 6): **NOT_RUN** локально — проверяется в CI-джоби `windows-package`.
   - Ручной OAuth `sonarqube-cloud` MCP в Antigravity: **NOT_RUN** (контроль качества проверяется через публичный SonarCloud CI/API в PR).
   - N02 production gates (`PRODUCTION_TRUST_ROOTS = ()`, `PRODUCTION_PUBLISHER_THUMBPRINTS = ()`, auto-install/boot-recovery **BLOCKED** с `MISSING_TRUST_ROOTS` / `NO_ROLLBACK_CONTRACT`): сохранены без изменений.
+- **Облачный CI и SonarCloud на кодовом коммите `5d455ff` (после устранения замечаний SonarCloud `S5145`/`S8786`/`S1313`)** ([PR #41](https://github.com/SolasFor/MCP-app/pull/41), `feat/n05-ssh-device-wizard` → `main`, статус: **OPEN**, merge не выполнялся; PR #32 и версия `1.0.2` не затронуты):
+  - `Verify & Test (ubuntu-latest)`: **PASS** (`2m22s`: https://github.com/SolasFor/MCP-app/actions/runs/46146057088/job/140982265635).
+  - `Verify & Test (windows-latest)`: **PASS** (`4m40s`: https://github.com/SolasFor/MCP-app/actions/runs/46146057088/job/140982265405).
+  - `windows-package`: **PASS** (`2m54s`: https://github.com/SolasFor/MCP-app/actions/runs/46146056998/job/140982265676).
+  - `SonarCloud Code Analysis`: **PASS** (`1m4s`, Quality Gate `OK`, `new_reliability_rating=1`, `new_security_rating=1`, `new_maintainability_rating=1`, `new_duplicated_lines_density=0.4%`, `new_security_hotspots_reviewed=100.0%`, неразрешённых issues: **0**, unreviewed hotspots: **0**): https://sonarcloud.io/dashboard?id=SolasFor_MCP-app&pullRequest=41.

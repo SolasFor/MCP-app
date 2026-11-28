@@ -954,3 +954,7 @@
 ## N05 — MERGED / v1.1.0 — подготовка выпуска (2026-11-28)
 - PR #41 объединён по разрешению владельца: 759d44e11d950a17095b54ce6dff0e1285e2baca; проверенный HEAD a55ead0, 4/4 CI SUCCESS. Независимый прогон: N05 27 PASS/1 SKIPPED, N03 5 PASS. Полный 424 PASS/1 SKIPPED и frozen smoke по отчёту AG.
 - Версия 1.1.0 для промежуточного выпуска. Публикация только gated Build; unsigned auto-install и boot-recovery BLOCKED. N06–N12 feature-first, P2/P3 в docs/deferred-review.md; N13 комплексная доработка. N06 не начат. PR #32 не изменять.
+
+## v1.1.0 — PUBLISHED / N06 — подготовка (2026-11-28)
+- GitHub Release v1.1.0 опубликован 2026-11-28 15:20:30 UTC, Latest, не draft/pre-release, tag -> 5ffa0f01fd56fae0ebb0e1cbe69548834166955b. Gated Build https://github.com/SolasFor/MCP-app/actions/runs/46158637069: Verify Ubuntu, Verify Windows, Build Windows, Publish gated release SUCCESS, clean install/upgrade/uninstall PASS. Проверены метаданные пяти assets (Setup, portable, SBOM, SHA256SUMS, manifest); не скачивали и не пересобирали независимо.
+- N06: feat/n06-security-center, план ANTIGRAVITY_PROMPT.md. Feature-first N06–N12; P2/P3 в deferred-review до N13; обязательные security/CI gates сохранены. Реализация N06 не начата, версия 1.1.0. Production auto-install/boot-recovery BLOCKED, реальные данные не трогать, PR #32 не изменять.

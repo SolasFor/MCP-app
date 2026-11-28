@@ -42,3 +42,6 @@ Claude Opus high reasoning либо Carbon как единственный ор�
 
 ## N05 — профиль запуска
 Claude Opus high reasoning либо Carbon как единственный оркестратор (при доступности). Superpowers/TDD, Ponytail, Graphify AST, один основной UI/UX Pro Max или Impeccable, Break UI, Context7/официальная документация Paramiko/OpenSSH/Tailscale, SonarCloud CI и GitHub. Проверить AG Installed; Sonar MCP OAuth NOT_RUN, PR-check допустим. Не менять глобальные настройки. Сетевые тесты по умолчанию loopback fixtures; живые устройства только в отдельно согласованном scope. План ANTIGRAVITY_PROMPT.md.
+
+## N06 — профиль запуска / feature-first
+Claude Opus High Reasoning либо Carbon как единственный оркестратор. Superpowers/TDD, Ponytail, Graphify AST, один UI/UX Pro Max или Impeccable, Break UI, Context7 при необходимости, GitHub и SonarCloud CI. Реализация функций N06–N12 последовательно, точечная независимая приёмка и обязательные gates; P2/P3 в docs/deferred-review.md, комплексная доработка N13. Не менять глобальные настройки. Sonar MCP OAuth NOT_RUN не блокирует PR-check.

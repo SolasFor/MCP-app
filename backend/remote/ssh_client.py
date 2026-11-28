@@ -3,25 +3,145 @@ from __future__ import annotations
 
 import base64
 import errno
+import hmac
+import io
 import posixpath
 import secrets
 import socket
 import stat
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import paramiko
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 
+from app.core.atomic_io import is_reparse_or_symlink
 from app.core.reconnect import BackoffPolicy
+from backend.remote.host_keys import (
+    ApprovedHostKey,
+    KEX_KEY_TYPES_BY_PUBLIC_ALG,
+    compute_host_key_sha256,
+    inspect_known_hosts,
+    load_public_host_key,
+)
 from backend.remote.models import (
     DeviceProfile,
+    format_known_hosts_host,
     normalize_posix_path,
     validate_remote_posix_path,
 )
 from backend.remote.store import DeviceStore
 
 MAX_CMD_OUTPUT_BYTES = 32 * 1024
+
+
+class SSHAuthDiagnosticError(PermissionError):
+    """Auth failure carrying a machine-readable diagnostic phase/code without leaking secrets."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_PARAMIKO_KEY_CLASSES: tuple[tuple[type[Any], type[paramiko.PKey]], ...] = (
+    (rsa.RSAPrivateKey, paramiko.RSAKey),
+    (ed25519.Ed25519PrivateKey, paramiko.Ed25519Key),
+    (ec.EllipticCurvePrivateKey, paramiko.ECDSAKey),
+)
+
+
+def _validate_private_key_file(key_path: str) -> tuple[Path, bytes]:
+    clean = (key_path or "").strip()
+    if not clean or "\x00" in clean:
+        raise SSHAuthDiagnosticError("key_path_missing", "Select a private key file")
+    path = Path(clean).expanduser()
+    if is_reparse_or_symlink(path) or is_reparse_or_symlink(path.parent):
+        raise SSHAuthDiagnosticError("key_path_symlink", "Refusing symlink or reparse point key path")
+    if not path.is_file():
+        raise SSHAuthDiagnosticError("key_file_missing", "Private key file was not found")
+    try:
+        st = path.stat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 256 * 1024:
+            raise SSHAuthDiagnosticError("key_invalid_file", "Private key file is not a bounded regular file")
+        return path, path.read_bytes()
+    except OSError as exc:
+        raise SSHAuthDiagnosticError("key_unreadable", f"Cannot access private key: {type(exc).__name__}") from exc
+
+
+def _decode_cryptography_private_key(raw_bytes: bytes, pwd_bytes: bytes | None) -> Any:
+    is_openssh = b"BEGIN OPENSSH PRIVATE KEY" in raw_bytes
+    loader = serialization.load_ssh_private_key if is_openssh else serialization.load_pem_private_key
+    try:
+        return loader(data=raw_bytes, password=pwd_bytes)
+    except ValueError as val_exc:
+        if pwd_bytes is not None:
+            try:
+                loader(data=raw_bytes, password=None)
+            except TypeError:
+                raise SSHAuthDiagnosticError(
+                    "key_passphrase_invalid", "Encrypted private key passphrase was rejected"
+                ) from val_exc
+            except ValueError:
+                pass
+        raise
+
+
+def _map_key_parse_exception(exc: BaseException, pwd: str | None) -> SSHAuthDiagnosticError:
+    if isinstance(exc, paramiko.PasswordRequiredException):
+        return SSHAuthDiagnosticError("key_passphrase_required", "Private key is encrypted and requires a passphrase")
+    msg = str(exc).lower()
+    passphrase_markers = ("password", "passphrase", "encrypted", "decrypt", "incorrect", "bad decrypt")
+    if any(tok in msg for tok in passphrase_markers):
+        code = "key_passphrase_required" if not pwd else "key_passphrase_invalid"
+        label = (
+            "Private key is encrypted and requires a passphrase"
+            if code == "key_passphrase_required"
+            else "Encrypted private key passphrase was rejected"
+        )
+        return SSHAuthDiagnosticError(code, label)
+    return SSHAuthDiagnosticError("key_parse_failed", f"Cannot parse private key ({type(exc).__name__})")
+
+
+def load_private_key_strict(key_path: str, passphrase: str | None = None) -> paramiko.PKey:
+    """Safely load a user-selected regular non-symlink SSH private key without agent/auto fallback."""
+    path, raw_bytes = _validate_private_key_file(key_path)
+    pwd = passphrase or None
+    pwd_bytes = pwd.encode("utf-8") if pwd is not None else None
+    try:
+        loaded = _decode_cryptography_private_key(raw_bytes, pwd_bytes)
+        key_cls = next((cls for crypto_t, cls in _PARAMIKO_KEY_CLASSES if isinstance(loaded, crypto_t)), None)
+        if key_cls is None:
+            raise SSHAuthDiagnosticError("key_parse_failed", f"Unsupported SSH key type: {type(loaded).__name__}")
+        pkey = key_cls.from_private_key(io.StringIO(raw_bytes.decode("utf-8")), password=pwd)
+        cert_path = Path(f"{path}-cert.pub")
+        if cert_path.is_file() and not is_reparse_or_symlink(cert_path):
+            pkey.load_certificate(str(cert_path))
+        return pkey
+    except SSHAuthDiagnosticError:
+        raise
+    except (TypeError, paramiko.SSHException, ValueError, OSError) as exc:
+        raise _map_key_parse_exception(exc, pwd) from exc
+
+
+def check_ssh_agent_keys() -> int:
+    """Return number of identities exposed by the local SSH agent, or fail closed if unavailable."""
+    agent = paramiko.Agent()
+    try:
+        keys = agent.get_keys()
+        count = len(keys)
+    except Exception as exc:  # noqa: BLE001
+        raise SSHAuthDiagnosticError("agent_unavailable", f"SSH agent is unavailable: {type(exc).__name__}") from exc
+    finally:
+        try:
+            agent.close()
+        except Exception:  # noqa: BLE001
+            pass
+    if count <= 0:
+        raise SSHAuthDiagnosticError("agent_unavailable", "SSH agent has no loaded identities")
+    return count
 
 
 def _is_sftp_enoent(exc: BaseException) -> bool:
@@ -178,63 +298,262 @@ class SSHConnectionManager:
         self._store = store
         self._health_backoff = BackoffPolicy(base_seconds=0.25, max_seconds=1.5, max_attempts=2)
 
-    def _open_client(self, device: DeviceProfile, *, timeout: float = 10.0) -> paramiko.SSHClient:
-        client = paramiko.SSHClient()
-        if not device.known_hosts_path:
+    @staticmethod
+    def _build_pinned_transport_factory(expected_alg: str):
+        preferred = KEX_KEY_TYPES_BY_PUBLIC_ALG.get(expected_alg, (expected_alg,))
+
+        def _factory(sock: socket.socket, disabled_algorithms: dict[str, Any] | None = None) -> paramiko.Transport:
+            transport = paramiko.Transport(sock, disabled_algorithms=disabled_algorithms)
+            sec_opts = transport.get_security_options()
+            allowed = [k for k in preferred if k in sec_opts.key_types]
+            if allowed:
+                sec_opts.key_types = allowed
+            return transport
+
+        return _factory
+
+    @staticmethod
+    def _verify_connected_pin(client: paramiko.SSHClient, expected_key: paramiko.PKey, host: str, port: int) -> None:
+        transport = client.get_transport() if hasattr(client, "get_transport") else None
+        if transport is None:
+            return
+        remote_key = transport.get_remote_server_key()
+        if remote_key is None:
+            raise PermissionError(f"SSH server {host}:{port} provided no host key")
+        if remote_key.get_name() != expected_key.get_name() or not hmac.compare_digest(
+            remote_key.asbytes(), expected_key.asbytes()
+        ):
+            raise PermissionError(f"SSH host key CHANGED/MISMATCHED for {host}:{port}")
+
+    @staticmethod
+    def _configure_pinned_trust(
+        client: paramiko.SSHClient,
+        *,
+        host: str,
+        port: int,
+        known_hosts_path: str,
+        pinned: tuple[str, str, str],
+    ) -> tuple[paramiko.PKey, Any]:
+        expected_alg, expected_sha, expected_b64 = pinned
+        expected_pkey = load_public_host_key(expected_alg, expected_b64)
+        if compute_host_key_sha256(expected_pkey) != expected_sha:
+            raise PermissionError("Pinned SSH host key SHA-256 mismatch")
+        if known_hosts_path:
+            kh_check = inspect_known_hosts(
+                host, port, expected_pkey, known_hosts_path=known_hosts_path, include_system_known_hosts=False
+            )
+            if kh_check.status == "host_key_changed":
+                raise PermissionError(
+                    f"SSH host key CHANGED in known_hosts for {host}:{port} (refusing connection)"
+                )
+        host_keys = client.get_host_keys()
+        host_keys.clear()
+        host_keys.add(format_known_hosts_host(host, port), expected_alg, expected_pkey)
+        if port == 22 and ":" not in host:
+            host_keys.add(f"[{host}]:22", expected_alg, expected_pkey)
+        return expected_pkey, SSHConnectionManager._build_pinned_transport_factory(expected_alg)
+
+    @staticmethod
+    def _prepare_host_key_trust(
+        client: paramiko.SSHClient,
+        *,
+        host: str,
+        port: int,
+        known_hosts_path: str,
+        pinned: tuple[str, str, str] | None,
+    ) -> tuple[paramiko.PKey | None, Any | None]:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        if pinned and any(pinned):
+            return SSHConnectionManager._configure_pinned_trust(
+                client, host=host, port=port, known_hosts_path=known_hosts_path, pinned=pinned
+            )
+        if not known_hosts_path:
             try:
                 client.load_system_host_keys()
             except OSError:
                 pass
-        known_hosts = (
-            Path(device.known_hosts_path).expanduser()
-            if device.known_hosts_path
-            else (Path.home() / ".ssh" / "known_hosts")
-        )
-        if known_hosts.is_file():
+        known_hosts = Path(known_hosts_path).expanduser() if known_hosts_path else (Path.home() / ".ssh" / "known_hosts")
+        if not is_reparse_or_symlink(known_hosts) and known_hosts.is_file():
             client.load_host_keys(str(known_hosts))
-        # Fail closed: never trust an unverified host when known_hosts is absent or unmatched.
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        return None, None
 
-        password = self._store.resolve_secret_ref(device.password_ref) if device.password_ref else None
-        passphrase = self._store.resolve_secret_ref(device.passphrase_ref) if device.passphrase_ref else None
-        key_filename = str(Path(device.key_path).expanduser()) if (device.auth_method == "key" and device.key_path) else None
-        allow_agent = device.auth_method != "password_ref"
-        look_for_keys = device.auth_method == "agent"
+    def _build_auth_kwargs(
+        self,
+        *,
+        auth_method: str,
+        key_path: str,
+        password: str | None,
+        passphrase: str | None,
+        strict_key_load: bool,
+    ) -> dict[str, Any]:
+        if auth_method == "password_ref":
+            if not password:
+                raise SSHAuthDiagnosticError("password_missing", "SSH password is not configured")
+            return {
+                "password": password,
+                "pkey": None,
+                "key_filename": None,
+                "passphrase": None,
+                "allow_agent": False,
+                "look_for_keys": False,
+            }
+        if auth_method == "key":
+            pkey = load_private_key_strict(key_path, passphrase) if strict_key_load else None
+            return {
+                "password": None,
+                "pkey": pkey,
+                "key_filename": None if pkey is not None else (str(Path(key_path).expanduser()) if key_path else None),
+                "passphrase": None if pkey is not None else passphrase,
+                "allow_agent": False,
+                "look_for_keys": False,
+            }
+        return {
+            "password": None,
+            "pkey": None,
+            "key_filename": None,
+            "passphrase": None,
+            "allow_agent": True,
+            "look_for_keys": False,
+        }
 
-        try:
-            client.connect(
-                hostname=device.host,
-                port=device.port,
-                username=device.username or None,
-                password=password if device.auth_method == "password_ref" else None,
-                key_filename=key_filename,
-                passphrase=passphrase,
-                allow_agent=allow_agent,
-                look_for_keys=look_for_keys,
-                timeout=timeout,
-                banner_timeout=timeout,
-                auth_timeout=timeout,
+    @staticmethod
+    def _translate_ssh_exception(exc: paramiko.SSHException, host: str, port: int) -> Exception:
+        msg = str(exc)
+        low = msg.lower()
+        if "no acceptable host key" in low:
+            return PermissionError(
+                f"SSH host key algorithm changed or mismatched for {host}:{port} (refusing connection)"
             )
+        if "not found in known_hosts" in low or "reject" in low or "unknown" in low:
+            return PermissionError(f"SSH host key not trusted in known_hosts for {host}:{port}")
+        return SSHConnectionError(f"SSH protocol error: {exc}")
+
+    def _connect_with_params(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        auth_method: str,
+        key_path: str,
+        password: str | None,
+        passphrase: str | None,
+        known_hosts_path: str,
+        pinned: tuple[str, str, str] | None,
+        timeout: float,
+        strict_key_load: bool,
+    ) -> paramiko.SSHClient:
+        client = paramiko.SSHClient()
+        try:
+            expected_pkey, transport_factory = self._prepare_host_key_trust(
+                client, host=host, port=port, known_hosts_path=known_hosts_path, pinned=pinned
+            )
+            auth_kwargs = self._build_auth_kwargs(
+                auth_method=auth_method,
+                key_path=key_path,
+                password=password,
+                passphrase=passphrase,
+                strict_key_load=strict_key_load,
+            )
+            connect_kwargs: dict[str, Any] = {
+                "hostname": host,
+                "port": port,
+                "username": username or None,
+                "timeout": timeout,
+                "banner_timeout": timeout,
+                "auth_timeout": timeout,
+                **auth_kwargs,
+            }
+            if transport_factory is not None:
+                connect_kwargs["transport_factory"] = transport_factory
+            client.connect(**connect_kwargs)
+            if expected_pkey is not None:
+                self._verify_connected_pin(client, expected_pkey, host, port)
             return client
         except paramiko.BadHostKeyException as exc:
             client.close()
-            raise PermissionError(
-                f"SSH host key CHANGED for {device.host}:{device.port} (refusing connection)"
-            ) from exc
+            raise PermissionError(f"SSH host key CHANGED for {host}:{port} (refusing connection)") from exc
         except paramiko.AuthenticationException as exc:
             client.close()
-            raise PermissionError(f"SSH authentication failed for {device.host}:{device.port}") from exc
+            raise SSHAuthDiagnosticError("auth_failed", f"SSH authentication failed for {host}:{port}") from exc
         except paramiko.SSHException as exc:
             client.close()
-            msg = str(exc)
-            if "not found in known_hosts" in msg.lower() or "reject" in msg.lower() or "unknown" in msg.lower():
-                raise PermissionError(
-                    f"SSH host key not trusted in known_hosts for {device.host}:{device.port}"
-                ) from exc
-            raise SSHConnectionError(f"SSH protocol error: {exc}") from exc
+            raise self._translate_ssh_exception(exc, host, port) from exc
+        except (SSHAuthDiagnosticError, PermissionError):
+            client.close()
+            raise
         except (OSError, socket.error) as exc:
             client.close()
-            raise SSHConnectionError(f"SSH network error connecting to {device.host}:{device.port}: {exc}") from exc
+            raise SSHConnectionError(f"SSH network error connecting to {host}:{port}: {exc}") from exc
+
+    @contextmanager
+    def open_verified_session(
+        self,
+        *,
+        host: str,
+        port: int,
+        username: str,
+        auth_method: str,
+        approved_host_key: ApprovedHostKey,
+        key_path: str = "",
+        password: str | None = None,
+        passphrase: str | None = None,
+        known_hosts_path: str = "",
+        timeout: float = 8.0,
+    ) -> Iterator[paramiko.SSHClient]:
+        """Open a single verified SSH session bound to an approved pre-auth host key pin."""
+        if approved_host_key.host != host or approved_host_key.port != int(port):
+            raise PermissionError("Approved host key does not match target endpoint")
+        if auth_method == "agent":
+            check_ssh_agent_keys()
+        client = self._connect_with_params(
+            host=host,
+            port=int(port),
+            username=username,
+            auth_method=auth_method,
+            key_path=key_path,
+            password=password,
+            passphrase=passphrase,
+            known_hosts_path=known_hosts_path,
+            pinned=(
+                approved_host_key.key_algorithm,
+                approved_host_key.fingerprint_sha256,
+                approved_host_key.public_key_base64,
+            ),
+            timeout=timeout,
+            strict_key_load=True,
+        )
+        try:
+            yield client
+        finally:
+            client.close()
+
+    def _open_client(self, device: DeviceProfile, *, timeout: float = 10.0) -> paramiko.SSHClient:
+        password = self._store.resolve_secret_ref(device.password_ref) if device.password_ref else None
+        passphrase = self._store.resolve_secret_ref(device.passphrase_ref) if device.passphrase_ref else None
+        pinned = (
+            (
+                device.pinned_host_key_algorithm,
+                device.pinned_host_key_sha256,
+                device.pinned_host_key_base64,
+            )
+            if device.has_pinned_host_key()
+            else None
+        )
+        strict_key_load = bool(device.auth_method == "key" and device.key_path and Path(device.key_path).expanduser().exists())
+        return self._connect_with_params(
+            host=device.host,
+            port=device.port,
+            username=device.username,
+            auth_method=device.auth_method,
+            key_path=device.key_path,
+            password=password,
+            passphrase=passphrase,
+            known_hosts_path=device.known_hosts_path,
+            pinned=pinned,
+            timeout=timeout,
+            strict_key_load=strict_key_load,
+        )
 
     def run_command(
         self,

@@ -110,7 +110,7 @@ def run_local_playground_call(
         from backend.remote.store import DeviceStore
 
         mgr = RemoteManager(DeviceStore(config_root / "remote" / "devices.json"), redactor=redactor)
-        data = mgr.list_devices()
+        data = mgr.list_devices(client_id="playground-preview", client_profile=profile, from_oauth=True)
         return {
             "allowed": True,
             "live_execution": True,

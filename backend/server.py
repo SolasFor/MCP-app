@@ -1562,6 +1562,7 @@ def _server_auth_rechecker(client_id: str, srv_profile, workspace_id: str = "") 
 SERVER_MANAGER.auth_rechecker = _server_auth_rechecker
 SERVER_MANAGER.live_client_authorizer = _live_client_authorizer
 WORKSPACE_MANAGER.live_client_authorizer = _live_client_authorizer
+REMOTE_MANAGER.live_client_authorizer = _live_client_authorizer
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -2830,6 +2831,7 @@ async def device_list(group: str = "") -> dict:
             group=group,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2849,6 +2851,7 @@ async def device_info(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2868,6 +2871,7 @@ async def device_health(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, TimeoutError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2889,6 +2893,7 @@ async def ssh_execute(device_id: str, command: str, timeout: int = 12) -> dict:
             timeout=timeout,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile_mode,
@@ -2921,6 +2926,7 @@ async def ssh_task_start(device_id: str, command: str, timeout: int = 60) -> dic
             timeout=timeout,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2941,6 +2947,7 @@ async def sftp_list(device_id: str, path: str) -> dict:
             path,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2962,6 +2969,7 @@ async def sftp_download(device_id: str, path: str, as_base64: bool = False) -> d
             as_base64=as_base64,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2984,6 +2992,7 @@ async def sftp_upload(device_id: str, path: str, content: str, encoding: str = "
             encoding=encoding,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3003,6 +3012,7 @@ async def remote_service_list(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3024,6 +3034,7 @@ async def remote_service_start(device_id: str, service_name: str) -> dict:
             "start",
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3045,6 +3056,7 @@ async def remote_service_stop(device_id: str, service_name: str) -> dict:
             "stop",
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3064,6 +3076,7 @@ async def remote_metrics(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3736,25 +3749,37 @@ def _sync_ssh_exec(
     cancel_event=None,
     register_transport=None,
 ) -> str:
+    from backend.remote.models import validate_host as _val_host, validate_ssh_username as _val_user
+    from backend.remote.onboarding import inspect_ssh_config as _safe_ssh_cfg
+
+    clean_host = _val_host(host)
+    clean_user = _val_user(user, required=False)
+    port_num = int(port)
+    if not (1 <= port_num <= 65535):
+        raise ValueError(f"Invalid SSH port: {port_num}")
+
     client = paramiko.SSHClient()
     known_hosts = Path.home() / ".ssh" / "known_hosts"
     client.load_system_host_keys()
-    if known_hosts.exists():
+    if known_hosts.is_file() and not known_hosts.is_symlink():
         client.load_host_keys(str(known_hosts))
     # Never trust unknown SSH hosts silently, even in Advanced mode.
     client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
-    actual_host, actual_user, actual_port, key_filename = host, user or None, port, None
+    actual_host, actual_user, actual_port, key_filename = clean_host, clean_user or None, port_num, None
     ssh_cfg_path = Path.home() / ".ssh" / "config"
-    if ssh_cfg_path.exists():
-        cfg = paramiko.SSHConfig.from_path(str(ssh_cfg_path))
-        host_cfg = cfg.lookup(host)
-        actual_host = host_cfg.get("hostname", host)
-        if not actual_user:
-            actual_user = host_cfg.get("user")
-        if port == 22 and "port" in host_cfg:
-            actual_port = int(host_cfg["port"])
-        key_filename = host_cfg.get("identityfile")
+    if ssh_cfg_path.is_file() and not ssh_cfg_path.is_symlink():
+        report = _safe_ssh_cfg(ssh_cfg_path)
+        for cand in report.candidates:
+            if cand.source_alias == clean_host:
+                actual_host = cand.profile.host
+                if not actual_user and cand.profile.username:
+                    actual_user = cand.profile.username
+                if port_num == 22 and cand.profile.port != 22:
+                    actual_port = cand.profile.port
+                if cand.profile.key_path:
+                    key_filename = cand.profile.key_path
+                break
 
     try:
         if cancel_event is not None and cancel_event.is_set():

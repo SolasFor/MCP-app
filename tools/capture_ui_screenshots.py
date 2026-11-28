@@ -299,6 +299,46 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             win.grab().save(str(p12))
             saved.append(p12)
 
+            # 12. Workspace Addition Wizard Dark & Light (RU) with static discovery preview
+            try:
+                from app.ui.workspace_wizard import WorkspaceWizardDialog
+                from backend.workspaces.discovery import analyze_workspace_directory
+
+                wiz_sample = data_dir / "sample_next_repo"
+                wiz_sample.mkdir(parents=True, exist_ok=True)
+                (wiz_sample / "tsconfig.json").write_text("{}", encoding="utf-8")
+                (wiz_sample / "package.json").write_text(
+                    '{"name": "demo-next", "dependencies": {"next": "15.0.0"}, '
+                    '"scripts": {"dev": "next dev -p 3000", "build": "next build"}}',
+                    encoding="utf-8",
+                )
+                ws_wiz = WorkspaceWizardDialog(
+                    win.workspaces_page.store,
+                    win.workspaces_page.server_store,
+                    win.workspaces_page.coordinator,
+                    parent=win,
+                )
+                ws_wiz.path_edit.setText(str(wiz_sample))
+                ws_wiz._apply_discovery_result(analyze_workspace_directory(wiz_sample))
+                ws_wiz._set_step(3)
+                ws_wiz.resize(760, 560)
+                win.set_theme_mode(theme.THEME_DARK)
+                ws_wiz.show()
+                app.processEvents()
+                p13 = out_dir / "workspace-wizard-dark.png"
+                ws_wiz.grab().save(str(p13))
+                saved.append(p13)
+
+                win.set_theme_mode(theme.THEME_LIGHT)
+                ws_wiz.retranslate()
+                app.processEvents()
+                p14 = out_dir / "workspace-wizard-light.png"
+                ws_wiz.grab().save(str(p14))
+                saved.append(p14)
+                ws_wiz.close()
+            except Exception:
+                pass
+
             win.allow_close()
             win.close()
 

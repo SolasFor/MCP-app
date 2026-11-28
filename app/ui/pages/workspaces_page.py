@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -45,6 +46,7 @@ from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
+from app.ui.workspace_wizard import WorkspaceWizardDialog
 from app.ui.pages.servers_page import (
     LinkServerDialog,
     RenameServerDialog,
@@ -59,6 +61,7 @@ from backend.servers.manager import ServerManager
 from backend.servers.models import ServerProfile
 from backend.servers.store import ServerConfigStore
 from backend.tasks.store import TaskStore
+from backend.workspaces.discovery import ManifestDriftError, verify_manifest_digests
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.manager import WorkspaceManager
 from backend.workspaces.models import (
@@ -152,7 +155,12 @@ class WorkspaceProfileDialog(SilentDialog):
     ) -> None:
         super().__init__(parent)
         self._store = store
-        self._base = existing or WorkspaceProfile(workspace_id="", name="", root_path="")
+        self._base = existing or WorkspaceProfile(
+            workspace_id="",
+            name="",
+            root_path="",
+            allow_oauth_clients=False,
+        )
         self._is_new = is_new
         self.saved_profile: WorkspaceProfile | None = None
 
@@ -241,6 +249,10 @@ class WorkspaceProfileDialog(SilentDialog):
         opts_row.addStretch(1)
         form.addRow("", opts_row)
 
+        self.allow_oauth_check = QCheckBox(tr("workspaces.dlg.allow_oauth_clients"))
+        self.allow_oauth_check.setChecked(self._base.allow_oauth_clients)
+        form.addRow("", self.allow_oauth_check)
+
         access_row = QHBoxLayout()
         self.min_profile_combo = SafeComboBox()
         for mp in WORKSPACE_MIN_PROFILES:
@@ -250,6 +262,7 @@ class WorkspaceProfileDialog(SilentDialog):
         )
         self.allowed_clients_edit = QLineEdit(", ".join(self._base.allowed_clients))
         self.allowed_clients_edit.setObjectName("UiInput")
+        self.allowed_clients_edit.setPlaceholderText(tr("workspaces.dlg.allowed_clients_ph"))
         access_row.addWidget(self.min_profile_combo, 1)
         access_row.addWidget(self.allowed_clients_edit, 2)
         form.addRow(
@@ -342,6 +355,8 @@ class WorkspaceProfileDialog(SilentDialog):
                 client_permissions=dict(self._base.client_permissions),
                 allowed_clients=_parse_csv(self.allowed_clients_edit.text()),
                 min_profile=str(self.min_profile_combo.currentData() or "allowlist"),
+                allow_oauth_clients=self.allow_oauth_check.isChecked(),
+                manifest_digests=dict(self._base.manifest_digests),
                 trust_git_hooks=self.trust_hooks_check.isChecked(),
                 enabled=self.enabled_check.isChecked(),
                 description=self._base.description,
@@ -989,6 +1004,12 @@ class WorkspacesPage(PageScaffold):
     def _open_list_menu(self) -> None:
         specs = [
             MenuActionSpec(
+                key="add_manual",
+                label=tr("workspaces.btn.add_manual"),
+                callback=self.add_workspace_manual,
+                icon_name="plus",
+            ),
+            MenuActionSpec(
                 key="template_server",
                 label=tr("workspaces.btn.template_server"),
                 callback=self.add_server_from_template,
@@ -1022,7 +1043,8 @@ class WorkspacesPage(PageScaffold):
         wid = self._row_id(row)
         if not wid or wid not in self._profiles:
             return []
-        return [
+        prof = self._profiles[wid]
+        specs = [
             MenuActionSpec(
                 key="edit",
                 label=tr("workspaces.btn.edit"),
@@ -1035,6 +1057,17 @@ class WorkspacesPage(PageScaffold):
                 callback=lambda w=wid: self._copy_item_id(w),
                 icon_name="copy",
             ),
+        ]
+        if prof.manifest_digests:
+            specs.append(
+                MenuActionSpec(
+                    key="reapprove_manifests",
+                    label=tr("workspaces.btn.reapprove_manifests"),
+                    callback=lambda w=wid: self._reapprove_workspace_manifests(w),
+                    icon_name="shield",
+                )
+            )
+        specs.append(
             MenuActionSpec(
                 key="delete",
                 label=tr("workspaces.btn.delete"),
@@ -1042,8 +1075,9 @@ class WorkspacesPage(PageScaffold):
                 icon_name="trash",
                 danger=True,
                 separator_before=True,
-            ),
-        ]
+            )
+        )
+        return specs
 
     def _build_ws_server_menu(self, row: int) -> list[MenuActionSpec]:
         name, is_missing = self._server_row_info(self.ws_servers_table, row)
@@ -1170,9 +1204,40 @@ class WorkspacesPage(PageScaffold):
 
     # ------------------------------ Workspace CRUD ------------------------------
     def add_workspace(self) -> None:
+        dlg = WorkspaceWizardDialog(
+            self.store,
+            self.server_store,
+            self.coordinator,
+            parent=self,
+        )
+        accepted = dlg.exec()
+        if accepted and dlg.committed_workspace_id:
+            wid = dlg.committed_workspace_id
+            prof = self.store.get_workspace(wid)
+            label = prof.name if prof is not None else wid
+            self.config_changed.emit()
+            self.status_message.emit(tr("workspaces.toast.saved", name=label), "ok")
+            self.reload()
+            self.select_workspace(wid)
+        elif dlg.manual_requested:
+            self.add_workspace_manual()
+
+    def add_workspace_manual(self) -> None:
         dlg = WorkspaceProfileDialog(self.store, is_new=True, parent=self)
         if dlg.exec() and dlg.saved_profile is not None:
             self.save_profile(dlg.saved_profile)
+            self.select_workspace(dlg.saved_profile.workspace_id)
+
+    def _reapprove_workspace_manifests(self, wid: str) -> None:
+        try:
+            updated = self.store.refresh_manifest_digests(wid)
+            self.config_changed.emit()
+            self.status_message.emit(
+                tr("workspaces.toast.manifests_reapproved", name=updated.name), "ok"
+            )
+            self.reload()
+        except Exception as exc:
+            SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
 
     def save_profile(self, profile: WorkspaceProfile) -> None:
         self.store.upsert_workspace(profile)
@@ -1532,10 +1597,51 @@ class WorkspacesPage(PageScaffold):
             )
         return asyncio.run(self.manager.run_workspace_task(wid, cname, client_id="owner"))
 
+    def _confirm_task_execution_prerequisites(self, wid: str, cname: str) -> bool:
+        prof = self._profiles.get(wid)
+        if prof is None:
+            return False
+        if prof.manifest_digests:
+            try:
+                verify_manifest_digests(Path(prof.root_path), prof.manifest_digests)
+            except ManifestDriftError:
+                ans = SilentMessageBox.question(
+                    self,
+                    tr("workspaces.exec_confirm.title"),
+                    tr("workspaces.exec_confirm.drift_body", name=prof.name, cmd_name=cname),
+                    SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                    SilentMessageBox.StandardButton.No,
+                )
+                if ans != SilentMessageBox.StandardButton.Yes:
+                    return False
+                prof = self.store.refresh_manifest_digests(wid)
+                self.reload()
+        if not prof.permissions.execute:
+            ans = SilentMessageBox.question(
+                self,
+                tr("workspaces.exec_confirm.title"),
+                tr(
+                    "workspaces.exec_confirm.body",
+                    cmd_name=cname,
+                    root=prof.root_path,
+                    command=prof.commands.get(cname, ""),
+                ),
+                SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
+                SilentMessageBox.StandardButton.No,
+            )
+            if ans != SilentMessageBox.StandardButton.Yes:
+                return False
+            updated = replace(prof, permissions=replace(prof.permissions, execute=True))
+            self.save_profile(updated)
+            self.select_workspace(wid)
+        return True
+
     def run_selected_task(self) -> None:
         wid = self._selected_id()
         cname = str(self.cmd_combo.currentData() or "")
         if not wid or not cname:
+            return
+        if not self._confirm_task_execution_prerequisites(wid, cname):
             return
         self._spawn_op(
             "task",

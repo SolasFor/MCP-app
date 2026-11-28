@@ -500,6 +500,64 @@ _STRINGS: dict[str, dict[str, str]] = {
         "workspaces.dlg.enabled": "Включено",
         "workspaces.dlg.min_profile": "Мин. профиль OAuth",
         "workspaces.dlg.allowed_clients": "Разрешённые client_id",
+        "workspaces.dlg.allowed_clients_ph": "ID клиентов через запятую",
+        "workspaces.dlg.allow_oauth_clients": "Разрешить доступ OAuth-клиентам к этому проекту",
+        "workspaces.btn.add_manual": "Добавить вручную…",
+        "workspaces.btn.reapprove_manifests": "Повторно подтвердить манифесты",
+        "workspaces.toast.manifests_reapproved": "Хеши манифестов обновлены для «{name}»",
+        "workspaces.exec_confirm.title": "Подтверждение запуска команды проекта",
+        "workspaces.exec_confirm.body": (
+            "Запустить команду «{cmd_name}» в каталоге:\n{root}\n\n"
+            "Команда: {command}\n\n"
+            "Внимание: выполнение не изолировано OS-песочницей и использует права текущего пользователя Windows "
+            "(скрипты npm/pnpm/yarn/bun могут запускать pre/post-хуки). Включить Execute и запустить?"
+        ),
+        "workspaces.exec_confirm.drift_body": (
+            "Манифесты проекта «{name}» изменились на диске после последнего подтверждения.\n\n"
+            "Проверьте файлы проекта и подтвердите обновление хешей манифестов перед запуском «{cmd_name}»?"
+        ),
+        "workspaces.wizard.title": "Мастер добавления Workspace",
+        "workspaces.wizard.lead": "Статический read-only анализ проекта без запуска кода, сети и чтения секретов.",
+        "workspaces.wizard.step.source": "1. Каталог",
+        "workspaces.wizard.step.analysis": "2. Анализ",
+        "workspaces.wizard.step.proposals": "3. Предложения",
+        "workspaces.wizard.step.access": "4. Доступ и итог",
+        "workspaces.wizard.mode.single": "Конкретная папка проекта",
+        "workspaces.wizard.mode.scan": "Поиск в родительском каталоге",
+        "workspaces.wizard.path_label": "Каталог",
+        "workspaces.wizard.path_ph": "Выберите локальную папку проекта или родительский каталог…",
+        "workspaces.wizard.scan_depth": "Глубина поиска",
+        "workspaces.wizard.readonly_note": (
+            "Гарантия read-only: мастер не выполняет код проекта, скрипты и команды, "
+            "не обращается к сети, не устанавливает пакеты и не читает .env / ключи / секреты."
+        ),
+        "workspaces.wizard.manual_btn": "Ручная форма…",
+        "workspaces.wizard.analyzing": "Выполняется безопасный статический анализ манифестов…",
+        "workspaces.wizard.cancel_scan": "Прервать анализ",
+        "workspaces.wizard.candidates": "Обнаруженные проекты / модули монорепо",
+        "workspaces.wizard.use_root": "Использовать корневой каталог",
+        "workspaces.wizard.confidence": "Уверенность",
+        "workspaces.wizard.sources": "Источники",
+        "workspaces.wizard.unknown_hint": (
+            "Признаки известного стека не обнаружены — доступен ручной ввод команд и параметров."
+        ),
+        "workspaces.wizard.cmds_title": "Предложенные команды (все поля редактируемы; работоспособность не проверялась)",
+        "workspaces.wizard.cmd_name_ph": "имя (например test)",
+        "workspaces.wizard.cmd_val_ph": "команда",
+        "workspaces.wizard.add_cmd": "Добавить команду",
+        "workspaces.wizard.servers_title": "Предлагаемые профили серверов (autostart=выкл, workspace_scoped=вкл)",
+        "workspaces.wizard.existing_servers": "Привязать существующие серверы (необязательно; права не расширяются)",
+        "workspaces.wizard.oauth_mode": "Режим OAuth-клиентов",
+        "workspaces.wizard.oauth_specific": "Только указанные client_id",
+        "workspaces.wizard.oauth_all": "Все одобренные клиенты (>= мин. профиля)",
+        "workspaces.wizard.ack_nested": "Подтверждаю создание вложенного/пересекающегося Workspace",
+        "workspaces.wizard.preview_title": "Предпросмотр изменений и эффективных прав (запись только после «Создать»)",
+        "workspaces.wizard.btn.back": "Назад",
+        "workspaces.wizard.btn.next": "Далее",
+        "workspaces.wizard.btn.analyze": "Анализировать",
+        "workspaces.wizard.btn.commit": "Создать Workspace",
+        "workspaces.wizard.need_path": "Укажите существующий локальный каталог.",
+        "workspaces.wizard.need_client_ids": "При выборе режима «Только указанные client_id» укажите хотя бы один client_id.",
         "workspaces.dlg.plain_env": "Обычные env (KEY=VAL)",
         "workspaces.dlg.secret_env": "Секретные env (KEY=VAL)",
         "workspaces.dlg.secret_hint": "Оставьте пустым, чтобы не менять секреты (SecretStore)",
@@ -1342,6 +1400,64 @@ _STRINGS: dict[str, dict[str, str]] = {
         "workspaces.dlg.enabled": "Enabled",
         "workspaces.dlg.min_profile": "Min OAuth Profile",
         "workspaces.dlg.allowed_clients": "Allowed client_ids",
+        "workspaces.dlg.allowed_clients_ph": "Comma-separated client IDs",
+        "workspaces.dlg.allow_oauth_clients": "Allow OAuth clients to access this workspace",
+        "workspaces.btn.add_manual": "Add Manually…",
+        "workspaces.btn.reapprove_manifests": "Re-approve Manifests",
+        "workspaces.toast.manifests_reapproved": "Manifest digests refreshed for '{name}'",
+        "workspaces.exec_confirm.title": "Confirm Workspace Command Execution",
+        "workspaces.exec_confirm.body": (
+            "Run command '{cmd_name}' in directory:\n{root}\n\n"
+            "Command: {command}\n\n"
+            "Warning: execution is NOT OS-sandboxed and runs with current Windows user privileges "
+            "(npm/pnpm/yarn/bun scripts may execute pre/post lifecycle hooks). Enable Execute and run?"
+        ),
+        "workspaces.exec_confirm.drift_body": (
+            "Manifests in workspace '{name}' changed on disk since last approval.\n\n"
+            "Review the project files and re-approve manifest digests before running '{cmd_name}'?"
+        ),
+        "workspaces.wizard.title": "Add Workspace Wizard",
+        "workspaces.wizard.lead": "Static read-only project discovery without code execution, network access, or secret reads.",
+        "workspaces.wizard.step.source": "1. Directory",
+        "workspaces.wizard.step.analysis": "2. Analysis",
+        "workspaces.wizard.step.proposals": "3. Proposals",
+        "workspaces.wizard.step.access": "4. Access & Review",
+        "workspaces.wizard.mode.single": "Single project folder",
+        "workspaces.wizard.mode.scan": "Discover inside parent folder",
+        "workspaces.wizard.path_label": "Directory",
+        "workspaces.wizard.path_ph": "Select a local project directory or parent folder…",
+        "workspaces.wizard.scan_depth": "Scan depth",
+        "workspaces.wizard.readonly_note": (
+            "Read-only guarantee: the wizard never runs project code, scripts, or binaries, "
+            "makes zero network requests, installs nothing, and never reads .env / keys / secrets."
+        ),
+        "workspaces.wizard.manual_btn": "Manual Form…",
+        "workspaces.wizard.analyzing": "Running bounded static manifest analysis…",
+        "workspaces.wizard.cancel_scan": "Cancel Scan",
+        "workspaces.wizard.candidates": "Detected projects / monorepo subprojects",
+        "workspaces.wizard.use_root": "Use Root Directory",
+        "workspaces.wizard.confidence": "Confidence",
+        "workspaces.wizard.sources": "Sources",
+        "workspaces.wizard.unknown_hint": (
+            "No known stack signatures found — you can configure commands and settings manually."
+        ),
+        "workspaces.wizard.cmds_title": "Suggested Commands (editable proposals; not verified by execution)",
+        "workspaces.wizard.cmd_name_ph": "name (e.g. test)",
+        "workspaces.wizard.cmd_val_ph": "command",
+        "workspaces.wizard.add_cmd": "Add Command",
+        "workspaces.wizard.servers_title": "Suggested Server Profiles (autostart=off, workspace_scoped=on)",
+        "workspaces.wizard.existing_servers": "Link existing servers (optional; never widens permissions)",
+        "workspaces.wizard.oauth_mode": "OAuth Client Mode",
+        "workspaces.wizard.oauth_specific": "Only listed client_ids",
+        "workspaces.wizard.oauth_all": "All approved clients (>= min profile)",
+        "workspaces.wizard.ack_nested": "Acknowledge nested/overlapping Workspace relationship",
+        "workspaces.wizard.preview_title": "Preview Changes & Effective Permissions (nothing written until Commit)",
+        "workspaces.wizard.btn.back": "Back",
+        "workspaces.wizard.btn.next": "Next",
+        "workspaces.wizard.btn.analyze": "Analyze",
+        "workspaces.wizard.btn.commit": "Create Workspace",
+        "workspaces.wizard.need_path": "Select an existing local directory.",
+        "workspaces.wizard.need_client_ids": "Provide at least one client_id when 'Only listed client_ids' is selected.",
         "workspaces.dlg.plain_env": "Plain Env Vars (KEY=VAL)",
         "workspaces.dlg.secret_env": "Secret Env Vars (KEY=VAL)",
         "workspaces.dlg.secret_hint": "Leave blank to preserve existing SecretStore values",

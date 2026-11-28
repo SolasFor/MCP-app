@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0] - 2026-11-28 (Workspaces and secure SSH onboarding)
+- N01: lifecycle and scheduler fixes.
+- N02: staged updater; production auto-install and boot recovery remain blocked.
+- N03: unified Server Manager inside Workspaces.
+- N04: bounded read-only discovery, manifest drift and exact preview approval.
+- N05: secure SSH onboarding, opt-in discovery, deny-by-default and unified legacy trust.
+- Manual installation only; no trusted publisher signature. See docs/releases/v1.1.0.md.
+
 ## [1.0.2] - 2026-11-27 (Compact management UI and contextual guides)
 - Connections: provider-specific Configure / Diagnose / Instructions context menus; aligned transport rows and compact owner-token controls.
 - Logs: unified search/source/level panel, compact actions, separate counters and no direct export button; persistent logs and protected audit remain.

@@ -9,7 +9,7 @@
 | N02 | Безопасное автообновление | N01 | MERGED (PR #38, 4b9bedb; production auto-install/boot-recovery BLOCKED, отдельный gate docs/auto-update.md) |
 | N03 | Server Manager внутри Workspaces; убрать отдельную навигацию «Серверы» | N01 | MERGED (PR #39, 3c0d1a1; независимые 24/24 N03 tests) |
 | N04 | Мастер добавления Workspaces | N03 | MERGED (PR #40, bebf7ea; независимые 22/22 N04 tests и venv drift regression) |
-| N05 | Мастер SSH-подключения устройств | N01 | VERIFIED (реализовано на ветке `feat/n05-ssh-device-wizard`, ждёт PR/CI и независимой приёмки; `RejectPolicy`, pre-auth host-key, opt-in discovery, deny-by-default OAuth, WAL) |
+| N05 | Мастер SSH-подключения устройств | N01 | MERGED (PR #41, 759d44e; независимые 32 PASS, 1 SKIPPED N05/N03) |
 | N06 | Центр безопасности | N01 | TODO |
 | N07 | Восстановление соединений | N01 | TODO |
 | N08 | Мониторинг и главная страница | N06, N07 | TODO |
@@ -18,6 +18,9 @@
 | N11 | Каталог и обновления расширений | N06 | TODO |
 | N12 | Визуальные последовательности автоматизации | N03, N06 | TODO |
 | N13 | Полная регрессия, документация, релизная приёмка | N02–N12 | TODO |
+
+## Порядок следующих этапов
+N06–N12: feature-first, целевая независимая приёмка и обязательные CI/security gates. Некритичные P2/P3 в [реестр N13](docs/deferred-review.md); блокирующие дефекты безопасности, данных, прав и работоспособности исправлять до merge. N13 — комплексная доработка. v1.1.0 — промежуточный выпуск N01–N05; публикацию подтверждает GitHub Release после gated Build.
 
 ## Содержание этапов
 

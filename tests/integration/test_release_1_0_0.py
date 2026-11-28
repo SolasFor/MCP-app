@@ -203,10 +203,10 @@ class Release100E2ETests(unittest.TestCase):
                 runner.close()
 
     def test_version_consistency_and_tracked_secret_scan(self) -> None:
-        self.assertEqual(__version__, "1.0.2")
+        self.assertEqual(__version__, "1.1.0")
         repo_root = Path(__file__).resolve().parents[2]
         pyproj = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertRegex(pyproj, r'version\s*=\s*"1\.0\.2"')
+        self.assertRegex(pyproj, r'version\s*=\s*"1\.1\.0"')
 
         # Tracked files must never contain real leaked API keys or private key headers
         ls = subprocess.run(

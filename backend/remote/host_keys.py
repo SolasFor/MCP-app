@@ -475,22 +475,36 @@ def verify_independent_host_key(
     )
 
 
+def _parse_known_hosts_tokens(line: str) -> tuple[list[str], paramiko.PKey] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in stripped):
+        return None
+    parts = stripped.split()
+    if parts and parts[0].startswith("@"):
+        parts = parts[1:]
+    if len(parts) < 3 or parts[1] not in SUPPORTED_HOST_KEY_ALGORITHMS:
+        return None
+    try:
+        pkey = load_public_host_key(parts[1], parts[2])
+    except ValueError:
+        return None
+    hostnames = [h.strip() for h in parts[0].split(",") if h.strip()]
+    return (hostnames, pkey) if hostnames else None
+
+
 def _line_matches_endpoint_key(
     line: str,
     lookup_names: tuple[str, ...],
 ) -> bool:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
+    parsed = _parse_known_hosts_tokens(line)
+    if parsed is None:
         return False
-    try:
-        entry = paramiko.hostkeys.HostKeyEntry.from_line(stripped)
-    except Exception:  # noqa: BLE001
-        return False
-    if entry is None:
-        return False
+    hostnames, pkey = parsed
     hk = paramiko.HostKeys()
-    for name in entry.hostnames:
-        hk.add(name, entry.key.get_name(), entry.key)
+    for name in hostnames:
+        hk.add(name, pkey.get_name(), pkey)
     return any(bool(hk.lookup(lname)) for lname in lookup_names)
 
 

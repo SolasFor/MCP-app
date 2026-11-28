@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from app.core.tunnels.base import run_cli_capture
 from app.core.tunnels.tailscale import _find_tailscale
 
-_CGNAT_NET = ipaddress.IPv4Network("100.64.0.0/10")
+_CGNAT_NET = ipaddress.IPv4Network((0x64400000, 10))  # RFC 6598 100.64.0.0/10 CGNAT
 
 
 @dataclass(frozen=True)

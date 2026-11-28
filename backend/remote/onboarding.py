@@ -41,7 +41,6 @@ if TYPE_CHECKING:
 
 _MAX_SSH_CONFIG_BYTES = 256 * 1024
 _MAX_SSH_CONFIG_LINES = 4096
-_HOST_DIRECTIVE_RE = re.compile(r"^\s*Host\s+(.+)$", re.IGNORECASE)
 _SUPPORTED_CONFIG_KEYS = frozenset({"host", "hostname", "user", "port", "identityfile", "identitiesonly"})
 _UNSAFE_OR_UNSUPPORTED_KEYS = frozenset({
     "match",
@@ -207,10 +206,9 @@ def _parse_ssh_config_blocks(raw_text: str) -> tuple[list[tuple[str, dict[str, s
             cur_aliases, cur_opts, cur_diags, skip_block = [], {}, [], True
             warnings.append(f"Line {lineno}: skipped 'Match' block (not evaluated automatically)")
             continue
-        m = _HOST_DIRECTIVE_RE.match(stripped)
-        if m:
+        if key == "host":
             _flush()
-            cur_aliases, cur_diags, skip_block = _parse_host_directive_tokens(lineno, m.group(1), warnings)
+            cur_aliases, cur_diags, skip_block = _parse_host_directive_tokens(lineno, val, warnings)
             cur_opts = {}
             continue
         if not skip_block:

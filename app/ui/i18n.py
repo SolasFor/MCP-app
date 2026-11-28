@@ -504,7 +504,20 @@ _STRINGS: dict[str, dict[str, str]] = {
         "workspaces.dlg.allow_oauth_clients": "Разрешить доступ OAuth-клиентам к этому проекту",
         "workspaces.btn.add_manual": "Добавить вручную…",
         "workspaces.btn.reapprove_manifests": "Повторно подтвердить манифесты",
-        "workspaces.toast.manifests_reapproved": "Хеши манифестов обновлены для «{name}»",
+        "workspaces.toast.manifests_reapproved": "Конфигурация и хеши манифестов обновлены для «{name}»",
+        "workspaces.reapprove.title": "Предпросмотр изменений манифестов",
+        "workspaces.reapprove.lead": (
+            "Манифесты или конфигурация проекта «{name}» изменились. "
+            "Проверьте отличия ниже — команды и код проекта не запускались."
+        ),
+        "workspaces.reapprove.apply_commands": "Применить новые/изменённые предложенные команды",
+        "workspaces.reapprove.apply_runtime": "Обновить параметры runtime (язык / venv / Node / Git)",
+        "workspaces.reapprove.apply_servers": "Обновить предложенные параметры связанных серверов мастера",
+        "workspaces.reapprove.refresh": "Обновить анализ",
+        "workspaces.reapprove.approve": "Подтвердить изменения",
+        "workspaces.reapprove.blocked": "Утверждение заблокировано из-за ошибок чтения, размера или безопасности манифестов.",
+        "workspaces.reapprove.stale": "Файлы или настройки изменились после предпросмотра — данные обновлены.",
+        "workspaces.reapprove.none": "Расхождений манифестов или параметров не обнаружено.",
         "workspaces.exec_confirm.title": "Подтверждение запуска команды проекта",
         "workspaces.exec_confirm.body": (
             "Запустить команду «{cmd_name}» в каталоге:\n{root}\n\n"
@@ -1404,7 +1417,20 @@ _STRINGS: dict[str, dict[str, str]] = {
         "workspaces.dlg.allow_oauth_clients": "Allow OAuth clients to access this workspace",
         "workspaces.btn.add_manual": "Add Manually…",
         "workspaces.btn.reapprove_manifests": "Re-approve Manifests",
-        "workspaces.toast.manifests_reapproved": "Manifest digests refreshed for '{name}'",
+        "workspaces.toast.manifests_reapproved": "Manifest approval updated for '{name}'",
+        "workspaces.reapprove.title": "Review Manifest Changes",
+        "workspaces.reapprove.lead": (
+            "Manifests or project settings for '{name}' changed on disk. "
+            "Review the diff below — no project code or scripts were executed."
+        ),
+        "workspaces.reapprove.apply_commands": "Apply new/updated suggested commands",
+        "workspaces.reapprove.apply_runtime": "Update detected runtime settings (language / venv / Node / Git)",
+        "workspaces.reapprove.apply_servers": "Update suggested parameters on wizard-managed servers",
+        "workspaces.reapprove.refresh": "Refresh Analysis",
+        "workspaces.reapprove.approve": "Approve Changes",
+        "workspaces.reapprove.blocked": "Approval is blocked until manifest size, parse, or security errors are resolved.",
+        "workspaces.reapprove.stale": "Files or settings changed since preview — preview refreshed.",
+        "workspaces.reapprove.none": "No manifest or parameter differences detected.",
         "workspaces.exec_confirm.title": "Confirm Workspace Command Execution",
         "workspaces.exec_confirm.body": (
             "Run command '{cmd_name}' in directory:\n{root}\n\n"

@@ -22,8 +22,16 @@ from backend.workspaces.discovery import (
     WizardConflictError,
     WizardPlanSnapshot,
     WizardStalePlanError,
+    analyze_workspace_directory,
     compute_registry_fingerprint,
     compute_root_identity,
+    redact_discovery_text,
+)
+from backend.workspaces.manifest_policy import (
+    ManifestDriftError,
+    ManifestReapprovalPreview,
+    build_manifest_change_items,
+    collect_significant_manifest_digests,
     verify_manifest_digests,
 )
 from backend.workspaces.models import (
@@ -230,11 +238,14 @@ def _rewrite_workspace_links_map(
 ) -> bool:
     changed = False
     for wid, ws in list(workspaces.items()):
-        if old_name not in ws.linked_servers:
+        in_linked = old_name in ws.linked_servers
+        in_wiz = old_name in ws.wizard_servers
+        if not in_linked and not in_wiz:
             continue
         workspaces[wid] = replace(
             ws,
             linked_servers=_dedupe_preserve([new_name if s == old_name else s for s in ws.linked_servers]),
+            wizard_servers=_dedupe_preserve([new_name if s == old_name else s for s in ws.wizard_servers]),
         )
         changed = True
     return changed
@@ -904,10 +915,11 @@ class WorkspaceServerCoordinator:
             workspaces = self.workspace_store.load_workspaces()
             ws_changed = False
             for wid, ws in list(workspaces.items()):
-                if clean_srv in ws.linked_servers:
+                if clean_srv in ws.linked_servers or clean_srv in ws.wizard_servers:
                     workspaces[wid] = replace(
                         ws,
                         linked_servers=tuple(s for s in ws.linked_servers if s != clean_srv),
+                        wizard_servers=tuple(s for s in ws.wizard_servers if s != clean_srv),
                     )
                     ws_changed = True
 
@@ -1023,7 +1035,19 @@ class WorkspaceServerCoordinator:
         )
 
     @staticmethod
-    def _normalize_new_wizard_server(srv: ServerProfile) -> ServerProfile:
+    def _normalize_new_wizard_server(
+        srv: ServerProfile,
+        *,
+        workspace_id: str = "",
+        manifest_digests: Mapping[str, str] | None = None,
+    ) -> ServerProfile:
+        tp = dict(srv.template_params)
+        if workspace_id:
+            tp["wizard_managed_workspace_id"] = workspace_id
+        tp["manifest_guarded"] = True
+        tp["manifest_digests"] = dict(
+            manifest_digests if manifest_digests is not None else tp.get("manifest_digests") or {}
+        )
         normalized = replace(
             srv,
             workspace_scoped=True,
@@ -1031,6 +1055,7 @@ class WorkspaceServerCoordinator:
             expose_externally=False,
             env_secret_refs={},
             min_profile="full",
+            template_params=tp,
         )
         normalized.validate()
         return normalized
@@ -1145,7 +1170,13 @@ class WorkspaceServerCoordinator:
         expected_root_identity: tuple[int, int] | None = None,
     ) -> WizardAdditionPreview:
         """Build a consistent non-mutating preview + state fingerprint for the Workspace Wizard."""
-        normalized_new = [self._normalize_new_wizard_server(s) for s in new_servers]
+        digests_seed = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        normalized_new = [
+            self._normalize_new_wizard_server(
+                s, workspace_id=profile.workspace_id, manifest_digests=digests_seed
+            )
+            for s in new_servers
+        ]
         normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
 
         with ExitStack() as stack:
@@ -1159,17 +1190,23 @@ class WorkspaceServerCoordinator:
         )
         if expected_root_identity is not None and root_ident != expected_root_identity:
             raise WizardStalePlanError("Workspace directory identity changed on disk since analysis")
-        digests = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
-        if digests:
-            verify_manifest_digests(canon_root, digests)
+        verify_manifest_digests(canon_root, digests_seed, check_unexpected_significant=True)
 
         combined_links = _dedupe_preserve([*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links])
-        preview_profile = replace(profile, root_path=str(canon_root), linked_servers=combined_links, manifest_digests=digests)
+        wiz_servers = _dedupe_preserve([*profile.wizard_servers, *(s.name for s in normalized_new)])
+        preview_profile = replace(
+            profile,
+            root_path=str(canon_root),
+            linked_servers=combined_links,
+            manifest_digests=digests_seed,
+            manifest_guarded=True,
+            wizard_servers=wiz_servers,
+        )
         snapshot = WizardPlanSnapshot(
             state_fingerprint=compute_registry_fingerprint(workspaces, servers),
             root_path=str(canon_root),
             root_identity=root_ident,
-            manifest_digests=digests,
+            manifest_digests=digests_seed,
             existing_workspace_ids=tuple(sorted(workspaces)),
             existing_server_names=tuple(sorted(servers)),
         )
@@ -1208,8 +1245,7 @@ class WorkspaceServerCoordinator:
         if expected_root_identity is not None and root_ident != expected_root_identity:
             raise WizardStalePlanError("Workspace root directory changed on disk since preview")
         digests = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
-        if digests:
-            verify_manifest_digests(canon_root, digests)
+        verify_manifest_digests(canon_root, digests, check_unexpected_significant=True)
         if conflicts:
             raise WizardConflictError("; ".join(conflicts))
         if nested and (not acknowledge_nested or (ack_nested_set and ack_nested_set != set(nested))):
@@ -1231,7 +1267,13 @@ class WorkspaceServerCoordinator:
         expected_nested_ids: Iterable[str] = (),
     ) -> dict[str, Any]:
         """Atomically commit a wizard workspace, new scoped servers, and explicit links without autostart."""
-        normalized_new = [self._normalize_new_wizard_server(s) for s in new_servers]
+        digests_seed = dict(expected_manifest_digests if expected_manifest_digests is not None else profile.manifest_digests)
+        normalized_new = [
+            self._normalize_new_wizard_server(
+                s, workspace_id=profile.workspace_id, manifest_digests=digests_seed
+            )
+            for s in new_servers
+        ]
         normalized_links = list(_dedupe_preserve([validate_server_name(s) for s in link_existing_servers]))
         ack_nested_set = {str(x).strip() for x in expected_nested_ids if str(x).strip()}
 
@@ -1246,14 +1288,22 @@ class WorkspaceServerCoordinator:
                 servers,
                 expected_state_fingerprint=expected_state_fingerprint,
                 expected_root_identity=expected_root_identity,
-                expected_manifest_digests=expected_manifest_digests,
+                expected_manifest_digests=digests_seed,
                 acknowledge_nested=acknowledge_nested,
                 ack_nested_set=ack_nested_set,
             )
 
             srv_changed = False
             for srv in normalized_new:
-                servers[srv.name] = srv
+                servers[srv.name] = replace(
+                    srv,
+                    template_params={
+                        **srv.template_params,
+                        "wizard_managed_workspace_id": profile.workspace_id,
+                        "manifest_guarded": True,
+                        "manifest_digests": dict(digests),
+                    },
+                )
                 srv_changed = True
             for sname in normalized_links:
                 existing_srv = servers[sname]
@@ -1264,11 +1314,14 @@ class WorkspaceServerCoordinator:
             combined_links = _dedupe_preserve(
                 [*profile.linked_servers, *(s.name for s in normalized_new), *normalized_links]
             )
+            wiz_servers = _dedupe_preserve([*profile.wizard_servers, *(s.name for s in normalized_new)])
             final_ws = replace(
                 profile,
                 root_path=str(canon_root),
                 linked_servers=combined_links,
                 manifest_digests=digests,
+                manifest_guarded=True,
+                wizard_servers=wiz_servers,
             )
             final_ws.validate()
             workspaces[final_ws.workspace_id] = final_ws
@@ -1285,3 +1338,390 @@ class WorkspaceServerCoordinator:
             )
 
         return self._run_tx(_plan)
+
+    @staticmethod
+    def _classify_linked_servers_for_reapproval(
+        ws: WorkspaceProfile,
+        canon_root: Path,
+        servers: Mapping[str, ServerProfile],
+        server_to_workspaces: Mapping[str, list[str]],
+    ) -> tuple[list[str], list[str]]:
+        updatable: list[str] = []
+        skipped: list[str] = []
+        root_norm = os.path.normcase(str(canon_root))
+        for sname in ws.linked_servers:
+            srv = servers.get(sname)
+            if srv is None:
+                skipped.append(sname)
+                continue
+            tp = srv.template_params
+            managed_here = (sname in ws.wizard_servers) or (tp.get("wizard_managed_workspace_id") == ws.workspace_id)
+            exclusive = len(server_to_workspaces.get(sname, [])) <= 1
+            try:
+                srv_cwd_norm = os.path.normcase(str(canonical_workspace_root(srv.cwd)))
+            except Exception:  # noqa: BLE001
+                srv_cwd_norm = ""
+            if managed_here and exclusive and srv_cwd_norm == root_norm:
+                updatable.append(sname)
+            else:
+                skipped.append(sname)
+        return updatable, skipped
+
+    @staticmethod
+    def _compute_command_and_runtime_diffs(
+        ws: WorkspaceProfile,
+        discovered: Any,
+    ) -> tuple[
+        dict[str, str],
+        dict[str, tuple[str, str]],
+        tuple[str, ...],
+        dict[str, str],
+        dict[str, tuple[str, str]],
+    ]:
+        proposed_cmds = {
+            c.name: redact_discovery_text(c.command)
+            for c in discovered.commands
+            if c.selected and c.command.strip()
+        }
+        added_cmds = {k: v for k, v in proposed_cmds.items() if k not in ws.commands}
+        changed_cmds = {
+            k: (redact_discovery_text(ws.commands[k]), v)
+            for k, v in proposed_cmds.items()
+            if k in ws.commands and ws.commands[k] != v
+        }
+        unmatched = tuple(sorted(k for k in ws.commands if k not in proposed_cmds))
+        runtime_changes: dict[str, tuple[str, str]] = {}
+        for attr, disc_val in (
+            ("language", discovered.language),
+            ("python_venv", discovered.python_venv),
+            ("node_path", discovered.node_path),
+            ("git_root", discovered.git_root),
+        ):
+            cur_val = str(getattr(ws, attr, "") or "")
+            new_val = str(disc_val or "")
+            if cur_val != new_val:
+                runtime_changes[attr] = (cur_val, new_val)
+        return added_cmds, changed_cmds, unmatched, proposed_cmds, runtime_changes
+
+    @staticmethod
+    def _single_server_param_diff(srv: ServerProfile, prop: Any) -> dict[str, Any]:
+        diff: dict[str, Any] = {}
+        if prop.port != srv.port:
+            diff["port"] = [srv.port, prop.port]
+        if prop.executable and srv.argv and prop.executable != srv.argv[0]:
+            diff["executable"] = [srv.argv[0], prop.executable]
+        if prop.entrypoint and prop.entrypoint not in srv.argv[1:]:
+            diff["entrypoint"] = prop.entrypoint
+        return diff
+
+    @staticmethod
+    def _compute_server_param_diffs(
+        updatable_names: list[str],
+        servers: Mapping[str, ServerProfile],
+        discovered: Any,
+    ) -> dict[str, dict[str, Any]]:
+        by_template = {prop.template: prop for prop in discovered.server_proposals}
+        changes: dict[str, dict[str, Any]] = {}
+        for sname in updatable_names:
+            srv = servers.get(sname)
+            prop = by_template.get(srv.template) if srv is not None else None
+            if srv is None or prop is None:
+                continue
+            diff = WorkspaceServerCoordinator._single_server_param_diff(srv, prop)
+            if diff:
+                changes[sname] = diff
+        return changes
+
+    @staticmethod
+    def _verify_single_server_digests(
+        profile: ServerProfile,
+        workspaces: Mapping[str, WorkspaceProfile],
+        canon_cwd: Path,
+        wiz_wids: list[str],
+    ) -> None:
+        tp = profile.template_params
+        raw_digests = tp.get("manifest_digests")
+        if not isinstance(raw_digests, dict):
+            raise ManifestDriftError(
+                f"Server {profile.name!r} is missing approved manifest_digests; re-approve workspace before starting"
+            )
+        verify_manifest_digests(canon_cwd, raw_digests, check_unexpected_significant=True)
+        owner_wid = str(tp.get("wizard_managed_workspace_id") or "").strip()
+        if not owner_wid and len(wiz_wids) == 1:
+            owner_wid = wiz_wids[0]
+        owner_ws = workspaces.get(owner_wid) if owner_wid else None
+        if owner_ws is None or not owner_ws.manifest_guarded:
+            return
+        try:
+            owner_root = canonical_workspace_root(owner_ws.root_path)
+        except Exception:  # noqa: BLE001
+            owner_root = canon_cwd
+        if os.path.normcase(str(owner_root)) == os.path.normcase(str(canon_cwd)) and owner_ws.manifest_digests != raw_digests:
+            raise ManifestDriftError(
+                f"Server {profile.name!r} manifest approval does not match workspace {owner_wid!r}; "
+                "review and re-approve manifests together"
+            )
+
+    def verify_server_manifests(self, profile: ServerProfile, *, workspace_id: str = "") -> None:
+        """Fail closed if a wizard-managed server's manifests drifted, disappeared, or diverged from its workspace."""
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+
+        tp = profile.template_params
+        canon_cwd = canonical_workspace_root(profile.cwd)
+        linked_wids = [wid for wid, ws in sorted(workspaces.items()) if profile.name in ws.linked_servers]
+        wiz_wids = [wid for wid, ws in sorted(workspaces.items()) if profile.name in ws.wizard_servers]
+        is_srv_guarded = (
+            bool(tp.get("manifest_guarded"))
+            or bool(tp.get("wizard_managed_workspace_id"))
+            or ("manifest_digests" in tp)
+            or bool(wiz_wids)
+        )
+        if is_srv_guarded:
+            self._verify_single_server_digests(profile, workspaces, canon_cwd, wiz_wids)
+
+        check_wid = workspace_id or (linked_wids[0] if len(linked_wids) == 1 else "")
+        ws_target = workspaces.get(check_wid)
+        if ws_target is not None and (ws_target.manifest_guarded or ws_target.manifest_digests or ws_target.wizard_servers):
+            ws_root = canonical_workspace_root(ws_target.root_path)
+            verify_manifest_digests(ws_root, ws_target.manifest_digests, check_unexpected_significant=True)
+
+    def prepare_manifest_reapproval(self, workspace_id: str) -> ManifestReapprovalPreview:
+        """Analyze current manifests vs approved baseline and return a redacted, snapshot-bound re-approval preview."""
+        clean_wid = validate_workspace_id(workspace_id)
+        with ExitStack() as stack:
+            auto_locked = self._enter_coordinator_locks(stack)
+            self._recover_pending_tx_unlocked(automation_locked=auto_locked)
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+
+        ws = workspaces.get(clean_wid)
+        if ws is None:
+            raise KeyError(f"Unknown workspace: {clean_wid!r}")
+        canon_root = canonical_workspace_root(ws.root_path)
+        root_ident = compute_root_identity(canon_root)
+        discovered = analyze_workspace_directory(canon_root, include_subprojects=False)
+        full_digests, hash_issues = collect_significant_manifest_digests(
+            canon_root, existing_digests=discovered.manifest_digests
+        )
+        changes = build_manifest_change_items(ws.manifest_digests, full_digests, hash_issues)
+
+        server_to_ws = _build_server_to_workspaces_map(workspaces, servers)
+        updatable, skipped = self._classify_linked_servers_for_reapproval(ws, canon_root, servers, server_to_ws)
+
+        added_cmds, changed_cmds, unmatched_cmds, proposed_cmds, runtime_changes = (
+            self._compute_command_and_runtime_diffs(ws, discovered)
+        )
+        srv_param_changes = self._compute_server_param_diffs(updatable, servers, discovered)
+        lifecycle_warnings = _collect_reapproval_lifecycle_warnings(discovered)
+        blocking = _collect_reapproval_blocking_errors(hash_issues, discovered.diagnostics)
+
+        snapshot = WizardPlanSnapshot(
+            state_fingerprint=compute_registry_fingerprint(workspaces, servers),
+            root_path=str(canon_root),
+            root_identity=root_ident,
+            manifest_digests=full_digests,
+            existing_workspace_ids=tuple(sorted(workspaces)),
+            existing_server_names=tuple(sorted(servers)),
+        )
+        return ManifestReapprovalPreview(
+            workspace_id=ws.workspace_id,
+            workspace_name=ws.name,
+            root_path=str(canon_root),
+            manifest_changes=changes,
+            new_digests=full_digests,
+            added_commands=added_cmds,
+            changed_commands=changed_cmds,
+            unmatched_existing_commands=unmatched_cmds,
+            proposed_commands=proposed_cmds,
+            runtime_changes=runtime_changes,
+            proposed_language=discovered.language,
+            proposed_python_venv=discovered.python_venv,
+            proposed_node_path=discovered.node_path,
+            proposed_git_root=discovered.git_root,
+            updatable_servers=tuple(updatable),
+            skipped_servers=tuple(skipped),
+            server_param_changes=srv_param_changes,
+            lifecycle_warnings=lifecycle_warnings,
+            effective_permissions=self._effective_permissions_summary(ws),
+            diagnostics=discovered.diagnostics,
+            blocking_errors=blocking,
+            snapshot=snapshot,
+            has_changes=bool(changes or added_cmds or changed_cmds or runtime_changes or srv_param_changes),
+        )
+
+    def commit_manifest_reapproval(
+        self,
+        workspace_id: str,
+        *,
+        expected_snapshot: WizardPlanSnapshot,
+        apply_command_updates: bool = False,
+        apply_runtime_updates: bool = False,
+        apply_server_updates: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically re-approve workspace and exclusive wizard server manifest digests bound to `expected_snapshot`."""
+        clean_wid = validate_workspace_id(workspace_id)
+
+        def _plan() -> _TxMutationPlan:
+            workspaces = self.workspace_store.load_workspaces()
+            servers = self.server_store.load_profiles(strict=True)
+            ws = workspaces.get(clean_wid)
+            if ws is None:
+                raise KeyError(f"Unknown workspace: {clean_wid!r}")
+            canon_root = _verify_reapproval_snapshot(ws, workspaces, servers, expected_snapshot)
+            approved_digests = dict(expected_snapshot.manifest_digests)
+
+            discovered = (
+                analyze_workspace_directory(canon_root, include_subprojects=False)
+                if (apply_command_updates or apply_runtime_updates or apply_server_updates)
+                else None
+            )
+            workspaces[clean_wid] = _build_reapproved_workspace(
+                ws,
+                approved_digests,
+                discovered,
+                apply_command_updates=apply_command_updates,
+                apply_runtime_updates=apply_runtime_updates,
+            )
+
+            server_to_ws = _build_server_to_workspaces_map(workspaces, servers)
+            updatable, skipped = self._classify_linked_servers_for_reapproval(
+                ws, canon_root, servers, server_to_ws
+            )
+            srv_changed = _apply_reapproved_server_updates(
+                clean_wid,
+                updatable,
+                servers,
+                approved_digests,
+                discovered,
+                apply_server_updates=apply_server_updates,
+            )
+            return _TxMutationPlan(
+                files_to_watch=(self.server_store.path, self.workspace_store.path),
+                save_servers=servers if srv_changed else None,
+                save_workspaces=workspaces,
+                result={
+                    "workspace": workspaces[clean_wid],
+                    "updated_servers": list(updatable),
+                    "skipped_servers": list(skipped),
+                    "manifest_digests": approved_digests,
+                },
+            )
+
+        return self._run_tx(_plan)
+
+
+def _build_server_to_workspaces_map(
+    workspaces: Mapping[str, WorkspaceProfile],
+    servers: Mapping[str, ServerProfile],
+) -> dict[str, list[str]]:
+    server_to_ws: dict[str, list[str]] = {name: [] for name in servers}
+    for wid, other_ws in workspaces.items():
+        for sname in other_ws.linked_servers:
+            server_to_ws.setdefault(sname, []).append(wid)
+    return server_to_ws
+
+
+def _collect_reapproval_lifecycle_warnings(discovered: Any) -> tuple[str, ...]:
+    msgs = [
+        *(d.message for d in discovered.diagnostics if d.code == "LIFECYCLE_HOOK_PRESENT"),
+        *(f"{c.name}: {c.warning}" for c in discovered.commands if c.warning),
+    ]
+    return tuple(dict.fromkeys(redact_discovery_text(msg) for msg in msgs if msg))
+
+
+def _collect_reapproval_blocking_errors(
+    hash_issues: Iterable[tuple[str, str]],
+    diagnostics: Iterable[Any],
+) -> tuple[str, ...]:
+    blocking: list[str] = [f"{rel}: {redact_discovery_text(msg)}" for rel, msg in hash_issues]
+    for diag in diagnostics:
+        if diag.code in ("MANIFEST_TOO_LARGE", "MANIFEST_PARSE_ERROR") or diag.level == "error":
+            blocking.append(f"{diag.source or diag.code}: {redact_discovery_text(diag.message)}")
+    return tuple(dict.fromkeys(blocking))
+
+
+def _verify_reapproval_snapshot(
+    ws: WorkspaceProfile,
+    workspaces: Mapping[str, WorkspaceProfile],
+    servers: Mapping[str, ServerProfile],
+    expected_snapshot: WizardPlanSnapshot,
+) -> Path:
+    if compute_registry_fingerprint(workspaces, servers) != expected_snapshot.state_fingerprint:
+        raise WizardStalePlanError(
+            "Workspace or server configuration changed since preview; refresh preview before approving"
+        )
+    canon_root = canonical_workspace_root(ws.root_path)
+    if os.path.normcase(str(canon_root)) != os.path.normcase(expected_snapshot.root_path):
+        raise WizardStalePlanError("Workspace root path changed since preview")
+    if compute_root_identity(canon_root) != expected_snapshot.root_identity:
+        raise WizardStalePlanError("Workspace directory identity changed since preview")
+    verify_manifest_digests(canon_root, expected_snapshot.manifest_digests, check_unexpected_significant=True)
+    return canon_root
+
+
+def _build_reapproved_workspace(
+    ws: WorkspaceProfile,
+    approved_digests: dict[str, str],
+    discovered: Any,
+    *,
+    apply_command_updates: bool,
+    apply_runtime_updates: bool,
+) -> WorkspaceProfile:
+    ws_kwargs: dict[str, Any] = {
+        "manifest_digests": approved_digests,
+        "manifest_guarded": True,
+    }
+    if apply_command_updates and discovered is not None:
+        merged_cmds = dict(ws.commands)
+        for cmd in discovered.commands:
+            if cmd.selected and cmd.command.strip():
+                merged_cmds[cmd.name] = cmd.command.strip()
+        ws_kwargs["commands"] = merged_cmds
+    if apply_runtime_updates and discovered is not None:
+        ws_kwargs.update(
+            language=discovered.language,
+            python_venv=discovered.python_venv,
+            node_path=discovered.node_path,
+            git_root=discovered.git_root,
+        )
+    updated_ws = replace(ws, **ws_kwargs)
+    updated_ws.validate()
+    return updated_ws
+
+
+def _apply_reapproved_server_updates(
+    workspace_id: str,
+    updatable: Iterable[str],
+    servers: dict[str, ServerProfile],
+    approved_digests: dict[str, str],
+    discovered: Any,
+    *,
+    apply_server_updates: bool,
+) -> bool:
+    prop_by_tpl = (
+        {prop.template: prop for prop in discovered.server_proposals}
+        if (apply_server_updates and discovered is not None)
+        else {}
+    )
+    changed = False
+    for sname in updatable:
+        srv = servers[sname]
+        new_tp = {
+            **srv.template_params,
+            "wizard_managed_workspace_id": workspace_id,
+            "manifest_guarded": True,
+            "manifest_digests": dict(approved_digests),
+        }
+        srv_kwargs: dict[str, Any] = {"template_params": new_tp}
+        if apply_server_updates and srv.template in prop_by_tpl:
+            prop = prop_by_tpl[srv.template]
+            if prop.port is not None:
+                srv_kwargs["port"] = prop.port
+        updated_srv = replace(srv, **srv_kwargs)
+        updated_srv.validate()
+        servers[sname] = updated_srv
+        changed = True
+    return changed

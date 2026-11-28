@@ -481,8 +481,12 @@ class N04DiscoveryAndSecurityUnitTests(unittest.TestCase):
             workspace_id="ATOMIC_PROJ",
             name="Dup",
             root_path=str(proj),
+            manifest_digests=dict(res.manifest_digests),
         )
-        fresh_preview = self.coordinator.prepare_addition_preview(dup_proj)
+        fresh_preview = self.coordinator.prepare_addition_preview(
+            dup_proj,
+            expected_manifest_digests=res.manifest_digests,
+        )
         self.assertTrue(fresh_preview.conflicts)
         with self.assertRaises(WizardConflictError):
             self.coordinator.commit_workspace_addition(

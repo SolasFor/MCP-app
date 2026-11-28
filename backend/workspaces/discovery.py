@@ -10,6 +10,7 @@ Security invariants:
 from __future__ import annotations
 
 import ctypes
+import fnmatch
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 import tomllib
+from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -32,6 +34,15 @@ from backend.workspaces.compose_yaml import (
     parse_safe_compose_yaml,
     parse_safe_yaml_mapping,
 )
+from backend.workspaces.manifest_policy import (
+    ManifestDriftError as ManifestDriftError,
+    ManifestLimitError,
+    collect_significant_manifest_digests,
+    hash_regular_file_bounded,
+    is_safe_regular_file,
+    read_regular_file_bounded,
+    verify_manifest_digests as verify_manifest_digests,
+)
 from backend.workspaces.models import (
     COMMAND_NAME_RE,
     WORKSPACE_ID_RE,
@@ -40,12 +51,11 @@ from backend.workspaces.models import (
 )
 from backend.workspaces.path_security import (
     PathSecurityError,
+    _is_reserved_win_name,
     canonical_workspace_root,
     is_reparse_or_link,
     is_sensitive_segment,
     resolve_workspace_path,
-    sha256_bytes,
-    verify_opened_fd,
 )
 
 if TYPE_CHECKING:
@@ -121,10 +131,6 @@ _DEFAULT_REDACTOR = SecretRedactor()
 
 class DiscoveryCancelledError(RuntimeError):
     """Raised when workspace discovery is cancelled via cancel_event."""
-
-
-class ManifestDriftError(ValueError):
-    """Raised when approved manifest files changed on disk before task/server execution."""
 
 
 class WizardConflictError(ValueError):
@@ -368,68 +374,90 @@ def _trusted_system_which(binary_name: str, *, project_root: Path | None = None)
     return shutil.which(binary_name, path=os.pathsep.join(safe_dirs)) or ""
 
 
-def _check_budget(start_t: float, limits: DiscoveryLimits, cancel_event: threading.Event | None) -> None:
-    if cancel_event is not None and cancel_event.is_set():
-        raise DiscoveryCancelledError("Workspace discovery cancelled")
-    if (time.monotonic() - start_t) > limits.max_seconds:
-        raise TimeoutError(f"Workspace discovery exceeded {limits.max_seconds:.1f}s limit")
+@dataclass
+class _DiscoveryBudget:
+    """Shared bounded resource tracker across discovery, subprojects, and manifest hashing."""
+
+    limits: DiscoveryLimits
+    start_t: float
+    cancel_event: threading.Event | None = None
+    entries_seen: int = 0
+    bytes_used: list[int] = field(default_factory=lambda: [0])
+    truncated: bool = False
+    diagnostics: list[DiagnosticItem] = field(default_factory=list)
+    _limit_codes: set[str] = field(default_factory=set)
+
+    def check(self) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise DiscoveryCancelledError("Workspace discovery cancelled")
+        if (time.monotonic() - self.start_t) > self.limits.max_seconds:
+            raise TimeoutError(f"Workspace discovery exceeded {self.limits.max_seconds:.1f}s limit")
+
+    def mark_limit(self, code: str, message: str, source: str = "") -> None:
+        self.truncated = True
+        if code in self._limit_codes:
+            return
+        self._limit_codes.add(code)
+        self.diagnostics.append(DiagnosticItem("warn", code, message, source))
+
+    def can_consume_entry(self, source: str = "") -> bool:
+        self.check()
+        if self.entries_seen >= self.limits.max_entries:
+            self.mark_limit(
+                "DISCOVERY_ENTRY_LIMIT",
+                f"Discovery reached entry budget ({self.limits.max_entries}); scan truncated",
+                source,
+            )
+            return False
+        return True
+
+    def consume_entry(self, source: str = "") -> bool:
+        if not self.can_consume_entry(source):
+            return False
+        self.entries_seen += 1
+        return True
+
+    def next_scandir_entry(self, it: Any, source: str = "") -> os.DirEntry[str] | None:
+        if not self.can_consume_entry(source):
+            return None
+        entry = next(it, None)
+        if entry is None:
+            return None
+        self.entries_seen += 1
+        return entry
 
 
-def _safe_file_exists(root: Path, rel_path: str) -> bool:
+def _safe_dir_exists(root: Path, rel_path: str) -> bool:
     try:
         target = resolve_workspace_path(root, rel_path, allow_missing=False)
-        return target.is_file() and not is_reparse_or_link(target)
+        return target.is_dir() and not is_reparse_or_link(target)
     except (OSError, PathSecurityError, FileNotFoundError):
         return False
-
-
-def _read_fd_bounded(fd: int, rel_path: str, limits: DiscoveryLimits, bytes_used: list[int]) -> bytes:
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):
-        return b""
-    if st.st_size > limits.max_manifest_bytes:
-        raise _ManifestTooLargeError(
-            f"{rel_path} exceeds manifest size limit ({st.st_size} > {limits.max_manifest_bytes} bytes)"
-        )
-    if bytes_used[0] + st.st_size > limits.max_total_bytes:
-        raise _ManifestTooLargeError(f"Total discovery read limit exceeded at {rel_path}")
-    chunks: list[bytes] = []
-    total = 0
-    while chunk := os.read(fd, 65536):
-        total += len(chunk)
-        if total > limits.max_manifest_bytes or bytes_used[0] + total > limits.max_total_bytes:
-            raise _ManifestTooLargeError(f"{rel_path} exceeded read budget")
-        chunks.append(chunk)
-    data = b"".join(chunks)
-    bytes_used[0] += len(data)
-    return data
 
 
 def _read_manifest_bytes(
     root: Path,
     rel_path: str,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
 ) -> tuple[bytes, str] | None:
+    budget.check()
     try:
-        target = resolve_workspace_path(root, rel_path, allow_missing=False)
-    except (FileNotFoundError, PathSecurityError):
+        return read_regular_file_bounded(
+            root,
+            rel_path,
+            max_file_bytes=budget.limits.max_manifest_bytes,
+            bytes_used=budget.bytes_used,
+            max_total_bytes=budget.limits.max_total_bytes,
+            check_cancel=budget.check,
+        )
+    except (FileNotFoundError, OSError, PathSecurityError):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(target, flags)
-    except OSError:
-        return None
-    try:
-        verify_opened_fd(root, fd, target)
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            return None
-        data = _read_fd_bounded(fd, rel_path, limits, bytes_used)
-        return data, sha256_bytes(data)
-    finally:
-        os.close(fd)
+    except ManifestLimitError as exc:
+        msg = str(exc)
+        if "Total discovery read limit" in msg:
+            budget.mark_limit("DISCOVERY_BYTE_LIMIT", msg, rel_path)
+        raise _ManifestTooLargeError(msg) from exc
 
 
 def _strict_json_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -534,18 +562,18 @@ def _parse_req_packages(raw_bytes: bytes) -> set[str]:
 
 def _read_pyproject_metadata(
     root: Path,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
-) -> tuple[set[str], bool]:
+) -> tuple[set[str], bool, dict[str, Any]]:
     deps: set[str] = set()
+    doc: dict[str, Any] = {}
     has_pytest_cfg = False
     try:
-        loaded = _read_manifest_bytes(root, "pyproject.toml", limits=limits, bytes_used=bytes_used)
+        loaded = _read_manifest_bytes(root, "pyproject.toml", budget=budget)
         if loaded is None:
-            return deps, False
+            return deps, False, doc
         raw, sha = loaded
         digests["pyproject.toml"] = sha
         sources.append("pyproject.toml")
@@ -564,23 +592,22 @@ def _read_pyproject_metadata(
         diagnostics.append(DiagnosticItem("error", "MANIFEST_TOO_LARGE", str(exc), "pyproject.toml"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError, ValueError) as exc:
         diagnostics.append(DiagnosticItem("error", "MANIFEST_PARSE_ERROR", redact_discovery_text(str(exc)), "pyproject.toml"))
-    return deps, has_pytest_cfg
+    return deps, has_pytest_cfg, doc
 
 
 def _read_requirements_deps(
     root: Path,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
 ) -> set[str]:
     deps: set[str] = set()
     for req_name in ("requirements.txt", "requirements-dev.txt"):
-        if not _safe_file_exists(root, req_name):
+        if not is_safe_regular_file(root, req_name):
             continue
         try:
-            loaded = _read_manifest_bytes(root, req_name, limits=limits, bytes_used=bytes_used)
+            loaded = _read_manifest_bytes(root, req_name, budget=budget)
             if loaded is not None:
                 digests[req_name] = loaded[1]
                 sources.append(req_name)
@@ -593,7 +620,11 @@ def _read_requirements_deps(
 def _build_python_servers(root: Path, deps: set[str], py_exe: str) -> list[ServerProposal]:
     exe_for_srv = py_exe or _trusted_system_which("python", project_root=root) or sys.executable
     if "fastapi" in deps or "uvicorn" in deps:
-        entry = "main:app" if _safe_file_exists(root, "main.py") else ("app:app" if _safe_file_exists(root, "app.py") else "main:app")
+        entry = (
+            "main:app"
+            if is_safe_regular_file(root, "main.py")
+            else ("app:app" if is_safe_regular_file(root, "app.py") else "main:app")
+        )
         return [
             ServerProposal(
                 name=_sanitize_server_id(f"{root.name}_api", "python_api"),
@@ -611,7 +642,7 @@ def _build_python_servers(root: Path, deps: set[str], py_exe: str) -> list[Serve
             )
         ]
     if "flask" in deps:
-        entry = "app:app" if _safe_file_exists(root, "app.py") else "main:app"
+        entry = "app:app" if is_safe_regular_file(root, "app.py") else "main:app"
         return [
             ServerProposal(
                 name=_sanitize_server_id(f"{root.name}_flask", "flask_app"),
@@ -637,7 +668,7 @@ def _build_python_commands(
     deps: set[str],
     has_pytest_cfg: bool,
 ) -> list[CommandProposal]:
-    if _safe_file_exists(root, "tests"):
+    if _safe_dir_exists(root, "tests"):
         return [
             CommandProposal(
                 name="test",
@@ -661,33 +692,33 @@ def _build_python_commands(
 def _analyze_python_project(
     root: Path,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
-) -> tuple[bool, set[str], list[CommandProposal], list[ServerProposal], str]:
+) -> tuple[bool, set[str], list[CommandProposal], list[ServerProposal], str, dict[str, Any]]:
     py_venv = _detect_safe_python_venv(root)
     py_exe = str(Path(py_venv) / ("Scripts/python.exe" if os.name == "nt" else "bin/python")) if py_venv else ""
     py_cmd = f'"{py_exe}"' if py_exe else "python"
 
-    has_pyproject = _safe_file_exists(root, "pyproject.toml")
+    has_pyproject = is_safe_regular_file(root, "pyproject.toml")
     py_markers = ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "main.py", "app.py")
-    detected = bool(py_venv) or any(_safe_file_exists(root, name) for name in py_markers)
+    detected = bool(py_venv) or any(is_safe_regular_file(root, name) for name in py_markers)
 
     deps: set[str] = set()
-    has_pytest_cfg = _safe_file_exists(root, "pytest.ini")
+    py_doc: dict[str, Any] = {}
+    has_pytest_cfg = is_safe_regular_file(root, "pytest.ini")
     if has_pyproject:
-        p_deps, p_pytest = _read_pyproject_metadata(root, limits, bytes_used, digests, sources, diagnostics)
+        p_deps, p_pytest, py_doc = _read_pyproject_metadata(root, budget, digests, sources, diagnostics)
         deps.update(p_deps)
         has_pytest_cfg = has_pytest_cfg or p_pytest
-    deps.update(_read_requirements_deps(root, limits, bytes_used, digests, sources, diagnostics))
+    deps.update(_read_requirements_deps(root, budget, digests, sources, diagnostics))
 
     if not detected and not deps:
-        return False, set(), [], [], py_venv
+        return False, set(), [], [], py_venv, py_doc
 
     cmds = _build_python_commands(root, py_cmd, deps, has_pytest_cfg)
-    return True, deps, cmds, _build_python_servers(root, deps, py_exe), py_venv
+    return True, deps, cmds, _build_python_servers(root, deps, py_exe), py_venv, py_doc
 
 
 def _extract_script_port(raw_val: str, current: int | None) -> int | None:
@@ -775,7 +806,7 @@ def _resolve_package_manager(root: Path, pkg: dict[str, Any], sources: list[str]
     if m_pm and m_pm.group(1) in _ALLOWED_PACKAGE_MANAGERS:
         return m_pm.group(1)
     for lock_file, lock_pm in _LOCKFILE_PM:
-        if _safe_file_exists(root, lock_file):
+        if is_safe_regular_file(root, lock_file):
             sources.append(lock_file)
             return lock_pm
     return "npm"
@@ -825,7 +856,7 @@ def _build_node_servers(
             )
         ]
     if "express" in deps_all:
-        entry = next((cand for cand in ("server.js", "index.js", "app.js") if _safe_file_exists(root, cand)), "")
+        entry = next((cand for cand in ("server.js", "index.js", "app.js") if is_safe_regular_file(root, cand)), "")
         if entry:
             return [
                 ServerProposal(
@@ -848,14 +879,13 @@ def _build_node_servers(
 
 def _read_package_json_dict(
     root: Path,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
 ) -> dict[str, Any] | None:
     try:
-        loaded = _read_manifest_bytes(root, "package.json", limits=limits, bytes_used=bytes_used)
+        loaded = _read_manifest_bytes(root, "package.json", budget=budget)
     except _ManifestTooLargeError as exc:
         diagnostics.append(DiagnosticItem("error", "MANIFEST_TOO_LARGE", str(exc), "package.json"))
         return None
@@ -886,26 +916,25 @@ def _collect_deps_map(pkg: dict[str, Any]) -> dict[str, Any]:
 def _analyze_node_project(
     root: Path,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
-) -> tuple[bool, str, list[str], list[CommandProposal], list[ServerProposal], str]:
+) -> tuple[bool, str, list[str], list[CommandProposal], list[ServerProposal], str, dict[str, Any] | None]:
     node_path = _trusted_system_which("node.exe" if os.name == "nt" else "node", project_root=root)
-    if not _safe_file_exists(root, "package.json"):
-        return False, "", [], [], [], node_path
-    pkg = _read_package_json_dict(root, limits, bytes_used, digests, sources, diagnostics)
+    if not is_safe_regular_file(root, "package.json"):
+        return False, "", [], [], [], node_path, None
+    pkg = _read_package_json_dict(root, budget, digests, sources, diagnostics)
     if pkg is None:
-        return True, "javascript", ["javascript"], [], [], node_path
+        return True, "javascript", ["javascript"], [], [], node_path, None
 
     pm = _resolve_package_manager(root, pkg, sources)
     deps_all = _collect_deps_map(pkg)
-    has_ts = _safe_file_exists(root, "tsconfig.json") or ("typescript" in deps_all)
+    has_ts = is_safe_regular_file(root, "tsconfig.json") or ("typescript" in deps_all)
     language = "typescript" if has_ts else "javascript"
     stacks: list[str] = [language]
-    has_next = ("next" in deps_all) or any(_safe_file_exists(root, f) for f in _NEXT_CONFIG_FILES)
-    has_vite = ("vite" in deps_all) or any(_safe_file_exists(root, f) for f in _VITE_CONFIG_FILES)
+    has_next = ("next" in deps_all) or any(is_safe_regular_file(root, f) for f in _NEXT_CONFIG_FILES)
+    has_vite = ("vite" in deps_all) or any(is_safe_regular_file(root, f) for f in _VITE_CONFIG_FILES)
     if has_next:
         stacks.append("nextjs")
     elif has_vite:
@@ -922,23 +951,22 @@ def _analyze_node_project(
         has_vite=has_vite,
         detected_port=detected_port,
     )
-    return True, language, stacks, cmds, servers, node_path
+    return True, language, stacks, cmds, servers, node_path, pkg
 
 
 def _analyze_compose_project(
     root: Path,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
     digests: dict[str, str],
     sources: list[str],
     diagnostics: list[DiagnosticItem],
 ) -> tuple[bool, list[ServerProposal]]:
-    compose_file = next((fname for fname in _COMPOSE_FILENAMES if _safe_file_exists(root, fname)), "")
+    compose_file = next((fname for fname in _COMPOSE_FILENAMES if is_safe_regular_file(root, fname)), "")
     if not compose_file:
         return False, []
     try:
-        loaded = _read_manifest_bytes(root, compose_file, limits=limits, bytes_used=bytes_used)
+        loaded = _read_manifest_bytes(root, compose_file, budget=budget)
     except _ManifestTooLargeError as exc:
         diagnostics.append(DiagnosticItem("error", "MANIFEST_TOO_LARGE", str(exc), compose_file))
         return True, []
@@ -951,7 +979,7 @@ def _analyze_compose_project(
         summary: ComposeStaticSummary = parse_safe_compose_yaml(
             loaded[0].decode("utf-8"),
             source_file=compose_file,
-            max_bytes=limits.max_manifest_bytes,
+            max_bytes=budget.limits.max_manifest_bytes,
         )
     except (UnicodeDecodeError, ComposeYamlError) as exc:
         diagnostics.append(DiagnosticItem("error", "MANIFEST_PARSE_ERROR", redact_discovery_text(str(exc)), compose_file))
@@ -982,74 +1010,66 @@ def _analyze_compose_project(
     ]
 
 
-def _globs_from_package_json(root: Path, limits: DiscoveryLimits, bytes_used: list[int]) -> list[str]:
-    if not _safe_file_exists(root, "package.json"):
+def _globs_from_package_json_doc(pkg: dict[str, Any] | None) -> list[str]:
+    if not isinstance(pkg, dict):
         return []
-    try:
-        loaded = _read_manifest_bytes(root, "package.json", limits=limits, bytes_used=bytes_used)
-        if loaded is None:
-            return []
-        pkg = json.loads(loaded[0].decode("utf-8"), object_pairs_hook=_strict_json_object_pairs)
-        ws = pkg.get("workspaces") if isinstance(pkg, dict) else None
-        if isinstance(ws, list):
-            return [str(x) for x in ws]
-        if isinstance(ws, dict) and isinstance(ws.get("packages"), list):
-            return [str(x) for x in ws["packages"]]
-    except Exception:  # noqa: BLE001
-        pass
+    ws = pkg.get("workspaces")
+    if isinstance(ws, list):
+        return [str(x) for x in ws]
+    if isinstance(ws, dict) and isinstance(ws.get("packages"), list):
+        return [str(x) for x in ws["packages"]]
     return []
 
 
 def _globs_from_pnpm_yaml(
     root: Path,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    budget: _DiscoveryBudget,
+    digests: dict[str, str],
+    sources: list[str],
     diagnostics: list[DiagnosticItem],
 ) -> list[str]:
-    if not _safe_file_exists(root, "pnpm-workspace.yaml"):
+    if not is_safe_regular_file(root, "pnpm-workspace.yaml"):
         return []
     try:
-        loaded = _read_manifest_bytes(root, "pnpm-workspace.yaml", limits=limits, bytes_used=bytes_used)
+        loaded = _read_manifest_bytes(root, "pnpm-workspace.yaml", budget=budget)
         if loaded is None:
             return []
-        ym = parse_safe_yaml_mapping(loaded[0].decode("utf-8"), max_bytes=limits.max_manifest_bytes)
+        digests["pnpm-workspace.yaml"] = loaded[1]
+        sources.append("pnpm-workspace.yaml")
+        ym = parse_safe_yaml_mapping(loaded[0].decode("utf-8"), max_bytes=budget.limits.max_manifest_bytes)
         pkgs = ym.get("packages")
         if isinstance(pkgs, list):
             return [str(x) for x in pkgs]
+    except _ManifestTooLargeError as exc:
+        diagnostics.append(DiagnosticItem("warn", "MANIFEST_TOO_LARGE", str(exc), "pnpm-workspace.yaml"))
     except Exception as exc:  # noqa: BLE001
         diagnostics.append(DiagnosticItem("warn", "MANIFEST_PARSE_ERROR", redact_discovery_text(str(exc)), "pnpm-workspace.yaml"))
     return []
 
 
-def _globs_from_pyproject(root: Path, limits: DiscoveryLimits, bytes_used: list[int]) -> list[str]:
-    if not _safe_file_exists(root, "pyproject.toml"):
-        return []
-    try:
-        loaded = _read_manifest_bytes(root, "pyproject.toml", limits=limits, bytes_used=bytes_used)
-        if loaded is None:
-            return []
-        doc = tomllib.loads(loaded[0].decode("utf-8"))
-        uv_ws = doc.get("tool", {}).get("uv", {}).get("workspace", {})
-        if isinstance(uv_ws, dict) and isinstance(uv_ws.get("members"), list):
-            return [str(x) for x in uv_ws["members"]]
-    except Exception:  # noqa: BLE001
-        pass
+def _globs_from_pyproject_doc(py_doc: dict[str, Any]) -> list[str]:
+    uv_ws = py_doc.get("tool", {}).get("uv", {}).get("workspace", {})
+    if isinstance(uv_ws, dict) and isinstance(uv_ws.get("members"), list):
+        return [str(x) for x in uv_ws["members"]]
     return []
 
 
 def _extract_workspace_globs(
     root: Path,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    pkg_doc: dict[str, Any] | None,
+    py_doc: dict[str, Any],
+    budget: _DiscoveryBudget,
+    digests: dict[str, str],
+    sources: list[str],
     diagnostics: list[DiagnosticItem],
 ) -> list[str]:
     globs = [
-        *_globs_from_package_json(root, limits, bytes_used),
-        *_globs_from_pnpm_yaml(root, limits, bytes_used, diagnostics),
-        *_globs_from_pyproject(root, limits, bytes_used),
+        *_globs_from_package_json_doc(pkg_doc),
+        *_globs_from_pnpm_yaml(root, budget, digests, sources, diagnostics),
+        *_globs_from_pyproject_doc(py_doc),
     ]
-    return globs[:24]
+    return list(dict.fromkeys(globs))[:24]
 
 
 def _is_safe_workspace_glob(pattern: str) -> str | None:
@@ -1057,9 +1077,69 @@ def _is_safe_workspace_glob(pattern: str) -> str | None:
     if not clean or clean.startswith("!") or clean.startswith("/") or ":" in clean or "**" in clean:
         return None
     parts = PurePosixPath(clean).parts
-    if any(part in ("..", ".") or is_sensitive_segment(part) or part in EXCLUDED_DISCOVERY_DIRS for part in parts):
+    if any(
+        part in ("..", ".")
+        or part.casefold() in EXCLUDED_DISCOVERY_DIRS
+        or is_sensitive_segment(part)
+        or _is_reserved_win_name(part)
+        for part in parts
+    ):
         return None
     return clean.rstrip("/")
+
+
+def _is_safe_scandir_subdir(entry: os.DirEntry[str]) -> bool:
+    name = entry.name
+    if name.casefold() in EXCLUDED_DISCOVERY_DIRS or is_sensitive_segment(name) or _is_reserved_win_name(name):
+        return False
+    try:
+        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            return False
+        return not is_reparse_or_link(Path(entry.path))
+    except OSError:
+        return False
+
+
+def _step_literal_segment(
+    parent: Path,
+    segment: str,
+    budget: _DiscoveryBudget,
+) -> Path | None:
+    if not budget.consume_entry("monorepo"):
+        return None
+    if segment.casefold() in EXCLUDED_DISCOVERY_DIRS or is_sensitive_segment(segment) or _is_reserved_win_name(segment):
+        return None
+    cand = parent / segment
+    try:
+        st = os.lstat(cand)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or is_reparse_or_link(cand):
+            return None
+        return cand
+    except OSError:
+        return None
+
+
+def _step_wildcard_segment(
+    parent: Path,
+    segment: str,
+    budget: _DiscoveryBudget,
+    limit: int,
+) -> list[Path]:
+    matched: list[Path] = []
+    try:
+        with os.scandir(parent) as it:
+            while len(matched) < limit:
+                entry = budget.next_scandir_entry(it, "monorepo")
+                if entry is None:
+                    break
+                if not _is_safe_scandir_subdir(entry):
+                    continue
+                matches_fn = fnmatch.fnmatch if os.name == "nt" else fnmatch.fnmatchcase
+                if matches_fn(entry.name, segment):
+                    matched.append(Path(entry.path))
+    except OSError:
+        return matched
+    return matched
 
 
 def _try_add_monorepo_match(
@@ -1067,8 +1147,7 @@ def _try_add_monorepo_match(
     match: Path,
     seen_roots: set[str],
     *,
-    limits: DiscoveryLimits,
-    cancel_event: threading.Event | None,
+    budget: _DiscoveryBudget,
 ) -> SubprojectCandidate | None:
     if is_reparse_or_link(match) or not match.is_dir():
         return None
@@ -1080,15 +1159,15 @@ def _try_add_monorepo_match(
         rel = canon.relative_to(root).as_posix()
     except (OSError, ValueError):
         return None
-    if rel in seen_roots or any(seg in EXCLUDED_DISCOVERY_DIRS or is_sensitive_segment(seg) for seg in rel_parts):
+    if rel in seen_roots or any(seg.casefold() in EXCLUDED_DISCOVERY_DIRS or is_sensitive_segment(seg) for seg in rel_parts):
         return None
     seen_roots.add(rel)
-    sub_res = analyze_workspace_directory(
+    sub_res = _analyze_directory_with_budget(
         canon,
-        limits=limits,
-        cancel_event=cancel_event,
+        budget=budget,
         allow_parent_git_lookup=False,
         include_subprojects=False,
+        collect_all_significant=False,
     )
     return SubprojectCandidate(
         relative_path=rel,
@@ -1100,23 +1179,56 @@ def _try_add_monorepo_match(
     )
 
 
-def _expand_safe_glob_pattern(
+def _advance_glob_dirs(
+    cur_dirs: list[Path],
+    segment: str,
+    budget: _DiscoveryBudget,
+) -> list[Path]:
+    has_wild = any(ch in segment for ch in ("*", "?", "["))
+    next_dirs: list[Path] = []
+    for parent in cur_dirs:
+        budget.check()
+        if budget.truncated or len(next_dirs) >= 24:
+            break
+        if has_wild:
+            next_dirs.extend(_step_wildcard_segment(parent, segment, budget, 24 - len(next_dirs)))
+            continue
+        lit = _step_literal_segment(parent, segment, budget)
+        if lit is not None:
+            next_dirs.append(lit)
+    return next_dirs
+
+
+def _expand_safe_glob_bounded(
     root: Path,
     safe_pat: str,
     seen_roots: set[str],
     candidates: list[SubprojectCandidate],
     *,
-    limits: DiscoveryLimits,
-    start_t: float,
-    cancel_event: threading.Event | None,
+    budget: _DiscoveryBudget,
+    diagnostics: list[DiagnosticItem],
 ) -> bool:
-    for match in sorted(root.glob(safe_pat))[:24]:
-        _check_budget(start_t, limits, cancel_event)
-        cand = _try_add_monorepo_match(root, match, seen_roots, limits=limits, cancel_event=cancel_event)
-        if cand is None:
-            continue
-        candidates.append(cand)
+    parts = PurePosixPath(safe_pat).parts
+    if not parts or len(parts) > budget.limits.max_depth:
+        diagnostics.append(
+            DiagnosticItem("warn", "WORKSPACE_GLOB_REJECTED", f"Monorepo glob exceeds max depth ({budget.limits.max_depth}): {safe_pat!r}")
+        )
+        return False
+
+    cur_dirs: list[Path] = [root]
+    for seg in parts:
+        cur_dirs = _advance_glob_dirs(cur_dirs, seg, budget)
+        if not cur_dirs or budget.truncated:
+            break
+
+    for match in cur_dirs:
+        budget.check()
         if len(candidates) >= 24:
+            return True
+        cand = _try_add_monorepo_match(root, match, seen_roots, budget=budget)
+        if cand is not None:
+            candidates.append(cand)
+        if budget.truncated or len(candidates) >= 24:
             return True
     return False
 
@@ -1124,29 +1236,41 @@ def _expand_safe_glob_pattern(
 def _discover_monorepo_subprojects(
     root: Path,
     *,
-    limits: DiscoveryLimits,
-    bytes_used: list[int],
+    pkg_doc: dict[str, Any] | None,
+    py_doc: dict[str, Any],
+    budget: _DiscoveryBudget,
+    digests: dict[str, str],
+    sources: list[str],
     diagnostics: list[DiagnosticItem],
-    start_t: float,
-    cancel_event: threading.Event | None,
 ) -> tuple[SubprojectCandidate, ...]:
-    raw_globs = _extract_workspace_globs(root, limits=limits, bytes_used=bytes_used, diagnostics=diagnostics)
+    raw_globs = _extract_workspace_globs(
+        root,
+        pkg_doc=pkg_doc,
+        py_doc=py_doc,
+        budget=budget,
+        digests=digests,
+        sources=sources,
+        diagnostics=diagnostics,
+    )
     if not raw_globs:
         return ()
     seen_roots: set[str] = set()
     candidates: list[SubprojectCandidate] = []
     for raw_pat in raw_globs:
-        _check_budget(start_t, limits, cancel_event)
+        budget.check()
+        if budget.truncated or len(candidates) >= 24:
+            break
         if raw_pat.strip().startswith("!"):
             continue
         safe_pat = _is_safe_workspace_glob(raw_pat)
         if safe_pat is None:
             diagnostics.append(DiagnosticItem("warn", "WORKSPACE_GLOB_REJECTED", f"Unsafe monorepo glob rejected: {raw_pat!r}"))
             continue
-        if _expand_safe_glob_pattern(
-            root, safe_pat, seen_roots, candidates, limits=limits, start_t=start_t, cancel_event=cancel_event
+        if _expand_safe_glob_bounded(
+            root, safe_pat, seen_roots, candidates, budget=budget, diagnostics=diagnostics
         ):
             break
+    candidates.sort(key=lambda c: c.relative_path.casefold())
     return tuple(candidates)
 
 
@@ -1185,22 +1309,39 @@ def _select_language_and_confidence(
     return language, "unknown"
 
 
-def analyze_workspace_directory(
-    root_path: str | Path,
+def _collect_remaining_significant_digests(
+    root: Path,
+    digests: dict[str, str],
+    budget: _DiscoveryBudget,
+    diagnostics: list[DiagnosticItem],
+) -> dict[str, str]:
+    merged, issues = collect_significant_manifest_digests(
+        root,
+        existing_digests=digests,
+        max_file_bytes=budget.limits.max_manifest_bytes,
+        bytes_used=budget.bytes_used,
+        max_total_bytes=budget.limits.max_total_bytes,
+        check_cancel=budget.check,
+    )
+    for rel, reason in issues:
+        if "Total discovery read limit" in reason:
+            budget.mark_limit("DISCOVERY_BYTE_LIMIT", reason, rel)
+        else:
+            diagnostics.append(DiagnosticItem("warn", "MANIFEST_HASH_SKIPPED", redact_discovery_text(reason), rel))
+    return merged
+
+
+def _analyze_directory_with_budget(
+    root: Path,
     *,
-    limits: DiscoveryLimits | None = None,
-    cancel_event: threading.Event | None = None,
-    allow_parent_git_lookup: bool = False,
-    include_subprojects: bool = True,
+    budget: _DiscoveryBudget,
+    allow_parent_git_lookup: bool,
+    include_subprojects: bool,
+    collect_all_significant: bool,
 ) -> WorkspaceDiscoveryResult:
-    """Perform strictly bounded static read-only inspection of one project directory."""
-    cfg = limits or DiscoveryLimits()
-    start_t = time.monotonic()
-    _check_budget(start_t, cfg, cancel_event)
-    root = _require_safe_root(root_path)
+    budget.check()
     root_ident = compute_root_identity(root)
 
-    bytes_used = [0]
     digests: dict[str, str] = {}
     sources: list[str] = []
     diagnostics: list[DiagnosticItem] = []
@@ -1212,23 +1353,29 @@ def analyze_workspace_directory(
     if git_verified:
         sources.append(".git")
 
-    _check_budget(start_t, cfg, cancel_event)
-    py_ok, _py_deps, py_cmds, py_srvs, py_venv = _analyze_python_project(
-        root, limits=cfg, bytes_used=bytes_used, digests=digests, sources=sources, diagnostics=diagnostics
+    budget.check()
+    py_ok, _py_deps, py_cmds, py_srvs, py_venv, py_doc = _analyze_python_project(
+        root, budget=budget, digests=digests, sources=sources, diagnostics=diagnostics
     )
-    _check_budget(start_t, cfg, cancel_event)
-    node_ok, node_lang, node_stacks, node_cmds, node_srvs, node_path = _analyze_node_project(
-        root, limits=cfg, bytes_used=bytes_used, digests=digests, sources=sources, diagnostics=diagnostics
+    budget.check()
+    node_ok, node_lang, node_stacks, node_cmds, node_srvs, node_path, pkg_doc = _analyze_node_project(
+        root, budget=budget, digests=digests, sources=sources, diagnostics=diagnostics
     )
-    _check_budget(start_t, cfg, cancel_event)
+    budget.check()
     compose_ok, compose_srvs = _analyze_compose_project(
-        root, limits=cfg, bytes_used=bytes_used, digests=digests, sources=sources, diagnostics=diagnostics
+        root, budget=budget, digests=digests, sources=sources, diagnostics=diagnostics
     )
 
     subprojects: tuple[SubprojectCandidate, ...] = ()
     if include_subprojects:
         subprojects = _discover_monorepo_subprojects(
-            root, limits=cfg, bytes_used=bytes_used, diagnostics=diagnostics, start_t=start_t, cancel_event=cancel_event
+            root,
+            pkg_doc=pkg_doc,
+            py_doc=py_doc,
+            budget=budget,
+            digests=digests,
+            sources=sources,
+            diagnostics=diagnostics,
         )
 
     stacks: list[str] = []
@@ -1239,9 +1386,13 @@ def analyze_workspace_directory(
     if compose_ok:
         stacks.append("docker_compose")
     for fname, stack_name in (("Cargo.toml", "rust"), ("go.mod", "go")):
-        if _safe_file_exists(root, fname):
+        if is_safe_regular_file(root, fname):
             stacks.append(stack_name)
             sources.append(fname)
+
+    if collect_all_significant and not budget.truncated:
+        digests = _collect_remaining_significant_digests(root, digests, budget, diagnostics)
+    diagnostics.extend(budget.diagnostics)
 
     commands = _dedupe_commands([*node_cmds, *py_cmds])
     server_proposals = [
@@ -1281,7 +1432,29 @@ def analyze_workspace_directory(
         diagnostics=tuple(diagnostics),
         manifest_digests=digests,
         root_identity=root_ident,
-        truncated=False,
+        truncated=budget.truncated,
+    )
+
+
+def analyze_workspace_directory(
+    root_path: str | Path,
+    *,
+    limits: DiscoveryLimits | None = None,
+    cancel_event: threading.Event | None = None,
+    allow_parent_git_lookup: bool = False,
+    include_subprojects: bool = True,
+) -> WorkspaceDiscoveryResult:
+    """Perform strictly bounded static read-only inspection of one project directory."""
+    cfg = limits or DiscoveryLimits()
+    budget = _DiscoveryBudget(limits=cfg, start_t=time.monotonic(), cancel_event=cancel_event)
+    budget.check()
+    root = _require_safe_root(root_path)
+    return _analyze_directory_with_budget(
+        root,
+        budget=budget,
+        allow_parent_git_lookup=allow_parent_git_lookup,
+        include_subprojects=include_subprojects,
+        collect_all_significant=True,
     )
 
 
@@ -1307,57 +1480,58 @@ def _has_project_marker(directory: Path) -> tuple[bool, str, str]:
         ("go.mod", "go", "go.mod"),
     )
     for fname, lang, src in markers:
-        if _safe_file_exists(directory, fname):
-            if fname == "package.json" and _safe_file_exists(directory, "tsconfig.json"):
+        if is_safe_regular_file(directory, fname):
+            if fname == "package.json" and is_safe_regular_file(directory, "tsconfig.json"):
                 return True, "typescript", "package.json + tsconfig.json"
             return True, lang, src
     return False, "generic", ""
 
 
-def _is_scannable_subdir(child: Path) -> bool:
-    if is_reparse_or_link(child) or not child.is_dir():
-        return False
-    return child.name.casefold() not in EXCLUDED_DISCOVERY_DIRS and not is_sensitive_segment(child.name)
+def _enqueue_scandir_child(
+    root: Path,
+    entry: os.DirEntry[str],
+    depth: int,
+    depth_cap: int,
+    queue: deque[tuple[Path, int]],
+    found: list[SubprojectCandidate],
+) -> None:
+    if not _is_safe_scandir_subdir(entry):
+        return
+    child = Path(entry.path)
+    has_marker, lang, src = _has_project_marker(child)
+    if has_marker:
+        found.append(
+            SubprojectCandidate(
+                relative_path=child.relative_to(root).as_posix(),
+                root_path=str(child),
+                name=entry.name,
+                language=lang,
+                confidence="medium",
+                source=src,
+            )
+        )
+    if depth < depth_cap:
+        queue.append((child, depth + 1))
 
 
 def _scan_children_bounded(
     root: Path,
-    cur: Path,
-    depth: int,
     depth_cap: int,
-    cfg: DiscoveryLimits,
-    start_t: float,
-    cancel_event: threading.Event | None,
+    budget: _DiscoveryBudget,
     found: list[SubprojectCandidate],
-    seen_entries: list[int],
 ) -> None:
-    if depth > depth_cap or seen_entries[0] >= cfg.max_entries or len(found) >= 50:
-        return
-    try:
-        children = sorted(cur.iterdir(), key=lambda p: p.name.casefold())
-    except OSError:
-        return
-    for child in children:
-        _check_budget(start_t, cfg, cancel_event)
-        seen_entries[0] += 1
-        if seen_entries[0] > cfg.max_entries or len(found) >= 50:
-            return
-        if not _is_scannable_subdir(child):
+    queue: deque[tuple[Path, int]] = deque([(root, 1)])
+    while queue and not budget.truncated and len(found) < 50:
+        cur, depth = queue.popleft()
+        try:
+            with os.scandir(cur) as it:
+                while len(found) < 50:
+                    entry = budget.next_scandir_entry(it, "parent_scan")
+                    if entry is None:
+                        break
+                    _enqueue_scandir_child(root, entry, depth, depth_cap, queue, found)
+        except OSError:
             continue
-        has_marker, lang, src = _has_project_marker(child)
-        if has_marker:
-            found.append(
-                SubprojectCandidate(
-                    relative_path=child.relative_to(root).as_posix(),
-                    root_path=str(child),
-                    name=child.name,
-                    language=lang,
-                    confidence="medium",
-                    source=src,
-                )
-            )
-        if depth < depth_cap:
-            _scan_children_bounded(root, child, depth + 1, depth_cap, cfg, start_t, cancel_event, found, seen_entries)
 
 
 def discover_projects_in_directory(
@@ -1366,47 +1540,32 @@ def discover_projects_in_directory(
     max_depth: int = 2,
     limits: DiscoveryLimits | None = None,
     cancel_event: threading.Event | None = None,
+    diagnostics_out: list[DiagnosticItem] | None = None,
 ) -> list[SubprojectCandidate]:
-    """Bounded read-only scan of immediate subdirectories under a user-selected parent folder."""
+    """Bounded read-only lazy BFS scan of subdirectories under a user-selected parent folder."""
     cfg = limits or DiscoveryLimits()
-    start_t = time.monotonic()
-    _check_budget(start_t, cfg, cancel_event)
+    budget = _DiscoveryBudget(limits=cfg, start_t=time.monotonic(), cancel_event=cancel_event)
+    budget.check()
     root = _require_safe_root(parent_path)
     depth_cap = max(1, min(int(max_depth), cfg.max_depth))
     found: list[SubprojectCandidate] = []
-    _scan_children_bounded(root, root, 1, depth_cap, cfg, start_t, cancel_event, found, [0])
+    _scan_children_bounded(root, depth_cap, budget, found)
+    found.sort(key=lambda c: c.relative_path.casefold())
+    if diagnostics_out is not None and budget.diagnostics:
+        diagnostics_out.extend(budget.diagnostics)
     return found
-
-
-def verify_manifest_digests(root: Path, expected_digests: Mapping[str, str]) -> None:
-    """Fail closed if any approved manifest file disappeared, became unsafe, or changed SHA-256."""
-    if not expected_digests:
-        return
-    canon_root = canonical_workspace_root(root)
-    budget = [0]
-    limits = DiscoveryLimits()
-    for rel, expected_sha in expected_digests.items():
-        loaded = _read_manifest_bytes(canon_root, rel, limits=limits, bytes_used=budget)
-        if loaded is None:
-            raise ManifestDriftError(
-                f"Approved manifest {rel!r} is missing or unreadable; re-approve workspace before running"
-            )
-        if loaded[1].lower() != str(expected_sha).lower():
-            raise ManifestDriftError(
-                f"Approved manifest {rel!r} changed on disk since approval; re-approve workspace before running"
-            )
 
 
 def compute_current_manifest_digests(root: Path, paths: Iterable[str]) -> dict[str, str]:
     """Recompute SHA-256 digests for approved manifest relative paths inside `root`."""
     canon_root = canonical_workspace_root(root)
     budget = [0]
-    limits = DiscoveryLimits()
     out: dict[str, str] = {}
     for rel in paths:
-        loaded = _read_manifest_bytes(canon_root, rel, limits=limits, bytes_used=budget)
-        if loaded is not None:
-            out[rel] = loaded[1]
+        try:
+            out[rel] = hash_regular_file_bounded(canon_root, rel, bytes_used=budget)
+        except (FileNotFoundError, OSError, PathSecurityError, ManifestLimitError):
+            continue
     return out
 
 

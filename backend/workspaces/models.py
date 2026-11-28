@@ -29,7 +29,7 @@ PERMISSION_FLAGS = ("read", "write", "delete", "execute", "git")
 
 def validate_manifest_digests(digests: Any) -> dict[str, str]:
     """Validate a bounded map of relative manifest paths to lowercase SHA-256 digests."""
-    if not isinstance(digests, dict) or len(digests) > 32:
+    if not isinstance(digests, dict) or len(digests) > 64:
         raise ValueError("Invalid manifest_digests dictionary")
     clean: dict[str, str] = {}
     for raw_path, raw_hash in digests.items():
@@ -133,6 +133,8 @@ class WorkspaceProfile:
     min_profile: str = "allowlist"
     allow_oauth_clients: bool = True
     manifest_digests: dict[str, str] = field(default_factory=dict)
+    manifest_guarded: bool = False
+    wizard_servers: tuple[str, ...] = ()
     trust_git_hooks: bool = False
     enabled: bool = True
     description: str = ""
@@ -147,7 +149,10 @@ class WorkspaceProfile:
             raise ValueError(f"Invalid min_profile: {self.min_profile!r}")
         if not isinstance(self.allow_oauth_clients, bool):
             raise ValueError("allow_oauth_clients must be a boolean")
+        if not isinstance(self.manifest_guarded, bool):
+            raise ValueError("manifest_guarded must be a boolean")
         validate_manifest_digests(self.manifest_digests)
+        self._validate_linked_servers(self.wizard_servers)
         for path_field in (self.git_root, self.python_venv, self.node_path):
             if "\x00" in path_field:
                 raise ValueError("Invalid NUL byte in workspace metadata")
@@ -216,6 +221,8 @@ class WorkspaceProfile:
             "min_profile": self.min_profile,
             "allow_oauth_clients": bool(self.allow_oauth_clients),
             "manifest_digests": dict(sorted(self.manifest_digests.items())),
+            "manifest_guarded": bool(self.manifest_guarded),
+            "wizard_servers": list(self.wizard_servers),
             "trust_git_hooks": bool(self.trust_git_hooks),
             "enabled": bool(self.enabled),
             "description": self.description,
@@ -237,6 +244,12 @@ class WorkspaceProfile:
         raw_allow_oauth = data.get("allow_oauth_clients", True)
         if not isinstance(raw_allow_oauth, bool):
             raise ValueError(f"Invalid allow_oauth_clients for {workspace_id!r}")
+        clean_digests = validate_manifest_digests(raw_digests)
+        clean_wizard_servers = _dedupe_str_tuple(data.get("wizard_servers"))
+        raw_guarded = data.get("manifest_guarded")
+        if raw_guarded is not None and not isinstance(raw_guarded, bool):
+            raise ValueError(f"Invalid manifest_guarded for {workspace_id!r}")
+        manifest_guarded = bool(raw_guarded) or bool(clean_digests) or bool(clean_wizard_servers)
 
         profile = cls(
             workspace_id=str(data.get("workspace_id") or workspace_id).strip(),
@@ -262,7 +275,9 @@ class WorkspaceProfile:
             allowed_clients=tuple(str(x).strip() for x in (data.get("allowed_clients") or ()) if str(x).strip()),
             min_profile=str(data.get("min_profile") or "allowlist").strip() or "allowlist",
             allow_oauth_clients=raw_allow_oauth,
-            manifest_digests=validate_manifest_digests(raw_digests),
+            manifest_digests=clean_digests,
+            manifest_guarded=manifest_guarded,
+            wizard_servers=clean_wizard_servers,
             trust_git_hooks=bool(data.get("trust_git_hooks", False)),
             enabled=bool(data.get("enabled", True)),
             description=str(data.get("description") or "").strip(),

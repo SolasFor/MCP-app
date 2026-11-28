@@ -65,6 +65,7 @@ class ServerManager:
         task_store: Any = None,
         auth_rechecker: Callable[..., None] | None = None,
         workspace_authorizer: Callable[..., list[str]] | None = None,
+        manifest_verifier: Callable[..., None] | None = None,
         live_client_authorizer: Callable[[str | None, str], str] | None = None,
         supervisor_poll_seconds: float = 0.2,
     ) -> None:
@@ -78,6 +79,7 @@ class ServerManager:
         self.task_store = task_store
         self.auth_rechecker = auth_rechecker
         self.workspace_authorizer = workspace_authorizer
+        self.manifest_verifier = manifest_verifier
         self.live_client_authorizer = live_client_authorizer
         self._poll_seconds = max(0.05, float(supervisor_poll_seconds))
         self._platform = get_platform()
@@ -591,6 +593,29 @@ class ServerManager:
             entry.state.healthy = readiness_cfg.kind == "none"
         self._persist_ledger_under_runtime_lock()
 
+    def _verify_server_manifests(self, profile: ServerProfile, *, workspace_id: str = "") -> None:
+        verifier = self.manifest_verifier
+        if verifier is None and self.workspace_authorizer is not None:
+            owner_obj = getattr(self.workspace_authorizer, "__self__", None)
+            verifier = getattr(owner_obj, "verify_server_manifests", None)
+        if verifier is not None:
+            verifier(profile, workspace_id=workspace_id)
+            return
+
+        tp = profile.template_params
+        is_guarded = bool(tp.get("manifest_guarded")) or bool(tp.get("wizard_managed_workspace_id")) or ("manifest_digests" in tp)
+        if not is_guarded:
+            return
+        from backend.workspaces.manifest_policy import ManifestDriftError, verify_manifest_digests
+
+        raw_digests = tp.get("manifest_digests")
+        if not isinstance(raw_digests, dict):
+            raise ManifestDriftError(
+                f"Server {profile.name!r} is missing approved manifest_digests; re-approve workspace before starting"
+            )
+        canon_cwd = canonical_workspace_root(profile.cwd)
+        verify_manifest_digests(canon_cwd, raw_digests, check_unexpected_significant=True)
+
     def _launch_single(
         self,
         profile: ServerProfile,
@@ -603,12 +628,8 @@ class ServerManager:
         pre_spawn_check: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         argv, cwd = profile.validate_launchable()
-        canon_cwd = canonical_workspace_root(cwd)
-        raw_digests = profile.template_params.get("manifest_digests")
-        if isinstance(raw_digests, dict) and raw_digests:
-            from backend.workspaces.discovery import verify_manifest_digests
-
-            verify_manifest_digests(canon_cwd, raw_digests)
+        canonical_workspace_root(cwd)
+        self._verify_server_manifests(profile, workspace_id=workspace_id)
         merged_env, secret_vals = self.store.resolve_profile_env(profile)
         for secret in secret_vals:
             self.redactor.register(secret)
@@ -882,13 +903,14 @@ class ServerManager:
             return existing_payload if is_target else None
 
         def _pre_spawn() -> None:
-            self._authorize_step_live(
+            fresh, _lp, _wids = self._authorize_step_live(
                 step_name,
                 tool_name="server_start",
                 client_id=client_id,
                 fallback_profile=client_profile,
                 workspace_id=workspace_id,
             )
+            self._verify_server_manifests(fresh, workspace_id=workspace_id)
 
         res = self._launch_single(
             fresh_prof,
@@ -1360,13 +1382,14 @@ class ServerManager:
                 raise PermissionError(f"Auto-restart disabled for {srv_name!r}")
 
             def _pre_spawn() -> None:
-                self._authorize_step_live(
+                rechecked, _lp, _wids = self._authorize_step_live(
                     srv_name,
                     tool_name="server_start",
                     client_id=owner,
                     fallback_profile="full",
                     workspace_id=owner_wid,
                 )
+                self._verify_server_manifests(rechecked, workspace_id=owner_wid)
 
             self._launch_single(
                 fresh_prof,

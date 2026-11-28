@@ -73,7 +73,7 @@ def is_reparse_or_link(path: Path) -> bool:
         st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode):
             return True
-        attrs = getattr(st, "st_file_attributes", 0)
+        attrs = getattr(st, "st_file_attributes", 0) or 0
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
         return bool(attrs & reparse_flag)
     except OSError:
@@ -245,13 +245,30 @@ def sha256_bytes(data: bytes) -> str:
 
 def read_verified_bytes(root: Path, target: Path, *, max_bytes: int) -> tuple[bytes, str]:
     """Open `target` safely, verify the opened OS handle inside `root`, and read bounded bytes."""
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    pre_st = os.lstat(target)
+    if stat.S_ISLNK(pre_st.st_mode) or is_reparse_or_link(target):
+        raise PathSecurityError("Refusing symlink or reparse target")
+    if stat.S_ISDIR(pre_st.st_mode):
+        raise IsADirectoryError("Target path is a directory")
+    if not stat.S_ISREG(pre_st.st_mode):
+        raise PathSecurityError("Refusing non-regular special file")
+    if getattr(pre_st, "st_file_attributes", 0) & 0x0040:
+        raise PathSecurityError("Refusing device file")
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     fd = os.open(target, flags)
     try:
-        verify_opened_fd(root, fd, target)
         st = os.fstat(fd)
         if stat.S_ISDIR(st.st_mode):
             raise IsADirectoryError("Target path is a directory")
+        if not stat.S_ISREG(st.st_mode):
+            raise PathSecurityError("Refusing non-regular special file")
+        verify_opened_fd(root, fd, target)
         if st.st_size > max_bytes:
             raise ValueError(f"File exceeds size limit ({st.st_size} > {max_bytes} bytes)")
         chunks: list[bytes] = []

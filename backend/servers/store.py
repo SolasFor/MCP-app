@@ -22,6 +22,28 @@ from backend.servers.models import (
 SECRETS_NAMESPACE = "servers"
 
 
+def _verify_server_manifest_params_preserved(existing: ServerProfile, updated: ServerProfile) -> None:
+    """Prevent removing manifest approval metadata from wizard-managed servers via direct upsert."""
+    old_tp = existing.template_params
+    new_tp = updated.template_params
+    old_guarded = bool(old_tp.get("manifest_guarded")) or bool(old_tp.get("wizard_managed_workspace_id"))
+    if not old_guarded and "manifest_digests" not in old_tp:
+        return
+    if "manifest_digests" not in new_tp or not isinstance(new_tp.get("manifest_digests"), dict):
+        raise ValueError(
+            "Cannot strip manifest_digests from manifest-guarded server profile; use workspace manifest re-approval"
+        )
+    if old_tp.get("manifest_digests") and not new_tp.get("manifest_digests"):
+        raise ValueError(
+            "Cannot clear approved server manifest_digests directly; use workspace manifest re-approval"
+        )
+    if old_guarded and not new_tp.get("manifest_guarded"):
+        raise ValueError("Cannot disable manifest_guarded on wizard-managed server profile")
+    old_wid = old_tp.get("wizard_managed_workspace_id")
+    if old_wid and new_tp.get("wizard_managed_workspace_id") != old_wid:
+        raise ValueError("Cannot alter wizard_managed_workspace_id on wizard-managed server profile")
+
+
 def validate_dependencies(profiles: Mapping[str, ServerProfile]) -> None:
     """Verify every `depends_on` target exists and the dependency graph is acyclic."""
     for name, prof in profiles.items():
@@ -174,6 +196,9 @@ class ServerConfigStore:
         profile.validate()
         with self.lock(), self._lock:
             profiles = self.load_profiles(strict=True)
+            existing = profiles.get(profile.name)
+            if existing is not None:
+                _verify_server_manifest_params_preserved(existing, profile)
             profiles[profile.name] = profile
             self.save_profiles(profiles)
 

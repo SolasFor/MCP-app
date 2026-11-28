@@ -11,9 +11,11 @@ from dataclasses import replace
 from app.core.atomic_io import atomic_write_json, atomic_write_text, cross_process_lock
 from app.core.secret_store import SecretStore
 from app.platform import get_platform
-from backend.workspaces.discovery import (
-    analyze_workspace_directory,
-    compute_current_manifest_digests,
+from backend.workspaces.discovery import analyze_workspace_directory
+from backend.workspaces.manifest_policy import (
+    ManifestDriftError,
+    collect_significant_manifest_digests,
+    verify_manifest_digests,
 )
 from backend.workspaces.models import (
     ENV_KEY_RE,
@@ -146,6 +148,20 @@ class WorkspaceStore:
         canonical_workspace_root(profile.root_path)
         with self.lock(), self._lock:
             profiles = self.load_workspaces()
+            existing = profiles.get(profile.workspace_id)
+            if existing is not None and existing.manifest_guarded:
+                if existing.manifest_digests and not profile.manifest_digests:
+                    raise ValueError(
+                        "Cannot clear approved manifest_digests directly; use workspace manifest re-approval"
+                    )
+                merged_wiz = tuple(dict.fromkeys([*existing.wizard_servers, *profile.wizard_servers]))
+                profile = replace(
+                    profile,
+                    manifest_guarded=True,
+                    wizard_servers=merged_wiz,
+                )
+            elif profile.manifest_digests or profile.wizard_servers:
+                profile = replace(profile, manifest_guarded=True)
             profiles[profile.workspace_id] = profile
             self.save_workspaces(profiles)
 
@@ -191,7 +207,12 @@ class WorkspaceStore:
             self.save_workspaces(profiles)
             return updated
 
-    def refresh_manifest_digests(self, workspace_id: str) -> WorkspaceProfile:
+    def refresh_manifest_digests(
+        self,
+        workspace_id: str,
+        *,
+        expected_digests: Mapping[str, str] | None = None,
+    ) -> WorkspaceProfile:
         """Explicitly re-hash approved manifests for an existing workspace after owner review."""
         clean_wid = validate_workspace_id(workspace_id)
         with self.lock(), self._lock:
@@ -200,12 +221,16 @@ class WorkspaceStore:
             if prof is None:
                 raise KeyError(f"Unknown workspace: {clean_wid!r}")
             root = canonical_workspace_root(prof.root_path)
-            if prof.manifest_digests:
-                new_digests = compute_current_manifest_digests(root, prof.manifest_digests.keys())
+            if expected_digests is not None:
+                verify_manifest_digests(root, expected_digests, check_unexpected_significant=True)
+                new_digests = dict(expected_digests)
             else:
-                res = analyze_workspace_directory(root, include_subprojects=False)
-                new_digests = dict(res.manifest_digests)
-            updated = replace(prof, manifest_digests=new_digests)
+                new_digests, issues = collect_significant_manifest_digests(root)
+                if issues:
+                    raise ManifestDriftError(
+                        f"Manifest {issues[0][0]!r} cannot be hashed safely: {issues[0][1]}"
+                    )
+            updated = replace(prof, manifest_digests=new_digests, manifest_guarded=True)
             profiles[clean_wid] = updated
             self.save_workspaces(profiles)
             return updated

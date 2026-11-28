@@ -968,18 +968,23 @@ class WorkspaceManager:
             required=("read", "execute"),
         )
         root = canonical_workspace_root(prof.root_path)
-        if prof.manifest_digests:
-            verify_manifest_digests(root, prof.manifest_digests)
+        self._verify_workspace_manifests(prof, root)
         env = self._redact_payload_secrets(prof)
-        _raw_cmd, argv = self._prepare_workspace_command(prof, cname, env)
+        raw_cmd, argv = self._prepare_workspace_command(prof, cname, env)
 
         def recheck() -> None:
-            self._authorize_live(
+            fresh_prof, _lp = self._authorize_live(
                 wid,
                 client_id=rec.owner_client_id,
                 fallback_profile=rec.profile,
                 required=("read", "execute"),
             )
+            fresh_root = canonical_workspace_root(fresh_prof.root_path)
+            if os.path.normcase(str(fresh_root)) != os.path.normcase(str(root)):
+                raise ValueError("Workspace root directory changed before dispatch")
+            if fresh_prof.commands.get(cname) != raw_cmd:
+                raise ValueError("Workspace command definition changed before dispatch")
+            self._verify_workspace_manifests(fresh_prof, fresh_root)
 
         return await self.runner.run_command(
             argv,
@@ -1047,6 +1052,11 @@ class WorkspaceManager:
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
 
+    @staticmethod
+    def _verify_workspace_manifests(prof: WorkspaceProfile, root: Path) -> None:
+        if prof.manifest_guarded or prof.manifest_digests or prof.wizard_servers:
+            verify_manifest_digests(root, prof.manifest_digests, check_unexpected_significant=True)
+
     async def run_workspace_task(
         self,
         workspace_id: str,
@@ -1063,18 +1073,23 @@ class WorkspaceManager:
             required=("read", "execute"),
         )
         root = canonical_workspace_root(prof.root_path)
-        if prof.manifest_digests:
-            verify_manifest_digests(root, prof.manifest_digests)
+        self._verify_workspace_manifests(prof, root)
         env = self._redact_payload_secrets(prof)
         raw_cmd, argv = self._prepare_workspace_command(prof, command_name, env)
 
         def recheck() -> None:
-            self._authorize_live(
+            fresh_prof, _lp = self._authorize_live(
                 workspace_id,
                 client_id=client_id,
                 fallback_profile=client_profile,
                 required=("read", "execute"),
             )
+            fresh_root = canonical_workspace_root(fresh_prof.root_path)
+            if os.path.normcase(str(fresh_root)) != os.path.normcase(str(root)):
+                raise ValueError("Workspace root directory changed before dispatch")
+            if fresh_prof.commands.get(command_name) != raw_cmd:
+                raise ValueError("Workspace command definition changed before dispatch")
+            self._verify_workspace_manifests(fresh_prof, fresh_root)
 
         bounded_timeout = max(1, min(int(timeout), 600))
         task_id = self._record_task_start(

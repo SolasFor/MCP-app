@@ -25,6 +25,12 @@ from backend.workspaces.discovery import (
     discover_projects_in_directory,
     verify_manifest_digests,
 )
+from backend.workspaces.manifest_policy import (
+    SIGNIFICANT_MANIFEST_BY_STACK,
+    SIGNIFICANT_MANIFEST_FILES,
+    ManifestChangeItem,
+    ManifestReapprovalPreview,
+)
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.manager import WorkspaceManager
 from backend.workspaces.server_links import WorkspaceServerCoordinator, WorkspaceServersSnapshot
@@ -70,10 +76,14 @@ __all__ = [
     "MAX_TREE_ENTRIES",
     "MAX_WORKSPACES",
     "MAX_WRITE_BYTES",
+    "ManifestChangeItem",
     "ManifestDriftError",
+    "ManifestReapprovalPreview",
     "PERMISSION_FLAGS",
     "PathSecurityError",
     "SCHEMA_VERSION",
+    "SIGNIFICANT_MANIFEST_BY_STACK",
+    "SIGNIFICANT_MANIFEST_FILES",
     "ServerProposal",
     "SubprojectCandidate",
     "WORKSPACE_MIN_PROFILES",

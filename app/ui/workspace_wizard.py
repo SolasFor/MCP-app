@@ -34,6 +34,7 @@ from backend.servers.store import ServerConfigStore
 from backend.servers.templates import build_profile_from_template
 from backend.workspaces.discovery import (
     CommandProposal,
+    DiagnosticItem,
     DiscoveryLimits,
     ServerProposal,
     SubprojectCandidate,
@@ -93,13 +94,15 @@ class _DiscoveryWorker(QThread):
         try:
             limits = DiscoveryLimits()
             if self._mode == "scan":
+                scan_diags: list[DiagnosticItem] = []
                 items = discover_projects_in_directory(
                     self._target_path,
                     max_depth=self._scan_depth,
                     limits=limits,
                     cancel_event=self._cancel_event,
+                    diagnostics_out=scan_diags,
                 )
-                self.finished_discovery.emit(self._generation, "scan", items, "")
+                self.finished_discovery.emit(self._generation, "scan", (items, scan_diags), "")
             else:
                 res = analyze_workspace_directory(
                     self._target_path,
@@ -556,6 +559,23 @@ class WorkspaceWizardDialog(SilentDialog):
         self._worker = worker
         worker.start()
 
+    def _apply_scan_payload(self, payload: object) -> None:
+        if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], list):
+            scan_items, scan_diags = payload[0], list(payload[1] or ())
+        elif isinstance(payload, list):
+            scan_items, scan_diags = list(payload), []
+        else:
+            return
+        self._scan_candidates = list(scan_items)
+        self._populate_candidates_list(self._scan_candidates)
+        self.analysis_status_lbl.setText(f"{len(self._scan_candidates)} candidate(s) found")
+        self.confidence_badge.setText(str(len(self._scan_candidates)))
+        self.confidence_badge.set_variant("accent" if (self._scan_candidates and not scan_diags) else "warn")
+        summary_lines = [f"- {c.relative_path} [{c.language}] ({c.source})" for c in self._scan_candidates]
+        summary_lines.extend(f"[{diag.level.upper()}:{diag.code}] {diag.message}" for diag in scan_diags)
+        self.analysis_summary.setPlainText("\n".join(summary_lines) or tr("workspaces.wizard.unknown_hint"))
+        self.next_btn.setEnabled(True)
+
     def _on_discovery_finished(self, generation: int, kind: str, payload: object, error: str) -> None:
         if generation != self._generation:
             return
@@ -568,22 +588,9 @@ class WorkspaceWizardDialog(SilentDialog):
             self.analysis_summary.setPlainText(error)
             self.next_btn.setEnabled(False)
             return
-
-        if kind == "scan" and isinstance(payload, list):
-            self._scan_candidates = list(payload)
-            self._populate_candidates_list(self._scan_candidates)
-            self.analysis_status_lbl.setText(
-                f"{len(self._scan_candidates)} candidate(s) found"
-            )
-            self.confidence_badge.setText(str(len(self._scan_candidates)))
-            self.confidence_badge.set_variant("accent" if self._scan_candidates else "warn")
-            self.analysis_summary.setPlainText(
-                "\n".join(f"- {c.relative_path} [{c.language}] ({c.source})" for c in self._scan_candidates)
-                or tr("workspaces.wizard.unknown_hint")
-            )
-            self.next_btn.setEnabled(True)
+        if kind == "scan":
+            self._apply_scan_payload(payload)
             return
-
         if isinstance(payload, WorkspaceDiscoveryResult):
             self._apply_discovery_result(payload)
             self.next_btn.setEnabled(True)
@@ -814,6 +821,8 @@ class WorkspaceWizardDialog(SilentDialog):
                         "autostart": False,
                         "template_params": {
                             **srv.template_params,
+                            "wizard_managed_workspace_id": self.id_edit.text().strip(),
+                            "manifest_guarded": True,
                             "manifest_digests": dict(prop.manifest_digests),
                         },
                     }
@@ -828,6 +837,7 @@ class WorkspaceWizardDialog(SilentDialog):
             raise ValueError("Run project analysis first")
         wid = self.id_edit.text().strip()
         commands, allow_oauth, allowed_clients = self._collect_commands_and_oauth()
+        selected_servers = self._build_selected_servers()
         profile = WorkspaceProfile(
             workspace_id=wid,
             name=self.name_edit.text().strip() or wid,
@@ -849,11 +859,13 @@ class WorkspaceWizardDialog(SilentDialog):
             min_profile=str(self.min_profile_combo.currentData() or "allowlist"),
             allow_oauth_clients=allow_oauth,
             manifest_digests=dict(self._discovery.manifest_digests),
+            manifest_guarded=True,
+            wizard_servers=tuple(s.name for s in selected_servers),
             trust_git_hooks=self.trust_hooks_check.isChecked(),
             enabled=True,
         )
         linked_existing = [sname for sname, cb in self._link_checks.items() if cb.isChecked()]
-        return profile, self._build_selected_servers(), linked_existing
+        return profile, selected_servers, linked_existing
 
     def _refresh_preview(self) -> None:
         if self.stack.currentIndex() != 3 or self._discovery is None:

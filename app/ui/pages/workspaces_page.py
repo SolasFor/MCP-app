@@ -45,6 +45,7 @@ from app.ui.components.safe_combo import SafeComboBox
 from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
+from app.ui.manifest_reapproval_dialog import ManifestReapprovalDialog
 from app.ui.pages.base import PageScaffold
 from app.ui.workspace_wizard import WorkspaceWizardDialog
 from app.ui.pages.servers_page import (
@@ -357,6 +358,8 @@ class WorkspaceProfileDialog(SilentDialog):
                 min_profile=str(self.min_profile_combo.currentData() or "allowlist"),
                 allow_oauth_clients=self.allow_oauth_check.isChecked(),
                 manifest_digests=dict(self._base.manifest_digests),
+                manifest_guarded=self._base.manifest_guarded,
+                wizard_servers=self._base.wizard_servers,
                 trust_git_hooks=self.trust_hooks_check.isChecked(),
                 enabled=self.enabled_check.isChecked(),
                 description=self._base.description,
@@ -572,6 +575,7 @@ class WorkspacesPage(PageScaffold):
             redactor=self._redactor,
             task_store=self.task_store,
             workspace_authorizer=self.coordinator.authorize_server_operation,
+            manifest_verifier=self.coordinator.verify_server_manifests,
         )
         self.runtime_proxy = _ServerRuntimeProxy(
             self.server_manager,
@@ -1058,7 +1062,7 @@ class WorkspacesPage(PageScaffold):
                 icon_name="copy",
             ),
         ]
-        if prof.manifest_digests:
+        if prof.manifest_guarded or prof.manifest_digests:
             specs.append(
                 MenuActionSpec(
                     key="reapprove_manifests",
@@ -1228,16 +1232,22 @@ class WorkspacesPage(PageScaffold):
             self.save_profile(dlg.saved_profile)
             self.select_workspace(dlg.saved_profile.workspace_id)
 
-    def _reapprove_workspace_manifests(self, wid: str) -> None:
+    def _reapprove_workspace_manifests(self, wid: str) -> bool:
         try:
-            updated = self.store.refresh_manifest_digests(wid)
-            self.config_changed.emit()
-            self.status_message.emit(
-                tr("workspaces.toast.manifests_reapproved", name=updated.name), "ok"
-            )
-            self.reload()
+            dlg = ManifestReapprovalDialog(self.coordinator, wid, parent=self)
+            if dlg.exec() and dlg.commit_result is not None:
+                updated = dlg.commit_result["workspace"]
+                self.config_changed.emit()
+                self.status_message.emit(
+                    tr("workspaces.toast.manifests_reapproved", name=updated.name), "ok"
+                )
+                self.reload()
+                self.select_workspace(wid)
+                return True
+            return False
         except Exception as exc:
             SilentMessageBox.warning(self, tr("workspaces.title"), str(exc))
+            return False
 
     def save_profile(self, profile: WorkspaceProfile) -> None:
         self.store.upsert_workspace(profile)
@@ -1535,9 +1545,50 @@ class WorkspacesPage(PageScaffold):
             lvl = "ok" if res.get("healthy") else "warn"
             self.status_message.emit(f"{name}: {res.get('detail', res.get('status'))}", lvl)
 
+    def _resolve_server_owner_workspace(self, srv: ServerProfile, selected_wid: str) -> str:
+        owner_wid = str(srv.template_params.get("wizard_managed_workspace_id") or "").strip()
+        if owner_wid and owner_wid in self._profiles:
+            return owner_wid
+        if selected_wid and selected_wid in self._profiles:
+            return selected_wid
+        if self._snapshot is not None:
+            linked = self._snapshot.server_to_workspaces.get(srv.name, [])
+            if len(linked) == 1 and linked[0] in self._profiles:
+                return linked[0]
+        return ""
+
+    def _ensure_server_manifests_ready(self, name: str, *, workspace_id: str) -> bool:
+        srv = self.server_store.load_profiles(strict=False).get(name)
+        if srv is None:
+            return True
+        try:
+            self.coordinator.verify_server_manifests(srv, workspace_id=workspace_id)
+            return True
+        except ManifestDriftError as exc:
+            target_wid = self._resolve_server_owner_workspace(srv, workspace_id)
+            if not target_wid:
+                SilentMessageBox.warning(self, tr("servers.title"), str(exc))
+                return False
+            if not self._reapprove_workspace_manifests(target_wid):
+                return False
+            refreshed_srv = self.server_store.load_profiles(strict=False).get(name)
+            if refreshed_srv is None:
+                return False
+            try:
+                self.coordinator.verify_server_manifests(refreshed_srv, workspace_id=target_wid)
+                return True
+            except Exception as exc2:  # noqa: BLE001
+                SilentMessageBox.warning(self, tr("servers.title"), str(exc2))
+                return False
+        except Exception as exc:  # noqa: BLE001
+            SilentMessageBox.warning(self, tr("servers.title"), str(exc))
+            return False
+
     def _run_server_op(self, kind: str, name: str) -> None:
         self._active_server_name = name
         wid = self._selected_id() or ""
+        if kind in ("start", "restart") and not self._ensure_server_manifests_ready(name, workspace_id=wid):
+            return
         ops = {
             "start": lambda: self.runtime_proxy.start_server(
                 name, client_id="owner", wait_readiness=True, workspace_id=wid
@@ -1601,21 +1652,19 @@ class WorkspacesPage(PageScaffold):
         prof = self._profiles.get(wid)
         if prof is None:
             return False
-        if prof.manifest_digests:
+        if prof.manifest_guarded or prof.manifest_digests or prof.wizard_servers:
             try:
-                verify_manifest_digests(Path(prof.root_path), prof.manifest_digests)
-            except ManifestDriftError:
-                ans = SilentMessageBox.question(
-                    self,
-                    tr("workspaces.exec_confirm.title"),
-                    tr("workspaces.exec_confirm.drift_body", name=prof.name, cmd_name=cname),
-                    SilentMessageBox.StandardButton.Yes | SilentMessageBox.StandardButton.No,
-                    SilentMessageBox.StandardButton.No,
+                verify_manifest_digests(
+                    Path(prof.root_path),
+                    prof.manifest_digests,
+                    check_unexpected_significant=True,
                 )
-                if ans != SilentMessageBox.StandardButton.Yes:
+            except ManifestDriftError:
+                if not self._reapprove_workspace_manifests(wid):
                     return False
-                prof = self.store.refresh_manifest_digests(wid)
-                self.reload()
+                prof = self._profiles.get(wid) or self.store.get_workspace(wid)
+                if prof is None:
+                    return False
         if not prof.permissions.execute:
             ans = SilentMessageBox.question(
                 self,

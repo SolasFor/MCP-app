@@ -235,6 +235,17 @@ class WizardPlanSnapshot:
     manifest_digests: dict[str, str]
     existing_workspace_ids: tuple[str, ...]
     existing_server_names: tuple[str, ...]
+    proposal_fingerprint: str = ""
+    plan_fingerprint: str = ""
+    proposed_commands: dict[str, str] = field(default_factory=dict)
+    proposed_language: str = ""
+    proposed_python_venv: str = ""
+    proposed_node_path: str = ""
+    proposed_git_root: str = ""
+    server_proposals: tuple[ServerProposal, ...] = ()
+    linked_servers: tuple[str, ...] = ()
+    updatable_servers: tuple[str, ...] = ()
+    decision_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1119,27 +1130,34 @@ def _step_literal_segment(
         return None
 
 
+def _scan_wildcard_it(
+    it: Any,
+    segment: str,
+    budget: _DiscoveryBudget,
+    limit: int,
+) -> list[Path]:
+    matched: list[Path] = []
+    matches_fn = fnmatch.fnmatch if os.name == "nt" else fnmatch.fnmatchcase
+    while len(matched) < limit:
+        entry = budget.next_scandir_entry(it, "monorepo")
+        if entry is None:
+            break
+        if _is_safe_scandir_subdir(entry) and matches_fn(entry.name, segment):
+            matched.append(Path(entry.path))
+    return matched
+
+
 def _step_wildcard_segment(
     parent: Path,
     segment: str,
     budget: _DiscoveryBudget,
     limit: int,
 ) -> list[Path]:
-    matched: list[Path] = []
     try:
         with os.scandir(parent) as it:
-            while len(matched) < limit:
-                entry = budget.next_scandir_entry(it, "monorepo")
-                if entry is None:
-                    break
-                if not _is_safe_scandir_subdir(entry):
-                    continue
-                matches_fn = fnmatch.fnmatch if os.name == "nt" else fnmatch.fnmatchcase
-                if matches_fn(entry.name, segment):
-                    matched.append(Path(entry.path))
+            return _scan_wildcard_it(it, segment, budget, limit)
     except OSError:
-        return matched
-    return matched
+        return []
 
 
 def _try_add_monorepo_match(
@@ -1567,6 +1585,69 @@ def compute_current_manifest_digests(root: Path, paths: Iterable[str]) -> dict[s
         except (FileNotFoundError, OSError, PathSecurityError, ManifestLimitError):
             continue
     return out
+
+
+def extract_decision_warnings(discovered: WorkspaceDiscoveryResult) -> tuple[str, ...]:
+    """Return deterministic redacted warnings from root-project analysis that can affect owner decisions."""
+    items: list[str] = []
+    for diag in discovered.diagnostics:
+        if diag.code == "WORKSPACE_GLOB_REJECTED" or diag.source in ("monorepo", "parent_scan"):
+            continue
+        items.append(f"{diag.level}:{diag.code}:{diag.source}:{redact_discovery_text(diag.message)}")
+    for cmd in discovered.commands:
+        if cmd.warning:
+            items.append(f"cmd:{cmd.name}:{redact_discovery_text(cmd.warning)}")
+    for srv in discovered.server_proposals:
+        if srv.warning:
+            items.append(f"srv:{srv.name}:{redact_discovery_text(srv.warning)}")
+    return tuple(dict.fromkeys(items))
+
+
+def compute_discovery_proposal_fingerprint(discovered: WorkspaceDiscoveryResult) -> str:
+    """Deterministic SHA-256 over proposed commands, runtimes, server params, manifests, and warnings."""
+    payload = {
+        "root_path": os.path.normcase(os.path.abspath(discovered.root_path)),
+        "language": discovered.language,
+        "stacks": list(discovered.stacks),
+        "git_root": discovered.git_root,
+        "git_verified": bool(discovered.git_verified),
+        "python_venv": discovered.python_venv,
+        "node_path": discovered.node_path,
+        "manifest_digests": {k: discovered.manifest_digests[k] for k in sorted(discovered.manifest_digests)},
+        "commands": [
+            {
+                "name": cmd.name,
+                "command": redact_discovery_text(cmd.command.strip()),
+                "source": cmd.source,
+                "selected": bool(cmd.selected),
+                "has_lifecycle_hooks": bool(cmd.has_lifecycle_hooks),
+                "warning": redact_discovery_text(cmd.warning),
+            }
+            for cmd in discovered.commands
+        ],
+        "server_proposals": [
+            {
+                "name": srv.name,
+                "display_name": srv.display_name,
+                "template": srv.template,
+                "cwd": srv.cwd,
+                "executable": srv.executable,
+                "entrypoint": srv.entrypoint,
+                "host": srv.host,
+                "port": srv.port,
+                "port_verified": bool(srv.port_verified),
+                "source": srv.source,
+                "extra_args": list(srv.extra_args),
+                "readiness_kind": srv.readiness_kind,
+                "health_path": srv.health_path,
+                "warning": redact_discovery_text(srv.warning),
+            }
+            for srv in discovered.server_proposals
+        ],
+        "decision_warnings": list(extract_decision_warnings(discovered)),
+    }
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def compute_registry_fingerprint(

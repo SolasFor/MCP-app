@@ -188,6 +188,58 @@ class N04ReviewReapprovalE2ETests(unittest.TestCase):
         self.assertTrue(self.page.server_manager.status_server(srv_name, workspace_id=wid)["running"])
         self.page.server_manager.stop_server(srv_name, client_id="owner", workspace_id=wid)
 
+    def test_wizard_rejects_unseen_venv_drift_between_step4_and_commit(self) -> None:
+        py_rel = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+        proj = self.root / "wiz_drift_py"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text('[project]\nname = "wiz-drift"\ndependencies = ["pytest"]\n', encoding="utf-8")
+        v1 = proj / "venv" / py_rel
+        v1.parent.mkdir(parents=True)
+        v1.write_bytes(b"stub-v1")
+
+        wiz = WorkspaceWizardDialog(
+            self.page.store,
+            self.page.server_store,
+            self.page.coordinator,
+            parent=self.page,
+        )
+        try:
+            wiz.show()
+            wiz.path_edit.setText(str(proj))
+            wiz.start_analysis()
+            self._pump_until(lambda: not wiz.is_analyzing())
+            wiz.go_next()
+            self.assertEqual(Path(wiz.venv_edit.text()).name, "venv")
+            wiz.go_next()
+            self.assertEqual(wiz.stack.currentIndex(), 3)
+
+            # While Step 4 preview is displayed, `.venv` appears on disk without touching manifests
+            v2 = proj / ".venv" / py_rel
+            v2.parent.mkdir(parents=True)
+            v2.write_bytes(b"stub-v2")
+
+            with patch.object(SilentMessageBox, "warning") as m_warn:
+                wiz.commit()
+                self.assertEqual(m_warn.call_count, 1)
+            self.assertIsNone(wiz.committed_workspace_id)
+            self.assertEqual(self.page.store.load_workspaces(), {})
+
+            # Re-analyze so the owner sees `.venv`, then commit succeeds cleanly
+            wiz.start_analysis()
+            self._pump_until(lambda: not wiz.is_analyzing())
+            wiz.go_next()
+            self.assertEqual(Path(wiz.venv_edit.text()).name, ".venv")
+            wiz.go_next()
+            wiz.commit()
+            self.assertEqual(wiz.committed_workspace_id, "wiz_drift_py")
+            saved = self.page.store.get_workspace("wiz_drift_py")
+            assert saved is not None
+            self.assertEqual(Path(saved.python_venv).name, ".venv")
+        finally:
+            wiz.close()
+            wiz.deleteLater()
+            self.app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

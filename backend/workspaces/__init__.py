@@ -22,7 +22,9 @@ from backend.workspaces.discovery import (
     WizardStalePlanError,
     WorkspaceDiscoveryResult,
     analyze_workspace_directory,
+    compute_discovery_proposal_fingerprint,
     discover_projects_in_directory,
+    extract_decision_warnings,
     verify_manifest_digests,
 )
 from backend.workspaces.manifest_policy import (
@@ -102,8 +104,10 @@ __all__ = [
     "analyze_workspace_directory",
     "atomic_write_verified",
     "canonical_workspace_root",
+    "compute_discovery_proposal_fingerprint",
     "detect_workspace_metadata",
     "discover_projects_in_directory",
+    "extract_decision_warnings",
     "is_reparse_or_link",
     "parse_safe_compose_yaml",
     "read_verified_bytes",

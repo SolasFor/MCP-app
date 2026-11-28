@@ -589,6 +589,205 @@ class N04ReviewBoundsAndManifestTests(unittest.TestCase):
             with self.assertRaises(ManifestDriftError):
                 asyncio.run(self.ws_manager.run_workspace_task("reapp_proj", "custom_ok", client_id="owner"))
 
+    def test_n04_final_01_reapproval_exact_preview_binding(self) -> None:
+        from backend.servers.templates import build_profile_from_template
+
+        py_rel = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+        proj = self.base / "final_bind_py"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text(
+            '[project]\nname = "final-bind"\ndependencies = ["fastapi", "pytest"]\n',
+            encoding="utf-8",
+        )
+        (proj / "main.py").write_text("app = object()\n", encoding="utf-8")
+        v1 = proj / "venv" / py_rel
+        v1.parent.mkdir(parents=True)
+        v1.write_bytes(b"stub-v1")
+
+        disc0 = analyze_workspace_directory(proj, include_subprojects=False)
+        self.assertEqual(Path(disc0.python_venv).name, "venv")
+        srv0 = build_profile_from_template(
+            name="final_bind_api",
+            template="python_fastapi",
+            cwd=str(proj),
+            port=8011,
+            executable=str(v1),
+            entrypoint="main:app",
+            readiness_kind="none",
+            autostart=False,
+        )
+        ws0 = WorkspaceProfile(
+            workspace_id="final_bind_py",
+            name="Final Bind",
+            root_path=str(proj),
+            language="python",
+            python_venv=disc0.python_venv,
+            commands={"custom_note": f'"{sys.executable}" -c "print(\'KEEP\')"'},
+            permissions=WorkspacePermissions(read=True, execute=False),
+            allow_oauth_clients=False,
+            manifest_digests=dict(disc0.manifest_digests),
+            manifest_guarded=True,
+        )
+        add_prev = self.coordinator.prepare_addition_preview(
+            ws0,
+            new_servers=(srv0,),
+            expected_manifest_digests=disc0.manifest_digests,
+            expected_root_identity=disc0.root_identity,
+            expected_discovery=disc0,
+        )
+        self.coordinator.commit_workspace_addition(ws0, new_servers=(srv0,), expected_snapshot=add_prev.snapshot)
+
+        # 1) New .venv appears between preview and commit (manifests untouched) -> WizardStalePlanError, zero writes
+        prev1 = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        self.assertEqual(Path(prev1.proposed_python_venv).name, "venv")
+        assert prev1.snapshot is not None
+        (proj / ".venv" / py_rel).parent.mkdir(parents=True)
+        (proj / ".venv" / py_rel).write_bytes(b"stub-v2")
+        ws_before = self.ws_store.path.read_text(encoding="utf-8")
+        srv_before = self.srv_store.path.read_text(encoding="utf-8")
+        with self.assertRaises(WizardStalePlanError):
+            self.coordinator.commit_manifest_reapproval(
+                "final_bind_py",
+                expected_snapshot=prev1.snapshot,
+                apply_runtime_updates=True,
+                apply_server_updates=True,
+            )
+        self.assertEqual(self.ws_store.path.read_text(encoding="utf-8"), ws_before)
+        self.assertEqual(self.srv_store.path.read_text(encoding="utf-8"), srv_before)
+
+        # 2) Proposed command changes (`tests/` added) -> WizardStalePlanError, zero writes
+        prev2 = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        self.assertEqual(Path(prev2.proposed_python_venv).name, ".venv")
+        assert prev2.snapshot is not None
+        (proj / "tests").mkdir()
+        with self.assertRaises(WizardStalePlanError):
+            self.coordinator.commit_manifest_reapproval(
+                "final_bind_py",
+                expected_snapshot=prev2.snapshot,
+                apply_command_updates=True,
+            )
+        self.assertEqual(self.ws_store.path.read_text(encoding="utf-8"), ws_before)
+        self.assertEqual(self.srv_store.path.read_text(encoding="utf-8"), srv_before)
+
+        # 3a) Runtime changes (.git appears) -> WizardStalePlanError, zero writes
+        prev3 = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        assert prev3.snapshot is not None
+        (proj / ".git" / "refs").mkdir(parents=True)
+        (proj / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        with self.assertRaises(WizardStalePlanError):
+            self.coordinator.commit_manifest_reapproval(
+                "final_bind_py",
+                expected_snapshot=prev3.snapshot,
+                apply_runtime_updates=True,
+            )
+        self.assertEqual(self.ws_store.path.read_text(encoding="utf-8"), ws_before)
+
+        # 3b) Node.js runtime path changes between preview and commit -> WizardStalePlanError, zero writes
+        prev3b = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        assert prev3b.snapshot is not None
+        fake_node = r"C:\custom\node.exe" if os.name == "nt" else "/opt/custom/bin/node"
+        with patch("backend.workspaces.discovery._trusted_system_which", return_value=fake_node):
+            with self.assertRaises(WizardStalePlanError):
+                self.coordinator.commit_manifest_reapproval(
+                    "final_bind_py",
+                    expected_snapshot=prev3b.snapshot,
+                    apply_runtime_updates=True,
+                )
+        self.assertEqual(self.ws_store.path.read_text(encoding="utf-8"), ws_before)
+
+        # 4) Server parameters change (`main.py` -> `app.py`, entrypoint changes without touching manifest) -> stale error
+        prev4 = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        assert prev4.snapshot is not None
+        (proj / "main.py").unlink()
+        (proj / "app.py").write_text("app = object()\n", encoding="utf-8")
+        with self.assertRaises(WizardStalePlanError):
+            self.coordinator.commit_manifest_reapproval(
+                "final_bind_py",
+                expected_snapshot=prev4.snapshot,
+                apply_server_updates=True,
+            )
+        self.assertEqual(self.ws_store.path.read_text(encoding="utf-8"), ws_before)
+        self.assertEqual(self.srv_store.path.read_text(encoding="utf-8"), srv_before)
+
+        # 5) Fresh preview commits exact approved runtime, commands, server params & preserves custom cmd/permissions
+        prev_ok = self.coordinator.prepare_manifest_reapproval("final_bind_py")
+        assert prev_ok.snapshot is not None
+        self.assertEqual(Path(prev_ok.proposed_python_venv).name, ".venv")
+        self.assertIn("app:app", str(prev_ok.server_param_changes.get("final_bind_api")))
+        res_ok = self.coordinator.commit_manifest_reapproval(
+            "final_bind_py",
+            expected_snapshot=prev_ok.snapshot,
+            apply_command_updates=True,
+            apply_runtime_updates=True,
+            apply_server_updates=True,
+        )
+        saved_ws = res_ok["workspace"]
+        self.assertEqual(saved_ws.python_venv, prev_ok.proposed_python_venv)
+        self.assertIn("custom_note", saved_ws.commands)
+        self.assertEqual(saved_ws.commands["test"], prev_ok.proposed_commands["test"])
+        self.assertFalse(saved_ws.allow_oauth_clients)
+        self.assertFalse(saved_ws.permissions.execute)
+        updated_srv = self.srv_store.get_profile("final_bind_api")
+        assert updated_srv is not None
+        self.assertIn(".venv", updated_srv.argv[0])
+        self.assertIn("app:app", updated_srv.argv)
+        self.assertEqual(updated_srv.template_params.get("entrypoint"), "app:app")
+        self.assertEqual(updated_srv.template_params.get("manifest_digests"), saved_ws.manifest_digests)
+
+    def test_n04_final_01_addition_wizard_exact_preview_binding(self) -> None:
+        py_rel = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+        proj = self.base / "add_bind_py"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text('[project]\nname = "add-bind"\ndependencies = ["pytest"]\n', encoding="utf-8")
+        v1 = proj / "venv" / py_rel
+        v1.parent.mkdir(parents=True)
+        v1.write_bytes(b"stub-v1")
+
+        disc = analyze_workspace_directory(proj, include_subprojects=False)
+        ws = WorkspaceProfile(
+            workspace_id="add_bind_py",
+            name="Add Bind",
+            root_path=str(proj),
+            language=disc.language,
+            python_venv=disc.python_venv,
+            commands={c.name: c.command for c in disc.commands if c.selected},
+            manifest_digests=dict(disc.manifest_digests),
+            manifest_guarded=True,
+        )
+        prev = self.coordinator.prepare_addition_preview(
+            ws,
+            expected_manifest_digests=disc.manifest_digests,
+            expected_root_identity=disc.root_identity,
+            expected_discovery=disc,
+        )
+        # `.venv` appears while preview is displayed -> commit_workspace_addition fails with zero writes
+        (proj / ".venv" / py_rel).parent.mkdir(parents=True)
+        (proj / ".venv" / py_rel).write_bytes(b"stub-v2")
+        with self.assertRaises(WizardStalePlanError):
+            self.coordinator.commit_workspace_addition(ws, expected_snapshot=prev.snapshot)
+        self.assertFalse(self.ws_store.path.exists())
+
+        # Refresh discovery + preview commits cleanly
+        disc2 = analyze_workspace_directory(proj, include_subprojects=False)
+        ws2 = WorkspaceProfile(
+            workspace_id="add_bind_py",
+            name="Add Bind",
+            root_path=str(proj),
+            language=disc2.language,
+            python_venv=disc2.python_venv,
+            commands={c.name: c.command for c in disc2.commands if c.selected},
+            manifest_digests=dict(disc2.manifest_digests),
+            manifest_guarded=True,
+        )
+        prev2 = self.coordinator.prepare_addition_preview(
+            ws2,
+            expected_manifest_digests=disc2.manifest_digests,
+            expected_root_identity=disc2.root_identity,
+            expected_discovery=disc2,
+        )
+        res = self.coordinator.commit_workspace_addition(ws2, expected_snapshot=prev2.snapshot)
+        self.assertEqual(Path(res["workspace"].python_venv).name, ".venv")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -878,6 +878,7 @@ class WorkspaceWizardDialog(SilentDialog):
                 link_existing_servers=linked_existing,
                 expected_manifest_digests=self._discovery.manifest_digests,
                 expected_root_identity=self._discovery.root_identity,
+                expected_discovery=self._discovery,
             )
             self._last_preview = preview
             if preview.nested_workspaces:
@@ -939,6 +940,8 @@ class WorkspaceWizardDialog(SilentDialog):
     def go_back(self) -> None:
         cur = self.stack.currentIndex()
         if cur > 0:
+            if cur == 3:
+                self._last_preview = None
             self._set_step(cur - 1)
 
     def go_next(self) -> None:
@@ -970,7 +973,8 @@ class WorkspaceWizardDialog(SilentDialog):
         self._committing = True
         self.next_btn.setEnabled(False)
         try:
-            self._refresh_preview()
+            if self._last_preview is None:
+                self._refresh_preview()
             if self._last_preview is None or self._discovery is None:
                 raise ValueError(self.preview_view.toPlainText() or "Invalid workspace configuration")
             if self._last_preview.conflicts:
@@ -980,9 +984,7 @@ class WorkspaceWizardDialog(SilentDialog):
                 profile,
                 new_servers=new_servers,
                 link_existing_servers=linked_existing,
-                expected_state_fingerprint=self._last_preview.snapshot.state_fingerprint,
-                expected_root_identity=self._last_preview.snapshot.root_identity,
-                expected_manifest_digests=self._last_preview.snapshot.manifest_digests,
+                expected_snapshot=self._last_preview.snapshot,
                 acknowledge_nested=self.ack_nested_check.isChecked(),
                 expected_nested_ids=self._last_preview.nested_workspaces,
             )

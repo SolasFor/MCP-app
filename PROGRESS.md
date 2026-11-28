@@ -878,3 +878,9 @@
     - Полный прогон (`QT_QPA_PLATFORM=offscreen`, `-W always::ResourceWarning`, изолированный `%APPDATA%`): `tests/unit` **284/284 PASS** (`31.626s`), `tests/integration` **111/111 PASS** (`76.985s`), `tests/e2e` **2/2 PASS** (`9.775s`) — итого **397/397 PASS**, `0` предупреждений `subprocess ... is still running`.
     - Изолированная сборка PyInstaller (`D:\Coding\.mcpapp-n04-tmp`, `CLEANUP_OK=True`): `MCPApp.exe` (`11,794,372` Б, SHA-256 `bed5da8398b2bc45b0de78f825b280bd6f0943736c3a602c88be184d1efbd081`), `--version` exit `0`, `--selftest` exit `0` (`RESULT OK`), `--headless` `/health` → `200 {"status":"ok"}`, неавторизованный `POST /mcp` → `401`.
 - **Остающиеся `BLOCKED` / `NOT_RUN`**: локальный `ISCC.exe` (**NOT_RUN** — проверяется в CI `windows-package`); живые внешние SaaS-туннели (**NOT_RUN** в рамках N04); N02 production gates (`PRODUCTION_TRUST_ROOTS = ()`, `PRODUCTION_PUBLISHER_THUMBPRINTS = ()`, auto-install/boot-recovery **BLOCKED** `MISSING_TRUST_ROOTS` / `NO_ROLLBACK_CONTRACT`) сохранены без изменений.
+
+## N04 — MERGED / N05 — подготовка (2026-11-28)
+- PR #40 объединён по разрешению владельца: bebf7ea91d7ae7fb325d235f4c22def4bd8084bb; проверенный HEAD d9552ea, 4 CI checks SUCCESS.
+- Независимая приёмка ChatGPT: 16 unit + 6 integration, 22/22 PASS, exit 0, временный профиль; отдельный тест venv drift: stale rejected, registry unchanged, fresh preview committed. Полный набор 397 и frozen smoke — по отчёту Antigravity, не повторены ChatGPT.
+- N04 discovery/permissions/atomic commit/manifest reapproval/exact preview приняты в проверенных сценариях. Внешние туннели и локальный ISCC NOT_RUN. N02 production gates сохранены, P2 mcp_audit.log остаётся.
+- N05: feat/n05-ssh-device-wizard; текущий план ANTIGRAVITY_PROMPT.md. Реализация не начата. Версия 1.0.2, PR #32 не изменять, релиз не опубликован.

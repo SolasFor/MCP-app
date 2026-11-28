@@ -299,6 +299,118 @@ def capture_screenshots(out_dir: Path) -> list[Path]:
             win.grab().save(str(p12))
             saved.append(p12)
 
+            # 12. Devices (SSH / SFTP) Dark & Light at 1366x768 + SSH Onboarding Wizard Dark & Light
+            try:
+                import base64
+                import hashlib
+
+                from app.ui.ssh_device_wizard import SSHDeviceWizardDialog
+                from backend.remote.host_keys import ApprovedHostKey, compute_host_key_sha256
+                from backend.remote.models import DevicePermissions, DeviceProfile
+
+                dummy_ed_pub = (
+                    b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00 "
+                    + hashlib.sha256(b"mcp-app-demo-host-key").digest()
+                )
+                dummy_b64 = base64.b64encode(dummy_ed_pub).decode("ascii")
+                dummy_sha = "SHA256:" + base64.b64encode(hashlib.sha256(dummy_ed_pub).digest()).decode("ascii").rstrip("=")
+                win.devices_page.store.upsert(
+                    DeviceProfile(
+                        device_id="prod_linux_01",
+                        name="Linux Build Node",
+                        host="192.0.2.10",
+                        port=22,
+                        username="deploy",
+                        group="linux-pool",
+                        auth_method="key",
+                        key_path="~/.ssh/id_ed25519_mcp",
+                        pinned_host_key_algorithm="ssh-ed25519",
+                        pinned_host_key_sha256=dummy_sha,
+                        pinned_host_key_base64=dummy_b64,
+                        detected_os="linux",
+                        detected_capabilities=("ssh_exec", "sftp"),
+                        permissions=DevicePermissions(execute=True, sftp_read=True, metrics=True),
+                        allow_oauth_clients=True,
+                        min_profile="allowlist",
+                    )
+                )
+                win.devices_page.store.upsert(
+                    DeviceProfile(
+                        device_id="win_office_ws",
+                        name="Windows Workstation",
+                        host="192.0.2.25",
+                        port=2222,
+                        username="opsadmin",
+                        group="windows-lan",
+                        auth_method="agent",
+                        pinned_host_key_algorithm="ssh-ed25519",
+                        pinned_host_key_sha256=dummy_sha,
+                        pinned_host_key_base64=dummy_b64,
+                        detected_os="windows",
+                        detected_capabilities=("ssh_exec", "sftp"),
+                        permissions=DevicePermissions(),
+                        allow_oauth_clients=False,
+                    )
+                )
+                win.set_theme_mode(theme.THEME_DARK)
+                win.set_language(LANG_RU)
+                win.show_page("devices")
+                win.devices_page.refresh_all()
+                win.devices_page.table.selectRow(0)
+                win.devices_page.output_view.setPlainText(
+                    "Device: prod_linux_01 (192.0.2.10:22)\n"
+                    f"Host Key (RejectPolicy pin): ssh-ed25519 {dummy_sha}\n"
+                    "OS: linux | Capabilities: ssh_exec, sftp"
+                )
+                win.toasts.clear_all()
+                app.processEvents()
+                p_dev_d = out_dir / "devices-dark.png"
+                win.grab().save(str(p_dev_d))
+                saved.append(p_dev_d)
+
+                win.set_theme_mode(theme.THEME_LIGHT)
+                win.devices_page.refresh_all()
+                win.toasts.clear_all()
+                app.processEvents()
+                p_dev_l = out_dir / "devices-light.png"
+                win.grab().save(str(p_dev_l))
+                saved.append(p_dev_l)
+
+                ssh_wiz = SSHDeviceWizardDialog(win.devices_page.store, parent=win)
+                ssh_wiz.id_edit.setText("edge_node_02")
+                ssh_wiz.name_edit.setText("Edge Node 02")
+                ssh_wiz.host_edit.setText("192.0.2.42")
+                ssh_wiz.port_spin.setValue(22)
+                ssh_wiz.user_edit.setText("opsuser")
+                ssh_wiz._approved_host_key = ApprovedHostKey(
+                    host="192.0.2.42",
+                    port=22,
+                    key_algorithm="ssh-ed25519",
+                    fingerprint_sha256=dummy_sha,
+                    public_key_base64=dummy_b64,
+                    verified_at=1.0,
+                )
+                ssh_wiz._auth_ok = True
+                ssh_wiz._set_step(4)
+                ssh_wiz.resize(760, 560)
+                win.set_theme_mode(theme.THEME_DARK)
+                ssh_wiz.show()
+                app.processEvents()
+                p_sw_d = out_dir / "ssh-wizard-dark.png"
+                ssh_wiz.grab().save(str(p_sw_d))
+                saved.append(p_sw_d)
+
+                win.set_theme_mode(theme.THEME_LIGHT)
+                ssh_wiz.retranslate()
+                app.processEvents()
+                p_sw_l = out_dir / "ssh-wizard-light.png"
+                ssh_wiz.grab().save(str(p_sw_l))
+                saved.append(p_sw_l)
+                ssh_wiz.close()
+                _ = compute_host_key_sha256
+            except Exception:
+                pass
+
             # 12. Workspace Addition Wizard Dark & Light (RU) with static discovery preview
             try:
                 from app.ui.workspace_wizard import WorkspaceWizardDialog

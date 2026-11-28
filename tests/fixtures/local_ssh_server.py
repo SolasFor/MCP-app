@@ -122,10 +122,22 @@ class _TestSFTPServer(paramiko.SFTPServerInterface):
 
 
 class _TestSSHInterface(paramiko.ServerInterface):
-    def __init__(self, username: str, password: str, state: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        state: dict[str, Any],
+        *,
+        authorized_pubkeys: tuple[paramiko.PKey, ...] = (),
+        os_flavor: str = "linux",
+        auth_attempts: list[tuple[str, str]] | None = None,
+    ) -> None:
         self.username = username
         self.password = password
         self.state = state
+        self.authorized_pubkeys = authorized_pubkeys
+        self.os_flavor = os_flavor
+        self.auth_attempts = auth_attempts if auth_attempts is not None else []
         self.exec_requests: list[str] = []
 
     def check_channel_request(self, kind: str, chanid: int) -> int:
@@ -134,11 +146,23 @@ class _TestSSHInterface(paramiko.ServerInterface):
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
     def check_auth_password(self, username: str, password: str) -> int:
+        self.auth_attempts.append(("password", username))
         if username == self.username and password == self.password:
             return paramiko.AUTH_SUCCESSFUL
         return paramiko.AUTH_FAILED
 
+    def check_auth_publickey(self, username: str, key: paramiko.PKey) -> int:
+        self.auth_attempts.append(("publickey", username))
+        if username == self.username and any(
+            key.get_name() == pub.get_name() and key.asbytes() == pub.asbytes()
+            for pub in self.authorized_pubkeys
+        ):
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
     def get_allowed_auths(self, username: str) -> str:
+        if self.authorized_pubkeys:
+            return "password,publickey"
         return "password"
 
     def check_channel_exec_request(self, channel: paramiko.Channel, command: bytes) -> bool:
@@ -152,10 +176,25 @@ class _TestSSHInterface(paramiko.ServerInterface):
         # check_channel_exec_request returns True before sending output or closing.
         time.sleep(0.03)
         try:
-            if cmd.strip() == "uname -s -m":
-                channel.sendall(b"Linux x86_64\n")
-                channel.send_exit_status(0)
-            elif cmd.strip() == "drop_connection":
+            stripped = cmd.strip()
+            if stripped == "uname -s -m":
+                if self.os_flavor == "windows":
+                    channel.sendall_stderr(b"'uname' is not recognized as an internal or external command\n")
+                    channel.send_exit_status(1)
+                elif self.os_flavor == "unknown":
+                    channel.sendall(b"FreeBSD amd64\n")
+                    channel.send_exit_status(0)
+                else:
+                    channel.sendall(b"Linux x86_64\n")
+                    channel.send_exit_status(0)
+            elif stripped == "cmd.exe /d /c ver":
+                if self.os_flavor == "windows":
+                    channel.sendall(b"\r\nMicrosoft Windows [Version 10.0.26100.1]\r\n")
+                    channel.send_exit_status(0)
+                else:
+                    channel.sendall_stderr(b"cmd.exe: command not found\n")
+                    channel.send_exit_status(127)
+            elif stripped == "drop_connection":
                 channel.sendall(b"partial...\n")
                 time.sleep(0.05)
                 channel.transport.close()  # type: ignore[union-attr]
@@ -197,28 +236,52 @@ class _TestSSHInterface(paramiko.ServerInterface):
 class LocalSSHServer:
     """In-process localhost Paramiko SSH+SFTP server for deterministic security & E2E tests."""
 
-    def __init__(self, sftp_root: Path, *, username: str = "ciuser", password: str = "cipass") -> None:
+    def __init__(
+        self,
+        sftp_root: Path,
+        *,
+        username: str = "ciuser",
+        password: str = "cipass",
+        authorized_pubkeys: list[paramiko.PKey] | tuple[paramiko.PKey, ...] = (),
+        extra_host_keys: list[paramiko.PKey] | tuple[paramiko.PKey, ...] = (),
+        os_flavor: str = "linux",
+        enable_sftp: bool = True,
+        bind_host: str = "127.0.0.1",
+        host_key: paramiko.PKey | None = None,
+    ) -> None:
         self.sftp_root = Path(sftp_root)
         self.sftp_root.mkdir(parents=True, exist_ok=True)
         self.username = username
         self.password = password
-        self.host_key = paramiko.RSAKey.generate(2048)
+        self.authorized_pubkeys = tuple(authorized_pubkeys)
+        self.host_key: paramiko.PKey = host_key or paramiko.RSAKey.generate(2048)
+        self.extra_host_keys: tuple[paramiko.PKey, ...] = tuple(extra_host_keys)
+        self.os_flavor = os_flavor
+        self.enable_sftp = enable_sftp
+        self.auth_attempts: list[tuple[str, str]] = []
         self.state: dict[str, Any] = {"services": {"nginx": "inactive"}}
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.bind(("127.0.0.1", 0))
+        family = socket.AF_INET6 if ":" in bind_host else socket.AF_INET
+        self._sock = socket.socket(family, socket.SOCK_STREAM)
+        self._sock.bind((bind_host, 0))
         self._sock.listen(16)
         self._sock.settimeout(0.25)
-        self.host = "127.0.0.1"
+        self.host = bind_host
         self.port = int(self._sock.getsockname()[1])
         self._stop = threading.Event()
         self._transports: list[paramiko.Transport] = []
         self._thread = threading.Thread(target=self._serve, daemon=True)
 
-    def rotate_host_key(self) -> None:
-        self.host_key = paramiko.RSAKey.generate(2048)
+    def rotate_host_key(self, new_key: paramiko.PKey | None = None) -> None:
+        self.host_key = new_key or paramiko.RSAKey.generate(2048)
+        self.extra_host_keys = ()
 
     def write_known_hosts(self, path: Path) -> Path:
-        line = f"[{self.host}]:{self.port} {self.host_key.get_name()} {self.host_key.get_base64()}\n"
+        host_entry = (
+            f"[{self.host}]:{self.port}"
+            if self.port != 22 or ":" in self.host
+            else self.host
+        )
+        line = f"{host_entry} {self.host_key.get_name()} {self.host_key.get_base64()}\n"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(line, encoding="utf-8")
         return path
@@ -240,8 +303,18 @@ class LocalSSHServer:
     def _handle_conn(self, sock: socket.socket) -> None:
         t = paramiko.Transport(sock)
         t.add_server_key(self.host_key)
-        t.set_subsystem_handler("sftp", paramiko.SFTPServer, sftp_si=_TestSFTPServer, root_dir=self.sftp_root)
-        iface = _TestSSHInterface(self.username, self.password, self.state)
+        for extra in self.extra_host_keys:
+            t.add_server_key(extra)
+        if self.enable_sftp:
+            t.set_subsystem_handler("sftp", paramiko.SFTPServer, sftp_si=_TestSFTPServer, root_dir=self.sftp_root)
+        iface = _TestSSHInterface(
+            self.username,
+            self.password,
+            self.state,
+            authorized_pubkeys=self.authorized_pubkeys,
+            os_flavor=self.os_flavor,
+            auth_attempts=self.auth_attempts,
+        )
         self._transports.append(t)
         try:
             t.start_server(server=iface)

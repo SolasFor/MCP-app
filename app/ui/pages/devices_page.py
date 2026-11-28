@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -34,8 +35,10 @@ from app.ui.components.silent_dialog import SilentDialog, SilentMessageBox
 from app.ui.components.table import DataTable
 from app.ui.i18n import tr
 from app.ui.pages.base import PageScaffold
+from app.ui.ssh_device_dialogs import HostKeyRotationDialog, SSHSetupGuideDialog
+from app.ui.ssh_device_wizard import SSHDeviceWizardDialog
 from backend.remote.manager import RemoteManager
-from backend.remote.models import DevicePermissions, DeviceProfile
+from backend.remote.models import DevicePermissions, DeviceProfile, canonical_endpoint_key
 from backend.remote.store import DeviceStore, import_ssh_config
 
 
@@ -123,8 +126,12 @@ class DeviceProfileDialog(SilentDialog):
         self.perm_svc.setChecked(perms.service_control)
         self.perm_metrics = QCheckBox("Metrics")
         self.perm_metrics.setChecked(perms.metrics)
+        self.perm_docker = QCheckBox("Docker")
+        self.perm_docker.setChecked(perms.docker_read)
         self.enabled_chk = QCheckBox(tr("devices.dlg.enabled"))
         self.enabled_chk.setChecked(self._base.enabled)
+        self.allow_oauth_chk = QCheckBox(tr("devices.dlg.allow_oauth_clients"))
+        self.allow_oauth_chk.setChecked(False if is_new else self._base.allow_oauth_clients)
 
         perm_row = QHBoxLayout()
         for chk in (
@@ -133,6 +140,7 @@ class DeviceProfileDialog(SilentDialog):
             self.perm_sftp_w,
             self.perm_svc,
             self.perm_metrics,
+            self.perm_docker,
             self.enabled_chk,
         ):
             perm_row.addWidget(chk)
@@ -153,6 +161,7 @@ class DeviceProfileDialog(SilentDialog):
         form.addRow(tr("devices.dlg.min_profile"), self.min_profile_combo)
         form.addRow(tr("devices.dlg.clients"), self.clients_edit)
         form.addRow(tr("devices.dlg.perms"), perm_row)
+        form.addRow("", self.allow_oauth_chk)
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(
@@ -162,47 +171,68 @@ class DeviceProfileDialog(SilentDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _build_profile_from_inputs(self) -> DeviceProfile:
+        dev_id = self.id_edit.text().strip()
+        new_host = self.host_edit.text().strip()
+        new_port = int(self.port_spin.value())
+        endpoint_changed = (not self._is_new) and (new_host != self._base.host or new_port != self._base.port)
+        pwd_ref = "" if endpoint_changed else self._base.password_ref
+        raw_pwd = self.password_edit.text()
+        if raw_pwd:
+            pwd_ref = self._store.set_secret(dev_id, "password", raw_pwd)
+        return DeviceProfile(
+            device_id=dev_id,
+            name=self.name_edit.text().strip() or dev_id,
+            host=new_host,
+            port=new_port,
+            username=self.user_edit.text().strip(),
+            group=self.group_edit.text().strip() or "default",
+            auth_method=str(self.auth_combo.currentData() or "agent"),
+            key_path=self.key_path_edit.text().strip(),
+            password_ref=pwd_ref,
+            passphrase_ref="" if endpoint_changed else self._base.passphrase_ref,
+            known_hosts_path=self.known_hosts_edit.text().strip(),
+            strict_host_key=True,
+            allowed_sftp_roots=_parse_csv(self.sftp_roots_edit.text()),
+            sftp_max_bytes=self._base.sftp_max_bytes,
+            allowed_commands=_parse_lines(self.commands_edit.toPlainText()),
+            allowed_services=_parse_csv(self.services_edit.text()),
+            remote_workspace_root=self._base.remote_workspace_root,
+            min_profile=str(self.min_profile_combo.currentData() or "allowlist"),
+            allowed_clients=_parse_csv(self.clients_edit.text()),
+            permissions=DevicePermissions(
+                execute=self.perm_exec.isChecked(),
+                sftp_read=self.perm_sftp_r.isChecked(),
+                sftp_write=self.perm_sftp_w.isChecked(),
+                service_control=self.perm_svc.isChecked(),
+                metrics=self.perm_metrics.isChecked(),
+                docker_read=self.perm_docker.isChecked(),
+            ),
+            enabled=self.enabled_chk.isChecked(),
+            notes=self._base.notes,
+            allow_oauth_clients=self.allow_oauth_chk.isChecked(),
+            pinned_host_key_algorithm="" if endpoint_changed else self._base.pinned_host_key_algorithm,
+            pinned_host_key_sha256="" if endpoint_changed else self._base.pinned_host_key_sha256,
+            pinned_host_key_base64="" if endpoint_changed else self._base.pinned_host_key_base64,
+            detected_os=self._base.detected_os,
+            detected_capabilities=self._base.detected_capabilities,
+        )
+
     def _on_accept(self) -> None:
         try:
-            dev_id = self.id_edit.text().strip()
-            pwd_ref = self._base.password_ref
-            raw_pwd = self.password_edit.text()
-            if raw_pwd:
-                pwd_ref = self._store.set_secret(dev_id, "password", raw_pwd)
-            prof = DeviceProfile(
-                device_id=dev_id,
-                name=self.name_edit.text().strip() or dev_id,
-                host=self.host_edit.text().strip(),
-                port=int(self.port_spin.value()),
-                username=self.user_edit.text().strip(),
-                group=self.group_edit.text().strip() or "default",
-                auth_method=str(self.auth_combo.currentData() or "agent"),
-                key_path=self.key_path_edit.text().strip(),
-                password_ref=pwd_ref,
-                passphrase_ref=self._base.passphrase_ref,
-                known_hosts_path=self.known_hosts_edit.text().strip(),
-                strict_host_key=True,
-                allowed_sftp_roots=_parse_csv(self.sftp_roots_edit.text()),
-                allowed_commands=_parse_lines(self.commands_edit.toPlainText()),
-                allowed_services=_parse_csv(self.services_edit.text()),
-                min_profile=str(self.min_profile_combo.currentData() or "allowlist"),
-                allowed_clients=_parse_csv(self.clients_edit.text()),
-                permissions=DevicePermissions(
-                    execute=self.perm_exec.isChecked(),
-                    sftp_read=self.perm_sftp_r.isChecked(),
-                    sftp_write=self.perm_sftp_w.isChecked(),
-                    service_control=self.perm_svc.isChecked(),
-                    metrics=self.perm_metrics.isChecked(),
-                ),
-                enabled=self.enabled_chk.isChecked(),
-            )
-            if self._is_new and prof.device_id in self._store.load_all():
+            prof = self._build_profile_from_inputs()
+            if self._is_new and prof.device_id in self._store.load_all(strict=True):
                 raise ValueError(f"Device '{prof.device_id}' already exists")
         except Exception as exc:  # noqa: BLE001
             SilentMessageBox.warning(self, tr("devices.title"), str(exc))
             return
         self.saved_profile = prof
+        self.password_edit.clear()
         self.accept()
+
+    def reject(self) -> None:
+        self.password_edit.clear()
+        super().reject()
 
 
 class DevicesPage(PageScaffold):
@@ -239,15 +269,28 @@ class DevicesPage(PageScaffold):
         self.add_btn = QPushButton(tr("devices.btn.add"))
         self.add_btn.setObjectName("Accent")
         self.add_btn.clicked.connect(self.add_device)
+        self.manual_add_btn = QPushButton(tr("devices.btn.manual_add"))
+        self.manual_add_btn.setObjectName("Ghost")
+        self.manual_add_btn.clicked.connect(self.add_device_manual)
         self.import_btn = QPushButton(tr("devices.btn.import"))
         self.import_btn.setObjectName("Ghost")
         self.import_btn.clicked.connect(lambda: self.import_from_ssh_config(None))
+        self.setup_guide_btn = QPushButton(tr("devices.btn.setup_guide"))
+        self.setup_guide_btn.setObjectName("Ghost")
+        self.setup_guide_btn.clicked.connect(self.open_ssh_setup_guide)
         self.refresh_btn = QPushButton(tr("devices.btn.refresh"))
         self.refresh_btn.setObjectName("Ghost")
         self.refresh_btn.clicked.connect(self.refresh_all)
         self.content.addWidget(management_toolbar(
-            self.search_input, (self.add_btn, self.import_btn, self.refresh_btn), compact=True
+            self.search_input,
+            (self.add_btn, self.manual_add_btn, self.import_btn, self.setup_guide_btn, self.refresh_btn),
+            compact=True,
         ))
+        self.corrupt_banner = QLabel(tr("devices.corrupt_banner"))
+        self.corrupt_banner.setObjectName("Hint")
+        self.corrupt_banner.setWordWrap(True)
+        self.corrupt_banner.hide()
+        self.content.addWidget(self.corrupt_banner)
 
         top_pane = ManagementPanel()
         top_lay = top_pane.body
@@ -282,28 +325,30 @@ class DevicesPage(PageScaffold):
     def apply_theme(self) -> None:
         self.empty_state.apply_theme()
 
+    @staticmethod
+    def _matches_device_filter(dev: dict[str, Any], query: str) -> bool:
+        if not query:
+            return True
+        haystack = (dev["device_id"], dev["name"], dev["host"], dev["group"])
+        return any(query in field.lower() for field in haystack)
+
     def refresh_all(self) -> None:
         q = self.search_input.text().strip().lower()
-        all_rows = self.manager.list_devices()["devices"]
-        self._devices = [
-            d
-            for d in all_rows
-            if not q or q in d["device_id"].lower() or q in d["name"].lower() or q in d["host"].lower() or q in d["group"].lower()
-        ]
+        try:
+            all_rows = self.manager.list_devices()["devices"]
+            self.corrupt_banner.hide()
+        except ValueError:
+            all_rows = []
+            self.corrupt_banner.show()
+        self._devices = [d for d in all_rows if self._matches_device_filter(d, q)]
         has_rows = bool(self._devices)
         self.table.setVisible(has_rows)
         self.empty_state.setVisible(not has_rows)
         self.table.setRowCount(len(self._devices))
         for row, dev in enumerate(self._devices):
             enabled_perms = [k for k, v in dev["permissions"].items() if v]
-            cells = [
-                dev["device_id"],
-                dev["name"],
-                f"{dev['username']}@{dev['host']}:{dev['port']}" if dev["username"] else f"{dev['host']}:{dev['port']}",
-                dev["group"],
-                dev["auth_method"],
-                ", ".join(enabled_perms) or "read-only",
-            ]
+            endpoint = f"{dev['username']}@{dev['host']}:{dev['port']}" if dev["username"] else f"{dev['host']}:{dev['port']}"
+            cells = [dev["device_id"], dev["name"], endpoint, dev["group"], dev["auth_method"], ", ".join(enabled_perms) or "read-only"]
             for col, val in enumerate(cells):
                 self.table.setItem(row, col, QTableWidgetItem(val))
             self.table.set_row_actions_cell(row, 6, tooltip=tr("common.actions"))
@@ -343,6 +388,12 @@ class DevicesPage(PageScaffold):
                 separator_before=True,
             ),
             MenuActionSpec(
+                key="rotate_key",
+                label=tr("devices.btn.rotate_key"),
+                callback=lambda d=dev_id: self._rotate_device_key(d),
+                icon_name="shield",
+            ),
+            MenuActionSpec(
                 key="copy_id",
                 label=tr("common.copy_id"),
                 callback=lambda d=dev_id: self._copy_device_id(d),
@@ -374,11 +425,34 @@ class DevicesPage(PageScaffold):
             self.output_view.setPlainText("\n".join(logs))
 
     def add_device(self) -> None:
+        wiz = SSHDeviceWizardDialog(self.store, redactor=self._redactor, parent=self)
+        res = wiz.exec()
+        if res == SilentDialog.DialogCode.Accepted and wiz.committed_profile is not None:
+            self.manager._register_secrets()
+            self.toast_requested.emit(tr("devices.toast.saved", name=wiz.committed_profile.name))
+            self.refresh_all()
+            return
+        if wiz.manual_requested:
+            self.add_device_manual()
+
+    def add_device_manual(self) -> None:
         dlg = DeviceProfileDialog(self.store, is_new=True, parent=self)
         if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.saved_profile is not None:
             self.store.upsert(dlg.saved_profile)
             self.manager._register_secrets()
             self.toast_requested.emit(tr("devices.toast.saved", name=dlg.saved_profile.name))
+            self.refresh_all()
+
+    def open_ssh_setup_guide(self) -> None:
+        SSHSetupGuideDialog(self).exec()
+
+    def _rotate_device_key(self, dev_id: str) -> None:
+        existing = self.store.get(dev_id)
+        if existing is None:
+            return
+        dlg = HostKeyRotationDialog(self.store, existing, parent=self)
+        if dlg.exec() == SilentDialog.DialogCode.Accepted and dlg.rotated_profile is not None:
+            self.toast_requested.emit(tr("devices.toast.rotated", name=dlg.rotated_profile.name))
             self.refresh_all()
 
     def _edit_device(self, dev_id: str) -> None:
@@ -398,12 +472,24 @@ class DevicesPage(PageScaffold):
             self._edit_device(dev_id)
 
     def import_from_ssh_config(self, config_path: Path | None = None) -> int:
+        try:
+            existing = self.store.load_all(strict=True)
+            self.corrupt_banner.hide()
+        except ValueError:
+            self.corrupt_banner.show()
+            return 0
+        seen_ids = {k.casefold() for k in existing}
+        seen_endpoints = {canonical_endpoint_key(d.host, d.port, d.username) for d in existing.values()}
         imported = import_ssh_config(config_path)
         count = 0
         for prof in imported:
-            if self.store.get(prof.device_id) is None:
-                self.store.upsert(prof)
-                count += 1
+            ep = canonical_endpoint_key(prof.host, prof.port, prof.username)
+            if prof.device_id.casefold() in seen_ids or ep in seen_endpoints:
+                continue
+            self.store.upsert(prof)
+            seen_ids.add(prof.device_id.casefold())
+            seen_endpoints.add(ep)
+            count += 1
         self.toast_requested.emit(tr("devices.toast.imported", count=count))
         self.refresh_all()
         return count
@@ -450,8 +536,11 @@ class DevicesPage(PageScaffold):
         self.guide_btn.setText(tr("management.guide.open"))
         self.search_input.setPlaceholderText(tr("devices.search"))
         self.add_btn.setText(tr("devices.btn.add"))
+        self.manual_add_btn.setText(tr("devices.btn.manual_add"))
         self.import_btn.setText(tr("devices.btn.import"))
+        self.setup_guide_btn.setText(tr("devices.btn.setup_guide"))
         self.refresh_btn.setText(tr("devices.btn.refresh"))
+        self.corrupt_banner.setText(tr("devices.corrupt_banner"))
         self._table_hdr.set_texts(tr("devices.table.title"))
         self._output_hdr.set_texts(tr("devices.details.output"))
         self.empty_state.set_content(tr("devices.empty.title"), tr("devices.empty.desc"))

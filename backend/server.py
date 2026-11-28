@@ -94,6 +94,8 @@ if __package__:
     from .desktop.models import effective_desktop_access
     from .extensions import ExtensionManager, ExtensionStore
     from .remote import DeviceStore, RemoteManager, SSHConnectionError
+    from .remote.onboarding import ResolvedSSHTarget, resolve_effective_ssh_target
+    from .remote.ssh_client import SSHConnectionManager, SSHTrustPolicy
     from .automation import (
         AutomationScheduler,
         MetricsRegistry,
@@ -246,6 +248,8 @@ else:
     from desktop.models import effective_desktop_access
     from extensions import ExtensionManager, ExtensionStore
     from remote import DeviceStore, RemoteManager, SSHConnectionError
+    from remote.onboarding import ResolvedSSHTarget, resolve_effective_ssh_target
+    from remote.ssh_client import SSHConnectionManager, SSHTrustPolicy
     from automation import (
         AutomationScheduler,
         MetricsRegistry,
@@ -900,6 +904,92 @@ def _scheduler_check_windows_args(spec: ScheduleSpec, profile: str, *, is_owner:
     return None
 
 
+def _authorize_resolved_ssh_target(
+    client_id: str,
+    target: ResolvedSSHTarget,
+    *,
+    command: str,
+    expected_profile: str,
+) -> SSHTrustPolicy:
+    """Authorize the exact resolved effective SSH endpoint (and alias if translated) fail-closed."""
+    if oauth_execution is None:
+        raise PermissionError("OAuth execution policy is unavailable")
+    if not oauth_execution.can_request(
+        client_id,
+        "ssh",
+        command=command,
+        host=target.effective_host,
+        user=target.effective_user,
+        port=target.effective_port,
+        expected_profile=expected_profile,
+    ):
+        raise PermissionError("SSH effective target or command is not permitted in the active profile")
+    if target.via_ssh_config and target.effective_host.casefold() != target.requested_host.casefold():
+        if not oauth_execution.can_request(
+            client_id,
+            "ssh",
+            command=command,
+            host=target.requested_host,
+            user=target.effective_user,
+            port=target.effective_port,
+            expected_profile=expected_profile,
+        ):
+            raise PermissionError("SSH host alias or command is not permitted in the active profile")
+    return REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
+        effective_host=target.effective_host,
+        effective_port=target.effective_port,
+        effective_user=target.effective_user,
+        command=command,
+        client_id=client_id,
+        client_profile=expected_profile,
+        from_oauth=True,
+    )
+
+
+def _scheduler_check_resolved_ssh(
+    spec: ScheduleSpec,
+    target: ResolvedSSHTarget,
+    *,
+    cmd: str,
+    profile: str,
+    is_owner: bool,
+) -> str | None:
+    if is_owner:
+        if profile == PROFILE_SAFE:
+            return f"Profile 'safe' forbids SSH execution in {spec.schedule_id}"
+        if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
+            pol = oauth_execution.policy()
+            if (
+                target.effective_host not in pol["hosts"]
+                or target.requested_host not in pol["hosts"]
+                or cmd.strip() not in pol["ssh_commands"]
+            ):
+                return f"Owner allowlist forbids SSH target/command in {spec.schedule_id}"
+        try:
+            REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
+                effective_host=target.effective_host,
+                effective_port=target.effective_port,
+                effective_user=target.effective_user,
+                command=cmd,
+                client_id="owner",
+                client_profile=profile,
+                from_oauth=False,
+            )
+        except (PermissionError, ValueError) as exc:
+            return f"SSH device policy forbids execution in {spec.schedule_id}: {exc}"
+        return None
+    try:
+        _authorize_resolved_ssh_target(
+            spec.client_id,
+            target,
+            command=cmd,
+            expected_profile=profile,
+        )
+    except (PermissionError, ValueError):
+        return f"Client {spec.client_id!r} is not authorized for SSH target/command in {spec.schedule_id}"
+    return None
+
+
 def _scheduler_check_ssh_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
     args = spec.arguments or {}
     cmd = args.get("command")
@@ -918,20 +1008,11 @@ def _scheduler_check_ssh_args(spec: ScheduleSpec, profile: str, *, is_owner: boo
         or timeout is None
     ):
         return f"Invalid SSH arguments in schedule {spec.schedule_id}"
-    if is_owner:
-        if profile == PROFILE_SAFE:
-            return f"Profile 'safe' forbids SSH execution in {spec.schedule_id}"
-        if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
-            pol = oauth_execution.policy()
-            if host not in pol["hosts"] or cmd.strip() not in pol["ssh_commands"]:
-                return f"Owner allowlist forbids SSH target/command in {spec.schedule_id}"
-        return None
-    assert oauth_execution is not None
-    if not oauth_execution.can_request(
-        spec.client_id, "ssh", command=cmd, host=host, user=user, port=port, expected_profile=profile
-    ):
-        return f"Client {spec.client_id!r} is not authorized for SSH target/command in {spec.schedule_id}"
-    return None
+    try:
+        target = resolve_effective_ssh_target(host, user, port)
+    except ValueError:
+        return f"Invalid SSH arguments in schedule {spec.schedule_id}"
+    return _scheduler_check_resolved_ssh(spec, target, cmd=cmd, profile=profile, is_owner=is_owner)
 
 
 def _scheduler_check_task_start_args(spec: ScheduleSpec, profile: str, *, is_owner: bool) -> str | None:
@@ -952,25 +1033,21 @@ def _scheduler_check_task_start_args(spec: ScheduleSpec, profile: str, *, is_own
         return f"Invalid timeout or port in task_start schedule {spec.schedule_id}"
     if profile != PROFILE_FULL and kind == "windows" and shell != "cmd":
         return f"PowerShell background task requires Full Access in {spec.schedule_id}"
-    if kind == "ssh" and (not isinstance(host, str) or not _SCHED_SSH_HOST_RE.fullmatch(host) or not isinstance(user, str)):
-        return f"Invalid SSH task target in schedule {spec.schedule_id}"
+    if kind == "ssh":
+        if not isinstance(host, str) or not _SCHED_SSH_HOST_RE.fullmatch(host) or not isinstance(user, str):
+            return f"Invalid SSH task target in schedule {spec.schedule_id}"
+        try:
+            target = resolve_effective_ssh_target(host, user, port)
+        except ValueError:
+            return f"Invalid SSH task target in schedule {spec.schedule_id}"
+        return _scheduler_check_resolved_ssh(spec, target, cmd=cmd, profile=profile, is_owner=is_owner)
     if is_owner:
         if profile == PROFILE_ALLOWLIST and oauth_execution is not None:
-            pol = oauth_execution.policy()
-            if kind == "windows" and not windows_whitelisted(cmd, pol["windows"]):
+            if not windows_whitelisted(cmd, oauth_execution.policy()["windows"]):
                 return f"Owner allowlist forbids Windows task command in {spec.schedule_id}"
-            if kind == "ssh" and (host not in pol["hosts"] or cmd.strip() not in pol["ssh_commands"]):
-                return f"Owner allowlist forbids SSH task in {spec.schedule_id}"
         return None
     assert oauth_execution is not None
-    ok = (
-        oauth_execution.can_request(
-            spec.client_id, "ssh", command=cmd, host=host, user=user, port=port, expected_profile=profile
-        )
-        if kind == "ssh"
-        else oauth_execution.can_request(spec.client_id, "windows", command=cmd, expected_profile=profile)
-    )
-    if not ok:
+    if not oauth_execution.can_request(spec.client_id, "windows", command=cmd, expected_profile=profile):
         return f"Client {spec.client_id!r} is not authorized for task_start command in {spec.schedule_id}"
     return None
 
@@ -1562,6 +1639,7 @@ def _server_auth_rechecker(client_id: str, srv_profile, workspace_id: str = "") 
 SERVER_MANAGER.auth_rechecker = _server_auth_rechecker
 SERVER_MANAGER.live_client_authorizer = _live_client_authorizer
 WORKSPACE_MANAGER.live_client_authorizer = _live_client_authorizer
+REMOTE_MANAGER.live_client_authorizer = _live_client_authorizer
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -2830,6 +2908,7 @@ async def device_list(group: str = "") -> dict:
             group=group,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2849,6 +2928,7 @@ async def device_info(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2868,6 +2948,7 @@ async def device_health(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, TimeoutError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2889,6 +2970,7 @@ async def ssh_execute(device_id: str, command: str, timeout: int = 12) -> dict:
             timeout=timeout,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile_mode,
@@ -2921,6 +3003,7 @@ async def ssh_task_start(device_id: str, command: str, timeout: int = 60) -> dic
             timeout=timeout,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError) as exc:
         return _remote_call_error(exc)
@@ -2941,6 +3024,7 @@ async def sftp_list(device_id: str, path: str) -> dict:
             path,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2962,6 +3046,7 @@ async def sftp_download(device_id: str, path: str, as_base64: bool = False) -> d
             as_base64=as_base64,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -2984,6 +3069,7 @@ async def sftp_upload(device_id: str, path: str, content: str, encoding: str = "
             encoding=encoding,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3003,6 +3089,7 @@ async def remote_service_list(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3024,6 +3111,7 @@ async def remote_service_start(device_id: str, service_name: str) -> dict:
             "start",
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3045,6 +3133,7 @@ async def remote_service_stop(device_id: str, service_name: str) -> dict:
             "stop",
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3064,6 +3153,7 @@ async def remote_metrics(device_id: str) -> dict:
             device_id,
             client_id=client_id,
             client_profile=profile_mode,
+            from_oauth=True,
         )
     except (OSError, ValueError, KeyError, PermissionError, RuntimeError, SSHConnectionError) as exc:
         return _remote_call_error(exc)
@@ -3084,10 +3174,14 @@ async def oauth_ssh_command(
     )
     assert oauth_execution is not None
     profile = oauth_execution.profile_for(client_id)
-    if (not oauth_execution.can_request(
-        client_id, "ssh", command=command, host=host, user=user, port=port,
-        expected_profile=profile,
-    ) or not 1 <= timeout <= (600 if profile == "full" else 12)):
+    try:
+        target = resolve_effective_ssh_target(host, user, port)
+        if not 1 <= timeout <= (600 if profile == "full" else 12):
+            raise PermissionError("SSH timeout is outside the active profile")
+        trust_policy = _authorize_resolved_ssh_target(
+            client_id, target, command=command, expected_profile=profile
+        )
+    except (ValueError, PermissionError):
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,
             event="denied", command=command, host=host, port=port,
@@ -3098,17 +3192,20 @@ async def oauth_ssh_command(
         live_client = require_execution_permission(
             EXEC_SSH, oauth_provider.store if oauth_provider else None, oauth_execution
         )
-        if not oauth_execution.can_request(
-            live_client, "ssh", command=command, host=host, user=user, port=port,
-            expected_profile=profile,
-        ):
-            raise PermissionError("SSH access revoked before dispatch")
+        live_target = resolve_effective_ssh_target(host, user, port)
+        if live_target != target:
+            raise PermissionError("SSH effective target changed after authorization")
+        live_trust = _authorize_resolved_ssh_target(
+            live_client, live_target, command=command, expected_profile=profile
+        )
+        if live_trust != trust_policy:
+            raise PermissionError("SSH host-key trust policy changed after authorization")
 
     action_id = secrets.token_hex(8)
     started = time.monotonic()
     EXEC_AUDIT.record(
         client_id=client_id, kind="ssh", profile=profile,
-        event="started", command=command, host=host, port=port,
+        event="started", command=command, host=target.effective_host, port=target.effective_port,
         action_id=action_id,
     )
     try:
@@ -3117,14 +3214,16 @@ async def oauth_ssh_command(
                 lambda cancel_ev, reg_cb: _sync_ssh_exec(
                     host, user, command, port, timeout,
                     cancel_event=cancel_ev, register_transport=reg_cb,
+                    resolved_target=target,
+                    trust_policy=trust_policy,
                 ),
                 client_id=client_id,
                 pre_dispatch_check=recheck_before_spawn,
             )
-    except PermissionError:
+    except (PermissionError, ValueError):
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,
-            event="denied", command=command, host=host, port=port,
+            event="denied", command=command, host=target.effective_host, port=target.effective_port,
             action_id=action_id,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
@@ -3132,7 +3231,7 @@ async def oauth_ssh_command(
     except BaseException as exc:
         EXEC_AUDIT.record(
             client_id=client_id, kind="ssh", profile=profile,
-            event="failed", command=command, host=host, port=port,
+            event="failed", command=command, host=target.effective_host, port=target.effective_port,
             action_id=action_id,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
@@ -3143,11 +3242,44 @@ async def oauth_ssh_command(
     outcome, exit_code = classify_command_output(output)
     EXEC_AUDIT.record(
         client_id=client_id, kind="ssh", profile=profile,
-        event=outcome, command=command, host=host, port=port,
+        event=outcome, command=command, host=target.effective_host, port=target.effective_port,
         action_id=action_id, exit_code=exit_code,
         duration_ms=int((time.monotonic() - started) * 1000),
     )
     return output
+
+
+def _resolve_and_verify_ssh_task_target(spec: TaskSpec) -> ResolvedSSHTarget:
+    live_target = resolve_effective_ssh_target(spec.host, spec.user, spec.port)
+    if spec.effective_host:
+        pinned = (
+            spec.effective_host,
+            spec.effective_user,
+            int(spec.effective_port or spec.port),
+            spec.effective_key_path,
+            bool(spec.via_ssh_config),
+        )
+        live_tuple = (
+            live_target.effective_host,
+            live_target.effective_user,
+            live_target.effective_port,
+            live_target.key_filename,
+            live_target.via_ssh_config,
+        )
+        if live_tuple != pinned:
+            raise PermissionError("SSH effective target changed after task creation")
+    return live_target
+
+
+def _verify_ssh_task_trust_pin(spec: TaskSpec, trust_policy: SSHTrustPolicy) -> None:
+    if spec.effective_host_key_sha256:
+        live_sha = trust_policy.pinned[1] if trust_policy.pinned else ""
+        if live_sha != spec.effective_host_key_sha256:
+            raise PermissionError("SSH host key pin changed after task creation")
+    if spec.effective_known_hosts_path:
+        norm = REMOTE_MANAGER._normalize_known_hosts_path
+        if norm(trust_policy.known_hosts_path) != norm(spec.effective_known_hosts_path):
+            raise PermissionError("SSH known_hosts trust source changed after task creation")
 
 
 def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
@@ -3183,11 +3315,14 @@ def _authorize_task_spec(client_id: str, spec: TaskSpec) -> str:
         max_to = 600 if profile == "full" else 12
         if not (1 <= spec.timeout <= max_to):
             raise PermissionError("SSH task timeout is outside the active profile")
-        if not oauth_execution.can_request(
-            client_id, "ssh", command=spec.command, host=spec.host,
-            user=spec.user, port=spec.port, expected_profile=profile,
-        ):
-            raise PermissionError("SSH host or command is not permitted in the active profile")
+        try:
+            target = _resolve_and_verify_ssh_task_target(spec)
+        except ValueError as exc:
+            raise PermissionError(f"Invalid SSH target: {exc}") from exc
+        trust_policy = _authorize_resolved_ssh_target(
+            client_id, target, command=spec.command, expected_profile=profile
+        )
+        _verify_ssh_task_trust_pin(spec, trust_policy)
     return profile
 
 
@@ -3229,11 +3364,18 @@ async def _task_command_executor(rec: TaskRecord, spec: TaskSpec) -> CommandResu
             if script_path:
                 script_path.unlink(missing_ok=True)
 
+    target = _resolve_and_verify_ssh_task_target(spec)
+    trust_policy = _authorize_resolved_ssh_target(
+        rec.owner_client_id, target, command=spec.command, expected_profile=profile
+    )
+    _verify_ssh_task_trust_pin(spec, trust_policy)
     async with PROCESS_RUNNER.request_slot():
         out = await PROCESS_RUNNER.run_ssh(
             lambda cancel_ev, reg_cb: _sync_ssh_exec(
                 spec.host, spec.user, spec.command, spec.port, spec.timeout,
                 cancel_event=cancel_ev, register_transport=reg_cb,
+                resolved_target=target,
+                trust_policy=trust_policy,
             ),
             client_id=rec.owner_client_id,
             pre_dispatch_check=pre_dispatch,
@@ -3308,6 +3450,32 @@ def _resolve_windows_shell_executable(shell: str) -> str:
         suggestion="Проверьте наличие системной оболочки Windows или выберите другой поддерживаемый shell.",
         internal_reason=f"Missing Windows shell executable for {shell!r}",
     )
+
+
+def _resolve_ssh_spec_args(host: str, user: str, port: int) -> ResolvedSSHTarget:
+    if not isinstance(host, str) or not host.strip():
+        raise TaskToolError(
+            code=TASK_INVALID_ARGUMENT,
+            message="Для SSH-задачи требуется непустой параметр host.",
+            details={"kind": "ssh"},
+            suggestion="Укажите имя или адрес SSH-хоста из настроенного списка.",
+        )
+    if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
+        raise TaskToolError(
+            code=TASK_INVALID_ARGUMENT,
+            message="SSH-порт должен быть целым числом в диапазоне 1–65535.",
+            details={"port": port},
+            suggestion="Укажите корректный TCP-порт (обычно 22).",
+        )
+    try:
+        return resolve_effective_ssh_target(host, user, port)
+    except ValueError as exc:
+        raise TaskToolError(
+            code=TASK_INVALID_ARGUMENT,
+            message=f"Недопустимый параметр SSH-цели: {exc}",
+            details={"kind": "ssh"},
+            suggestion="Укажите корректный хост, пользователя и порт SSH.",
+        ) from exc
 
 
 @_conditional_tool(OAUTH_ENABLED)
@@ -3416,21 +3584,15 @@ async def task_start(
                     },
                     suggestion=f"Укажите timeout от 1 до {max_to} сек. либо опустите параметр, чтобы использовать значение по умолчанию ({max_to if profile != 'full' else 60} сек.).",
                 )
-        if kind == "ssh":
-            if not isinstance(host, str) or not host.strip():
-                raise TaskToolError(
-                    code=TASK_INVALID_ARGUMENT,
-                    message="Для SSH-задачи требуется непустой параметр host.",
-                    details={"kind": kind},
-                    suggestion="Укажите имя или адрес SSH-хоста из настроенного списка.",
-                )
-            if isinstance(port, bool) or not isinstance(port, int) or not (1 <= port <= 65535):
-                raise TaskToolError(
-                    code=TASK_INVALID_ARGUMENT,
-                    message="SSH-порт должен быть целым числом в диапазоне 1–65535.",
-                    details={"port": port},
-                    suggestion="Укажите корректный TCP-порт (обычно 22).",
-                )
+        resolved_ssh = _resolve_ssh_spec_args(host, user, port) if kind == "ssh" else None
+        initial_trust = (
+            REMOTE_MANAGER.resolve_legacy_ssh_trust_policy(
+                effective_host=resolved_ssh.effective_host,
+                effective_port=resolved_ssh.effective_port,
+            )
+            if resolved_ssh is not None
+            else None
+        )
         if kind == "windows" and os.name == "nt" and profile == "full":
             _resolve_windows_shell_executable(shell)
         spec = TaskSpec(
@@ -3438,9 +3600,19 @@ async def task_start(
             command=command,
             shell=shell,
             timeout=resolved_timeout,
-            host=host,
+            host=resolved_ssh.requested_host if resolved_ssh is not None else host,
             user=user,
             port=port,
+            effective_host=resolved_ssh.effective_host if resolved_ssh is not None else "",
+            effective_user=resolved_ssh.effective_user if resolved_ssh is not None else "",
+            effective_port=resolved_ssh.effective_port if resolved_ssh is not None else 0,
+            effective_key_path=resolved_ssh.key_filename if resolved_ssh is not None else "",
+            via_ssh_config=resolved_ssh.via_ssh_config if resolved_ssh is not None else False,
+            config_alias=resolved_ssh.config_alias if resolved_ssh is not None else "",
+            effective_host_key_sha256=(
+                initial_trust.pinned[1] if initial_trust is not None and initial_trust.pinned else ""
+            ),
+            effective_known_hosts_path=(initial_trust.known_hosts_path if initial_trust is not None else ""),
         )
         spec.validate()
         profile = _authorize_task_spec(client_id, spec)
@@ -3465,8 +3637,13 @@ async def task_start(
             raise
         try:
             EXEC_AUDIT.record(
-                client_id=client_id, kind=kind, profile=profile,
-                event="started", command=command, host=host or None, port=port if host else None,
+                client_id=client_id,
+                kind=kind,
+                profile=profile,
+                event="started",
+                command=command,
+                host=(resolved_ssh.effective_host if resolved_ssh is not None else host) or None,
+                port=(resolved_ssh.effective_port if resolved_ssh is not None else port) if host else None,
                 action_id=rec.task_id,
             )
             _LOGGING_MGR.info(
@@ -3726,6 +3903,51 @@ async def run_local_command(command: str, timeout: int = 30, cwd: str | None = N
     except OSError as exc:
         return f"❌ Не удалось запустить разрешённую программу: {type(exc).__name__}"
 
+def _connect_legacy_ssh_client(
+    client: paramiko.SSHClient,
+    *,
+    actual_host: str,
+    actual_port: int,
+    actual_user: str | None,
+    key_filename: str | None,
+    trust_policy: SSHTrustPolicy | None,
+) -> None:
+    live_policy = REMOTE_MANAGER.resolve_legacy_ssh_trust_policy(
+        effective_host=actual_host,
+        effective_port=actual_port,
+    )
+    if trust_policy is not None and live_policy != trust_policy:
+        raise PermissionError("SSH host-key trust policy changed after authorization")
+    expected_pkey, transport_factory = SSHConnectionManager._prepare_host_key_trust(
+        client,
+        host=actual_host,
+        port=actual_port,
+        known_hosts_path=live_policy.known_hosts_path,
+        pinned=live_policy.pinned,
+    )
+    connect_kwargs: dict[str, Any] = {
+        "hostname": actual_host,
+        "port": actual_port,
+        "username": actual_user,
+        "key_filename": key_filename,
+        "timeout": 10,
+        "banner_timeout": 10,
+    }
+    if transport_factory is not None:
+        connect_kwargs["transport_factory"] = transport_factory
+    try:
+        client.connect(**connect_kwargs)
+    except paramiko.BadHostKeyException as exc:
+        raise PermissionError(f"SSH host key CHANGED for {actual_host}:{actual_port} (refusing connection)") from exc
+    except paramiko.SSHException as exc:
+        translated = SSHConnectionManager._translate_ssh_exception(exc, actual_host, actual_port)
+        if isinstance(translated, PermissionError):
+            raise translated from exc
+        raise
+    if expected_pkey is not None:
+        SSHConnectionManager._verify_connected_pin(client, expected_pkey, actual_host, actual_port)
+
+
 def _sync_ssh_exec(
     host: str,
     user: str,
@@ -3735,33 +3957,39 @@ def _sync_ssh_exec(
     *,
     cancel_event=None,
     register_transport=None,
+    resolved_target: ResolvedSSHTarget | None = None,
+    trust_policy: SSHTrustPolicy | None = None,
 ) -> str:
+    from backend.remote.models import validate_host as _val_host, validate_ssh_username as _val_user
+
+    clean_host = _val_host(host)
+    clean_user = _val_user(user, required=False)
+    port_num = int(port)
+    if not (1 <= port_num <= 65535):
+        raise ValueError(f"Invalid SSH port: {port_num}")
+
+    if resolved_target is not None:
+        actual_host = _val_host(resolved_target.effective_host)
+        actual_user = _val_user(resolved_target.effective_user, required=False) or None
+        actual_port = int(resolved_target.effective_port)
+        key_filename: str | None = resolved_target.key_filename or None
+    else:
+        actual_host, actual_user, actual_port, key_filename = clean_host, clean_user or None, port_num, None
+
     client = paramiko.SSHClient()
-    known_hosts = Path.home() / ".ssh" / "known_hosts"
-    client.load_system_host_keys()
-    if known_hosts.exists():
-        client.load_host_keys(str(known_hosts))
-    # Never trust unknown SSH hosts silently, even in Advanced mode.
-    client.set_missing_host_key_policy(paramiko.RejectPolicy())
-
-    actual_host, actual_user, actual_port, key_filename = host, user or None, port, None
-    ssh_cfg_path = Path.home() / ".ssh" / "config"
-    if ssh_cfg_path.exists():
-        cfg = paramiko.SSHConfig.from_path(str(ssh_cfg_path))
-        host_cfg = cfg.lookup(host)
-        actual_host = host_cfg.get("hostname", host)
-        if not actual_user:
-            actual_user = host_cfg.get("user")
-        if port == 22 and "port" in host_cfg:
-            actual_port = int(host_cfg["port"])
-        key_filename = host_cfg.get("identityfile")
-
     try:
         if cancel_event is not None and cancel_event.is_set():
             return "❌ SSH command cancelled."
         if register_transport is not None:
             register_transport(client, None)
-        client.connect(hostname=actual_host, port=actual_port, username=actual_user, key_filename=key_filename, timeout=10, banner_timeout=10)
+        _connect_legacy_ssh_client(
+            client,
+            actual_host=actual_host,
+            actual_port=actual_port,
+            actual_user=actual_user,
+            key_filename=key_filename,
+            trust_policy=trust_policy,
+        )
         if cancel_event is not None and cancel_event.is_set():
             return "❌ SSH command cancelled."
         _, stdout, stderr = client.exec_command(command, timeout=timeout)
@@ -3799,14 +4027,42 @@ def _sync_ssh_exec(
 
 @_conditional_tool(EXECUTION_TOOLS and bool(ALLOWED_HOSTS))
 async def run_ssh_command(host: str, command: str, user: str = "", port: int = 22, timeout: int = 30) -> str:
-    if not allowed_ssh_host(host, ALLOWED_HOSTS):
-        return "❌ Отказано: SSH-хост отсутствует в разрешённом списке."
-    if not (1 <= port <= 65535) or len(command) > 2000 or not command.strip():
-        return "❌ Отказано: недопустимый порт или команда."
-    timeout = min(max(timeout, 1), 120)
-    logger.info("[SSH] host=%s port=%s (command redacted)", host, port)
     try:
-        return await asyncio.to_thread(_sync_ssh_exec, host, user, command, port, timeout)
+        target = resolve_effective_ssh_target(host, user, port)
+    except ValueError:
+        return "❌ Отказано: недопустимый SSH-хост, пользователь или порт."
+    if not (
+        allowed_ssh_host(target.requested_host, ALLOWED_HOSTS)
+        and allowed_ssh_host(target.effective_host, ALLOWED_HOSTS)
+    ):
+        return "❌ Отказано: SSH-хост отсутствует в разрешённом списке."
+    if not (1 <= target.effective_port <= 65535) or len(command) > 2000 or not command.strip():
+        return "❌ Отказано: недопустимый порт или команда."
+    try:
+        trust_policy = REMOTE_MANAGER.authorize_legacy_ssh_endpoint(
+            effective_host=target.effective_host,
+            effective_port=target.effective_port,
+            effective_user=target.effective_user,
+            command=command,
+            client_id="owner",
+            client_profile="allowlist",
+            from_oauth=False,
+        )
+    except (PermissionError, ValueError):
+        return "❌ Отказано: SSH-цель запрещена политикой устройства."
+    timeout = min(max(timeout, 1), 120)
+    logger.info("[SSH] port=%s (target and command redacted)", target.effective_port)
+    try:
+        return await asyncio.to_thread(
+            _sync_ssh_exec,
+            host,
+            user,
+            command,
+            port,
+            timeout,
+            resolved_target=target,
+            trust_policy=trust_policy,
+        )
     except Exception as exc:
         logger.warning("SSH call failed: %s", type(exc).__name__)
         return "❌ SSH операция не выполнена; подробности в журнале администратора."

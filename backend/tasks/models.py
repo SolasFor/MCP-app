@@ -71,6 +71,22 @@ class TaskSpec:
     port: int = 22
     workspace_id: str = ""
     workspace_command: str = ""
+    effective_host: str = ""
+    effective_user: str = ""
+    effective_port: int = 0
+    effective_key_path: str = ""
+    via_ssh_config: bool = False
+    config_alias: str = ""
+    effective_host_key_sha256: str = ""
+    effective_known_hosts_path: str = ""
+
+    def _validate_ssh(self) -> None:
+        if not (self.host or "").strip():
+            raise ValueError("SSH task requires target host.")
+        if not (1 <= int(self.port) <= 65535):
+            raise ValueError("SSH port must be within 1..65535.")
+        if self.effective_port and not (1 <= int(self.effective_port) <= 65535):
+            raise ValueError("Effective SSH port must be within 1..65535.")
 
     def validate(self) -> None:
         if self.kind not in ("windows", "ssh"):
@@ -84,10 +100,26 @@ class TaskSpec:
         if not (1 <= int(self.timeout) <= 3600):
             raise ValueError("Task timeout must be between 1 and 3600 seconds.")
         if self.kind == "ssh":
-            if not (self.host or "").strip():
-                raise ValueError("SSH task requires target host.")
-            if not (1 <= int(self.port) <= 65535):
-                raise ValueError("SSH port must be within 1..65535.")
+            self._validate_ssh()
+
+    def _populate_ssh_payload(self, payload: dict[str, Any]) -> None:
+        if self.kind != "ssh" or not self.effective_host:
+            return
+        payload["effective_host"] = self.effective_host
+        payload["effective_user"] = self.effective_user
+        payload["effective_port"] = int(self.effective_port or self.port)
+        optional_fields = (
+            ("effective_key_path", self.effective_key_path),
+            ("effective_host_key_sha256", self.effective_host_key_sha256),
+            ("effective_known_hosts_path", self.effective_known_hosts_path),
+        )
+        for key, value in optional_fields:
+            if value:
+                payload[key] = value
+        if self.via_ssh_config:
+            payload["via_ssh_config"] = True
+            if self.config_alias:
+                payload["config_alias"] = self.config_alias
 
     def to_json(self) -> str:
         payload: dict[str, Any] = {
@@ -103,6 +135,7 @@ class TaskSpec:
             payload["workspace_id"] = self.workspace_id
         if self.workspace_command:
             payload["workspace_command"] = self.workspace_command
+        self._populate_ssh_payload(payload)
         return json.dumps(payload, ensure_ascii=False)
 
     @classmethod
@@ -122,6 +155,14 @@ class TaskSpec:
             port=int(data.get("port", 22)),
             workspace_id=str(data.get("workspace_id") or ""),
             workspace_command=str(data.get("workspace_command") or ""),
+            effective_host=str(data.get("effective_host") or ""),
+            effective_user=str(data.get("effective_user") or ""),
+            effective_port=int(data.get("effective_port", 0)),
+            effective_key_path=str(data.get("effective_key_path") or ""),
+            via_ssh_config=bool(data.get("via_ssh_config", False)),
+            config_alias=str(data.get("config_alias") or ""),
+            effective_host_key_sha256=str(data.get("effective_host_key_sha256") or ""),
+            effective_known_hosts_path=str(data.get("effective_known_hosts_path") or ""),
         )
 
 

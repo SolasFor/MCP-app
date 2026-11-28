@@ -2,21 +2,28 @@
 from __future__ import annotations
 
 import base64
+import getpass
+import inspect
+import os
 import secrets
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 from app.core.redaction import SecretRedactor
 from backend.remote.models import (
     DeviceProfile,
     RemoteJobRecord,
+    canonical_endpoint_key,
     contains_shell_metacharacters,
     validate_device_id,
+    validate_host,
     validate_service_name,
+    validate_ssh_username,
 )
-from backend.remote.ssh_client import SSHConnectionError, SSHConnectionManager
+from backend.remote.ssh_client import SSHConnectionError, SSHConnectionManager, SSHTrustPolicy
 from backend.remote.store import DeviceStore
 
 
@@ -29,10 +36,12 @@ class RemoteManager:
         *,
         ssh_client: SSHConnectionManager | None = None,
         redactor: SecretRedactor | None = None,
+        live_client_authorizer: Callable[..., str] | None = None,
     ) -> None:
         self.store = store or DeviceStore()
         self._redactor = redactor or SecretRedactor()
         self.ssh = ssh_client or SSHConnectionManager(self.store)
+        self.live_client_authorizer = live_client_authorizer
         self._lock = threading.RLock()
         self._jobs: dict[str, RemoteJobRecord] = {}
         self._logs: dict[str, deque[str]] = {}
@@ -52,6 +61,36 @@ class RemoteManager:
         with self._lock:
             return list(self._logs.get(device_id, ()))
 
+    def _effective_client_profile(
+        self,
+        *,
+        client_id: str,
+        client_profile: str,
+        from_oauth: bool,
+        tool_name: str,
+    ) -> str:
+        is_owner = (not from_oauth) and client_id == "owner"
+        if is_owner:
+            return "full"
+        if from_oauth and client_id in ("", "owner"):
+            raise PermissionError("OAuth caller cannot impersonate local owner")
+        if self.live_client_authorizer is not None:
+            sig = inspect.signature(self.live_client_authorizer)
+            if len(sig.parameters) >= 2:
+                live_profile = str(self.live_client_authorizer(client_id, tool_name))
+            else:
+                live_profile = str(self.live_client_authorizer(client_id))
+            return live_profile
+        return client_profile
+
+    @staticmethod
+    def _is_device_visible_for_client(dev: DeviceProfile, client_id: str, eff_profile: str) -> bool:
+        if not dev.allow_oauth_clients:
+            return False
+        if dev.allowed_clients and client_id not in dev.allowed_clients:
+            return False
+        return not (dev.min_profile == "full" and eff_profile != "full")
+
     def _authorize(
         self,
         device_id: str,
@@ -59,39 +98,181 @@ class RemoteManager:
         client_id: str,
         client_profile: str,
         need_permission: str = "",
-    ) -> DeviceProfile:
+        from_oauth: bool = False,
+        tool_name: str = "",
+    ) -> tuple[DeviceProfile, str]:
         clean_id = validate_device_id(device_id)
-        dev = self.store.get(clean_id)
+        is_owner = (not from_oauth) and client_id == "owner"
+        eff_profile = self._effective_client_profile(
+            client_id=client_id,
+            client_profile=client_profile,
+            from_oauth=from_oauth,
+            tool_name=tool_name,
+        )
+        dev = self.store.get(clean_id, strict=True)
         if dev is None:
             raise KeyError(f"Unknown remote device: {clean_id}")
         if not dev.enabled:
             raise PermissionError(f"Device {clean_id!r} is disabled")
-        if client_id != "owner":
-            if client_profile == "safe":
-                raise PermissionError("Safe OAuth profile cannot access remote devices")
-            if dev.min_profile == "full" and client_profile != "full":
-                raise PermissionError(f"Device {clean_id!r} requires Full Access OAuth profile")
-            if dev.allowed_clients and client_id not in dev.allowed_clients:
-                raise PermissionError(f"Client {client_id!r} is not allowed on device {clean_id!r}")
-        if need_permission:
-            allowed = getattr(dev.permissions, need_permission, False)
-            if not allowed:
-                raise PermissionError(
-                    f"Device {clean_id!r} does not grant '{need_permission}' permission"
-                )
-        return dev
+        if not is_owner:
+            self._enforce_oauth_device_access(dev, clean_id, client_id, eff_profile)
+        if need_permission and not getattr(dev.permissions, need_permission, False):
+            raise PermissionError(f"Device {clean_id!r} does not grant '{need_permission}' permission")
+        return dev, eff_profile
 
     @staticmethod
-    def _validate_command_for_profile(device: DeviceProfile, command: str, *, client_id: str, client_profile: str) -> str:
+    def _enforce_oauth_device_access(
+        dev: DeviceProfile,
+        clean_id: str,
+        client_id: str,
+        eff_profile: str,
+    ) -> None:
+        if eff_profile == "safe":
+            raise PermissionError("Safe OAuth profile cannot access remote devices")
+        if not dev.allow_oauth_clients:
+            raise PermissionError(
+                f"Device {clean_id!r} is deny-by-default for OAuth clients (enable explicit grant first)"
+            )
+        if dev.min_profile == "full" and eff_profile != "full":
+            raise PermissionError(f"Device {clean_id!r} requires Full Access OAuth profile")
+        if dev.allowed_clients and client_id not in dev.allowed_clients:
+            raise PermissionError(f"Client {client_id!r} is not allowed on device {clean_id!r}")
+
+    @staticmethod
+    def _validate_command_for_profile(device: DeviceProfile, command: str, *, client_id: str, client_profile: str, from_oauth: bool = False) -> str:
         cmd = (command or "").strip()
         if not cmd:
             raise ValueError("Command must not be empty")
-        if client_id != "owner" and client_profile != "full":
+        is_owner = (not from_oauth) and client_id == "owner"
+        if not is_owner and client_profile != "full":
             if contains_shell_metacharacters(cmd):
                 raise PermissionError("Shell metacharacters prohibited in allowlist profile")
             if not device.allowed_commands or cmd not in device.allowed_commands:
                 raise PermissionError("Command is not in device allowed_commands allowlist")
         return cmd
+
+    @staticmethod
+    def _device_allows_legacy_ssh(
+        dev: DeviceProfile,
+        *,
+        effective_user: str,
+        command: str,
+        client_id: str,
+        client_profile: str,
+        from_oauth: bool,
+    ) -> bool:
+        if not dev.enabled or not dev.permissions.execute:
+            return False
+        if dev.username:
+            actual_user = effective_user or validate_ssh_username(getpass.getuser(), required=False)
+            if actual_user != dev.username:
+                return False
+        try:
+            if from_oauth:
+                RemoteManager._enforce_oauth_device_access(dev, dev.device_id, client_id, client_profile)
+            RemoteManager._validate_command_for_profile(
+                dev,
+                command,
+                client_id=client_id,
+                client_profile=client_profile,
+                from_oauth=from_oauth,
+            )
+        except PermissionError:
+            return False
+        return True
+
+    @staticmethod
+    def _normalize_known_hosts_path(raw: str) -> str:
+        clean = (raw or "").strip()
+        if not clean:
+            return ""
+        return os.path.normcase(os.path.abspath(os.path.expanduser(clean)))
+
+    def _extract_device_trust(self, dev: DeviceProfile) -> tuple[tuple[str, str, str] | None, str]:
+        pinned = (
+            (
+                dev.pinned_host_key_algorithm,
+                dev.pinned_host_key_sha256,
+                dev.pinned_host_key_base64,
+            )
+            if dev.has_pinned_host_key()
+            else None
+        )
+        kh = dev.known_hosts_path
+        if not kh and pinned is not None and self.store.managed_known_hosts_path.exists():
+            kh = str(self.store.managed_known_hosts_path)
+        return pinned, kh
+
+    def _merge_endpoint_trust(
+        self, clean_host: str, port_num: int, matching: list[DeviceProfile]
+    ) -> SSHTrustPolicy:
+        first_pin, first_kh = self._extract_device_trust(matching[0])
+        first_norm_kh = self._normalize_known_hosts_path(first_kh)
+        for dev in matching[1:]:
+            pin, kh = self._extract_device_trust(dev)
+            if pin != first_pin or self._normalize_known_hosts_path(kh) != first_norm_kh:
+                raise PermissionError(
+                    f"Conflicting SSH host-key trust policies across registered devices for {clean_host}:{port_num}"
+                )
+        policy = SSHTrustPolicy(
+            registered=True,
+            known_hosts_path=first_kh,
+            pinned=first_pin,
+            device_ids=tuple(sorted(d.device_id for d in matching)),
+        )
+        SSHConnectionManager.validate_host_key_trust_policy(host=clean_host, port=port_num, policy=policy)
+        return policy
+
+    def resolve_legacy_ssh_trust_policy(self, *, effective_host: str, effective_port: int) -> SSHTrustPolicy:
+        """Resolve unified SSH host-key trust policy for an endpoint against DeviceStore."""
+        clean_host = validate_host(effective_host)
+        port_num = int(effective_port)
+        target_key = canonical_endpoint_key(clean_host, port_num, "")[:2]
+        devices = self.store.load_all(strict=True)
+        matching = [
+            dev for dev in devices.values() if canonical_endpoint_key(dev.host, dev.port, "")[:2] == target_key
+        ]
+        if not matching:
+            return SSHTrustPolicy(registered=False)
+        return self._merge_endpoint_trust(clean_host, port_num, matching)
+
+    def authorize_legacy_ssh_endpoint(
+        self,
+        *,
+        effective_host: str,
+        effective_port: int,
+        effective_user: str,
+        command: str,
+        client_id: str,
+        client_profile: str,
+        from_oauth: bool = True,
+    ) -> SSHTrustPolicy:
+        """Enforce registered DeviceProfile permissions and unified host-key trust for legacy SSH tools."""
+        clean_host = validate_host(effective_host)
+        port_num = int(effective_port)
+        target_key = canonical_endpoint_key(clean_host, port_num, "")[:2]
+        devices = self.store.load_all(strict=True)
+        matching = [
+            dev
+            for dev in devices.values()
+            if canonical_endpoint_key(dev.host, dev.port, "")[:2] == target_key
+        ]
+        if not matching:
+            return SSHTrustPolicy(registered=False)
+        policy = self._merge_endpoint_trust(clean_host, port_num, matching)
+        for dev in matching:
+            if self._device_allows_legacy_ssh(
+                dev,
+                effective_user=effective_user,
+                command=command,
+                client_id=client_id,
+                client_profile=client_profile,
+                from_oauth=from_oauth,
+            ):
+                return policy
+        raise PermissionError(
+            f"Target SSH endpoint {clean_host}:{port_num} is restricted by DeviceProfile permissions"
+        )
 
     def list_devices(
         self,
@@ -99,19 +280,24 @@ class RemoteManager:
         group: str = "",
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        if client_id != "owner" and client_profile == "safe":
+        is_owner = (not from_oauth) and client_id == "owner"
+        eff_profile = self._effective_client_profile(
+            client_id=client_id,
+            client_profile=client_profile,
+            from_oauth=from_oauth,
+            tool_name="device_list",
+        )
+        if not is_owner and eff_profile == "safe":
             raise PermissionError("Safe OAuth profile cannot list remote devices")
         grp = (group or "").strip().lower()
         rows: list[dict[str, Any]] = []
-        for dev in self.store.load_all().values():
+        for dev in self.store.load_all(strict=True).values():
             if grp and dev.group.lower() != grp:
                 continue
-            if client_id != "owner":
-                if dev.allowed_clients and client_id not in dev.allowed_clients:
-                    continue
-                if dev.min_profile == "full" and client_profile != "full":
-                    continue
+            if not is_owner and not self._is_device_visible_for_client(dev, client_id, eff_profile):
+                continue
             d = dev.to_dict()
             d.pop("password_ref", None)
             d.pop("passphrase_ref", None)
@@ -124,9 +310,19 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(device_id, client_id=client_id, client_profile=client_profile)
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            from_oauth=from_oauth,
+            tool_name="device_info",
+        )
         data = dev.to_dict()
+        if from_oauth or client_id != "owner":
+            data.pop("password_ref", None)
+            data.pop("passphrase_ref", None)
         data["logs"] = self.get_logs(dev.device_id)
         return data
 
@@ -136,8 +332,15 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(device_id, client_id=client_id, client_profile=client_profile)
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            from_oauth=from_oauth,
+            tool_name="device_health",
+        )
         try:
             res = self.ssh.probe_health(dev)
             self._log(dev.device_id, f"[health] ok latency={res['latency_ms']}ms")
@@ -155,14 +358,19 @@ class RemoteManager:
         timeout: int = 12,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
+        dev, eff_profile = self._authorize(
             device_id,
             client_id=client_id,
             client_profile=client_profile,
             need_permission="execute",
+            from_oauth=from_oauth,
+            tool_name="ssh_execute",
         )
-        cmd = self._validate_command_for_profile(dev, command, client_id=client_id, client_profile=client_profile)
+        cmd = self._validate_command_for_profile(
+            dev, command, client_id=client_id, client_profile=eff_profile, from_oauth=from_oauth
+        )
         res = self.ssh.run_command(dev, cmd, timeout=timeout)
         res["stdout"] = self._redactor.redact_text(res["stdout"])
         res["stderr"] = self._redactor.redact_text(res["stderr"])
@@ -177,14 +385,19 @@ class RemoteManager:
         timeout: int = 60,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
+        dev, eff_profile = self._authorize(
             device_id,
             client_id=client_id,
             client_profile=client_profile,
             need_permission="execute",
+            from_oauth=from_oauth,
+            tool_name="ssh_task_start",
         )
-        cmd = self._validate_command_for_profile(dev, command, client_id=client_id, client_profile=client_profile)
+        cmd = self._validate_command_for_profile(
+            dev, command, client_id=client_id, client_profile=eff_profile, from_oauth=from_oauth
+        )
         job_id = secrets.token_hex(8)
         rec = RemoteJobRecord(
             job_id=job_id,
@@ -198,7 +411,25 @@ class RemoteManager:
 
         def _worker() -> None:
             try:
-                res = self.ssh.run_command(dev, cmd, timeout=timeout)
+                live_dev, live_prof = self._authorize(
+                    device_id,
+                    client_id=client_id,
+                    client_profile=eff_profile,
+                    need_permission="execute",
+                    from_oauth=from_oauth,
+                    tool_name="ssh_task_start",
+                )
+                if (
+                    live_dev.host,
+                    live_dev.port,
+                    live_dev.username,
+                    live_dev.pinned_host_key_sha256,
+                ) != (dev.host, dev.port, dev.username, dev.pinned_host_key_sha256):
+                    raise PermissionError("Device SSH endpoint or host key pin changed before task dispatch")
+                live_cmd = self._validate_command_for_profile(
+                    live_dev, cmd, client_id=client_id, client_profile=live_prof, from_oauth=from_oauth
+                )
+                res = self.ssh.run_command(live_dev, live_cmd, timeout=timeout)
                 with self._lock:
                     rec.exit_code = int(res["exit_code"])
                     rec.output = self._redactor.redact_text((res["stdout"] + "\n" + res["stderr"]).strip())
@@ -234,9 +465,15 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="sftp_read"
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="sftp_read",
+            from_oauth=from_oauth,
+            tool_name="sftp_list",
         )
         res = self.ssh.sftp_list(dev, path)
         self._log(dev.device_id, f"[sftp_list] path={res['path']} entries={len(res['entries'])}")
@@ -250,9 +487,15 @@ class RemoteManager:
         as_base64: bool = False,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="sftp_read"
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="sftp_read",
+            from_oauth=from_oauth,
+            tool_name="sftp_download",
         )
         res = self.ssh.sftp_download(dev, path, as_base64=as_base64)
         if not as_base64:
@@ -269,9 +512,15 @@ class RemoteManager:
         encoding: str = "utf-8",
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="sftp_write"
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="sftp_write",
+            from_oauth=from_oauth,
+            tool_name="sftp_upload",
         )
         raw = base64.b64decode(content) if encoding.lower() == "base64" else content.encode("utf-8")
         res = self.ssh.sftp_upload(dev, path, raw)
@@ -284,9 +533,15 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="metrics"
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="metrics",
+            from_oauth=from_oauth,
+            tool_name="remote_metrics",
         )
         probe = (
             "sh -c 'uname -a; "
@@ -308,9 +563,15 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="service_control"
+        dev, _ = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="service_control",
+            from_oauth=from_oauth,
+            tool_name="remote_service_list",
         )
         res = self.ssh.run_command(
             dev,
@@ -331,14 +592,21 @@ class RemoteManager:
         *,
         client_id: str = "owner",
         client_profile: str = "full",
+        from_oauth: bool = False,
     ) -> dict[str, Any]:
         if action not in ("start", "stop"):
             raise ValueError(f"Unsupported service action: {action!r}")
-        dev = self._authorize(
-            device_id, client_id=client_id, client_profile=client_profile, need_permission="service_control"
+        dev, eff_profile = self._authorize(
+            device_id,
+            client_id=client_id,
+            client_profile=client_profile,
+            need_permission="service_control",
+            from_oauth=from_oauth,
+            tool_name=f"remote_service_{action}",
         )
         svc = validate_service_name(service_name)
-        if client_id != "owner" and client_profile != "full":
+        is_owner = (not from_oauth) and client_id == "owner"
+        if not is_owner and eff_profile != "full":
             if not dev.allowed_services or svc not in dev.allowed_services:
                 raise PermissionError(f"Service {svc!r} is not in allowed_services allowlist")
         # Never elevate via sudo automatically; invoke direct service manager with explicit user rights.

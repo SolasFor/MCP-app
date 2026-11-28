@@ -32,7 +32,7 @@ from backend.workspaces.discovery import (
 from backend.workspaces.history import WorkspaceHistory
 from backend.workspaces.manager import WorkspaceManager
 from backend.workspaces.models import WorkspacePermissions, WorkspaceProfile
-from backend.workspaces.path_security import PathSecurityError, read_verified_bytes
+from backend.workspaces.path_security import PathSecurityError, read_verified_bytes, resolve_workspace_path
 from backend.workspaces.server_links import WorkspaceServerCoordinator
 from backend.workspaces.store import WorkspaceStore
 
@@ -40,7 +40,7 @@ from backend.workspaces.store import WorkspaceStore
 class N04ReviewBoundsAndManifestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.ws_store = WorkspaceStore(
             self.base / "workspaces.json",
             secret_store=SecretStore(self.base / "ws_secrets"),
@@ -234,11 +234,12 @@ class N04ReviewBoundsAndManifestTests(unittest.TestCase):
                 raise AssertionError("Special file must be rejected by os.lstat before os.open")
             return real_open(path, flags, *args, **kwargs)
 
+        safe_pkg = resolve_workspace_path(proj, "package.json")
         with patch("os.lstat", side_effect=_fake_fifo_lstat), patch("os.open", side_effect=_forbid_fifo_open):
             res_fifo = analyze_workspace_directory(proj)
             self.assertNotIn("package.json", res_fifo.manifest_digests)
             with self.assertRaises(PathSecurityError):
-                read_verified_bytes(proj, pkg, max_bytes=1024)
+                read_verified_bytes(proj, safe_pkg, max_bytes=1024)
 
         def _recording_open(path: os.PathLike[str] | str, flags: int, *args: object, **kwargs: object) -> int:
             if Path(path).name == "package.json":
@@ -246,7 +247,7 @@ class N04ReviewBoundsAndManifestTests(unittest.TestCase):
             return real_open(path, flags, *args, **kwargs)
 
         with patch("os.open", side_effect=_recording_open):
-            data, _ = read_verified_bytes(proj, pkg, max_bytes=1024)
+            data, _ = read_verified_bytes(proj, safe_pkg, max_bytes=1024)
         self.assertIn(b'"ok"', data)
         if hasattr(os, "O_NONBLOCK"):
             self.assertTrue(seen_flags and (seen_flags[0] & os.O_NONBLOCK))

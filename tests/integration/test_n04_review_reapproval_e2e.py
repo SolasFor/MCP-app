@@ -31,7 +31,7 @@ class N04ReviewReapprovalE2ETests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
+        self.root = Path(self._tmp.name).resolve()
         self.data_dir = self.root / "appdata"
         self.data_dir.mkdir(parents=True)
         i18n.set_language(LANG_RU)
